@@ -19,6 +19,27 @@ export interface InterpolatedMotionState {
   probe: ProbeSnapshot | null;
 }
 
+export const reconcileStructureMotionWithSnapshot = (
+  snapshotStructures: StructureSnapshot[],
+  motionStructures: StructureSnapshot[],
+): StructureSnapshot[] => {
+  const movingStructures = new Map(
+    motionStructures.map((structure) => [structure.id, structure]),
+  );
+  return snapshotStructures.map((structure) => {
+    const moving = movingStructures.get(structure.id);
+    if (!moving || structure.isSleeping || structure.locked || structure.isHeld !== moving.isHeld) {
+      return structure;
+    }
+    return {
+      ...structure,
+      x: moving.x,
+      y: moving.y,
+      angle: moving.angle,
+    };
+  });
+};
+
 const holdingIdentity = (holding: HoldingSnapshot | null): string | null => {
   if (!holding) return null;
   switch (holding.kind) {
@@ -47,20 +68,8 @@ export const reconcileMotionWithSnapshot = (
     };
   }
 
-  const motionStructures = new Map(
-    motion.structures.map((structure) => [structure.id, structure]),
-  );
   const motionAnimals = new Map(motion.animals.map((animal) => [animal.id, animal]));
-  const structures = snapshot.structures.map((structure) => {
-    const moving = motionStructures.get(structure.id);
-    if (!moving || structure.isSleeping || structure.locked) return structure;
-    return {
-      ...structure,
-      x: moving.x,
-      y: moving.y,
-      angle: moving.angle,
-    };
-  });
+  const structures = reconcileStructureMotionWithSnapshot(snapshot.structures, motion.structures);
   const animals = snapshot.animals.map((animal) => motionAnimals.get(animal.id) ?? animal);
   const holding = holdingIdentity(snapshot.holding) === holdingIdentity(motion.holding)
     ? motion.holding
@@ -188,7 +197,9 @@ export const interpolateMotionFrames = (
     interpolated: true,
     structures: current.structures.map((structure) => {
       const before = previousStructures.get(structure.id);
-      return before ? interpolateStructure(before, structure, ratio) : structure;
+      return before && before.isHeld === structure.isHeld
+        ? interpolateStructure(before, structure, ratio)
+        : structure;
     }),
     animals: current.animals.map((animal) => {
       const before = previousAnimals.get(animal.id);

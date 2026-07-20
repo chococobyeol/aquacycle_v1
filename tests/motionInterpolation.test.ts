@@ -144,4 +144,53 @@ describe('Pixi motion interpolation', () => {
     expect(reconciled.structures[0].angle).toBe(0.4);
     expect(reconciled.structures[0].isSleeping).toBe(true);
   });
+
+  it('keeps the dropped snapshot pose when a stale held motion frame remains', () => {
+    const dropped = {
+      ...structure(520, 0.35),
+      isHeld: false,
+      isSleeping: false,
+    };
+    const staleHeld = {
+      ...structure(110, -0.2),
+      isHeld: true,
+    };
+    const snapshot = {
+      structures: [dropped],
+      animals: [],
+      holding: null,
+      probe: null,
+    } as unknown as SimulationSnapshot;
+    const staleMotion = {
+      sequence: 31,
+      interpolated: false,
+      structures: [staleHeld],
+      animals: [],
+      holding: null,
+      probe: null,
+    };
+
+    const reconciled = reconcileMotionWithSnapshot(snapshot, staleMotion);
+
+    expect(reconciled.structures[0].x).toBe(520);
+    expect(reconciled.structures[0].angle).toBe(0.35);
+    expect(reconciled.structures[0].isHeld).toBe(false);
+  });
+
+  it('does not interpolate across the held-to-dropped boundary', () => {
+    const previous = frame(40, 1_000, 2_000, [], [{
+      ...structure(110, -0.2),
+      isHeld: true,
+    }]);
+    const current = frame(41, 1_033, 2_033, [], [{
+      ...structure(520, 0.35),
+      isHeld: false,
+    }]);
+
+    const sampled = interpolateMotionFrames({ previous, current }, 2_033);
+
+    expect(sampled?.structures[0].x).toBe(520);
+    expect(sampled?.structures[0].angle).toBe(0.35);
+    expect(sampled?.structures[0].isHeld).toBe(false);
+  });
 });

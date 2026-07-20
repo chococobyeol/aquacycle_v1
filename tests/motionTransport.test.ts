@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createSimulationMotionStore } from '../src/renderer/hooks/useSimulation';
+import {
+  commandRebasesMotion,
+  createSimulationMotionStore,
+} from '../src/renderer/hooks/useSimulation';
 import {
   MOTION_SAMPLE_INTERVAL_MS,
   type SimulationCommand,
@@ -38,7 +41,17 @@ describe('simulation motion store', () => {
     store.clear();
     expect(store.getFrames()).toEqual({ previous: null, current: null });
     expect(listener).toHaveBeenCalledTimes(21);
+    expect(store.accept(motionMessage(20), 2_002)).toBe(false);
+    expect(store.accept(motionMessage(19), 2_003)).toBe(false);
+    expect(store.accept(motionMessage(21), 2_004)).toBe(true);
     unsubscribe();
+  });
+
+  it('keeps the latest visual pose while a drop command waits for its snapshot', () => {
+    expect(commandRebasesMotion({ type: 'drop-held', point: { x: 520, y: 330 } })).toBe(false);
+    expect(commandRebasesMotion({ type: 'cancel-held' })).toBe(false);
+    expect(commandRebasesMotion({ type: 'retrieve-held' })).toBe(false);
+    expect(commandRebasesMotion({ type: 'remove-held-structure' })).toBe(false);
   });
 });
 

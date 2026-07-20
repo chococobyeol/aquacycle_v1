@@ -71,6 +71,7 @@ import {
 import {
   interpolateMotionFrames,
   reconcileMotionWithSnapshot,
+  reconcileStructureMotionWithSnapshot,
 } from './motionInterpolation';
 
 interface AquariumCanvasProps {
@@ -2531,13 +2532,17 @@ export function AquariumCanvas({
         const nowMs = performance.now();
         const motion = sampleMotion(nowMs);
         if (motion) {
+          const reconciledStructures = reconcileStructureMotionWithSnapshot(
+            currentSnapshot.structures,
+            motion.structures,
+          );
           if (motion.sequence !== syncedMotionSequence) {
             syncStructures(
               layers.structures,
               currentSnapshot,
               ownedTextures,
               ownedDisplays,
-              motion.structures,
+              reconciledStructures,
               isPendingInventoryHandoff(),
             );
             syncAnimals(
@@ -2552,7 +2557,7 @@ export function AquariumCanvas({
             );
             syncedMotionSequence = motion.sequence;
           } else {
-            applyStructureMotion(ownedDisplays, motion.structures);
+            applyStructureMotion(ownedDisplays, reconciledStructures);
             applyAnimalMotion(
               ownedAnimalDisplays,
               motion.animals,

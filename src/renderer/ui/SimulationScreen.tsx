@@ -640,7 +640,7 @@ export function SimulationScreen({
               type="button"
               className={`hud-tool-button ${openHudPanels.inventory ? 'active' : ''} ${pendingInventory || snapshot.holding ? 'has-attention' : ''}`}
               aria-label="보유 목록"
-              aria-expanded={openHudPanels.inventory}
+              aria-expanded={inventoryPanelVisible}
               aria-controls="floating-inventory-panel"
               title="보유 목록"
               onClick={() => toggleHudPanel('inventory')}
@@ -745,7 +745,7 @@ export function SimulationScreen({
             </section>
           )}
 
-          {openHudPanels.inventory && (
+          {inventoryPanelVisible && (
           <aside id="floating-inventory-panel" className="inventory-panel paper-panel floating-note floating-inventory-panel" aria-label="보유 목록">
             <div className="inventory-heading">
               <div>
@@ -789,11 +789,8 @@ export function SimulationScreen({
                 .map((definitionId) => {
                   const definition = STRUCTURES[definitionId];
                   const remaining = snapshot.remainingStructures[definitionId];
-                  const isHeld = snapshot.holding?.kind === 'structure'
-                    ? snapshot.holding.structureDefinitionId === definitionId
-                    : pendingInventory?.kind === 'structure' && pendingInventory.definitionId === definitionId;
                   return (
-                    <article className={`inventory-card structure-card ${isHeld ? 'held' : ''}`} key={definitionId}>
+                    <article className="inventory-card structure-card" key={definitionId}>
                       <button
                         type="button"
                         className="inventory-card-main"
@@ -809,14 +806,13 @@ export function SimulationScreen({
                             definitionId,
                           });
                           setActiveTool('move');
-                          closeHudPanel('inventory');
                         }}
                       >
                         <span className="inventory-thumb rock-thumb"><img src={definition.assetPath} alt="" /></span>
                         <span className="inventory-copy">
                           <strong>{definition.label}</strong>
                           <small>{definition.material}</small>
-                          <em>{isHeld ? '배치 중' : countLabel(remaining)}</em>
+                          <em>{countLabel(remaining)}</em>
                         </span>
                       </button>
                     </article>
@@ -829,11 +825,8 @@ export function SimulationScreen({
                 const species = SPECIES[speciesId];
                 const unlocked = true;
                 const remaining = snapshot.remainingSeeds[speciesId];
-                const isHeld = snapshot.holding?.kind === 'seed'
-                  ? snapshot.holding.speciesId === speciesId
-                  : pendingInventory?.kind === 'seed' && pendingInventory.speciesId === speciesId;
                 return (
-                  <article className={`inventory-card organism-card ${!unlocked ? 'locked' : ''} ${isHeld ? 'held' : ''}`} key={speciesId}>
+                  <article className={`inventory-card organism-card ${!unlocked ? 'locked' : ''}`} key={speciesId}>
                     <button
                       type="button"
                       className="inventory-card-main"
@@ -844,14 +837,13 @@ export function SimulationScreen({
                         setPendingInventory({ kind: 'seed', label: species.shortName, speciesId });
                         setCatalogSpecies(speciesId);
                         setActiveTool('move');
-                        closeHudPanel('inventory');
                       }}
                     >
                       <span className={`inventory-thumb colony-thumb colony-${speciesId}`} aria-hidden="true"><i /><i /><i /></span>
                       <span className="inventory-copy">
                         <strong>{unlocked ? species.shortName : '잠긴 생물'}</strong>
                         <small>{unlocked ? species.scientificName : '이전 미션 완료 후 해금'}</small>
-                        <em>{isHeld ? '배치 중' : unlocked ? countLabel(remaining) : '특성 미공개'}</em>
+                        <em>{unlocked ? countLabel(remaining) : '특성 미공개'}</em>
                       </span>
                     </button>
                     <button type="button" className="info-chip" disabled={!unlocked || Boolean(snapshot.holding) || Boolean(pendingInventory)} onClick={() => showCatalogSpecies(speciesId)}>정보</button>
@@ -864,11 +856,8 @@ export function SimulationScreen({
                 .map((speciesId) => {
                   const animal = ANIMALS[speciesId];
                   const remaining = snapshot.remainingAnimals[speciesId];
-                  const isHeld = snapshot.holding?.kind === 'animal'
-                    ? snapshot.holding.animalSpeciesId === speciesId
-                    : pendingInventory?.kind === 'animal' && pendingInventory.animalSpeciesId === speciesId;
                   return (
-                    <article className={`inventory-card organism-card animal-card ${isHeld ? 'held' : ''}`} key={speciesId}>
+                    <article className="inventory-card organism-card animal-card" key={speciesId}>
                       <button
                         type="button"
                         className="inventory-card-main"
@@ -884,7 +873,6 @@ export function SimulationScreen({
                             animalSpeciesId: speciesId,
                           });
                           setActiveTool('move');
-                          closeHudPanel('inventory');
                         }}
                       >
                         <span className="inventory-thumb animal-thumb cherry-shrimp-thumb" aria-hidden="true">
@@ -893,7 +881,7 @@ export function SimulationScreen({
                         <span className="inventory-copy">
                           <strong>{animal.displayName}</strong>
                           <small>{animal.scientificName}</small>
-                          <em>{isHeld ? '방류 위치 선택 중' : remaining === null ? '무제한' : `${remaining}마리 남음`}</em>
+                          <em>{remaining === null ? '무제한' : `${remaining}마리 남음`}</em>
                         </span>
                       </button>
                       <button type="button" className="info-chip" disabled={Boolean(snapshot.holding) || Boolean(pendingInventory)} onClick={() => showCatalogAnimal(speciesId)}>정보</button>

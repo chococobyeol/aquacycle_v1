@@ -36,7 +36,10 @@ export interface SimulationMotionSource {
 
 export interface SimulationMotionStore extends SimulationMotionSource {
   accept: (message: WorkerMotionMessage, receivedAtMs: number) => boolean;
+  /** Clears render samples while retaining the last accepted sequence barrier. */
   clear: () => void;
+  /** Clears both samples and sequence state when a brand-new worker is created. */
+  reset: () => void;
 }
 
 const EMPTY_MOTION_FRAMES: SimulationMotionFrames = {
@@ -52,7 +55,14 @@ const EMPTY_MOTION_FRAMES: SimulationMotionFrames = {
  */
 export const createSimulationMotionStore = (): SimulationMotionStore => {
   let frames = EMPTY_MOTION_FRAMES;
+  let highestSequence = 0;
   const listeners = new Set<() => void>();
+
+  const publishEmptyFrames = (): void => {
+    if (!frames.current && !frames.previous) return;
+    frames = EMPTY_MOTION_FRAMES;
+    for (const listener of [...listeners]) listener();
+  };
 
   return {
     getFrames: () => frames,
@@ -61,17 +71,18 @@ export const createSimulationMotionStore = (): SimulationMotionStore => {
       return () => listeners.delete(listener);
     },
     accept: (message, receivedAtMs) => {
-      if (frames.current && message.sequence <= frames.current.sequence) return false;
+      if (message.sequence <= highestSequence) return false;
+      highestSequence = message.sequence;
       const { type: _type, ...sample } = message;
       const current: SimulationMotionFrame = { ...sample, receivedAtMs };
       frames = { previous: frames.current, current };
       for (const listener of [...listeners]) listener();
       return true;
     },
-    clear: () => {
-      if (!frames.current && !frames.previous) return;
-      frames = EMPTY_MOTION_FRAMES;
-      for (const listener of [...listeners]) listener();
+    clear: publishEmptyFrames,
+    reset: () => {
+      highestSequence = 0;
+      publishEmptyFrames();
     },
   };
 };
@@ -82,7 +93,7 @@ export interface SimulationController {
   send: (command: SimulationCommand) => void;
 }
 
-const commandRebasesMotion = (command: SimulationCommand): boolean => {
+export const commandRebasesMotion = (command: SimulationCommand): boolean => {
   switch (command.type) {
     case 'initialize':
     case 'reset':
@@ -94,16 +105,25 @@ const commandRebasesMotion = (command: SimulationCommand): boolean => {
     case 'pick-seed':
     case 'pick-animal':
     case 'pick-at':
-    case 'drop-held':
-    case 'cancel-held':
-    case 'retrieve-held':
     case 'rotate-held':
-    case 'remove-held-structure':
     case 'retrieve-structure':
     case 'retrieve-animal':
       return true;
     default:
       return false;
+  }
+};
+
+const sameHoldingIdentity = (
+  first: HoldingSnapshot | null,
+  second: HoldingSnapshot | null,
+): boolean => {
+  if (!first || !second) return first === second;
+  if (first.kind !== second.kind || first.source !== second.source) return false;
+  switch (first.kind) {
+    case 'structure': return first.structureId === second.structureId;
+    case 'animal': return first.animalId === second.animalId;
+    case 'seed': return first.speciesId === second.speciesId;
   }
 };
 
@@ -113,6 +133,7 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
   const [snapshot, setSnapshot] = useState<SimulationSnapshot | null>(null);
 
   useEffect(() => {
+    motionStore.reset();
     const worker = new Worker(
       new URL('../../simulation/sim.worker.ts', import.meta.url),
       { type: 'module' },
@@ -123,6 +144,12 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
     const receiveSnapshot = (event: MessageEvent<WorkerMessage>): void => {
       if (event.data.type === 'snapshot') {
         if (event.data.snapshot.scenarioId !== scenarioId) return;
+        const bufferedHolding = motionStore.getFrames().current?.holding ?? null;
+        if (!sameHoldingIdentity(bufferedHolding, event.data.snapshot.holding)) {
+          // A full snapshot is the acknowledgement for pick/drop/cancel. Motion
+          // from the prior holding state must never repaint an older cursor pose.
+          motionStore.clear();
+        }
         setSnapshot(event.data.snapshot);
       } else {
         const motion = event.data;
@@ -148,7 +175,7 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
       worker.removeEventListener('message', receiveSnapshot);
       worker.terminate();
       workerRef.current = null;
-      motionStore.clear();
+      motionStore.reset();
     };
   }, [motionStore, scenarioId]);
 
