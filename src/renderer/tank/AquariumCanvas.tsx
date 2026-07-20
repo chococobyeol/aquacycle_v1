@@ -1258,8 +1258,8 @@ export interface AlgaeColonizationState {
 
 const algaeDensitySurfaces = new WeakMap<Container, AlgaeDensitySurface>();
 
-export const ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL = 3;
-export const ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL = 4;
+export const ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL = 4;
+export const ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL = 5;
 
 export const algaeColonizationDetailSeed = (
   cellId: string,
@@ -1307,31 +1307,65 @@ const appendOedogoniumFilament = (
   );
   const position = algaeDetailPosition(cell, surfaceAngle, seed);
   const angle = surfaceAngle + hash01(seed * 97 + 41) * Math.PI * 2;
-  const length = 5.5 + hash01(seed * 59 + 13) * 8.5;
-  const bend = (hash01(seed * 83 + 23) - 0.5) * length * 0.72;
+  const length = 5.5 + hash01(seed * 59 + 13) * 5;
+  const shape = hash01(seed * 83 + 23);
+  const curveSign = hash01(seed * 107 + 37) < 0.5 ? -1 : 1;
   const cosine = Math.cos(angle);
   const sine = Math.sin(angle);
   const normalX = -sine;
   const normalY = cosine;
-  const startX = position.x - cosine * length * 0.5;
-  const startY = position.y - sine * length * 0.5;
-  const endX = position.x + cosine * length * 0.5;
-  const endY = position.y + sine * length * 0.5;
 
-  // Two short curves form one irregular thread or hook.
+  if (shape < 0.55) {
+    // A small open C reads as a loose filament instead of a solid worm.
+    const bend = length * 0.38 * curveSign;
+    context
+      .moveTo(
+        position.x - cosine * length * 0.45,
+        position.y - sine * length * 0.45,
+      )
+      .bezierCurveTo(
+        position.x - cosine * length * 0.12 + normalX * bend,
+        position.y - sine * length * 0.12 + normalY * bend,
+        position.x + cosine * length * 0.12 + normalX * bend,
+        position.y + sine * length * 0.12 + normalY * bend,
+        position.x + cosine * length * 0.45,
+        position.y + sine * length * 0.45,
+      );
+    return;
+  }
+
+  if (shape < 0.85) {
+    // A shallow S adds variation without making a dense tangled scribble.
+    const bend = length * 0.3 * curveSign;
+    context
+      .moveTo(
+        position.x - cosine * length * 0.45,
+        position.y - sine * length * 0.45,
+      )
+      .bezierCurveTo(
+        position.x - cosine * length * 0.15 + normalX * bend,
+        position.y - sine * length * 0.15 + normalY * bend,
+        position.x + cosine * length * 0.15 - normalX * bend,
+        position.y + sine * length * 0.15 - normalY * bend,
+        position.x + cosine * length * 0.45,
+        position.y + sine * length * 0.45,
+      );
+    return;
+  }
+
+  // A narrow hairpin recalls the hooked strands in the earlier doodle art.
   context
-    .moveTo(startX, startY)
-    .quadraticCurveTo(
-      position.x - cosine * length * 0.12 + normalX * bend,
-      position.y - sine * length * 0.12 + normalY * bend,
-      position.x,
-      position.y,
+    .moveTo(
+      position.x - cosine * length * 0.4 - normalX * length * 0.11,
+      position.y - sine * length * 0.4 - normalY * length * 0.11,
     )
-    .quadraticCurveTo(
-      position.x + cosine * length * 0.16 - normalX * bend * 0.45,
-      position.y + sine * length * 0.16 - normalY * bend * 0.45,
-      endX,
-      endY,
+    .bezierCurveTo(
+      position.x + cosine * length * 0.48 - normalX * length * 0.11,
+      position.y + sine * length * 0.48 - normalY * length * 0.11,
+      position.x + cosine * length * 0.48 + normalX * length * 0.11,
+      position.y + sine * length * 0.48 + normalY * length * 0.11,
+      position.x - cosine * length * 0.4 + normalX * length * 0.11,
+      position.y - sine * length * 0.4 + normalY * length * 0.11,
     );
 };
 
@@ -1352,19 +1386,25 @@ const appendNitzschiaSpeck = (
   );
   const position = algaeDetailPosition(cell, surfaceAngle, seed);
   const angle = surfaceAngle + hash01(seed * 101 + 43) * Math.PI * 2;
-  const length = 2.1 + hash01(seed * 61 + 11) * 3.7;
-  const halfLength = length * 0.5;
-  const cosine = Math.cos(angle);
-  const sine = Math.sin(angle);
-  context
-    .moveTo(
-      position.x - cosine * halfLength,
-      position.y - sine * halfLength,
-    )
-    .lineTo(
-      position.x + cosine * halfLength,
-      position.y + sine * halfLength,
-    );
+  const tangentX = Math.cos(angle);
+  const tangentY = Math.sin(angle);
+  const normalX = -tangentY;
+  const normalY = tangentX;
+  const radius = 0.58 + hash01(seed * 61 + 11) * 0.42;
+  const aspect = 0.56 + hash01(seed * 89 + 17) * 0.34;
+  const pointCount = 6;
+
+  for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+    const theta = pointIndex / pointCount * Math.PI * 2;
+    const wobble = 0.84 + hash01(seed + pointIndex * 53 + 131) * 0.28;
+    const localX = Math.cos(theta) * radius * wobble;
+    const localY = Math.sin(theta) * radius * aspect * wobble;
+    const x = position.x + tangentX * localX + normalX * localY;
+    const y = position.y + tangentY * localX + normalY * localY;
+    if (pointIndex === 0) context.moveTo(x, y);
+    else context.lineTo(x, y);
+  }
+  context.closePath();
 };
 
 const styleAlgaeDetailContext = (context: GraphicsContext): void => {
@@ -1681,35 +1721,7 @@ const rebuildAlgaeDetailGeometry = (
     }
     context.stroke({
       color: 0x294f31,
-      alpha: 0.54,
-      width: 0.98,
-      cap: 'round',
-      join: 'round',
-    });
-    for (const cell of cells) {
-      const generation = surface.colonization.oedogonium.get(cell.id)?.generation ?? 1;
-      const highlightSeed = algaeColonizationDetailSeed(
-        cell.id,
-        'oedogonium',
-        generation,
-        1,
-        0,
-      );
-      if (hash01(highlightSeed + 101) < 0.44) continue;
-      appendOedogoniumFilament(
-        context,
-        cell,
-        cell.surfaceKind === 'structure-face'
-          ? structureAngles.get(cell.ownerId) ?? 0
-          : 0,
-        generation,
-        1,
-        0,
-      );
-    }
-    context.stroke({
-      color: 0x8ca064,
-      alpha: 0.28,
+      alpha: 0.45,
       width: 0.7,
       cap: 'round',
       join: 'round',
@@ -1737,38 +1749,9 @@ const rebuildAlgaeDetailGeometry = (
       );
     }
   }
-  context.stroke({
-    color: 0x684528,
-    alpha: 0.55,
-    width: 1.04,
-    cap: 'round',
-  });
-  for (const cell of cells) {
-    const generation = surface.colonization.nitzschia.get(cell.id)?.generation ?? 1;
-    const highlightSeed = algaeColonizationDetailSeed(
-      cell.id,
-      'nitzschia',
-      generation,
-      1,
-      0,
-    );
-    if (hash01(highlightSeed + 211) < 0.38) continue;
-    appendNitzschiaSpeck(
-      context,
-      cell,
-      cell.surfaceKind === 'structure-face'
-        ? structureAngles.get(cell.ownerId) ?? 0
-        : 0,
-      generation,
-      1,
-      0,
-    );
-  }
-  context.stroke({
-    color: 0xd0a25c,
-    alpha: 0.32,
-    width: 0.74,
-    cap: 'round',
+  context.fill({
+    color: 0x6f4d34,
+    alpha: 0.48,
   });
 };
 
