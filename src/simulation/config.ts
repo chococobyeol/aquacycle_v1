@@ -1,0 +1,437 @@
+import type {
+  AnimalSpeciesId,
+  ScenarioId,
+  SpeciesId,
+  StructureDefinitionId,
+  Vec2,
+} from './types';
+
+// This is the lowest biomass that is actually drawn as a colony in the tank.
+// Selection and removal use the same value so anything visible can be cleaned.
+export const ALGAE_VISIBLE_BIOMASS = 0.001;
+
+export interface AnimalDefinition {
+  id: AnimalSpeciesId;
+  displayName: string;
+  scientificName: string;
+  description: string;
+  diet: string;
+  adultLength: string;
+  color: number;
+  accentColor: string;
+}
+
+export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
+  'cherry-shrimp': {
+    id: 'cherry-shrimp',
+    displayName: '체리새우',
+    scientificName: 'Neocaridina davidi',
+    description: '표면을 돌아다니며 조류와 생물막을 조금씩 뜯어 먹는 담수 새우입니다.',
+    diet: '규조류와 어린 조류 군락을 선호하며, 먹이가 부족하면 번식과 성장이 먼저 멈춥니다.',
+    adultLength: '성체 약 2~3cm',
+    color: 0xcf6f61,
+    accentColor: '#cf6f61',
+  },
+};
+
+export interface LightCurvePoint {
+  light: number;
+  netRate: number;
+}
+
+export interface TemperatureCurvePoint {
+  temperature: number;
+  suitability: number;
+}
+
+export interface SpeciesDefinition {
+  id: SpeciesId;
+  displayName: string;
+  shortName: string;
+  scientificName: string;
+  color: number;
+  accentColor: string;
+  description: string;
+  realScale: string;
+  colonyAppearance: string;
+  niche: string;
+  lightCurve: LightCurvePoint[];
+  temperatureCurve: TemperatureCurvePoint[];
+  temperatureSummary: string;
+  dispersalRate: number;
+  maximumPositiveRate: number;
+}
+
+export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
+  oedogonium: {
+    id: 'oedogonium',
+    displayName: '붓뚜껑말속',
+    shortName: '붓뚜껑말',
+    scientificName: 'Oedogonium sp.',
+    color: 0x557f4d,
+    accentColor: '#557f4d',
+    description:
+      '표면에 붙어 가느다란 실 모양 군락을 만드는 담수 녹조류입니다. 이 수조 계통은 중간에서 밝은 빛에서 빠르게 퍼집니다.',
+    realScale: '실 한 가닥의 굵기는 현미경으로 구분할 정도로 가늘어 육안으로는 군락만 보입니다.',
+    colonyAppearance: '육안으로는 밝은 녹색의 얇은 솜털이나 부드러운 막처럼 보입니다.',
+    niche: '밝은 돌 앞면에서 빠르게 성장하지만 깊은 그늘에서는 서서히 감소합니다.',
+    lightCurve: [
+      { light: 0, netRate: -0.032 },
+      { light: 15, netRate: -0.016 },
+      { light: 28, netRate: 0 },
+      { light: 45, netRate: 0.042 },
+      { light: 68, netRate: 0.068 },
+      { light: 82, netRate: 0.046 },
+      { light: 94, netRate: 0.006 },
+      { light: 100, netRate: -0.024 },
+    ],
+    temperatureCurve: [
+      { temperature: 8, suitability: 0.12 },
+      { temperature: 14, suitability: 0.58 },
+      { temperature: 20, suitability: 0.92 },
+      { temperature: 24, suitability: 1 },
+      { temperature: 30, suitability: 0.72 },
+      { temperature: 36, suitability: 0.08 },
+    ],
+    temperatureSummary: '이 수조 계통은 20~27°C에서 안정적이며 극단적인 저온·고온에서는 성장이 둔화됩니다.',
+    dispersalRate: 0.19,
+    maximumPositiveRate: 0.068,
+  },
+  nitzschia: {
+    id: 'nitzschia',
+    displayName: '음영 적응형 규조류',
+    shortName: '규조류',
+    scientificName: 'Nitzschia palea',
+    color: 0x9a7047,
+    accentColor: '#9a7047',
+    description:
+      '표면 생물막을 이루는 부착성 규조류입니다. 현실의 모든 계통이 같지는 않으며, 게임에서는 낮은 빛에 적응한 수조 계통으로 다룹니다.',
+    realScale: '개별 세포는 수십 마이크로미터 규모여서 수조 화면에서는 따로 보이지 않습니다.',
+    colonyAppearance: '육안으로는 황갈색 먼지나 아주 얇은 얼룩막처럼 보입니다.',
+    niche: '그늘에서 붓뚜껑말보다 유리하며 밝은 곳에서 즉시 죽지는 않지만 경쟁 우위가 줄어듭니다.',
+    lightCurve: [
+      { light: 0, netRate: -0.024 },
+      { light: 6, netRate: -0.012 },
+      { light: 12, netRate: 0.006 },
+      { light: 25, netRate: 0.055 },
+      { light: 38, netRate: 0.062 },
+      { light: 55, netRate: 0.034 },
+      { light: 72, netRate: 0.01 },
+      { light: 86, netRate: -0.009 },
+      { light: 100, netRate: -0.028 },
+    ],
+    temperatureCurve: [
+      { temperature: 8, suitability: 0.18 },
+      { temperature: 15, suitability: 0.65 },
+      { temperature: 22, suitability: 0.92 },
+      { temperature: 28, suitability: 1 },
+      { temperature: 34, suitability: 0.58 },
+      { temperature: 40, suitability: 0.06 },
+    ],
+    temperatureSummary: '폭넓은 수온에서 유지되지만 이 게임의 계통은 22~31°C에서 가장 잘 증식합니다.',
+    dispersalRate: 0.21,
+    maximumPositiveRate: 0.062,
+  },
+};
+
+export interface StructureDefinition {
+  id: StructureDefinitionId;
+  label: string;
+  assetPath: string;
+  width: number;
+  height: number;
+  material: string;
+  collisionPolygon: Vec2[];
+  ecologyPolygon: Vec2[];
+  ecologyCellSize: number;
+  density: number;
+  friction: number;
+}
+
+export const STRUCTURES: Record<StructureDefinitionId, StructureDefinition> = {
+  'flat-stone': {
+    id: 'flat-stone',
+    label: '넓적한 사암',
+    assetPath: './assets/rocks/flat-stone-doodle.svg',
+    width: 290,
+    height: 85,
+    material: '거친 돌 · 부착 가능',
+    collisionPolygon: [
+      { x: -140, y: 5 }, { x: -127, y: -19 }, { x: -91, y: -34 },
+      { x: -28, y: -40 }, { x: 48, y: -38 }, { x: 105, y: -27 },
+      { x: 137, y: -7 }, { x: 137, y: 13 }, { x: 113, y: 29 },
+      { x: 67, y: 37 }, { x: -3, y: 39 }, { x: -77, y: 34 },
+      { x: -124, y: 21 },
+    ],
+    ecologyPolygon: [
+      { x: -130, y: 3 }, { x: -116, y: -16 }, { x: -84, y: -28 },
+      { x: -25, y: -34 }, { x: 45, y: -32 }, { x: 98, y: -22 },
+      { x: 126, y: -5 }, { x: 125, y: 9 }, { x: 103, y: 23 },
+      { x: 62, y: 31 }, { x: -1, y: 33 }, { x: -71, y: 28 },
+      { x: -114, y: 17 },
+    ],
+    ecologyCellSize: 9,
+    density: 0.0045,
+    friction: 0.88,
+  },
+  'round-stone': {
+    id: 'round-stone',
+    label: '둥근 강돌',
+    assetPath: './assets/rocks/round-stone-doodle.svg',
+    width: 180,
+    height: 117,
+    material: '매끈한 돌 · 부착 가능',
+    collisionPolygon: [
+      { x: -85, y: 13 }, { x: -80, y: -19 }, { x: -62, y: -43 },
+      { x: -30, y: -56 }, { x: 10, y: -56 }, { x: 49, y: -43 },
+      { x: 76, y: -19 }, { x: 86, y: 10 }, { x: 79, y: 34 },
+      { x: 53, y: 50 }, { x: 14, y: 57 }, { x: -30, y: 53 },
+      { x: -65, y: 40 },
+    ],
+    ecologyPolygon: [
+      { x: -76, y: 10 }, { x: -71, y: -16 }, { x: -55, y: -36 },
+      { x: -26, y: -48 }, { x: 10, y: -49 }, { x: 43, y: -37 },
+      { x: 67, y: -16 }, { x: 76, y: 9 }, { x: 69, y: 28 },
+      { x: 47, y: 42 }, { x: 12, y: 49 }, { x: -26, y: 46 },
+      { x: -57, y: 34 },
+    ],
+    ecologyCellSize: 9,
+    density: 0.0048,
+    friction: 0.79,
+  },
+  'tall-stone': {
+    id: 'tall-stone',
+    label: '세로 판석',
+    assetPath: './assets/rocks/tall-stone-doodle.svg',
+    width: 118,
+    height: 255,
+    material: '층리 판석 · 부착 가능',
+    collisionPolygon: [
+      { x: -50, y: 116 }, { x: -55, y: 71 }, { x: -51, y: 14 },
+      { x: -45, y: -50 }, { x: -37, y: -100 }, { x: -20, y: -121 },
+      { x: 4, y: -126 }, { x: 25, y: -112 }, { x: 35, y: -70 },
+      { x: 34, y: -15 }, { x: 47, y: 29 }, { x: 49, y: 83 },
+      { x: 50, y: 119 },
+    ],
+    ecologyPolygon: [
+      { x: -42, y: 108 }, { x: -46, y: 68 }, { x: -43, y: 12 },
+      { x: -37, y: -47 }, { x: -30, y: -94 }, { x: -16, y: -113 },
+      { x: 3, y: -118 }, { x: 18, y: -106 }, { x: 27, y: -67 },
+      { x: 26, y: -13 }, { x: 38, y: 31 }, { x: 40, y: 82 },
+      { x: 40, y: 109 },
+    ],
+    ecologyCellSize: 9,
+    density: 0.0052,
+    friction: 0.94,
+  },
+};
+
+export interface ScenarioDefinition {
+  id: ScenarioId;
+  mode: 'challenge' | 'laboratory';
+  title: string;
+  subtitle: string;
+  instruction: string;
+  briefing: {
+    question: string;
+    goal: string;
+    success: string;
+    supplied: string;
+  };
+  timeLimitSeconds: number | null;
+  lightOutput: number;
+  seedBudget: Record<SpeciesId, number | null>;
+  animalBudget: Record<AnimalSpeciesId, number | null>;
+  structureBudget: Record<StructureDefinitionId, number | null>;
+  requiredStructures: Partial<Record<StructureDefinitionId, number>>;
+  allowedSpecies: SpeciesId[];
+  requiredSeedSpecies: SpeciesId[];
+  allowedAnimals: AnimalSpeciesId[];
+  allowedStructures: StructureDefinitionId[];
+  target:
+    | {
+        type: 'coverage';
+        ratio: number;
+        holdSeconds: number;
+        label: string;
+      }
+    | {
+        type: 'habitat-coverage';
+        speciesId: SpeciesId;
+        ratio: number;
+        minBiomass: number;
+        minLight: number;
+        maxLight: number;
+        holdSeconds: number;
+        label: string;
+      }
+    | {
+        type: 'biomass';
+        speciesId: SpeciesId;
+        amount: number;
+        holdSeconds: number;
+        label: string;
+      }
+    | {
+        type: 'adult-population';
+        speciesId: AnimalSpeciesId;
+        count: number;
+        holdSeconds: number;
+        label: string;
+      }
+    | null;
+  targetIncludesSubstrate: boolean;
+}
+
+export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
+  'mission-1': {
+    id: 'mission-1',
+    mode: 'challenge',
+    title: '첫 번째 실험 · 빛을 찾아서',
+    subtitle: '붓뚜껑말 정착',
+    instruction:
+      '넓적한 사암 앞면에서 붓뚜껑말이 덮은 면적을 목표치까지 늘리세요.',
+    briefing: {
+      question: '붓뚜껑말은 수조의 어느 위치에서 가장 빠르게 정착할까요?',
+      goal: '넓적한 사암 앞면의 32%를 붓뚜껑말 군락으로 덮고 3초간 유지하세요.',
+      success: '목표 점유율을 3초 동안 유지하면 성공합니다.',
+      supplied: '넓적한 사암 1개 · 붓뚜껑말 접종 1회 · 광량 탐침 · 수온계',
+    },
+    timeLimitSeconds: 140,
+    lightOutput: 92,
+    seedBudget: { oedogonium: 1, nitzschia: 0 },
+    animalBudget: { 'cherry-shrimp': 0 },
+    structureBudget: { 'flat-stone': 1, 'round-stone': 0, 'tall-stone': 0 },
+    requiredStructures: { 'flat-stone': 1 },
+    allowedSpecies: ['oedogonium'],
+    requiredSeedSpecies: ['oedogonium'],
+    allowedAnimals: [],
+    allowedStructures: ['flat-stone'],
+    target: { type: 'coverage', ratio: 0.32, holdSeconds: 3, label: '붓뚜껑말 표면 점유' },
+    targetIncludesSubstrate: false,
+  },
+  'mission-2': {
+    id: 'mission-2',
+    mode: 'challenge',
+    title: '두 번째 실험 · 빛의 틈새',
+    subtitle: '규조류 서식 면적',
+    instruction:
+      '강한 고정 조명 아래에서 규조류가 안정적으로 자라는 앞면을 전체 구조물 면적의 18%까지 늘리세요.',
+    briefing: {
+      question: '밝은 수조에서 저광량을 선호하는 규조류의 서식처를 어떻게 만들 수 있을까요?',
+      goal: '배치한 구조물 전체 앞면 중 규조류가 안정적으로 자란 면적을 18% 이상 만들고 4초간 유지하세요.',
+      success: '너무 밝거나 너무 어두운 곳은 제외하고, 적합한 빛에서 일정 밀도 이상 자란 앞면만 집계합니다.',
+      supplied: '규조류 접종 4회 · 넓적한 사암 3개 · 둥근 강돌 4개 · 세로 판석 3개 · 광량 탐침 · 수온계',
+    },
+    timeLimitSeconds: 260,
+    lightOutput: 104,
+    seedBudget: { oedogonium: 0, nitzschia: 4 },
+    animalBudget: { 'cherry-shrimp': 0 },
+    structureBudget: { 'flat-stone': 3, 'round-stone': 4, 'tall-stone': 3 },
+    requiredStructures: {},
+    allowedSpecies: ['nitzschia'],
+    requiredSeedSpecies: ['nitzschia'],
+    allowedAnimals: [],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    target: {
+      type: 'habitat-coverage',
+      speciesId: 'nitzschia',
+      ratio: 0.18,
+      minBiomass: 0.045,
+      minLight: 12,
+      maxLight: 58,
+      holdSeconds: 4,
+      label: '안정된 규조류 면적',
+    },
+    targetIncludesSubstrate: false,
+  },
+  'mission-3': {
+    id: 'mission-3',
+    mode: 'challenge',
+    title: '세 번째 실험 · 닿지 않는 빛',
+    subtitle: '제한된 빛의 붓뚜껑말',
+    instruction:
+      '빛이 약한 수조에서 붓뚜껑말이 자란 양을 목표치까지 늘리세요.',
+    briefing: {
+      question: '바닥까지 빛이 약한 수조에서 붓뚜껑말을 어떻게 번식시킬 수 있을까요?',
+      goal: '수조 전체에서 붓뚜껑말이 자란 양을 145 이상으로 늘리고 5초간 유지하세요.',
+      success: '위치나 방법과 관계없이 수조 안의 붓뚜껑말을 모두 합산합니다.',
+      supplied: '붓뚜껑말 접종 2회 · 세 종류의 구조물 무제한 · 광량 탐침 · 수온계',
+    },
+    timeLimitSeconds: 300,
+    lightOutput: 60,
+    seedBudget: { oedogonium: 2, nitzschia: 0 },
+    animalBudget: { 'cherry-shrimp': 0 },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    requiredStructures: {},
+    allowedSpecies: ['oedogonium'],
+    requiredSeedSpecies: ['oedogonium'],
+    allowedAnimals: [],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    target: {
+      type: 'biomass',
+      speciesId: 'oedogonium',
+      amount: 145,
+      holdSeconds: 5,
+      label: '붓뚜껑말이 자란 양',
+    },
+    targetIncludesSubstrate: true,
+  },
+  'mission-4': {
+    id: 'mission-4',
+    mode: 'challenge',
+    title: '네 번째 실험 · 첫 번째 소비자',
+    subtitle: '체리새우의 생존',
+    instruction: '체리새우 성체 4마리가 살아 있는 상태를 2분 동안 유지하세요.',
+    briefing: {
+      question: '직접 먹이를 주지 않고 체리새우가 살아갈 수 있는 수조를 만들 수 있을까요?',
+      goal: '체리새우 성체 4마리를 연속 2분 동안 유지하세요.',
+      success: '성체 수가 4마리 아래로 내려가면 유지 시간이 처음부터 다시 계산됩니다.',
+      supplied: '체리새우 성체 4마리 · 두 조류 접종 각 4회 · 세 종류의 구조물 무제한 · 광량 탐침 · 수온계',
+    },
+    timeLimitSeconds: 300,
+    lightOutput: 88,
+    seedBudget: { oedogonium: 4, nitzschia: 4 },
+    animalBudget: { 'cherry-shrimp': 4 },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    requiredStructures: {},
+    allowedSpecies: ['oedogonium', 'nitzschia'],
+    requiredSeedSpecies: [],
+    allowedAnimals: ['cherry-shrimp'],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    target: {
+      type: 'adult-population',
+      speciesId: 'cherry-shrimp',
+      count: 4,
+      holdSeconds: 120,
+      label: '체리새우 성체',
+    },
+    targetIncludesSubstrate: true,
+  },
+  laboratory: {
+    id: 'laboratory',
+    mode: 'laboratory',
+    title: '실험실',
+    subtitle: '조류와 체리새우 자유 실험',
+    instruction:
+      '돌, 두 조류, 체리새우와 광원을 자유롭게 시험하세요. 실행한 뒤에는 일시정지해야 배치를 다시 바꿀 수 있습니다.',
+    briefing: {
+      question: '자유 실험실에서 어떤 수중 환경을 만들고 싶나요?',
+      goal: '정해진 성공 조건 없이 구조, 빛, 온도, 군락과 개체군 변화를 관찰합니다.',
+      success: '실험실에는 성공·실패 판정이 없습니다.',
+      supplied: '모든 구조물 · 두 조류 · 체리새우 · 광량 탐침 · 수온계 · 광원 출력 조절',
+    },
+    timeLimitSeconds: null,
+    lightOutput: 90,
+    seedBudget: { oedogonium: null, nitzschia: null },
+    animalBudget: { 'cherry-shrimp': null },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    requiredStructures: {},
+    allowedSpecies: ['oedogonium', 'nitzschia'],
+    requiredSeedSpecies: [],
+    allowedAnimals: ['cherry-shrimp'],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    target: null,
+    targetIncludesSubstrate: true,
+  },
+};

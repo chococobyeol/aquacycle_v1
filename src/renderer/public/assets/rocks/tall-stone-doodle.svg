@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="118" height="255" viewBox="0 0 118 255">
+  <defs>
+    <path id="stone" d="M9 243.5 4 198.5 8 141.5 14 77.5 22 27.5 39 6.5 63 1.5 84 15.5 94 57.5 93 112.5 106 156.5 108 210.5 109 246.5Z"/>
+    <clipPath id="stone-clip"><use href="#stone"/></clipPath>
+  </defs>
+  <use href="#stone" fill="#afa286"/>
+  <g clip-path="url(#stone-clip)">
+    <path d="M5 256 7 157 20 79 31 21 48 3l15-2-8 54-3 60-12 68-4 73Z" fill="#d8cca9"/>
+    <path d="M52-5c17 22 23 45 18 73-6 36-3 68 13 95 14 24 18 56 15 98h22V-5Z" fill="#837c6b" opacity=".32"/>
+    <path d="M38 14c8 34 5 64-5 94-11 33-13 71-7 114M66 22c11 30 11 60 3 91-7 29-3 58 12 87M87 62c-9 31-7 62 6 93M48 145c9 25 8 54-3 86" fill="none" stroke="#646c64" stroke-width="2.2" stroke-linecap="round" opacity=".68"/>
+    <path d="m28 45 5-15m-11 54 4-16m-8 75 3-18m45-75 3-16m-4 79 4-18m15 70 5-14m-45 61 4-18" fill="none" stroke="#efe2bd" stroke-width="2.5" stroke-linecap="round" opacity=".74"/>
+  </g>
+  <use href="#stone" fill="none" stroke="#303c3a" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

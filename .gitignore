@@ -1,0 +1,10 @@
+node_modules/
+.vite/
+out/
+coverage/
+dist/
+.DS_Store
+*.log
+*.tsbuildinfo
+/.codex-render-diagnostic.ts
+/index-*.js
