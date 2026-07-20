@@ -1310,7 +1310,7 @@ export class SimulationWorld {
   }
 
   private retrieveStructure(id: string): void {
-    if (this.scenario.mode !== 'laboratory' || !this.canEdit() || this.held) return;
+    if (!this.canEdit() || this.held) return;
     const structure = this.structureById(id);
     if (!structure || structure.locked) return;
     const label = STRUCTURES[structure.definitionId].label;
@@ -1325,7 +1325,7 @@ export class SimulationWorld {
   }
 
   private retrieveAnimal(id: string): void {
-    if (this.scenario.mode !== 'laboratory' || !this.canEdit() || this.held) return;
+    if (!this.canEdit() || this.held) return;
     const animal = this.animals.find((candidate) => candidate.id === id);
     if (!animal) return;
     this.animals = this.animals.filter((candidate) => candidate.id !== id);
@@ -1343,7 +1343,7 @@ export class SimulationWorld {
   }
 
   private removeSelectedAlgae(speciesId: SpeciesId): void {
-    if (this.scenario.mode !== 'laboratory' || !this.canEdit() || this.held) return;
+    if (!this.canEdit() || this.held) return;
     const selection = this.selection;
     if (!selection || (selection.kind !== 'colony' && selection.kind !== 'region')) return;
     const scopeLabel = selection.kind === 'colony' ? '선택 지점' : '선택 영역';

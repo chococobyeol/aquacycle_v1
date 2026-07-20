@@ -12,7 +12,7 @@ const seed = (world: SimulationWorld, speciesId: SpeciesId, point: Vec2): void =
   world.handle({ type: 'drop-held', point });
 };
 
-describe('laboratory-only removal tools', () => {
+describe('editable removal tools', () => {
   it('returns a selected structure to inventory and removes its attached colony', () => {
     const world = new SimulationWorld('laboratory');
     const placement = { x: 510, y: 280 };
@@ -34,12 +34,25 @@ describe('laboratory-only removal tools', () => {
     expect(removed.selection).toBeNull();
   });
 
-  it('refuses direct structure removal in a challenge and while the laboratory is running', () => {
+  it('returns challenge structures before start but refuses removal after start', () => {
     const challenge = new SimulationWorld('mission-1');
     challenge.handle({ type: 'pick-structure', definitionId: 'flat-stone', point: { x: 510, y: 280 } });
     challenge.handle({ type: 'drop-held', point: { x: 510, y: 280 } });
     settle(challenge);
-    const challengeId = challenge.snapshot().structures[0].id;
+    const firstChallengeId = challenge.snapshot().structures[0].id;
+    challenge.handle({ type: 'retrieve-structure', id: firstChallengeId });
+    expect(challenge.snapshot().structures).toHaveLength(0);
+    expect(challenge.snapshot().remainingStructures['flat-stone']).toBe(1);
+
+    challenge.handle({ type: 'pick-structure', definitionId: 'flat-stone', point: { x: 510, y: 280 } });
+    challenge.handle({ type: 'drop-held', point: { x: 510, y: 280 } });
+    settle(challenge);
+    const placed = challenge.snapshot();
+    const challengeId = placed.structures[0].id;
+    const surfaceCell = placed.cells.find((cell) => cell.ownerId === challengeId)!;
+    seed(challenge, 'oedogonium', surfaceCell);
+    challenge.handle({ type: 'start' });
+    challenge.handle({ type: 'pause' });
     challenge.handle({ type: 'retrieve-structure', id: challengeId });
     expect(challenge.snapshot().structures).toHaveLength(1);
 
@@ -74,7 +87,7 @@ describe('laboratory-only removal tools', () => {
     expect(fallen.y).toBeGreaterThan(upper.y + 10);
   });
 
-  it('removes a selected shrimp only while laboratory editing is allowed', () => {
+  it('removes a selected shrimp while editing but not after a challenge starts', () => {
     const laboratory = new SimulationWorld('laboratory');
     const point = { x: 600, y: 300 };
     laboratory.handle({ type: 'pick-animal', speciesId: 'cherry-shrimp', point });
@@ -93,6 +106,15 @@ describe('laboratory-only removal tools', () => {
     challenge.handle({ type: 'drop-held', point });
     const challengeAnimalId = challenge.snapshot().animals[0].id;
     challenge.handle({ type: 'retrieve-animal', id: challengeAnimalId });
+    expect(challenge.snapshot().animals).toHaveLength(0);
+    expect(challenge.snapshot().remainingAnimals['cherry-shrimp']).toBe(4);
+
+    challenge.handle({ type: 'pick-animal', speciesId: 'cherry-shrimp', point });
+    challenge.handle({ type: 'drop-held', point });
+    const lockedAnimalId = challenge.snapshot().animals[0].id;
+    challenge.handle({ type: 'start' });
+    challenge.handle({ type: 'pause' });
+    challenge.handle({ type: 'retrieve-animal', id: lockedAnimalId });
     expect(challenge.snapshot().animals).toHaveLength(1);
   });
 
@@ -161,9 +183,19 @@ describe('laboratory-only removal tools', () => {
     expect(running.snapshot().cells.find((candidate) => candidate.id === runningCell.id)!.biomass.oedogonium)
       .toBeGreaterThan(0);
 
-    const challenge = new SimulationWorld('mission-1');
+    const challenge = new SimulationWorld('mission-4');
     const challengeCell = challenge.snapshot().cells.find((candidate) => candidate.surfaceKind === 'substrate')!;
     seed(challenge, 'oedogonium', challengeCell);
+    challenge.handle({ type: 'select-at', point: challengeCell, filter: 'organism' });
+    challenge.handle({ type: 'remove-selected-algae', speciesId: 'oedogonium' });
+    expect(challenge.snapshot().cells.find((candidate) => candidate.id === challengeCell.id)!
+      .biomass.oedogonium).toBe(0);
+    expect(challenge.snapshot().seeds).toHaveLength(0);
+    expect(challenge.snapshot().remainingSeeds.oedogonium).toBe(4);
+
+    seed(challenge, 'oedogonium', challengeCell);
+    challenge.handle({ type: 'start' });
+    challenge.handle({ type: 'pause' });
     challenge.handle({ type: 'select-at', point: challengeCell, filter: 'organism' });
     challenge.handle({ type: 'remove-selected-algae', speciesId: 'oedogonium' });
     expect(challenge.snapshot().cells.find((candidate) => candidate.id === challengeCell.id)!

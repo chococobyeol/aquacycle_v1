@@ -82,6 +82,7 @@ interface AquariumCanvasProps {
   editable: boolean;
   hasPendingInventory: boolean;
   onConsumePendingInventory: (point: Vec2) => void;
+  onPendingInventoryReady: () => void;
   onToolComplete: () => void;
   onCameraChange?: (transform: AquariumCameraTransform) => void;
   cameraResetToken?: number;
@@ -130,13 +131,30 @@ export const algaeVisualLevel = (amount: number): number => {
 
 export const algaeParticleRadiusRatio = (visualLevel: number): number => {
   const visible = Math.max(0, Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT));
-  return 0.72 + visible * 0.72;
+  return 0.69 + visible * 0.46;
 };
 
 export const algaeParticleAlpha = (visualLevel: number): number => {
   const visible = Math.max(0, Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT));
   return 0.22 + visible * 0.78;
 };
+
+export const isInventoryHandoffCaughtUp = (
+  holding: SimulationSnapshot['holding'],
+  latestPointer: Vec2 | null,
+  elapsedMs: number,
+  hasSettledMotionPair = false,
+  tolerance = 6,
+): boolean => {
+  if (!holding || holding.source !== 'inventory' || !latestPointer || elapsedMs < 48) return false;
+  return Math.hypot(holding.x - latestPointer.x, holding.y - latestPointer.y) <= tolerance ||
+    hasSettledMotionPair;
+};
+
+export const isSecondaryPointerGesture = (
+  button: number,
+  ctrlKey: boolean,
+): boolean => button === 2 || (button === 0 && ctrlKey);
 
 const algaeKeyNumber = (value: number): number => Math.round(value * 1000) / 1000;
 
@@ -633,6 +651,7 @@ const syncStructures = (
   textures: Map<string, Texture>,
   displays: Map<string, StructureDisplay>,
   structures: StructureSnapshot[] = snapshot.structures,
+  suppressInventoryHolding = false,
 ): void => {
   const currentIds = new Set(structures.map((structure) => structure.id));
   for (const [id, display] of displays) {
@@ -664,6 +683,10 @@ const syncStructures = (
       display,
       structure,
       snapshot.selection?.kind === 'structure' && snapshot.selection.structureId === structure.id,
+    );
+    display.container.visible = !(
+      suppressInventoryHolding &&
+      structure.isHeld
     );
   }
 };
@@ -950,6 +973,7 @@ const syncAnimals = (
   holding: SimulationSnapshot['holding'] = snapshot.holding,
   interpolatedPosition = false,
   removeMissing = true,
+  suppressInventoryHolding = false,
 ): void => {
   const held = holding?.kind === 'animal' ? holding : null;
   const heldId = held?.animalId ?? null;
@@ -981,6 +1005,7 @@ const syncAnimals = (
       layer.addChild(display.container);
     }
     display.target = target;
+    display.container.visible = true;
   }
 
   if (held && heldId) {
@@ -1006,6 +1031,7 @@ const syncAnimals = (
       layer.addChild(display.container);
     }
     display.target = target;
+    display.container.visible = !(suppressInventoryHolding && held.source === 'inventory');
   }
 };
 
@@ -1307,7 +1333,7 @@ const appendOedogoniumFilament = (
   );
   const position = algaeDetailPosition(cell, surfaceAngle, seed);
   const angle = surfaceAngle + hash01(seed * 97 + 41) * Math.PI * 2;
-  const length = 5.5 + hash01(seed * 59 + 13) * 5;
+  const length = 6 + hash01(seed * 59 + 13) * 6.5;
   const shape = hash01(seed * 83 + 23);
   const curveSign = hash01(seed * 107 + 37) < 0.5 ? -1 : 1;
   const cosine = Math.cos(angle);
@@ -1390,8 +1416,8 @@ const appendNitzschiaSpeck = (
   const tangentY = Math.sin(angle);
   const normalX = -tangentY;
   const normalY = tangentX;
-  const radius = 0.58 + hash01(seed * 61 + 11) * 0.42;
-  const aspect = 0.56 + hash01(seed * 89 + 17) * 0.34;
+  const radius = 0.28 + hash01(seed * 61 + 11) * 0.34;
+  const aspect = 0.48 + hash01(seed * 89 + 17) * 0.24;
   const pointCount = 6;
 
   for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
@@ -1425,8 +1451,8 @@ const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement =>
   context.save();
   context.filter = 'blur(4px)';
   context.fillStyle = speciesId === 'oedogonium'
-    ? 'rgba(74, 121, 66, 0.52)'
-    : 'rgba(150, 105, 61, 0.47)';
+    ? 'rgba(84, 132, 73, 0.52)'
+    : 'rgba(154, 116, 74, 0.47)';
   // One broad translucent membrane reproduces the connected wash of the old
   // shared raster. Four overlapping circles made an almost opaque center but
   // a much smaller footprint, so a colony looked like separated dark dots.
@@ -1490,6 +1516,9 @@ const createAlgaeParticleLayer = (
     const densitySprite = new Sprite(densityTexture);
     densitySprite.width = TANK_WIDTH;
     densitySprite.height = TANK_HEIGHT;
+    // Keep the density texture opaque enough to mask crisp details, while the
+    // visible wash itself stays as light as the earlier hand-drawn colonies.
+    densitySprite.alpha = speciesId === 'oedogonium' ? 0.86 : 0.5;
 
     // Density and biological detail deliberately use different renderers.
     // The small dynamic bitmap produces a soft, grid-free colony boundary;
@@ -1720,9 +1749,9 @@ const rebuildAlgaeDetailGeometry = (
       }
     }
     context.stroke({
-      color: 0x294f31,
-      alpha: 0.45,
-      width: 0.7,
+      color: 0x355f3b,
+      alpha: 0.4,
+      width: 0.52,
       cap: 'round',
       join: 'round',
     });
@@ -1750,8 +1779,8 @@ const rebuildAlgaeDetailGeometry = (
     }
   }
   context.fill({
-    color: 0x6f4d34,
-    alpha: 0.48,
+    color: 0x76563c,
+    alpha: 0.36,
   });
 };
 
@@ -1960,10 +1989,15 @@ const drawSeeds = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   }
 };
 
-const drawInteraction = (layer: Graphics, snapshot: SimulationSnapshot): void => {
+const drawInteraction = (
+  layer: Graphics,
+  snapshot: SimulationSnapshot,
+  suppressInventoryHolding = false,
+): void => {
   layer.clear();
   const held = snapshot.holding;
-  if (!held || held.kind !== 'seed' || !held.speciesId) return;
+  if (!held || held.kind !== 'seed' || !held.speciesId ||
+    (suppressInventoryHolding && held.source === 'inventory')) return;
   const color = held.valid ? SPECIES[held.speciesId].color : 0xcf5f5a;
   layer
     .circle(held.x, held.y, 11)
@@ -2128,6 +2162,7 @@ export function AquariumCanvas({
   editable,
   hasPendingInventory,
   onConsumePendingInventory,
+  onPendingInventoryReady,
   onToolComplete,
   onCameraChange,
   cameraResetToken = 0,
@@ -2151,6 +2186,12 @@ export function AquariumCanvas({
   const lastAlgaeStructureGeometryRef = useRef('');
   const lastSeedsRevisionRef = useRef(-1);
   const pendingConsumedRef = useRef(false);
+  const pendingHandoffStartedAtRef = useRef<number | null>(null);
+  const pendingHandoffNotifiedRef = useRef(false);
+  const latestPointerWorldRef = useRef<Vec2 | null>(null);
+  const secondaryPointerCancelAtRef = useRef<number | null>(null);
+  const hasPendingInventoryRef = useRef(hasPendingInventory);
+  const onPendingInventoryReadyRef = useRef(onPendingInventoryReady);
   const dragStartRef = useRef<Vec2 | null>(null);
   const dragStartClientRef = useRef<Vec2 | null>(null);
   const dragCurrentRef = useRef<Vec2 | null>(null);
@@ -2173,6 +2214,8 @@ export function AquariumCanvas({
   motionSourceRef.current = motionSource;
   activeToolRef.current = activeTool;
   onCameraChangeRef.current = onCameraChange;
+  hasPendingInventoryRef.current = hasPendingInventory;
+  onPendingInventoryReadyRef.current = onPendingInventoryReady;
   showGoalGuideRef.current = showGoalGuide;
 
   const sampleMotion = (nowMs: number) => {
@@ -2198,8 +2241,34 @@ export function AquariumCanvas({
     );
   };
 
+  const isPendingInventoryHandoff = (): boolean =>
+    hasPendingInventoryRef.current && pendingConsumedRef.current;
+
+  const tryCompletePendingInventoryHandoff = (
+    holding: SimulationSnapshot['holding'],
+    nowMs: number,
+  ): void => {
+    if (!isPendingInventoryHandoff() || pendingHandoffNotifiedRef.current) return;
+    const startedAt = pendingHandoffStartedAtRef.current;
+    const motionFrames = motionSourceRef.current.getFrames();
+    const hasSettledMotionPair = motionFrames.previous?.holding?.source === 'inventory' &&
+      motionFrames.current?.holding?.source === 'inventory';
+    if (startedAt === null || !isInventoryHandoffCaughtUp(
+      holding,
+      latestPointerWorldRef.current,
+      nowMs - startedAt,
+      hasSettledMotionPair,
+    )) return;
+    pendingHandoffNotifiedRef.current = true;
+    onPendingInventoryReadyRef.current();
+  };
+
   useEffect(() => {
-    if (hasPendingInventory) pendingConsumedRef.current = false;
+    if (hasPendingInventory) {
+      pendingConsumedRef.current = false;
+      pendingHandoffStartedAtRef.current = null;
+      pendingHandoffNotifiedRef.current = false;
+    }
   }, [hasPendingInventory]);
 
   useEffect(() => {
@@ -2420,6 +2489,7 @@ export function AquariumCanvas({
         ownedTextures,
         ownedDisplays,
         initialRenderState.structures,
+        isPendingInventoryHandoff(),
       );
       syncAlgaeParticles(
         layers.substrateAlgae,
@@ -2440,12 +2510,14 @@ export function AquariumCanvas({
         initialRenderState.animals,
         initialRenderState.holding,
         initialMotion?.interpolated ?? false,
+        true,
+        isPendingInventoryHandoff(),
       );
       syncedMotionSequence = initialMotion?.sequence ?? null;
       syncAnimalCarcasses(layers.animals, initialSnapshot, ownedAnimalCarcassDisplays);
       drawGoalGuide(layers.goalGuide, initialSnapshot, showGoalGuideRef.current);
       drawSeeds(layers.seeds, initialSnapshot);
-      drawInteraction(layers.interaction, initialSnapshot);
+      drawInteraction(layers.interaction, initialSnapshot, isPendingInventoryHandoff());
       drawMeasurements(layers.measurements, initialSnapshot);
       drawProbe(layers.probe, initialSnapshot, activeToolRef.current);
       drawSelection(layers.selection, initialSnapshot);
@@ -2456,7 +2528,8 @@ export function AquariumCanvas({
       animalTicker = (ticker: Ticker): void => {
         if (!isCurrentGeneration()) return;
         const currentSnapshot = snapshotRef.current;
-        const motion = sampleMotion(performance.now());
+        const nowMs = performance.now();
+        const motion = sampleMotion(nowMs);
         if (motion) {
           if (motion.sequence !== syncedMotionSequence) {
             syncStructures(
@@ -2465,6 +2538,7 @@ export function AquariumCanvas({
               ownedTextures,
               ownedDisplays,
               motion.structures,
+              isPendingInventoryHandoff(),
             );
             syncAnimals(
               layers.animals,
@@ -2474,6 +2548,7 @@ export function AquariumCanvas({
               motion.holding,
               motion.interpolated,
               false,
+              isPendingInventoryHandoff(),
             );
             syncedMotionSequence = motion.sequence;
           } else {
@@ -2485,6 +2560,9 @@ export function AquariumCanvas({
               motion.interpolated,
             );
           }
+          tryCompletePendingInventoryHandoff(motion.holding, nowMs);
+        } else {
+          tryCompletePendingInventoryHandoff(currentSnapshot.holding, nowMs);
         }
         animateAnimals(ownedAnimalDisplays, currentSnapshot, ticker.deltaMS / 1000);
         animateAnimalCarcasses(ownedAnimalCarcassDisplays, ticker.deltaMS / 1000);
@@ -2520,6 +2598,7 @@ export function AquariumCanvas({
         ownedTextures,
         ownedDisplays,
         latestMotion?.structures,
+        isPendingInventoryHandoff(),
       );
     }).catch(() => {
       destroyOwnedTextures();
@@ -2529,7 +2608,9 @@ export function AquariumCanvas({
 
     const handleKeyDown = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') {
+        pendingConsumedRef.current = false;
         send({ type: 'cancel-held' });
+        if (hasPendingInventoryRef.current) onPendingInventoryReadyRef.current();
         onToolComplete();
       }
       if (snapshotRef.current.holding?.kind === 'structure' && (event.key === 'q' || event.key === 'Q')) {
@@ -2589,6 +2670,7 @@ export function AquariumCanvas({
       texturesRef.current,
       structureDisplaysRef.current,
       renderState.structures,
+      isPendingInventoryHandoff(),
     );
     syncAnimals(
       layers.animals,
@@ -2597,6 +2679,8 @@ export function AquariumCanvas({
       renderState.animals,
       renderState.holding,
       motion?.interpolated ?? false,
+      true,
+      isPendingInventoryHandoff(),
     );
     syncAnimalCarcasses(layers.animals, snapshot, animalCarcassDisplaysRef.current);
     const structureGeometryKey = structureAlgaeGeometryKey(snapshot);
@@ -2629,11 +2713,12 @@ export function AquariumCanvas({
       lastSeedsRevisionRef.current = snapshot.revision;
     }
     drawGoalGuide(layers.goalGuide, snapshot, showGoalGuide);
-    drawInteraction(layers.interaction, snapshot);
+    drawInteraction(layers.interaction, snapshot, isPendingInventoryHandoff());
     drawMeasurements(layers.measurements, snapshot);
     drawProbe(layers.probe, snapshot, activeTool);
     drawSelection(layers.selection, snapshot);
-  }, [activeTool, editable, showGoalGuide, snapshot]);
+    tryCompletePendingInventoryHandoff(renderState.holding, performance.now());
+  }, [activeTool, editable, hasPendingInventory, showGoalGuide, snapshot]);
 
   const clientToViewportPoint = (clientX: number, clientY: number): Vec2 => {
     const host = hostRef.current;
@@ -2711,6 +2796,9 @@ export function AquariumCanvas({
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>): void => {
     const point = toWorldPoint(event);
+    latestPointerWorldRef.current = isTankInteractionPoint(point)
+      ? point
+      : clampTankInteractionPoint(point);
     if (panPointerRef.current === event.pointerId && panLastPointRef.current) {
       const host = hostRef.current;
       if (!host) return;
@@ -2731,7 +2819,12 @@ export function AquariumCanvas({
     if (hasPendingInventory && !pendingConsumedRef.current) {
       if (!interactive) return;
       pendingConsumedRef.current = true;
+      pendingHandoffStartedAtRef.current = performance.now();
       onConsumePendingInventory(point);
+      return;
+    }
+    if (hasPendingInventory && pendingConsumedRef.current) {
+      send({ type: 'pointer-move', point: interactive ? point : clampTankInteractionPoint(point) });
       return;
     }
     if (dragPointerRef.current === event.pointerId && dragStartRef.current) {
@@ -2776,10 +2869,15 @@ export function AquariumCanvas({
       return;
     }
     const point = toWorldPoint(event);
-    if (event.button === 2) {
+    latestPointerWorldRef.current = isTankInteractionPoint(point)
+      ? point
+      : clampTankInteractionPoint(point);
+    if (isSecondaryPointerGesture(event.button, event.ctrlKey)) {
       event.preventDefault();
+      secondaryPointerCancelAtRef.current = performance.now();
       pendingConsumedRef.current = false;
       send({ type: 'cancel-held' });
+      if (hasPendingInventory) onPendingInventoryReady();
       onToolComplete();
       return;
     }
@@ -2794,6 +2892,7 @@ export function AquariumCanvas({
     if (hasPendingInventory || (pendingConsumedRef.current && !snapshot.holding)) {
       if (!pendingConsumedRef.current) {
         pendingConsumedRef.current = true;
+        pendingHandoffStartedAtRef.current = performance.now();
         onConsumePendingInventory(point);
       }
       // The worker handles commands in FIFO order. Sending the drop directly
@@ -2802,6 +2901,7 @@ export function AquariumCanvas({
       // not made the round trip back from the worker yet.
       send({ type: 'drop-held', point });
       pendingConsumedRef.current = false;
+      onPendingInventoryReady();
       onToolComplete();
       return;
     }
@@ -2895,8 +2995,12 @@ export function AquariumCanvas({
       }}
       onContextMenu={(event) => {
         event.preventDefault();
+        const secondaryCancelAt = secondaryPointerCancelAtRef.current;
+        secondaryPointerCancelAtRef.current = null;
+        if (secondaryCancelAt !== null && performance.now() - secondaryCancelAt < 750) return;
         pendingConsumedRef.current = false;
         send({ type: 'cancel-held' });
+        if (hasPendingInventory) onPendingInventoryReady();
         onToolComplete();
       }}
       onWheel={(event) => {

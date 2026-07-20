@@ -317,9 +317,11 @@ export function SimulationScreen({
     } else if (pending.kind === 'animal' && pending.animalSpeciesId) {
       send({ type: 'pick-animal', speciesId: pending.animalSpeciesId, point });
     }
-    setPendingInventory(null);
     setActiveTool('move');
   }, [send]);
+  const finishPendingInventoryHandoff = useCallback((): void => {
+    setPendingInventory(null);
+  }, []);
 
   if (!snapshot) {
     return (
@@ -332,7 +334,7 @@ export function SimulationScreen({
 
   const editable = snapshot.phase === 'setup' ||
     (snapshot.mode === 'laboratory' && snapshot.phase === 'paused');
-  const laboratoryEditable = snapshot.mode === 'laboratory' && editable && !snapshot.holding;
+  const removalEditable = editable && !snapshot.holding && !pendingInventory;
   const progress = snapshot.missionProgress;
   const scoredZoneTarget = scenario.target?.type === 'habitat-coverage' ? scenario.target : null;
   const goalGuideCopy = scoredZoneTarget
@@ -980,6 +982,7 @@ export function SimulationScreen({
                     editable={editable}
                     hasPendingInventory={Boolean(pendingInventory)}
                     onConsumePendingInventory={consumePendingInventory}
+                    onPendingInventoryReady={finishPendingInventoryHandoff}
                     onToolComplete={returnToSelection}
                     onCameraChange={setCameraTransform}
                     cameraResetToken={cameraResetToken}
@@ -993,7 +996,7 @@ export function SimulationScreen({
                     </div>
                   )}
 
-                  {snapshot.holding?.kind === 'structure' && heldStructure && (
+                  {!pendingInventory && snapshot.holding?.kind === 'structure' && heldStructure && (
                     <div
                       className="tank-rotation-orbit"
                       style={rotationOrbitStyle}
@@ -1109,7 +1112,7 @@ export function SimulationScreen({
                 structure={selectedStructure}
                 snapshot={snapshot}
                 isHeld={snapshot.holding?.kind === 'structure' && snapshot.holding.structureId === selectedStructure.id}
-                canRetrieve={laboratoryEditable && !selectedStructure.locked}
+                canRetrieve={removalEditable && !selectedStructure.locked}
                 onRetrieve={() => send({ type: 'retrieve-structure', id: selectedStructure.id })}
               />
             ) : selectedMeasurement ? (
@@ -1117,7 +1120,7 @@ export function SimulationScreen({
             ) : selectedAnimal ? (
               <AnimalInspector
                 animal={selectedAnimal}
-                canRetrieve={laboratoryEditable}
+                canRetrieve={removalEditable}
                 onRetrieve={() => send({ type: 'retrieve-animal', id: selectedAnimal.id })}
               />
             ) : selectedCarcass ? (
@@ -1135,7 +1138,7 @@ export function SimulationScreen({
                     availableSpecies={selectionSpeciesIds}
                     headingLabel="선택 영역의 조류"
                     scopeLabel={`선택 영역 관찰점 ${selectedCells.length}개`}
-                    onRemoveFromSelection={laboratoryEditable
+                    onRemoveFromSelection={removalEditable
                       ? () => send({ type: 'remove-selected-algae', speciesId: inspectedSpecies })
                       : undefined}
                     removalScopeLabel="선택 영역"
@@ -1154,7 +1157,7 @@ export function SimulationScreen({
                 availableSpecies={selectionSpeciesIds.length ? selectionSpeciesIds : [inspectedSpecies]}
                 headingLabel={selectionSpeciesIds.length ? '선택한 생물' : '생물 정보'}
                 scopeLabel={snapshot.selection?.kind === 'region' ? `선택 영역 관찰점 ${selectedCells.length}개` : '선택한 위치'}
-                onRemoveFromSelection={laboratoryEditable && selectedCells.length
+                onRemoveFromSelection={removalEditable && selectedCells.length
                   ? () => send({ type: 'remove-selected-algae', speciesId: inspectedSpecies })
                   : undefined}
                 removalScopeLabel={snapshot.selection?.kind === 'region' ? '선택 영역' : '선택 지점'}
@@ -1394,7 +1397,7 @@ function AnimalInspector({
       {canRetrieve && onRetrieve && (
         <div className="manual-removal-actions">
           <button type="button" onClick={onRetrieve}>수조에서 회수하기</button>
-          <small>실험실 편집 중에만 선택한 개체를 보유 목록으로 돌려보낼 수 있습니다.</small>
+          <small>배치를 편집할 수 있을 때 선택한 개체를 보유 목록으로 돌려보냅니다.</small>
         </div>
       )}
     </section>
@@ -1639,7 +1642,7 @@ function SpeciesGuide({
           <button type="button" onClick={onRemoveFromSelection}>
             {removalScopeLabel ?? '선택 범위'}에서 {species.shortName} 걷어내기
           </button>
-          <small>실험실 편집에서만 사용할 수 있으며 다른 조류 종은 남습니다.</small>
+          <small>배치를 편집할 수 있을 때 사용하며 다른 조류 종은 남습니다.</small>
         </div>
       )}
     </section>
