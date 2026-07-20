@@ -1287,6 +1287,19 @@ const algaeDensitySurfaces = new WeakMap<Container, AlgaeDensitySurface>();
 
 export const ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL = 4;
 export const ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL = 5;
+export const NITZSCHIA_VISUAL_STYLE = {
+  brush: { red: 176, green: 126, blue: 58, alpha: 0.58 },
+  substrateAlpha: 0.72,
+  structureAlpha: 0.58,
+  speck: {
+    radiusMin: 0.42,
+    radiusSpan: 0.38,
+    aspectMin: 0.72,
+    aspectSpan: 0.22,
+    color: 0x6f4a2b,
+    alpha: 0.46,
+  },
+} as const;
 
 export const algaeColonizationDetailSeed = (
   cellId: string,
@@ -1417,8 +1430,13 @@ const appendNitzschiaSpeck = (
   const tangentY = Math.sin(angle);
   const normalX = -tangentY;
   const normalY = tangentX;
-  const radius = 0.28 + hash01(seed * 61 + 11) * 0.34;
-  const aspect = 0.48 + hash01(seed * 89 + 17) * 0.24;
+  // Keep the cells as tiny dust-like flecks, but large enough to survive the
+  // default 84% tank zoom.  The previous sub-pixel, narrow ovals disappeared
+  // completely after texture scaling even over a mature colony.
+  const radius = NITZSCHIA_VISUAL_STYLE.speck.radiusMin +
+    hash01(seed * 61 + 11) * NITZSCHIA_VISUAL_STYLE.speck.radiusSpan;
+  const aspect = NITZSCHIA_VISUAL_STYLE.speck.aspectMin +
+    hash01(seed * 89 + 17) * NITZSCHIA_VISUAL_STYLE.speck.aspectSpan;
   const pointCount = 6;
 
   for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
@@ -1451,9 +1469,10 @@ const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement =>
 
   context.save();
   context.filter = 'blur(4px)';
+  const nitzschiaBrush = NITZSCHIA_VISUAL_STYLE.brush;
   context.fillStyle = speciesId === 'oedogonium'
     ? 'rgba(84, 132, 73, 0.52)'
-    : 'rgba(154, 116, 74, 0.47)';
+    : `rgba(${nitzschiaBrush.red}, ${nitzschiaBrush.green}, ${nitzschiaBrush.blue}, ${nitzschiaBrush.alpha})`;
   // One broad translucent membrane reproduces the connected wash of the old
   // shared raster. Four overlapping circles made an almost opaque center but
   // a much smaller footprint, so a colony looked like separated dark dots.
@@ -1519,7 +1538,11 @@ const createAlgaeParticleLayer = (
     densitySprite.height = TANK_HEIGHT;
     // Keep the density texture opaque enough to mask crisp details, while the
     // visible wash itself stays as light as the earlier hand-drawn colonies.
-    densitySprite.alpha = speciesId === 'oedogonium' ? 0.86 : 0.5;
+    densitySprite.alpha = speciesId === 'oedogonium'
+      ? 0.86
+      : surfaceKind === 'substrate'
+        ? NITZSCHIA_VISUAL_STYLE.substrateAlpha
+        : NITZSCHIA_VISUAL_STYLE.structureAlpha;
 
     // Density and biological detail deliberately use different renderers.
     // The small dynamic bitmap produces a soft, grid-free colony boundary;
@@ -1780,8 +1803,8 @@ const rebuildAlgaeDetailGeometry = (
     }
   }
   context.fill({
-    color: 0x76563c,
-    alpha: 0.36,
+    color: NITZSCHIA_VISUAL_STYLE.speck.color,
+    alpha: NITZSCHIA_VISUAL_STYLE.speck.alpha,
   });
 };
 

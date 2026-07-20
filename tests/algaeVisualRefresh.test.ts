@@ -13,6 +13,7 @@ import {
   ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL,
   ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL,
   ALGAE_PARTICLE_JITTER_SPAN,
+  NITZSCHIA_VISUAL_STYLE,
   advanceAlgaeColonizationState,
   algaeCellVisualKey,
   algaeColonizationDetailSeed,
@@ -47,6 +48,28 @@ const matureCell = (
 });
 
 describe('algae visual refresh decisions', () => {
+  it('keeps a mature diatom film legible on substrate at the default fit zoom', () => {
+    const substrate = [0x95, 0x78, 0x5a];
+    const brush = NITZSCHIA_VISUAL_STYLE.brush;
+    const effectiveAlpha = brush.alpha * NITZSCHIA_VISUAL_STYLE.substrateAlpha;
+    const composite = [brush.red, brush.green, brush.blue].map(
+      (channel, index) => substrate[index] + (channel - substrate[index]) * effectiveAlpha,
+    );
+    const colorDistance = Math.hypot(
+      ...composite.map((channel, index) => channel - substrate[index]),
+    );
+    const averageSpeckDiameterAtDefaultZoom = (
+      NITZSCHIA_VISUAL_STYLE.speck.radiusMin +
+      NITZSCHIA_VISUAL_STYLE.speck.radiusSpan / 2
+    ) * 2 * 0.84;
+
+    expect(colorDistance).toBeGreaterThanOrEqual(16);
+    expect(averageSpeckDiameterAtDefaultZoom).toBeGreaterThanOrEqual(1);
+    expect(NITZSCHIA_VISUAL_STYLE.structureAlpha).toBeLessThan(
+      NITZSCHIA_VISUAL_STYLE.substrateAlpha,
+    );
+  });
+
   it('keeps neighboring low-biomass brushes overlapping despite deterministic jitter', () => {
     const minimumVisibleLevel = 1;
     const combinedRadius = algaeParticleRadiusRatio(minimumVisibleLevel) * 2;
