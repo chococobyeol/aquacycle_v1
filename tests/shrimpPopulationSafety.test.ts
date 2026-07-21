@@ -11,6 +11,7 @@ interface ReproductionAnimalState {
   sex: 'female' | 'male';
   energy: number;
   recentIntake: number;
+  storedBiomass: number;
   secondsSinceFood: number;
   reproductionCooldown: number;
   gestationRemaining: number | null;
@@ -109,6 +110,7 @@ describe('shrimp population safety contract', () => {
     mother.energy = 0.9;
     mother.recentIntake = 1;
     mother.secondsSinceFood = 0;
+    mother.storedBiomass = 0.5;
     mother.gestationRemaining = 1;
 
     internals.stepAnimalEcology(1);
@@ -129,6 +131,7 @@ describe('shrimp population safety contract', () => {
     const nourished = configureReadyPair(nourishedWorld, true);
     const nourishedFemale = nourished.animals.find((animal) => animal.sex === 'female');
     if (!nourishedFemale) throw new Error('nourished fixture needs a female shrimp');
+    nourishedFemale.storedBiomass = 0.5;
 
     for (let second = 0; second < 3; second += 1) {
       depleted.stepAnimalEcology(1);

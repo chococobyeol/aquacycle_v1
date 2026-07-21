@@ -22,13 +22,30 @@ export interface InterpolatedMotionState {
 export const reconcileStructureMotionWithSnapshot = (
   snapshotStructures: StructureSnapshot[],
   motionStructures: StructureSnapshot[],
+  holding: HoldingSnapshot | null = null,
 ): StructureSnapshot[] => {
   const movingStructures = new Map(
     motionStructures.map((structure) => [structure.id, structure]),
   );
   return snapshotStructures.map((structure) => {
     const moving = movingStructures.get(structure.id);
-    if (!moving || structure.isSleeping || structure.locked || structure.isHeld !== moving.isHeld) {
+    const isActivelyHeld = Boolean(
+      moving?.isHeld &&
+      holding?.kind === 'structure' &&
+      holding.structureId === structure.id,
+    );
+    // A settled stone is normally sleeping just before the player picks it up.
+    // Matter keeps that flag on the static held body, but held motion is still
+    // authoritative. The lightweight holding update can also arrive one React
+    // render before the full structure snapshot flips `isHeld`, so the holding
+    // identity—not the older structure flag—decides that transition frame.
+    if (
+      !moving ||
+      structure.locked ||
+      (moving.isHeld && !isActivelyHeld) ||
+      (!moving.isHeld && structure.isHeld) ||
+      (structure.isSleeping && !isActivelyHeld)
+    ) {
       return structure;
     }
     return {
@@ -36,6 +53,8 @@ export const reconcileStructureMotionWithSnapshot = (
       x: moving.x,
       y: moving.y,
       angle: moving.angle,
+      isHeld: moving.isHeld,
+      placementValid: moving.placementValid,
     };
   });
 };
@@ -46,6 +65,7 @@ const holdingIdentity = (holding: HoldingSnapshot | null): string | null => {
     case 'structure': return `${holding.source}:${holding.kind}:${holding.structureId}`;
     case 'animal': return `${holding.source}:${holding.kind}:${holding.animalId}`;
     case 'seed': return `${holding.source}:${holding.kind}:${holding.speciesId}`;
+    case 'biofilm': return `${holding.source}:${holding.kind}:${holding.microbeGuildId}`;
   }
 };
 
@@ -69,7 +89,11 @@ export const reconcileMotionWithSnapshot = (
   }
 
   const motionAnimals = new Map(motion.animals.map((animal) => [animal.id, animal]));
-  const structures = reconcileStructureMotionWithSnapshot(snapshot.structures, motion.structures);
+  const structures = reconcileStructureMotionWithSnapshot(
+    snapshot.structures,
+    motion.structures,
+    snapshot.holding,
+  );
   const animals = snapshot.animals.map((animal) => motionAnimals.get(animal.id) ?? animal);
   const holding = holdingIdentity(snapshot.holding) === holdingIdentity(motion.holding)
     ? motion.holding
@@ -104,6 +128,7 @@ const matchingHolding = (
     case 'structure': return previous.structureId === current.structureId;
     case 'animal': return previous.animalId === current.animalId;
     case 'seed': return previous.speciesId === current.speciesId;
+    case 'biofilm': return previous.microbeGuildId === current.microbeGuildId;
   }
 };
 

@@ -145,6 +145,53 @@ describe('Pixi motion interpolation', () => {
     expect(reconciled.structures[0].isSleeping).toBe(true);
   });
 
+  it('lets a picked sleeping structure follow held motion', () => {
+    const pickedSnapshot = {
+      ...structure(260, 0.1),
+      isSleeping: true,
+      // A lightweight holding packet can reach React before the full structure
+      // snapshot has switched this older flag to true.
+      isHeld: false,
+    };
+    const pointerMotion = {
+      ...structure(540, -0.35),
+      isSleeping: true,
+      isHeld: true,
+    };
+    const snapshot = {
+      structures: [pickedSnapshot],
+      animals: [],
+      holding: {
+        kind: 'structure',
+        source: 'existing',
+        valid: true,
+        x: 260,
+        y: 500,
+        structureId: pickedSnapshot.id,
+        structureDefinitionId: pickedSnapshot.definitionId,
+      },
+      probe: null,
+    } as unknown as SimulationSnapshot;
+    const motion = {
+      sequence: 15,
+      interpolated: false,
+      structures: [pointerMotion],
+      animals: [],
+      holding: {
+        ...snapshot.holding!,
+        x: 540,
+        y: 500,
+      },
+      probe: null,
+    };
+
+    const reconciled = reconcileMotionWithSnapshot(snapshot, motion);
+
+    expect(reconciled.structures[0].x).toBe(540);
+    expect(reconciled.structures[0].angle).toBe(-0.35);
+    expect(reconciled.structures[0].isHeld).toBe(true);
+  });
+
   it('keeps the dropped snapshot pose when a stale held motion frame remains', () => {
     const dropped = {
       ...structure(520, 0.35),

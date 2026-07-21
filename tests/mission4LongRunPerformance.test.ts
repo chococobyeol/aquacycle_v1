@@ -9,6 +9,7 @@ type WorldSnapshot = ReturnType<SimulationWorld['snapshot']>;
 const LONG_RUN_SECONDS = 1_800;
 const REAL_FRAME_SECONDS = 0.1;
 const MAX_STABLE_ARRAY_ENTRY_DRIFT = 32;
+const MAX_DIAGNOSTIC_ANIMAL_EVENTS = 240;
 
 const placeSeed = (
   world: SimulationWorld,
@@ -85,23 +86,27 @@ const recursiveArrayEntryCount = (value: unknown): number => {
   return 0;
 };
 
-/** Live animals and short-lived carcasses are legitimate dynamic state. Remove
- * only those two top-level collections before checking that the rest of the
- * snapshot stays bounded; a newly attached history or message backlog is still
- * included in this count. */
+/** Live animals, short-lived carcasses and the separately capped diagnostic
+ * ledger are legitimate dynamic state. Everything else must remain stable. */
 const stableSnapshotArrayEntryCount = (snapshot: WorldSnapshot): number => {
-  const { animals: _animals, carcasses: _carcasses, ...stableSnapshot } = snapshot;
+  const {
+    animals: _animals,
+    carcasses: _carcasses,
+    animalPopulationEvents: _animalPopulationEvents,
+    ...stableSnapshot
+  } = snapshot;
   return recursiveArrayEntryCount(stableSnapshot);
 };
 
 /** Guards direct persistent collections on the world while excluding the same
- * two ecological populations. This deliberately ignores Matter's nested
- * fixed-size caches, while still catching a newly introduced `history = []` or
- * snapshot backlog. */
+ * two ecological populations and the explicitly capped diagnostic ledger. */
 const stableWorldArrayEntryCount = (world: SimulationWorld): number =>
   Object.entries(world as unknown as Record<string, unknown>).reduce<number>(
     (total, [key, value]) => total + (
-      key !== 'animals' && key !== 'carcasses' && Array.isArray(value)
+      key !== 'animals' &&
+      key !== 'carcasses' &&
+      key !== 'animalPopulationEvents' &&
+      Array.isArray(value)
         ? value.length
         : 0
     ),
@@ -132,6 +137,14 @@ const assertBoundedMissionFourSnapshot = (
   for (const carcass of snapshot.carcasses) {
     expect(recursiveArrayEntryCount(carcass)).toBe(0);
     expect(carcass.ageSeconds).toBeLessThan(carcass.lifetimeSeconds);
+  }
+  expect(snapshot.animalPopulationEvents.length).toBeLessThanOrEqual(
+    MAX_DIAGNOSTIC_ANIMAL_EVENTS,
+  );
+  expect(new Set(snapshot.animalPopulationEvents.map((event) => event.sequence)).size)
+    .toBe(snapshot.animalPopulationEvents.length);
+  for (const event of snapshot.animalPopulationEvents) {
+    expect(recursiveArrayEntryCount(event)).toBe(0);
   }
 };
 

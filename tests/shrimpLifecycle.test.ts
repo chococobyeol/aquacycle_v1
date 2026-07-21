@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SimulationWorld } from "../src/simulation/SimulationWorld";
+import { BiogeochemistryLedger } from "../src/simulation/biogeochemistry";
 import type {
   AnimalSpeciesId,
   SpeciesId,
@@ -9,8 +10,13 @@ import type {
 const SHRIMP: AnimalSpeciesId = "cherry-shrimp";
 const MIN_LIFESPAN_SECONDS = 900;
 const MAX_LIFESPAN_SECONDS = 1_350;
+const MIN_SUPPLIED_ADULT_AGE_SECONDS = 180;
+const MAX_SUPPLIED_ADULT_AGE_SECONDS = 300;
 const MAX_TEST_TIME_SECONDS = 1_450;
-const LIFECYCLE_TEST_TIMEOUT_MS = 15_000;
+// The lifecycle simulation intentionally advances more than a thousand
+// in-world seconds. On slower Macs or while other long-run suites execute in
+// parallel it can exceed 15 seconds without indicating a simulation failure.
+const LIFECYCLE_TEST_TIMEOUT_MS = 30_000;
 
 type WorldSnapshot = ReturnType<SimulationWorld["snapshot"]>;
 
@@ -53,6 +59,10 @@ const configureFoodRichLaboratory = (
   shrimpPoints: Vec2[],
 ): { world: SimulationWorld; initial: WorldSnapshot } => {
   const world = new SimulationWorld("laboratory");
+  // Lifecycle tests isolate age and reproduction. Laboratory mode now also
+  // simulates water chemistry, which is covered independently by mission 5.
+  (world as unknown as { biogeochemistry: BiogeochemistryLedger }).biogeochemistry =
+    new BiogeochemistryLedger();
   seedFoodRichSubstrate(world);
   for (const point of shrimpPoints) placeShrimp(world, point);
   const initial = world.snapshot();
@@ -92,6 +102,33 @@ describe("cherry shrimp lifecycle", () => {
     expect(new Set(lifespans).size).toBeGreaterThan(1);
   });
 
+  it("keeps newly supplied adults young even after many animal IDs have been issued", () => {
+    const world = new SimulationWorld("laboratory");
+
+    // Repeated cancelled placements reproduce a long-running/edit-heavy tank:
+    // IDs continue to advance even though no shrimp remains in the water.
+    for (let index = 0; index < 500; index += 1) {
+      world.handle({ type: "pick-animal", speciesId: SHRIMP, point: { x: 600, y: 400 } });
+      world.handle({ type: "cancel-held" });
+    }
+
+    placeShrimp(world, { x: 600, y: 610 });
+    const introduced = world.snapshot().animals.at(-1);
+
+    expect(introduced).toBeDefined();
+    expect(introduced?.id).toBe("animal-501");
+    expect(introduced?.ageSeconds).toBeGreaterThanOrEqual(MIN_SUPPLIED_ADULT_AGE_SECONDS);
+    expect(introduced?.ageSeconds).toBeLessThanOrEqual(MAX_SUPPLIED_ADULT_AGE_SECONDS);
+    expect((introduced?.lifespanSeconds ?? 0) - (introduced?.ageSeconds ?? 0)).toBeGreaterThanOrEqual(
+      MIN_LIFESPAN_SECONDS - MAX_SUPPLIED_ADULT_AGE_SECONDS,
+    );
+
+    world.handle({ type: "start" });
+    world.tick(0.1);
+    expect(world.snapshot().animals.some((animal) => animal.id === "animal-501")).toBe(true);
+    expect(world.snapshot().animalPopulationEventTotals.deathsByCause["old-age"]).toBe(0);
+  });
+
   it("lets a well-fed shrimp die of old age instead of living forever", () => {
     const { world, initial } = configureFoodRichLaboratory([
       { x: 600, y: 610 },
@@ -122,7 +159,42 @@ describe("cherry shrimp lifecycle", () => {
     expect(lastLivingAge).toBeGreaterThanOrEqual(lifespan - 2);
     expect(lastLivingEnergy).toBeGreaterThan(0);
     expect(oldAgeCarcass?.cause as string).toBe("old-age");
+
+    const deathRecord = world.snapshot().animalPopulationEvents.find(
+      (event) => event.animalId === original.id && event.kind === "death",
+    );
+    expect(deathRecord?.cause).toBe("old-age");
+    expect(deathRecord?.ageSeconds).toBeGreaterThanOrEqual(lifespan - 2);
+    expect(world.snapshot().animalPopulationEventTotals.deathsByCause["old-age"]).toBe(1);
+
+    // The visual carcass is temporary, but its diagnostic record must survive.
+    for (let elapsed = 0; elapsed < 56; elapsed += 0.1) advanceOneTick(world);
+    const afterDecomposition = world.snapshot();
+    expect(afterDecomposition.carcasses.some(
+      (carcass) => carcass.sourceAnimalId === original.id,
+    )).toBe(false);
+    expect(afterDecomposition.animalPopulationEvents.some(
+      (event) => event.animalId === original.id && event.kind === "death",
+    )).toBe(true);
   }, LIFECYCLE_TEST_TIMEOUT_MS);
+
+  it("records introductions and laboratory removals as population changes", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const animalId = world.snapshot().animals[0].id;
+
+    expect(world.snapshot().animalPopulationEvents).toHaveLength(0);
+    world.handle({ type: "start" });
+    expect(world.snapshot().animalPopulationEventTotals.introduced).toBe(1);
+    expect(world.snapshot().animalPopulationEvents.at(-1)?.kind).toBe("introduced");
+
+    world.handle({ type: "pause" });
+    world.handle({ type: "retrieve-animal", id: animalId });
+    const snapshot = world.snapshot();
+    expect(snapshot.animalPopulationEventTotals.removed).toBe(1);
+    expect(snapshot.animalPopulationEvents.at(-1)?.kind).toBe("removed");
+    expect(snapshot.animalPopulation[SHRIMP].total).toBe(0);
+  });
 
   it("produces offspring and leaves a later generation after founders begin dying of old age", () => {
     const { world, initial } = configureFoodRichLaboratory([

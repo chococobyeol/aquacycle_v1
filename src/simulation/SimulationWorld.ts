@@ -2,12 +2,19 @@ import Matter, { type Body as MatterBody } from 'matter-js';
 import {
   ALGAE_VISIBLE_BIOMASS,
   ANIMALS,
+  MICROBE_ECOLOGY_RULES,
+  MICROBES,
   SCENARIOS,
+  SHRIMP_ECOLOGY_RULES,
   SPECIES,
   STRUCTURES,
+  WATER_CYCLE_RULES,
   type ScenarioDefinition,
 } from './config';
-import { BiogeochemistryLedger } from './biogeochemistry';
+import {
+  BiogeochemistryLedger,
+  emptyBiofilm,
+} from './biogeochemistry';
 import { FIXED_LAMP_WIDTH, FIXED_LAMP_X, FIXED_LAMP_Y } from './lightGeometry';
 import {
   clamp01,
@@ -34,14 +41,20 @@ import {
   TANK_WIDTH,
   WATER_TOP,
   type AnimalBehavior,
+  type AnimalDeathCause,
   type AnimalLifeStage,
+  type AnimalPopulationEventKind,
+  type AnimalPopulationEventSnapshot,
+  type AnimalPopulationEventTotals,
   type AnimalSnapshot,
+  type BiofilmBiomass,
   type AnimalCarcassSnapshot,
   type AnimalSpeciesId,
   type HoldingSnapshot,
   type LightFieldSnapshot,
   type MeasurementKind,
   type MeasurementSnapshot,
+  type MicrobeGuildId,
   type MissionOutcome,
   type MissionProgressSnapshot,
   type ProbeSnapshot,
@@ -71,6 +84,7 @@ interface SurfaceCellState extends LocalSurfaceCell {
   index: number;
   light: number;
   biomass: SpeciesBiomass;
+  biofilm: BiofilmBiomass;
   localNeighborIds: string[];
   neighborIds: string[];
 }
@@ -138,6 +152,8 @@ interface AnimalState {
   ageSeconds: number;
   lifespanSeconds: number;
   energy: number;
+  structuralBiomass: number;
+  storedBiomass: number;
   health: number;
   behavior: AnimalBehavior;
   behaviorTimer: number;
@@ -164,6 +180,7 @@ interface AnimalCarcassState {
   bodyLength: number;
   lifeStage: AnimalLifeStage;
   cause: AnimalCarcassSnapshot['cause'];
+  waterAtDeath: AnimalCarcassSnapshot['waterAtDeath'];
   ageSeconds: number;
 }
 
@@ -177,7 +194,15 @@ interface HeldAnimalState {
   originState?: AnimalState;
 }
 
-type HeldState = HeldStructureState | HeldSeedState | HeldAnimalState;
+interface HeldBiofilmState {
+  kind: 'biofilm';
+  source: 'inventory';
+  guildId: MicrobeGuildId;
+  candidateCellId: string | null;
+  valid: boolean;
+}
+
+type HeldState = HeldStructureState | HeldSeedState | HeldAnimalState | HeldBiofilmState;
 
 const LIGHT_COLUMNS = 36;
 const LIGHT_ROWS = 20;
@@ -217,19 +242,28 @@ const animalMotionStepSecondsForSpeed = (speed: SimulationSpeed): number =>
 
 const SETTLE_REQUIRED_SECONDS = 0.48;
 const SEED_BIOMASS = 0.28;
+const BIOFILM_INOCULUM_BIOMASS = 0.18;
 const PICK_SEED_DISTANCE = 18;
 const PICK_ANIMAL_DISTANCE = 28;
 const SHRIMP_ADULT_LENGTH = 36;
 const SHRIMP_JUVENILE_LENGTH = 14;
-const SHRIMP_MATURITY_SECONDS = 180;
+const SHRIMP_MATURITY_SECONDS = SHRIMP_ECOLOGY_RULES.maturationSeconds;
 // Two real-world months are compressed to the 180-second maturation period.
 // Keeping the same scale maps the observed 10–15 month life span to 15–22.5
 // simulation minutes. A deterministic per-animal value prevents cohort-wide
 // deaths while keeping replay results reproducible.
-const SHRIMP_MIN_LIFESPAN_SECONDS = 900;
-const SHRIMP_MAX_LIFESPAN_SECONDS = 1350;
-const SHRIMP_BASE_METABOLISM = 0.005;
+const SHRIMP_MIN_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds;
+const SHRIMP_MAX_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds;
+const SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS =
+  SHRIMP_ECOLOGY_RULES.suppliedAdultMinimumAgeSeconds;
+const SHRIMP_SUPPLIED_ADULT_MAX_AGE_SECONDS =
+  SHRIMP_ECOLOGY_RULES.suppliedAdultMaximumAgeSeconds;
+const SHRIMP_BASE_METABOLISM = SHRIMP_ECOLOGY_RULES.adultBaseMetabolismPerSecond;
 const SHRIMP_WEAK_ENERGY = 0.18;
+const SHRIMP_OXYGEN_STRESS_START = SHRIMP_ECOLOGY_RULES.oxygenStressStart;
+const SHRIMP_TOXIC_STRESS_START = SHRIMP_ECOLOGY_RULES.toxicWasteStressStart;
+const SHRIMP_TOXIC_STRESS_FULL = SHRIMP_ECOLOGY_RULES.toxicWasteFullStress;
+const SHRIMP_WATER_RECOVERY_RATE = SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerSecond;
 const SHRIMP_FORAGE_START_ENERGY = 0.48;
 const SHRIMP_FORAGE_STOP_ENERGY = 0.7;
 // Grazing must remove enough visible algae for consumers to affect the tank.
@@ -238,8 +272,8 @@ const SHRIMP_FORAGE_STOP_ENERGY = 0.7;
 // sustained intake (~0.13 biomass/s), 0.08 leaves enough reserve above adult
 // grazing metabolism for genuinely food-rich tanks to support reproduction;
 // sparse/overgrazed tanks still fall below this intake and lose population.
-const SHRIMP_BITE_RATE = 0.375;
-const SHRIMP_ENERGY_PER_BIOMASS = 0.08;
+const SHRIMP_BITE_RATE = SHRIMP_ECOLOGY_RULES.maximumBiteBiomassPerSecond;
+const SHRIMP_ENERGY_PER_BIOMASS = SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass;
 const SHRIMP_GRAZE_DISTANCE = 15;
 // Below this density the film is too sparse to be a useful grazing target.
 // Using one threshold for detection, retargeting, and actual removal prevents
@@ -258,7 +292,7 @@ const SHRIMP_POST_GRAZE_ROAM_VARIANCE_SECONDS = 1.5;
 // In a healthy tank adults settle near 0.5 energy. Reproduction is therefore
 // gated by current reserve and recent access to food rather than a hidden
 // population-capacity formula.
-const SHRIMP_REPRODUCTION_ENERGY = 0.46;
+const SHRIMP_REPRODUCTION_ENERGY = SHRIMP_ECOLOGY_RULES.reproductionEnergy;
 const SHRIMP_INITIAL_REPRODUCTION_COOLDOWN = 80;
 const SHRIMP_NEW_ADULT_REPRODUCTION_COOLDOWN = 120;
 const SHRIMP_MATING_SECONDS = 3;
@@ -266,6 +300,7 @@ const SHRIMP_GESTATION_SECONDS = 75;
 const SHRIMP_POST_BROOD_COOLDOWN = 160;
 const SHRIMP_MALE_POST_MATING_COOLDOWN = 45;
 const SHRIMP_CARCASS_LIFETIME_SECONDS = 55;
+const MAX_ANIMAL_POPULATION_EVENTS = 240;
 // This is not an ecological carrying capacity. It is only a last-resort guard
 // against allocating an unbounded clutch after a corrupted/extreme run. Under
 // normal rules, food depletion and mortality must limit the population first.
@@ -287,6 +322,20 @@ const distanceSquared = (a: Vec2, b: Vec2): number => {
 const cloneBiomass = (biomass: SpeciesBiomass): SpeciesBiomass => ({
   oedogonium: biomass.oedogonium,
   nitzschia: biomass.nitzschia,
+});
+
+const emptyAnimalPopulationEventTotals = (): AnimalPopulationEventTotals => ({
+  introduced: 0,
+  removed: 0,
+  births: 0,
+  maturations: 0,
+  deaths: 0,
+  deathsByCause: {
+    starvation: 0,
+    'old-age': 0,
+    hypoxia: 0,
+    toxicity: 0,
+  },
 });
 
 const cloneAnimalState = (animal: AnimalState): AnimalState => ({
@@ -338,8 +387,18 @@ export class SimulationWorld {
   private seedPlacements: SeedPlacementState[] = [];
   private animals: AnimalState[] = [];
   private carcasses: AnimalCarcassState[] = [];
+  private animalPopulationEvents: AnimalPopulationEventSnapshot[] = [];
+  private animalPopulationEventTotals = emptyAnimalPopulationEventTotals();
+  private animalPopulationEventSequence = 0;
   private totalAlgaeConsumed = 0;
   private animalInventoryUsed: Record<AnimalSpeciesId, number> = { 'cherry-shrimp': 0 };
+  private microbeInventoryUsed: Record<MicrobeGuildId, number> = {
+    decomposer: 0,
+    nitrifier: 0,
+  };
+  private suspendedBiofilm: BiofilmBiomass = emptyBiofilm();
+  private biofilmSettlementCursor = 0;
+  private materialReference: { nitrogen: number; carbon: number } | null = null;
   private biogeochemistry = new BiogeochemistryLedger();
   private lightOutput = 90;
   private waterTemperature = 23.5;
@@ -393,9 +452,19 @@ export class SimulationWorld {
     this.seedPlacements = [];
     this.animals = [];
     this.carcasses = [];
+    this.animalPopulationEvents = [];
+    this.animalPopulationEventTotals = emptyAnimalPopulationEventTotals();
+    this.animalPopulationEventSequence = 0;
     this.totalAlgaeConsumed = 0;
     this.animalInventoryUsed = { 'cherry-shrimp': 0 };
-    this.biogeochemistry = new BiogeochemistryLedger();
+    this.microbeInventoryUsed = { decomposer: 0, nitrifier: 0 };
+    this.suspendedBiofilm = emptyBiofilm();
+    this.biofilmSettlementCursor = 0;
+    this.materialReference = null;
+    this.biogeochemistry = new BiogeochemistryLedger({
+      effectsEnabled: Boolean(this.scenario.waterCycle),
+      initial: this.scenario.waterCycle?.initial,
+    });
     this.lightOutput = this.scenario.lightOutput;
     this.waterTemperature = 22 + this.lightOutput * 0.018;
     this.lightDirty = true;
@@ -466,6 +535,10 @@ export class SimulationWorld {
       case 'pick-animal':
         if (command.point) this.pointer = this.clampPointer(command.point);
         this.pickAnimalFromInventory(command.speciesId);
+        break;
+      case 'pick-biofilm':
+        if (command.point) this.pointer = this.clampPointer(command.point);
+        this.pickBiofilmFromInventory(command.guildId);
         break;
       case 'pick-at':
         this.pickExistingAt(command.point);
@@ -612,10 +685,12 @@ export class SimulationWorld {
           this.growthAccumulator -= growthStepSeconds;
           if (Math.abs(this.growthAccumulator) < 1e-10) this.growthAccumulator = 0;
           this.elapsedSeconds += growthStepSeconds;
+          this.biogeochemistry.beginStep();
           this.stepTemperature(growthStepSeconds);
           this.stepGrowth(growthStepSeconds);
-          this.stepBiogeochemistry(growthStepSeconds);
           this.stepAnimalEcology(growthStepSeconds);
+          this.stepBiofilmDispersal(growthStepSeconds);
+          this.resolveBiogeochemistry(growthStepSeconds);
           this.evaluateMission(growthStepSeconds);
           growthSteps += 1;
           processedEvent = true;
@@ -658,6 +733,25 @@ export class SimulationWorld {
     const coverageRatio = eligibleCells.length
       ? eligibleCells.filter((cell) => occupied(cell.biomass)).length / eligibleCells.length
       : 0;
+    const biogeochemistry = this.biogeochemistry.snapshot();
+    biogeochemistry.biofilmTotals = cells.reduce<BiofilmBiomass>((total, cell) => ({
+      decomposer: total.decomposer + cell.biofilm.decomposer,
+      nitrifier: total.nitrifier + cell.biofilm.nitrifier,
+    }), emptyBiofilm());
+    const materialTotals = this.computeMaterialTotals();
+    const reference = this.materialReference;
+    biogeochemistry.materialBalance = {
+      totalNitrogen: materialTotals.nitrogen,
+      totalCarbon: materialTotals.carbon,
+      referenceNitrogen: reference?.nitrogen ?? null,
+      referenceCarbon: reference?.carbon ?? null,
+      nitrogenDriftRatio: reference && reference.nitrogen > 0
+        ? (materialTotals.nitrogen - reference.nitrogen) / reference.nitrogen
+        : 0,
+      carbonDriftRatio: reference && reference.carbon > 0
+        ? (materialTotals.carbon - reference.carbon) / reference.carbon
+        : 0,
+    };
 
     this.revision += 1;
     this.snapshotDirty = false;
@@ -697,6 +791,10 @@ export class SimulationWorld {
       remainingAnimals: {
         'cherry-shrimp': this.remainingAnimals('cherry-shrimp'),
       },
+      remainingMicrobes: {
+        decomposer: this.remainingMicrobes('decomposer'),
+        nitrifier: this.remainingMicrobes('nitrifier'),
+      },
       remainingStructures: {
         'flat-stone': this.remainingStructures('flat-stone'),
         'round-stone': this.remainingStructures('round-stone'),
@@ -707,7 +805,15 @@ export class SimulationWorld {
       animalPopulation: {
         'cherry-shrimp': this.animalPopulation('cherry-shrimp'),
       },
-      biogeochemistry: this.biogeochemistry.snapshot(),
+      animalPopulationEvents: this.animalPopulationEvents.map((event) => ({
+        ...event,
+        water: event.water ? { ...event.water } : null,
+      })),
+      animalPopulationEventTotals: {
+        ...this.animalPopulationEventTotals,
+        deathsByCause: { ...this.animalPopulationEventTotals.deathsByCause },
+      },
+      biogeochemistry,
       coverageRatio,
       missionProgress: this.missionProgress(coverageRatio),
       message: this.message,
@@ -735,6 +841,26 @@ export class SimulationWorld {
     );
   }
 
+  private computeMaterialTotals(): { nitrogen: number; carbon: number } {
+    const water = this.biogeochemistry.materialState();
+    const surfaceBiomass = this.allCells().reduce((sum, cell) => sum +
+      cell.biomass.oedogonium + cell.biomass.nitzschia +
+      cell.biofilm.decomposer + cell.biofilm.nitrifier, 0);
+    const animalBiomass = this.animals.reduce(
+      (sum, animal) => sum + animal.structuralBiomass + animal.storedBiomass,
+      0,
+    );
+    const suspended = this.suspendedBiofilm.decomposer + this.suspendedBiofilm.nitrifier;
+    const biologicalMatter = water.organicMatter + water.detritus +
+      surfaceBiomass + animalBiomass + suspended;
+    return {
+      nitrogen: water.toxicWaste + water.nutrients +
+        biologicalMatter * WATER_CYCLE_RULES.biomassNitrogen,
+      carbon: water.dissolvedInorganicCarbon + water.headspaceCarbonDioxide +
+        biologicalMatter * WATER_CYCLE_RULES.biomassCarbon,
+    };
+  }
+
   private createSubstrateCells(): SurfaceCellState[] {
     const sampled = sampleSubstrate();
     const ids = sampled.map((_, index) => `substrate:cell-${index}`);
@@ -747,6 +873,7 @@ export class SimulationWorld {
       index,
       light: 0,
       biomass: emptyBiomass(),
+      biofilm: emptyBiofilm(),
       localNeighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
       neighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
     }));
@@ -800,6 +927,7 @@ export class SimulationWorld {
         index,
         light: 0,
         biomass: emptyBiomass(),
+        biofilm: emptyBiofilm(),
         localNeighborIds: cell.neighborIndices.map((neighbor) => cellIds[neighbor]),
         neighborIds: cell.neighborIndices.map((neighbor) => cellIds[neighbor]),
       })),
@@ -856,6 +984,7 @@ export class SimulationWorld {
       valid: false,
     };
     this.updateHeldSeedCandidate(this.pointer);
+    this.selection = null;
     this.message = `${SPECIES[speciesId].shortName} 접종체가 선택되었습니다. 돌 앞면이나 바닥재에 놓으세요.`;
   }
 
@@ -878,6 +1007,30 @@ export class SimulationWorld {
     this.pointer = position;
     this.selection = null;
     this.message = `${ANIMALS[speciesId].displayName}가 커서에 붙었습니다. 수중의 원하는 위치에 놓으세요.`;
+  }
+
+  private pickBiofilmFromInventory(guildId: MicrobeGuildId): void {
+    if (
+      !this.canInoculateBiofilm() ||
+      this.held ||
+      !this.scenario.waterCycle?.allowedMicrobes.includes(guildId)
+    ) return;
+    const remaining = this.remainingMicrobes(guildId);
+    if (remaining !== null && remaining <= 0) {
+      this.message = '이 균 접종체는 모두 사용했습니다.';
+      return;
+    }
+    this.held = {
+      kind: 'biofilm',
+      source: 'inventory',
+      guildId,
+      candidateCellId: null,
+      valid: false,
+    };
+    this.updateHeldBiofilmCandidate(this.pointer);
+    this.selection = null;
+    this.message = `${MICROBES[guildId].displayName} 접종체가 선택되었습니다. 부착할 표면을 고르세요.`;
+    this.snapshotDirty = true;
   }
 
   private pickExistingAt(point: Vec2): void {
@@ -1130,7 +1283,11 @@ export class SimulationWorld {
     this.selection = {
       kind: 'measurement',
       ...measurement.point,
-      ownerLabel: measurement.kind === 'light' ? '광량 측정점' : '수온 측정점',
+      ownerLabel: measurement.kind === 'light'
+        ? '광량 측정점'
+        : measurement.kind === 'temperature'
+          ? '수온 측정점'
+          : '수질 측정점',
       measurementId: measurement.id,
     };
     this.message = `${this.selection.ownerLabel}을 선택했습니다.`;
@@ -1157,6 +1314,8 @@ export class SimulationWorld {
       this.updateHeldStructureValidity(structure);
     } else if (this.held.kind === 'seed') {
       this.updateHeldSeedCandidate(this.pointer);
+    } else if (this.held.kind === 'biofilm') {
+      this.updateHeldBiofilmCandidate(this.pointer);
     } else {
       this.held.position = this.clampAnimalPoint(this.pointer);
       this.held.valid = this.isAnimalPlacementPoint(this.held.position);
@@ -1164,7 +1323,7 @@ export class SimulationWorld {
   }
 
   private dropHeld(point: Vec2): void {
-    if (!this.held || !this.canEdit()) return;
+    if (!this.held || !this.canPlaceHeld(this.held)) return;
     this.movePointer(point);
     if (!this.held.valid) {
       const held = this.held;
@@ -1177,6 +1336,8 @@ export class SimulationWorld {
         ? '다른 돌과 깊이 겹치지 않는 수조 안쪽 위치를 선택하세요.'
         : held.kind === 'animal'
           ? '체리새우는 수면 아래와 바닥 위의 수중에 놓아야 합니다.'
+        : held.kind === 'biofilm'
+          ? '균 필름은 돌의 보이는 앞면이나 바닥재 표면에 접종해야 합니다.'
         : duplicateSeed
           ? '이 표면에는 같은 조류가 이미 접종되어 있습니다. 다른 지점을 선택하세요.'
           : '접종체는 돌의 보이는 앞면이나 바닥재 표면에 놓아야 합니다.';
@@ -1215,9 +1376,35 @@ export class SimulationWorld {
       this.animals.push(restored);
       if (heldAnimal.source === 'inventory') {
         this.animalInventoryUsed[heldAnimal.speciesId] += 1;
+        if (this.hasStarted) this.recordAnimalPopulationEvent('introduced', restored);
       }
       this.held = null;
       this.message = `${ANIMALS[restored.speciesId].displayName}를 수조에 놓았습니다.`;
+      this.snapshotDirty = true;
+      return;
+    }
+
+    if (this.held.kind === 'biofilm') {
+      const heldBiofilm = this.held;
+      const cell = heldBiofilm.candidateCellId
+        ? this.cellById(heldBiofilm.candidateCellId)
+        : undefined;
+      if (!cell) return;
+      const total = cell.biofilm.decomposer + cell.biofilm.nitrifier;
+      const available = Math.max(0, 1 - total);
+      const inoculum = Math.min(BIOFILM_INOCULUM_BIOMASS, available);
+      cell.biofilm[heldBiofilm.guildId] += inoculum;
+      if (
+        this.hasStarted &&
+        this.scenario.mode === 'challenge' &&
+        this.materialReference
+      ) {
+        this.materialReference.nitrogen += inoculum * WATER_CYCLE_RULES.biomassNitrogen;
+        this.materialReference.carbon += inoculum * WATER_CYCLE_RULES.biomassCarbon;
+      }
+      this.microbeInventoryUsed[heldBiofilm.guildId] += 1;
+      this.held = null;
+      this.message = `${MICROBES[heldBiofilm.guildId].displayName}을 접종했습니다.`;
       this.snapshotDirty = true;
       return;
     }
@@ -1258,7 +1445,11 @@ export class SimulationWorld {
       if (this.held.source === 'existing' && this.held.originState) {
         this.animals.push(cloneAnimalState(this.held.originState));
       }
-    } else if (this.held.source === 'existing' && this.held.originCellId) {
+    } else if (
+      this.held.kind === 'seed' &&
+      this.held.source === 'existing' &&
+      this.held.originCellId
+    ) {
       const origin = this.cellById(this.held.originCellId);
       if (origin) origin.biomass[this.held.speciesId] = this.held.originBiomass ?? SEED_BIOMASS;
       this.seedPlacements.push({
@@ -1328,6 +1519,7 @@ export class SimulationWorld {
     if (!this.canEdit() || this.held) return;
     const animal = this.animals.find((candidate) => candidate.id === id);
     if (!animal) return;
+    if (this.hasStarted) this.recordAnimalPopulationEvent('removed', animal);
     this.animals = this.animals.filter((candidate) => candidate.id !== id);
     if (animal.origin === 'supplied') {
       this.animalInventoryUsed[animal.speciesId] = Math.max(
@@ -1457,9 +1649,34 @@ export class SimulationWorld {
     held.valid = Boolean(candidateCellId) && !duplicate;
   }
 
+  private updateHeldBiofilmCandidate(point: Vec2): void {
+    if (!this.held || this.held.kind !== 'biofilm') return;
+    const nearest = this.nearestCell(point);
+    const validDistance = nearest ? Math.max(8, nearest.cell.cellSize * 0.95) : 0;
+    const candidateCellId = nearest && nearest.distance <= validDistance
+      ? nearest.cell.id
+      : null;
+    const candidate = candidateCellId ? this.cellById(candidateCellId) : undefined;
+    const occupied = candidate
+      ? candidate.biofilm.decomposer + candidate.biofilm.nitrifier
+      : 1;
+    this.held.candidateCellId = candidateCellId;
+    this.held.valid = Boolean(candidateCellId) && occupied < 0.995;
+  }
+
   private canEdit(): boolean {
     if (this.phase === 'setup') return true;
     return this.scenario.mode === 'laboratory' && this.phase === 'paused';
+  }
+
+  private canInoculateBiofilm(): boolean {
+    if (!this.scenario.waterCycle) return false;
+    if (this.phase === 'setup') return true;
+    return this.phase === 'paused';
+  }
+
+  private canPlaceHeld(held: HeldState): boolean {
+    return held.kind === 'biofilm' ? this.canInoculateBiofilm() : this.canEdit();
   }
 
   private start(): void {
@@ -1491,6 +1708,10 @@ export class SimulationWorld {
     if (this.lightDirty) this.recomputeLight();
     this.phase = 'running';
     this.hasStarted = true;
+    for (const animal of this.animals) {
+      this.recordAnimalPopulationEvent('introduced', animal);
+    }
+    this.materialReference = this.computeMaterialTotals();
     this.message = '배치가 잠겼습니다. 군락과 개체군의 변화를 관찰하세요.';
   }
 
@@ -1499,18 +1720,28 @@ export class SimulationWorld {
     this.phase = 'paused';
     this.message = this.scenario.mode === 'laboratory'
       ? '일시정지됨 · 구조물과 새 접종체를 편집할 수 있습니다.'
-      : '일시정지됨 · 도전 중 배치는 계속 잠겨 있습니다.';
+      : this.scenario.waterCycle
+        ? '일시정지됨 · 일반 배치는 잠겨 있으며 균 필름만 접종할 수 있습니다.'
+        : '일시정지됨 · 도전 중 배치는 계속 잠겨 있습니다.';
   }
 
   private resume(): void {
     if (this.phase !== 'paused') return;
-    if (this.scenario.mode === 'laboratory' && (this.held || !this.allSettled)) {
-      this.message = '들고 있는 항목을 놓고 모든 구조물이 안착해야 재개할 수 있습니다.';
+    if (this.held || (this.scenario.mode === 'laboratory' && !this.allSettled)) {
+      this.message = this.held
+        ? '들고 있는 항목을 놓거나 취소해야 재개할 수 있습니다.'
+        : '모든 구조물이 안착해야 재개할 수 있습니다.';
       return;
     }
     this.sleepStructures();
     if (this.crossConnectionsDirty) this.rebuildCrossConnections();
     if (this.lightDirty) this.recomputeLight();
+    // Laboratory pause editing may import or remove arbitrary material, so a
+    // resumed lab starts a new closed observation interval. Challenge-mode
+    // inocula are accounted when placed and must not hide earlier drift.
+    if (this.scenario.mode === 'laboratory') {
+      this.materialReference = this.computeMaterialTotals();
+    }
     this.phase = 'running';
     this.message = '생태 시뮬레이션이 진행 중입니다.';
   }
@@ -1607,6 +1838,14 @@ export class SimulationWorld {
     return Math.max(0, budget - this.animalInventoryUsed[speciesId] - held);
   }
 
+  private remainingMicrobes(guildId: MicrobeGuildId): number | null {
+    if (!this.scenario.waterCycle) return 0;
+    const budget = this.scenario.waterCycle.microbeBudget[guildId];
+    if (budget === null) return null;
+    const held = this.held?.kind === 'biofilm' && this.held.guildId === guildId ? 1 : 0;
+    return Math.max(0, budget - this.microbeInventoryUsed[guildId] - held);
+  }
+
   private remainingStructures(definitionId: StructureDefinitionId): number | null {
     const budget = this.scenario.structureBudget[definitionId];
     if (budget === null) return null;
@@ -1623,6 +1862,9 @@ export class SimulationWorld {
     const snapDistance = nearest ? Math.max(7, nearest.cell.cellSize * 0.72) : 0;
     const onSurface = nearest && nearest.distance <= snapDistance ? nearest : null;
     const light = onSurface ? onSurface.cell.light : this.lightAt(exact);
+    const measuredPoint = onSurface ? this.cellWorldPoint(onSurface.cell) : exact;
+    const biofilm = onSurface ? { ...onSurface.cell.biofilm } : emptyBiofilm();
+    const occupiedBiofilm = biofilm.decomposer + biofilm.nitrifier;
     return {
       ...exact,
       light,
@@ -1636,6 +1878,20 @@ export class SimulationWorld {
       trends: {
         oedogonium: growthTrend('oedogonium', light, this.waterTemperature),
         nitzschia: growthTrend('nitzschia', light, this.waterTemperature),
+      },
+      water: this.biogeochemistry.sampleAt(measuredPoint),
+      biofilm,
+      microbeNetGrowth: {
+        decomposer: this.biogeochemistry.microbeNetGrowthAt(
+          'decomposer',
+          measuredPoint,
+          occupiedBiofilm,
+        ),
+        nitrifier: this.biogeochemistry.microbeNetGrowthAt(
+          'nitrifier',
+          measuredPoint,
+          occupiedBiofilm,
+        ),
       },
     };
   }
@@ -2051,8 +2307,7 @@ export class SimulationWorld {
     }
   }
 
-  private stepBiogeochemistry(deltaSeconds: number): void {
-    this.biogeochemistry.beginStep();
+  private recordAlgaeBiogeochemistry(deltaSeconds: number): void {
     for (const cell of this.allCells()) {
       this.biogeochemistry.recordAlgae(
         this.cellWorldPoint(cell),
@@ -2060,6 +2315,152 @@ export class SimulationWorld {
         cell.light,
         deltaSeconds,
       );
+    }
+  }
+
+  private resolveBiogeochemistry(deltaSeconds: number): void {
+    this.biogeochemistry.advance(
+      deltaSeconds,
+      this.allCells().map((cell) => ({
+        point: this.cellWorldPoint(cell),
+        biofilm: cell.biofilm,
+      })),
+    );
+    if (this.probe) this.setProbe(this.probe);
+  }
+
+  private stepBiofilmDispersal(deltaSeconds: number): void {
+    if (!this.biogeochemistry.effectsEnabled || deltaSeconds <= 0) return;
+    const cells = this.allCells();
+    const byId = new Map(cells.map((cell) => [cell.id, cell]));
+    interface Transfer {
+      source: SurfaceCellState;
+      receiver: SurfaceCellState;
+      guildId: MicrobeGuildId;
+      amount: number;
+    }
+    const transfers: Transfer[] = [];
+
+    for (const cell of cells) {
+      for (const neighborId of cell.neighborIds) {
+        if (cell.id >= neighborId) continue;
+        const neighbor = byId.get(neighborId);
+        if (!neighbor) continue;
+        for (const guildId of ['decomposer', 'nitrifier'] as const) {
+          const response = 1 - Math.exp(
+            -MICROBE_ECOLOGY_RULES[guildId].surfaceSpreadRate * deltaSeconds,
+          );
+          const difference = cell.biofilm[guildId] - neighbor.biofilm[guildId];
+          if (Math.abs(difference) < 0.012) continue;
+          const source = difference > 0 ? cell : neighbor;
+          const receiver = difference > 0 ? neighbor : cell;
+          const available = Math.max(
+            0,
+            1 - receiver.biofilm.decomposer - receiver.biofilm.nitrifier,
+          );
+          const amount = Math.min(available, Math.abs(difference) * response * 0.5);
+          if (amount > 0) transfers.push({ source, receiver, guildId, amount });
+        }
+      }
+    }
+
+    const incoming = new Map<string, number>();
+    const outgoing = new Map<string, number>();
+    for (const transfer of transfers) {
+      incoming.set(
+        transfer.receiver.id,
+        (incoming.get(transfer.receiver.id) ?? 0) + transfer.amount,
+      );
+      const sourceKey = `${transfer.source.id}\0${transfer.guildId}`;
+      outgoing.set(sourceKey, (outgoing.get(sourceKey) ?? 0) + transfer.amount);
+    }
+    for (const transfer of transfers) {
+      const receiverCapacity = Math.max(
+        0,
+        1 - transfer.receiver.biofilm.decomposer - transfer.receiver.biofilm.nitrifier,
+      );
+      const incomingDemand = incoming.get(transfer.receiver.id) ?? 0;
+      if (incomingDemand > receiverCapacity && incomingDemand > 0) {
+        transfer.amount *= receiverCapacity / incomingDemand;
+      }
+      const sourceKey = `${transfer.source.id}\0${transfer.guildId}`;
+      const outgoingDemand = outgoing.get(sourceKey) ?? 0;
+      const available = transfer.source.biofilm[transfer.guildId];
+      if (outgoingDemand > available && outgoingDemand > 0) {
+        transfer.amount *= available / outgoingDemand;
+      }
+    }
+    for (const transfer of transfers) {
+      transfer.source.biofilm[transfer.guildId] = Math.max(
+        0,
+        transfer.source.biofilm[transfer.guildId] - transfer.amount,
+      );
+      transfer.receiver.biofilm[transfer.guildId] += transfer.amount;
+    }
+
+    // A small viable fraction leaves mature films, is carried by unresolved
+    // tank circulation, and can establish on a disconnected wetted surface.
+    // This is mass-conserving: every suspended propagule is removed from a
+    // source film first, then either settles or loses viability.
+    for (const cell of cells) {
+      for (const guildId of ['decomposer', 'nitrifier'] as const) {
+        const kinetics = MICROBE_ECOLOGY_RULES[guildId];
+        const detached = cell.biofilm[guildId] *
+          (1 - Math.exp(-kinetics.waterborneExportRate * deltaSeconds));
+        if (detached <= 0) continue;
+        cell.biofilm[guildId] = Math.max(0, cell.biofilm[guildId] - detached);
+        this.suspendedBiofilm[guildId] += detached;
+      }
+    }
+
+    for (const guildId of ['decomposer', 'nitrifier'] as const) {
+      const kinetics = MICROBE_ECOLOGY_RULES[guildId];
+      const suspendedBeforeDecay = this.suspendedBiofilm[guildId];
+      this.suspendedBiofilm[guildId] *= Math.exp(-kinetics.suspendedDecayRate * deltaSeconds);
+      this.biogeochemistry.recordSuspendedBiomassDeath(
+        { x: TANK_WIDTH / 2, y: (WATER_TOP + GROUND_Y) / 2 },
+        suspendedBeforeDecay - this.suspendedBiofilm[guildId],
+      );
+      const attempts = Math.max(
+        1,
+        Math.round(MICROBE_ECOLOGY_RULES.settlementAttemptsPerSecond * deltaSeconds),
+      );
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (this.suspendedBiofilm[guildId] <= 1e-8 || cells.length === 0) break;
+        this.biofilmSettlementCursor += 1;
+        const guildOffset = guildId === 'decomposer' ? 17.3 : 71.9;
+        const candidateIndex = Math.min(
+          cells.length - 1,
+          Math.floor(
+            deterministicNoise(this.biofilmSettlementCursor * 1.97 + guildOffset) * cells.length,
+          ),
+        );
+        const receiver = cells[candidateIndex];
+        const occupiedFraction = receiver.biofilm.decomposer + receiver.biofilm.nitrifier;
+        const available = Math.max(0, 1 - occupiedFraction);
+        if (available <= 0) continue;
+        const netGrowth = this.biogeochemistry.microbeNetGrowthAt(
+          guildId,
+          this.cellWorldPoint(receiver),
+          occupiedFraction,
+        );
+        // Propagules may land in a poor site, but a food- and oxygen-rich site
+        // retains a much larger viable fraction and becomes a visible colony.
+        const retention = clamp(0.12 + netGrowth * 38, 0.04, 1);
+        const offered = Math.max(
+          MICROBE_ECOLOGY_RULES.minimumSettlement,
+          this.suspendedBiofilm[guildId] *
+            MICROBE_ECOLOGY_RULES.settlementFractionPerAttempt,
+        );
+        const amount = Math.min(
+          available,
+          this.suspendedBiofilm[guildId],
+          offered * retention,
+        );
+        if (amount <= 0) continue;
+        receiver.biofilm[guildId] += amount;
+        this.suspendedBiofilm[guildId] -= amount;
+      }
     }
   }
 
@@ -2084,7 +2485,7 @@ export class SimulationWorld {
       oedogonium: number;
     }
     const requestsByCell = new Map<string, GrazingRequest[]>();
-    const metabolismRecorded = new Set<string>();
+    const waterDeathCauses = new Map<string, 'hypoxia' | 'toxicity'>();
 
     for (const animal of this.animals) {
       animal.ageSeconds += deltaSeconds;
@@ -2094,12 +2495,45 @@ export class SimulationWorld {
 
       const stageScale = animal.lifeStage === 'adult' ? 1 : 0.58;
       const activityCost = animal.behavior === 'traveling'
-        ? 0.0018
+        ? SHRIMP_ECOLOGY_RULES.travelingActivityCostPerSecond
         : animal.behavior === 'grazing' || animal.behavior === 'exploring'
-          ? 0.0008
-          : 0.0002;
-      const baseCost = animal.lifeStage === 'adult' ? SHRIMP_BASE_METABOLISM : 0.003;
+          ? SHRIMP_ECOLOGY_RULES.grazingActivityCostPerSecond
+          : SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond;
+      const baseCost = animal.lifeStage === 'adult'
+        ? SHRIMP_BASE_METABOLISM
+        : SHRIMP_ECOLOGY_RULES.juvenileBaseMetabolismPerSecond;
       animal.energy = Math.max(0, animal.energy - (baseCost + activityCost) * deltaSeconds);
+
+      if (this.biogeochemistry.effectsEnabled) {
+        const water = this.biogeochemistry.sampleAt(animal.position);
+        const oxygenStress = clamp(
+          (SHRIMP_OXYGEN_STRESS_START - water.oxygen) / SHRIMP_OXYGEN_STRESS_START,
+          0,
+          1,
+        );
+        const toxicStress = clamp(
+          (water.toxicWaste - SHRIMP_TOXIC_STRESS_START) /
+            (SHRIMP_TOXIC_STRESS_FULL - SHRIMP_TOXIC_STRESS_START),
+          0,
+          1,
+        );
+        const damageRate =
+          Math.pow(oxygenStress, 1.35) *
+            SHRIMP_ECOLOGY_RULES.oxygenMaximumDamagePerSecond +
+          Math.pow(toxicStress, 1.25) *
+            SHRIMP_ECOLOGY_RULES.toxicMaximumDamagePerSecond;
+        const recoveryRate = Math.max(0, 1 - Math.max(oxygenStress, toxicStress)) *
+          SHRIMP_WATER_RECOVERY_RATE;
+        animal.health = clamp01(
+          animal.health + (recoveryRate - damageRate) * deltaSeconds,
+        );
+        if (animal.health <= 0) {
+          waterDeathCauses.set(
+            animal.id,
+            oxygenStress >= toxicStress ? 'hypoxia' : 'toxicity',
+          );
+        }
+      }
 
       const target = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
       if (target && animal.behavior === 'grazing') {
@@ -2157,13 +2591,26 @@ export class SimulationWorld {
         request.animal.grazingSessionIntake += consumed;
         this.totalAlgaeConsumed += consumed;
         request.animal.secondsSinceFood = 0;
-        this.biogeochemistry.recordAnimalMetabolism(
+        const assimilated = this.biogeochemistry.recordAnimalFeeding(
           request.animal.position,
-          request.animal.lifeStage === 'adult' ? 1 : 0.58,
           consumed,
-          deltaSeconds,
         );
-        metabolismRecorded.add(request.animal.id);
+        if (this.biogeochemistry.effectsEnabled) {
+          const reserveLimit = request.animal.lifeStage === 'adult'
+            ? WATER_CYCLE_RULES.shrimp.adultReserveBiomass
+            : WATER_CYCLE_RULES.shrimp.juvenileReserveBiomass;
+          const retained = Math.min(
+            assimilated,
+            Math.max(0, reserveLimit - request.animal.storedBiomass),
+          );
+          request.animal.storedBiomass += retained;
+          this.biogeochemistry.recordAnimalAssimilationOverflow(
+            request.animal.position,
+            assimilated - retained,
+          );
+        } else {
+          request.animal.storedBiomass += assimilated;
+        }
       }
       cell.biomass.nitzschia = Math.max(0, cell.biomass.nitzschia - consumedNitzschia);
       cell.biomass.oedogonium = Math.max(0, cell.biomass.oedogonium - consumedOedogonium);
@@ -2174,13 +2621,34 @@ export class SimulationWorld {
     const newborns: AnimalState[] = [];
     const living: AnimalState[] = [];
     for (const animal of this.animals) {
-      if (!metabolismRecorded.has(animal.id)) {
-        this.biogeochemistry.recordAnimalMetabolism(
-          animal.position,
-          animal.lifeStage === 'adult' ? 1 : 0.58,
-          0,
-          deltaSeconds,
-        );
+      const maintenanceRate = animal.lifeStage === 'adult'
+        ? WATER_CYCLE_RULES.shrimp.adultMaintenanceBiomassPerSecond
+        : WATER_CYCLE_RULES.shrimp.juvenileMaintenanceBiomassPerSecond;
+      const maintenanceRequest = maintenanceRate * deltaSeconds;
+      const reserveLoss = this.biogeochemistry.effectsEnabled
+        ? Math.min(animal.storedBiomass, maintenanceRequest)
+        : maintenanceRequest;
+      if (this.biogeochemistry.effectsEnabled) {
+        animal.storedBiomass -= reserveLoss;
+      }
+      const structuralLoss = this.biogeochemistry.effectsEnabled
+        ? Math.min(
+          animal.structuralBiomass,
+          Math.max(0, maintenanceRequest - reserveLoss),
+        )
+        : 0;
+      if (this.biogeochemistry.effectsEnabled) {
+        animal.structuralBiomass -= structuralLoss;
+      }
+      this.biogeochemistry.recordAnimalRespiration(
+        animal.position,
+        reserveLoss + structuralLoss,
+      );
+
+      const waterDeathCause = waterDeathCauses.get(animal.id);
+      if (waterDeathCause) {
+        this.killAnimal(animal, waterDeathCause);
+        continue;
       }
 
       if (animal.ageSeconds >= animal.lifespanSeconds) {
@@ -2190,7 +2658,24 @@ export class SimulationWorld {
 
       if (animal.lifeStage === 'juvenile') {
         if (animal.energy >= 0.44 && animal.secondsSinceFood < 12) {
-          animal.growthProgress = Math.min(1, animal.growthProgress + deltaSeconds / SHRIMP_MATURITY_SECONDS);
+          const desiredProgress = Math.min(
+            1,
+            animal.growthProgress + deltaSeconds / SHRIMP_MATURITY_SECONDS,
+          );
+          const birthBiomass = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
+          const adultBiomass = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+          const desiredStructuralBiomass = birthBiomass +
+            (adultBiomass - birthBiomass) * desiredProgress;
+          const materialNeeded = Math.max(
+            0,
+            desiredStructuralBiomass - animal.structuralBiomass,
+          );
+          const materialUsed = Math.min(animal.storedBiomass, materialNeeded);
+          animal.storedBiomass -= materialUsed;
+          animal.structuralBiomass += materialUsed;
+          animal.growthProgress = clamp01(
+            (animal.structuralBiomass - birthBiomass) / (adultBiomass - birthBiomass),
+          );
         }
         animal.bodyLength = SHRIMP_JUVENILE_LENGTH +
           (SHRIMP_ADULT_LENGTH - SHRIMP_JUVENILE_LENGTH) * animal.growthProgress;
@@ -2198,6 +2683,18 @@ export class SimulationWorld {
           animal.lifeStage = 'adult';
           animal.bodyLength = SHRIMP_ADULT_LENGTH;
           animal.reproductionCooldown = SHRIMP_NEW_ADULT_REPRODUCTION_COOLDOWN;
+          this.recordAnimalPopulationEvent('matured', animal);
+          const overflow = Math.max(
+            0,
+            animal.storedBiomass - WATER_CYCLE_RULES.shrimp.adultReserveBiomass,
+          );
+          if (overflow > 0) {
+            animal.storedBiomass -= overflow;
+            this.biogeochemistry.recordAnimalAssimilationOverflow(
+              animal.position,
+              overflow,
+            );
+          }
         }
       }
 
@@ -2206,43 +2703,58 @@ export class SimulationWorld {
           // Embryo development pauses when the mother is no longer feeding;
           // it resumes after she recovers instead of producing young from
           // depleted reserves.
-          const gestationCanAdvance = animal.energy >= 0.42 && animal.secondsSinceFood <= 20;
+          const gestationCanAdvance =
+            animal.energy >= SHRIMP_ECOLOGY_RULES.gestationEnergy &&
+            animal.secondsSinceFood <= SHRIMP_ECOLOGY_RULES.gestationRecentFeedingSeconds;
           if (gestationCanAdvance) animal.gestationRemaining -= deltaSeconds;
           if (animal.gestationRemaining <= 0) {
-            const desiredClutchSize = 1 + Math.floor(deterministicNoise(
-              animal.randomSeed + animal.ageSeconds * 0.31,
-            ) * 2);
+            const desiredClutchSize = SHRIMP_ECOLOGY_RULES.minimumClutchSize +
+              Math.floor(deterministicNoise(
+                animal.randomSeed + animal.ageSeconds * 0.31,
+              ) * (
+                SHRIMP_ECOLOGY_RULES.maximumClutchSize -
+                SHRIMP_ECOLOGY_RULES.minimumClutchSize + 1
+              ));
             const availableSlots = Math.max(
               0,
               SHRIMP_TECHNICAL_POPULATION_LIMIT - this.animals.length - newborns.length,
             );
-            const clutchSize = Math.min(desiredClutchSize, availableSlots);
-            if (clutchSize > 0) {
+            const materialSlots = Math.floor(
+              animal.storedBiomass / WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
+            );
+            const clutchSize = Math.min(desiredClutchSize, availableSlots, materialSlots);
+            if (clutchSize >= SHRIMP_ECOLOGY_RULES.minimumClutchSize) {
+              animal.storedBiomass -=
+                clutchSize * WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
               for (let index = 0; index < clutchSize; index += 1) {
-                newborns.push(this.createJuvenileAnimalState(animal, index));
+                const newborn = this.createJuvenileAnimalState(animal, index);
+                newborns.push(newborn);
+                this.recordAnimalPopulationEvent('birth', newborn, { parentId: animal.id });
               }
               animal.gestationRemaining = null;
               animal.reproductionCooldown = SHRIMP_POST_BROOD_COOLDOWN;
               animal.energy = Math.max(0, animal.energy - 0.1);
             } else {
-              // The technical safety guard should be unreachable in normal
-              // ecology. If an extreme/corrupted run reaches it, keep the clutch
-              // pending instead of charging the mother for a zero-offspring birth.
+              // Wait until a complete compressed brood can be born. This keeps
+              // material accounting exact and avoids creating a lone-sex brood.
               animal.gestationRemaining = 0;
             }
           }
         } else if (
           animal.reproductionCooldown <= 0 &&
           animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
-          animal.secondsSinceFood < 8 &&
+          animal.storedBiomass >=
+            WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
+            SHRIMP_ECOLOGY_RULES.minimumClutchSize &&
+          animal.secondsSinceFood < SHRIMP_ECOLOGY_RULES.matingRecentFeedingSeconds &&
           this.animals.length + newborns.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
         ) {
           const eligibleMale = this.animals.find((candidate) =>
             candidate.id !== animal.id &&
             candidate.lifeStage === 'adult' &&
             candidate.sex === 'male' &&
-            candidate.energy >= 0.45 &&
-            candidate.secondsSinceFood < 8 &&
+            candidate.energy >= SHRIMP_ECOLOGY_RULES.maleReproductionEnergy &&
+            candidate.secondsSinceFood < SHRIMP_ECOLOGY_RULES.matingRecentFeedingSeconds &&
             candidate.reproductionCooldown <= 0,
           );
           animal.matingAccumulator = eligibleMale
@@ -2261,7 +2773,9 @@ export class SimulationWorld {
         }
       }
 
-      animal.health = clamp01(animal.energy / SHRIMP_WEAK_ENERGY);
+      if (!this.biogeochemistry.effectsEnabled) {
+        animal.health = clamp01(animal.energy / SHRIMP_WEAK_ENERGY);
+      }
       if (animal.energy <= 0) {
         this.killAnimal(animal, 'starvation');
         continue;
@@ -2273,6 +2787,10 @@ export class SimulationWorld {
   }
 
   private killAnimal(animal: AnimalState, cause: AnimalCarcassSnapshot['cause']): void {
+    const waterAtDeath = this.biogeochemistry.effectsEnabled
+      ? this.biogeochemistry.sampleAt(animal.position)
+      : null;
+    this.recordAnimalPopulationEvent('death', animal, { cause, water: waterAtDeath });
     this.carcasses.push({
       id: `carcass:${animal.id}`,
       sourceAnimalId: animal.id,
@@ -2283,11 +2801,16 @@ export class SimulationWorld {
       bodyLength: animal.bodyLength,
       lifeStage: animal.lifeStage,
       cause,
+      waterAtDeath,
       ageSeconds: 0,
     });
     this.biogeochemistry.recordDeath(
       animal.position,
-      animal.lifeStage === 'adult' ? 1 : Math.max(0.18, animal.growthProgress * 0.58),
+      this.biogeochemistry.effectsEnabled
+        ? animal.structuralBiomass + animal.storedBiomass
+        : animal.lifeStage === 'adult'
+          ? WATER_CYCLE_RULES.shrimp.adultStructuralBiomass
+          : WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
     );
     if (this.selection?.kind === 'animal' && this.selection.animalId === animal.id) {
       this.selection = null;
@@ -2366,6 +2889,13 @@ export class SimulationWorld {
         oedogonium: netGrowthPotential('oedogonium', cell.light, this.waterTemperature),
         nitzschia: netGrowthPotential('nitzschia', cell.light, this.waterTemperature),
       };
+      if (this.biogeochemistry.effectsEnabled) {
+        const resourceFactor = this.biogeochemistry.algaeResourceFactor(
+          this.cellWorldPoint(cell),
+        );
+        if (rates.oedogonium > 0) rates.oedogonium *= resourceFactor;
+        if (rates.nitzschia > 0) rates.nitzschia *= resourceFactor;
+      }
       const weightedAverage = total > 0
         ? (
           current.oedogonium * rates.oedogonium +
@@ -2373,11 +2903,19 @@ export class SimulationWorld {
         ) / total
         : 0;
       const result = emptyBiomass();
+      let fixedBiomass = 0;
       for (const speciesId of this.scenario.allowedSpecies) {
         const amount = current[speciesId];
         if (amount <= 0) continue;
         const rate = rates[speciesId];
-        const expansion = amount * rate * (rate > 0 ? freeCapacity : 1) * deltaSeconds;
+        const requestedExpansion = amount * rate * (rate > 0 ? freeCapacity : 1) * deltaSeconds;
+        const expansion = requestedExpansion > 0
+          ? this.biogeochemistry.commitAlgaeProduction(
+            this.cellWorldPoint(cell),
+            requestedExpansion,
+          )
+          : requestedExpansion;
+        fixedBiomass += Math.max(0, expansion);
         const replacement = total > 0.04
           ? amount * (rate - weightedAverage) * total * 1.35 * deltaSeconds
           : 0;
@@ -2392,6 +2930,11 @@ export class SimulationWorld {
           result.nitzschia - current.nitzschia * current.oedogonium * 0.018 * deltaSeconds,
         );
       }
+      const localLoss = Math.max(
+        0,
+        total + fixedBiomass - result.oedogonium - result.nitzschia,
+      );
+      this.biogeochemistry.recordAlgaeTurnover(this.cellWorldPoint(cell), localLoss);
       next.set(cell.id, result);
     }
 
@@ -2537,6 +3080,18 @@ export class SimulationWorld {
   private missionProgress(coverageRatio: number): MissionProgressSnapshot | null {
     const target = this.scenario.target;
     if (!target) return null;
+    if (target.type === 'population-survival') {
+      const current = this.animalPopulation(target.speciesId).total;
+      return {
+        current,
+        target: target.count,
+        unit: 'population-count',
+        label: target.label,
+        ratio: current / target.count,
+        holdCurrent: this.successHoldAccumulator,
+        holdTarget: target.holdSeconds,
+      };
+    }
     if (target.type === 'adult-population') {
       const current = this.animalPopulation(target.speciesId).adults;
       return {
@@ -2678,6 +3233,7 @@ export class SimulationWorld {
       bodyLength: carcass.bodyLength,
       lifeStage: carcass.lifeStage,
       cause: carcass.cause,
+      waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
       ageSeconds: carcass.ageSeconds,
       lifetimeSeconds: SHRIMP_CARCASS_LIFETIME_SECONDS,
       progress: clamp01(carcass.ageSeconds / SHRIMP_CARCASS_LIFETIME_SECONDS),
@@ -2688,14 +3244,79 @@ export class SimulationWorld {
     total: number;
     adults: number;
     juveniles: number;
+    adultFemales: number;
+    adultMales: number;
+    juvenileFemales: number;
+    juvenileMales: number;
   } {
     const animals = this.animals.filter((animal) => animal.speciesId === speciesId);
-    const adults = animals.filter((animal) => animal.lifeStage === 'adult').length;
+    const adultFemales = animals.filter((animal) =>
+      animal.lifeStage === 'adult' && animal.sex === 'female').length;
+    const adultMales = animals.filter((animal) =>
+      animal.lifeStage === 'adult' && animal.sex === 'male').length;
+    const juvenileFemales = animals.filter((animal) =>
+      animal.lifeStage === 'juvenile' && animal.sex === 'female').length;
+    const juvenileMales = animals.filter((animal) =>
+      animal.lifeStage === 'juvenile' && animal.sex === 'male').length;
+    const adults = adultFemales + adultMales;
     return {
       total: animals.length,
       adults,
       juveniles: animals.length - adults,
+      adultFemales,
+      adultMales,
+      juvenileFemales,
+      juvenileMales,
     };
+  }
+
+  private recordAnimalPopulationEvent(
+    kind: AnimalPopulationEventKind,
+    animal: AnimalState,
+    options?: {
+      cause?: AnimalDeathCause;
+      parentId?: string;
+      water?: AnimalPopulationEventSnapshot['water'];
+    },
+  ): void {
+    const cause = options?.cause ?? null;
+    const water = options?.water !== undefined
+      ? options.water
+      : this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.sampleAt(animal.position)
+        : null;
+    this.animalPopulationEvents.push({
+      sequence: ++this.animalPopulationEventSequence,
+      kind,
+      elapsedSeconds: this.elapsedSeconds,
+      animalId: animal.id,
+      speciesId: animal.speciesId,
+      lifeStage: animal.lifeStage,
+      sex: animal.sex,
+      x: animal.position.x,
+      y: animal.position.y,
+      ageSeconds: animal.ageSeconds,
+      energy: animal.energy,
+      cause,
+      parentId: options?.parentId ?? null,
+      water: water ? { ...water } : null,
+    });
+    if (this.animalPopulationEvents.length > MAX_ANIMAL_POPULATION_EVENTS) {
+      this.animalPopulationEvents.splice(
+        0,
+        this.animalPopulationEvents.length - MAX_ANIMAL_POPULATION_EVENTS,
+      );
+    }
+
+    if (kind === 'introduced') this.animalPopulationEventTotals.introduced += 1;
+    if (kind === 'removed') this.animalPopulationEventTotals.removed += 1;
+    if (kind === 'birth') this.animalPopulationEventTotals.births += 1;
+    if (kind === 'matured') this.animalPopulationEventTotals.maturations += 1;
+    if (kind === 'death' && cause) {
+      this.animalPopulationEventTotals.deaths += 1;
+      this.animalPopulationEventTotals.deathsByCause[cause] += 1;
+    }
+    this.snapshotDirty = true;
   }
 
   private surfaceSnapshots(): SurfaceCellSnapshot[] {
@@ -2712,6 +3333,7 @@ export class SimulationWorld {
         cellSize: cell.cellSize,
         light: cell.light,
         biomass: cloneBiomass(cell.biomass),
+        biofilm: { ...cell.biofilm },
         targetEligible:
           cell.surfaceKind === 'structure-face' || this.scenario.targetIncludesSubstrate,
       };
@@ -2754,6 +3376,20 @@ export class SimulationWorld {
         animalSpeciesId: this.held.speciesId,
       };
     }
+    if (this.held.kind === 'biofilm') {
+      const candidate = this.held.candidateCellId
+        ? this.cellById(this.held.candidateCellId)
+        : undefined;
+      const point = candidate ? this.cellWorldPoint(candidate) : this.pointer;
+      return {
+        kind: 'biofilm',
+        source: 'inventory',
+        valid: this.held.valid,
+        x: point.x,
+        y: point.y,
+        microbeGuildId: this.held.guildId,
+      };
+    }
     const candidate = this.held.candidateCellId ? this.cellById(this.held.candidateCellId) : undefined;
     const point = candidate ? this.cellWorldPoint(candidate) : this.pointer;
     return {
@@ -2784,11 +3420,15 @@ export class SimulationWorld {
       bodyLength: SHRIMP_ADULT_LENGTH * (0.94 + deterministicNoise(numericId * 5.1) * 0.12),
       lifeStage: 'adult',
       sex: numericId % 2 === 1 ? 'female' : 'male',
-      ageSeconds: 180 + numericId * 7,
+      ageSeconds: SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS +
+        (numericId * 7) %
+        (SHRIMP_SUPPLIED_ADULT_MAX_AGE_SECONDS - SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS),
       lifespanSeconds: SHRIMP_MIN_LIFESPAN_SECONDS +
         deterministicNoise(numericId * 29.73) *
         (SHRIMP_MAX_LIFESPAN_SECONDS - SHRIMP_MIN_LIFESPAN_SECONDS),
       energy: 0.52 + ((numericId - 1) % 4) * 0.01,
+      structuralBiomass: WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
+      storedBiomass: WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass,
       health: 1,
       behavior: 'resting',
       behaviorTimer: 1 + deterministicNoise(numericId * 2.7) * 2,
@@ -2830,6 +3470,8 @@ export class SimulationWorld {
         deterministicNoise(numericId * 29.73) *
         (SHRIMP_MAX_LIFESPAN_SECONDS - SHRIMP_MIN_LIFESPAN_SECONDS),
       energy: 0.46,
+      structuralBiomass: WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
+      storedBiomass: 0,
       health: 1,
       behavior: 'resting',
       behaviorTimer: deterministicNoise(numericId * 4.1),

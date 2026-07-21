@@ -9,12 +9,16 @@ module.exports = {
       name: '@electron-forge/maker-squirrel',
       config: {
         name: 'aquacycle',
+        authors: 'AquaCycle Project',
+        noMsi: true,
       },
       platforms: ['win32'],
     },
     {
       name: '@electron-forge/maker-zip',
-      platforms: ['darwin'],
+      // The Windows zip is the no-installer portable build: extract it and
+      // launch AquaCycle.exe without Node.js or other development tools.
+      platforms: ['darwin', 'win32'],
     },
     {
       name: '@electron-forge/maker-dmg',

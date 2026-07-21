@@ -73,6 +73,24 @@ const MISSION_CARDS: readonly MissionCardDefinition[] = [
       </>
     ),
   },
+  {
+    id: 'mission-5',
+    stamp: '실험 5',
+    className: 'mission-five',
+    title: '보이지 않는 순환',
+    description: '균 필름과 수질의 변화를 관찰하며 체리새우 군집을 오래 유지하세요.',
+    tags: '분해균 · 질산화균 · 수질 순환 · 군집 생존',
+    illustrationClassName: 'microbe-cycle',
+    illustration: (
+      <>
+        <i className="mini-cycle-arrow cycle-a" />
+        <i className="mini-cycle-arrow cycle-b" />
+        <i className="mini-microbe decomposer" />
+        <i className="mini-microbe nitrifier" />
+        <i className="mini-shrimp-water" />
+      </>
+    ),
+  },
 ];
 export const MISSION_IDS: readonly MissionId[] = MISSION_CARDS.map(({ id }) => id);
 
@@ -409,7 +427,7 @@ export function MissionMenu({
         <div>
           <p className="section-number">02</p>
           <h2>실험실</h2>
-          <p>두 조류와 체리새우, 모든 돌을 사용해 생산자와 소비자의 변화를 자유롭게 시험합니다.</p>
+          <p>조류와 체리새우, 균 필름과 수질 순환을 자유롭게 조합해 동적 평형을 시험합니다.</p>
         </div>
         <button type="button" className="primary-button" onClick={() => onOpen('laboratory')}>
           실험실 열기
@@ -417,7 +435,7 @@ export function MissionMenu({
       </section>
 
       <footer className="menu-footer">
-        <span>현재 구현 범위 · 생산자와 첫 소비자</span>
+        <span>현재 구현 범위 · 생산자·소비자·미생물 순환</span>
         <span>Windows / macOS 데스크톱 프로토타입</span>
       </footer>
     </main>

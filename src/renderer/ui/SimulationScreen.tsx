@@ -1,18 +1,31 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import {
   ALGAE_VISIBLE_BIOMASS,
   ANIMALS,
+  MICROBES,
   SCENARIOS,
+  SHRIMP_ECOLOGY_RULES,
   SPECIES,
   STRUCTURES,
+  WATER_CYCLE_RULES,
 } from '../../simulation/config';
 import { growthTrend, netGrowthPotential } from '../../simulation/growth';
 import { SIMULATION_SPEED_OPTIONS, type SimulationSpeed } from '../../simulation/speed';
 import type {
+  AnimalPopulationEventSnapshot,
   AnimalSpeciesId,
   GrowthTrend,
   InteractionTool,
   InventoryCategory,
+  MeasurementKind,
+  MicrobeGuildId,
   SelectionFilter,
   ScenarioId,
   SimulationCommand,
@@ -24,6 +37,10 @@ import type {
 import { TANK_HEIGHT, TANK_WIDTH } from '../../simulation/types';
 import { useSimulation } from '../hooks/useSimulation';
 import { AquariumCanvas, type AquariumCameraTransform } from '../tank/AquariumCanvas';
+import {
+  analysisLayerStatistics,
+  type WaterQualityLayer,
+} from '../tank/waterQualityOverlay';
 
 interface SimulationScreenProps {
   scenarioId: ScenarioId;
@@ -32,18 +49,34 @@ interface SimulationScreenProps {
 }
 
 interface PendingInventoryItem {
-  kind: 'structure' | 'seed' | 'animal';
+  requestId: number;
+  kind: 'structure' | 'seed' | 'animal' | 'biofilm';
   label: string;
   assetPath?: string;
   definitionId?: StructureDefinitionId;
   speciesId?: SpeciesId;
   animalSpeciesId?: AnimalSpeciesId;
+  microbeGuildId?: MicrobeGuildId;
 }
 
 interface EcologyHistoryPoint {
   elapsedSeconds: number;
   algaeBiomass: number;
   shrimpCount: number;
+  shrimpAdultFemales: number;
+  shrimpAdultMales: number;
+  shrimpJuveniles: number;
+  cumulativeBirths: number;
+  cumulativeDeaths: number;
+  organicMatter: number;
+  toxicWaste: number;
+  nutrients: number;
+  oxygen: number;
+  decomposer: number;
+  nitrifier: number;
+  dissolvedInorganicCarbon: number;
+  headspaceCarbonDioxide: number;
+  headspaceOxygen: number;
 }
 
 type HudPanelId = 'menu' | 'inventory' | 'quest' | 'observation';
@@ -58,6 +91,35 @@ const closedHudPanels = (): Record<HudPanelId, boolean> => ({
 const STRUCTURE_IDS: StructureDefinitionId[] = ['flat-stone', 'round-stone', 'tall-stone'];
 const SPECIES_IDS: SpeciesId[] = ['oedogonium', 'nitzschia'];
 const ANIMAL_IDS: AnimalSpeciesId[] = ['cherry-shrimp'];
+const MICROBE_IDS: MicrobeGuildId[] = ['decomposer', 'nitrifier'];
+
+const WATER_QUALITY_CHANNELS: readonly {
+  id: WaterQualityLayer;
+  label: string;
+  shortLabel: string;
+}[] = [
+  { id: 'organicMatter', label: '유기물', shortLabel: '유기물' },
+  { id: 'toxicWaste', label: '암모니아성 노폐물', shortLabel: '암모니아' },
+  { id: 'nutrients', label: '영양염', shortLabel: '영양염' },
+  { id: 'oxygen', label: '용존산소', shortLabel: '산소' },
+  { id: 'decomposer', label: '분해균 필름', shortLabel: '분해균' },
+  { id: 'nitrifier', label: '질산화균 필름', shortLabel: '질산화균' },
+];
+
+const waterQualityChannel = (layer: WaterQualityLayer | null) =>
+  WATER_QUALITY_CHANNELS.find((channel) => channel.id === layer);
+
+const waterQualityValue = (
+  sample: NonNullable<SimulationSnapshot['probe']>,
+  layer: WaterQualityLayer,
+): number => layer === 'decomposer' || layer === 'nitrifier'
+  ? sample.biofilm[layer] * 100
+  : sample.water[layer];
+
+const formatWaterQualityValue = (layer: WaterQualityLayer, value: number): string =>
+  layer === 'decomposer' || layer === 'nitrifier'
+    ? `${value.toFixed(2)}%`
+    : value.toFixed(2);
 
 const formatTime = (seconds: number): string => {
   const safeSeconds = Math.max(0, Math.floor(seconds));
@@ -65,11 +127,16 @@ const formatTime = (seconds: number): string => {
   return `${String(minutes).padStart(2, '0')}:${String(safeSeconds % 60).padStart(2, '0')}`;
 };
 
+const formatSignedPercent = (ratio: number): string => {
+  const percent = ratio * 100;
+  return `${percent >= 0 ? '+' : ''}${percent.toFixed(4)}%`;
+};
+
 const formatProgressValue = (
   progress: NonNullable<SimulationSnapshot['missionProgress']>,
 ): string => progress.unit === 'biomass'
   ? `${progress.current.toFixed(1)} / ${progress.target.toFixed(1)}`
-  : progress.unit === 'adult-count'
+  : progress.unit === 'adult-count' || progress.unit === 'population-count'
     ? `${Math.round(progress.current)} / ${Math.round(progress.target)}마리`
     : `${Math.round(progress.current * 100)} / ${Math.round(progress.target * 100)}%`;
 
@@ -113,7 +180,7 @@ function MeasurementIcon({
   kind,
   compact = false,
 }: {
-  kind: 'light' | 'temperature';
+  kind: MeasurementKind;
   compact?: boolean;
 }) {
   return (
@@ -123,11 +190,18 @@ function MeasurementIcon({
           <circle cx="12" cy="12" r="4" />
           <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1" />
         </>
-      ) : (
+      ) : kind === 'temperature' ? (
         <>
           <path d="M9 14.8V5a3 3 0 0 1 6 0v9.8a5 5 0 1 1-6 0Z" />
           <path d="M12 8v8" />
           <circle cx="12" cy="18" r="2" />
+        </>
+      ) : (
+        <>
+          <path d="M4 8.5c2.2-2 4.4-2 6.6 0s4.4 2 6.6 0 3.8-1.5 3.8-1.5M4 13c2.2-2 4.4-2 6.6 0s4.4 2 6.6 0 3.8-1.5 3.8-1.5M5 18h14" />
+          <circle cx="6" cy="4" r="1.2" />
+          <circle cx="12" cy="5.5" r="1.2" />
+          <circle cx="18" cy="3.5" r="1.2" />
         </>
       )}
     </svg>
@@ -218,6 +292,8 @@ export function SimulationScreen({
   const [catalogSpecies, setCatalogSpecies] = useState<SpeciesId | null>(null);
   const [catalogAnimal, setCatalogAnimal] = useState<AnimalSpeciesId | null>(null);
   const [pendingInventory, setPendingInventory] = useState<PendingInventoryItem | null>(null);
+  const [waterQualityLayers, setWaterQualityLayers] = useState<WaterQualityLayer[]>([]);
+  const waterQualityLayer = waterQualityLayers[0] ?? null;
   const [showMissionBriefing, setShowMissionBriefing] = useState(scenario.mode === 'challenge');
   const [openHudPanels, setOpenHudPanels] = useState<Record<HudPanelId, boolean>>(closedHudPanels);
   const [showGoalGuide, setShowGoalGuide] = useState(false);
@@ -227,9 +303,20 @@ export function SimulationScreen({
   const completionReported = useRef(false);
   const resumeAfterBriefing = useRef(false);
   const pendingInventoryRef = useRef<PendingInventoryItem | null>(null);
+  const pendingInventoryRequestIdRef = useRef(0);
   const lastEcologySampleAt = useRef(Number.NEGATIVE_INFINITY);
   const [ecologyHistory, setEcologyHistory] = useState<EcologyHistoryPoint[]>([]);
   pendingInventoryRef.current = pendingInventory;
+
+  const enableWaterQualityLayer = useCallback((layer: WaterQualityLayer): void => {
+    setWaterQualityLayers((current) => current.includes(layer) ? current : [...current, layer]);
+  }, []);
+
+  const toggleWaterQualityLayer = useCallback((layer: WaterQualityLayer): void => {
+    setWaterQualityLayers((current) => current.includes(layer)
+      ? current.filter((item) => item !== layer)
+      : [...current, layer]);
+  }, []);
 
   useEffect(() => {
     completionReported.current = false;
@@ -238,6 +325,7 @@ export function SimulationScreen({
     setCatalogSpecies(null);
     setCatalogAnimal(null);
     setPendingInventory(null);
+    setWaterQualityLayers([]);
     setOpenHudPanels(closedHudPanels());
     setShowGoalGuide(false);
     setCameraTransform(null);
@@ -255,6 +343,22 @@ export function SimulationScreen({
       elapsedSeconds,
       algaeBiomass: snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia,
       shrimpCount: snapshot.animalPopulation['cherry-shrimp'].total,
+      shrimpAdultFemales: snapshot.animalPopulation['cherry-shrimp'].adultFemales,
+      shrimpAdultMales: snapshot.animalPopulation['cherry-shrimp'].adultMales,
+      shrimpJuveniles: snapshot.animalPopulation['cherry-shrimp'].juveniles,
+      cumulativeBirths: snapshot.animalPopulationEventTotals.births,
+      cumulativeDeaths: snapshot.animalPopulationEventTotals.deaths,
+      organicMatter: snapshot.biogeochemistry.average.organicMatter,
+      toxicWaste: snapshot.biogeochemistry.average.toxicWaste,
+      nutrients: snapshot.biogeochemistry.average.nutrients,
+      oxygen: snapshot.biogeochemistry.average.oxygen,
+      decomposer: snapshot.biogeochemistry.biofilmTotals.decomposer,
+      nitrifier: snapshot.biogeochemistry.biofilmTotals.nitrifier,
+      dissolvedInorganicCarbon:
+        snapshot.biogeochemistry.carbonCycle.dissolvedInorganicCarbon,
+      headspaceCarbonDioxide:
+        snapshot.biogeochemistry.carbonCycle.headspaceCarbonDioxide,
+      headspaceOxygen: snapshot.biogeochemistry.carbonCycle.headspaceOxygen,
     };
 
     // A same-scenario reset sends elapsed time back to zero. Start a fresh trace
@@ -273,6 +377,20 @@ export function SimulationScreen({
     snapshot?.totalBiomass.oedogonium,
     snapshot?.totalBiomass.nitzschia,
     snapshot?.animalPopulation['cherry-shrimp'].total,
+    snapshot?.animalPopulation['cherry-shrimp'].adultFemales,
+    snapshot?.animalPopulation['cherry-shrimp'].adultMales,
+    snapshot?.animalPopulation['cherry-shrimp'].juveniles,
+    snapshot?.animalPopulationEventTotals.births,
+    snapshot?.animalPopulationEventTotals.deaths,
+    snapshot?.biogeochemistry.average.organicMatter,
+    snapshot?.biogeochemistry.average.toxicWaste,
+    snapshot?.biogeochemistry.average.nutrients,
+    snapshot?.biogeochemistry.average.oxygen,
+    snapshot?.biogeochemistry.biofilmTotals.decomposer,
+    snapshot?.biogeochemistry.biofilmTotals.nitrifier,
+    snapshot?.biogeochemistry.carbonCycle.dissolvedInorganicCarbon,
+    snapshot?.biogeochemistry.carbonCycle.headspaceCarbonDioxide,
+    snapshot?.biogeochemistry.carbonCycle.headspaceOxygen,
   ]);
 
   useEffect(() => {
@@ -282,23 +400,31 @@ export function SimulationScreen({
   }, [onMissionComplete, scenarioId, snapshot?.outcome]);
 
   useEffect(() => {
-    if (!pendingInventory) return;
     const move = (event: PointerEvent): void => setPointer({ x: event.clientX, y: event.clientY });
+    window.addEventListener('pointermove', move);
+    return () => window.removeEventListener('pointermove', move);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingInventory) return;
     const cancel = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return;
       setPendingInventory(null);
       setActiveTool('select');
     };
-    window.addEventListener('pointermove', move);
     window.addEventListener('keydown', cancel);
-    return () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('keydown', cancel);
-    };
+    return () => window.removeEventListener('keydown', cancel);
   }, [pendingInventory]);
 
   const returnToSelection = useCallback((): void => {
     setActiveTool('select');
+    send({ type: 'clear-probe' });
+  }, [send]);
+  const completeCanvasInteraction = useCallback((completedTool: InteractionTool): void => {
+    // Move is a persistent mode: after placing, cancelling, or retrieving one
+    // object the next click must be able to pick another object immediately.
+    // One-shot probes still return to ordinary selection after installation.
+    setActiveTool(completedTool === 'move' ? 'move' : 'select');
     send({ type: 'clear-probe' });
   }, [send]);
   const toggleHudPanel = useCallback((panel: HudPanelId): void => {
@@ -316,12 +442,27 @@ export function SimulationScreen({
       send({ type: 'pick-seed', speciesId: pending.speciesId, point });
     } else if (pending.kind === 'animal' && pending.animalSpeciesId) {
       send({ type: 'pick-animal', speciesId: pending.animalSpeciesId, point });
+    } else if (pending.kind === 'biofilm' && pending.microbeGuildId) {
+      send({ type: 'pick-biofilm', guildId: pending.microbeGuildId, point });
     }
     setActiveTool('move');
   }, [send]);
   const finishPendingInventoryHandoff = useCallback((): void => {
     setPendingInventory(null);
   }, []);
+  const rememberInventoryActivationPoint = (
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ): void => {
+    if (event.clientX !== 0 || event.clientY !== 0) {
+      setPointer({ x: event.clientX, y: event.clientY });
+      return;
+    }
+    // Keyboard activation and some macOS accessibility-generated clicks report
+    // (0, 0). Put the preview beside the activated card instead of outside the
+    // window until the first real pointer movement arrives.
+    const rect = event.currentTarget.getBoundingClientRect();
+    setPointer({ x: rect.right, y: rect.top + rect.height / 2 });
+  };
 
   if (!snapshot) {
     return (
@@ -334,6 +475,11 @@ export function SimulationScreen({
 
   const editable = snapshot.phase === 'setup' ||
     (snapshot.mode === 'laboratory' && snapshot.phase === 'paused');
+  const biofilmEditable = snapshot.phase === 'setup' ||
+    (snapshot.phase === 'paused' && (snapshot.scenarioId === 'mission-5' || snapshot.mode === 'laboratory'));
+  const canvasEditable = editable || (biofilmEditable && (
+    pendingInventory?.kind === 'biofilm' || snapshot.holding?.kind === 'biofilm'
+  ));
   const removalEditable = editable && !snapshot.holding && !pendingInventory;
   const progress = snapshot.missionProgress;
   const scoredZoneTarget = scenario.target?.type === 'habitat-coverage' ? scenario.target : null;
@@ -429,6 +575,23 @@ export function SimulationScreen({
       '--orbit-span': `${span}%`,
     } as CSSProperties;
   })();
+  const biologicalPlacementMarker = snapshot.holding &&
+    (snapshot.holding.kind === 'seed' || snapshot.holding.kind === 'biofilm') &&
+    cameraTransform
+    ? {
+      kind: snapshot.holding.kind,
+      valid: snapshot.holding.valid,
+      style: {
+        left: `${cameraTransform.offsetX + snapshot.holding.x * cameraTransform.scale}px`,
+        top: `${cameraTransform.offsetY + snapshot.holding.y * cameraTransform.scale}px`,
+        '--placement-color': `#${(
+          snapshot.holding.kind === 'seed'
+            ? SPECIES[snapshot.holding.speciesId!].color
+            : MICROBES[snapshot.holding.microbeGuildId!].color
+        ).toString(16).padStart(6, '0')}`,
+      } as CSSProperties,
+    }
+    : null;
 
   const phaseAction = (): void => {
     if (snapshot.phase === 'setup') {
@@ -456,7 +619,8 @@ export function SimulationScreen({
   );
   const setupReady = !pendingInventory && !snapshot.holding && snapshot.allSettled &&
     requiredStructuresReady && targetSurfaceReady && requiredSeedsReady;
-  const pausedEditBlocked = snapshot.phase === 'paused' && snapshot.mode === 'laboratory' &&
+  const pausedEditBlocked = snapshot.phase === 'paused' &&
+    (snapshot.mode === 'laboratory' || snapshot.scenarioId === 'mission-5') &&
     (Boolean(pendingInventory) || Boolean(snapshot.holding) || !snapshot.allSettled);
   const setupButtonLabel = pendingInventory || snapshot.holding
     ? '먼저 항목 놓기'
@@ -486,13 +650,16 @@ export function SimulationScreen({
 
   const inventoryHint = (() => {
     if (pendingInventory || snapshot.holding) return '현재 항목을 배치하는 중입니다';
+    if (!editable && inventoryCategory === 'organisms' && biofilmEditable) {
+      return '일시정지 중에는 균 필름을 표면에 접종할 수 있습니다';
+    }
     if (!editable && inventoryCategory !== 'instruments') {
       return snapshot.phase === 'running'
         ? '관찰 중에는 배치가 잠겨 있습니다'
         : '도전 중에는 배치를 수정할 수 없습니다';
     }
     if (inventoryCategory === 'structures') return '구조물을 꺼내 수조에 놓으세요';
-    if (inventoryCategory === 'organisms') return '조류를 접종하거나 동물을 수중에 놓으세요';
+    if (inventoryCategory === 'organisms') return '조류나 균을 접종하고 동물을 수중에 놓으세요';
     return snapshot.phase === 'running'
       ? '관찰 중에도 측정점을 설치할 수 있습니다'
       : '도구를 골라 수조 값을 측정하세요';
@@ -522,15 +689,52 @@ export function SimulationScreen({
     send({ type: 'clear-selection' });
   };
 
-  const toggleMeasurementTool = (tool: 'light-probe' | 'temperature-probe'): void => {
+  const toggleMeasurementTool = (
+    tool: 'light-probe' | 'temperature-probe' | 'water-quality-probe',
+  ): void => {
     setPendingInventory(null);
+    setCatalogSpecies(null);
+    setCatalogAnimal(null);
     if (activeTool === tool) {
       setActiveTool('select');
       send({ type: 'clear-probe' });
     } else {
       setActiveTool(tool);
+      if (tool === 'water-quality-probe') {
+        setWaterQualityLayers((current) => current.length ? current : ['organicMatter']);
+      }
       send({ type: 'clear-selection' });
+      if (tool === 'water-quality-probe') {
+        setOpenHudPanels((current) => ({
+          ...current,
+          inventory: false,
+          observation: true,
+        }));
+      }
     }
+  };
+
+  const closeObservationMode = (): void => {
+    setOpenHudPanels((current) => ({ ...current, observation: false }));
+    setWaterQualityLayers([]);
+    if (activeTool === 'water-quality-probe') {
+      setActiveTool('select');
+      send({ type: 'clear-probe' });
+    }
+  };
+
+  const toggleObservationMode = (): void => {
+    if (openHudPanels.observation) {
+      closeObservationMode();
+      return;
+    }
+    setOpenHudPanels((current) => ({ ...current, inventory: false, observation: true }));
+    if (!scenario.waterCycle) return;
+    setWaterQualityLayers((current) => current.length ? current : ['organicMatter']);
+    // The map is an observation overlay, not an installation tool. Opening it
+    // must leave the pointer in ordinary selection mode.
+    setActiveTool('select');
+    send({ type: 'clear-probe' });
   };
 
   const resetUiState = (): void => {
@@ -539,6 +743,7 @@ export function SimulationScreen({
     setCatalogSpecies(null);
     setCatalogAnimal(null);
     setPendingInventory(null);
+    setWaterQualityLayers([]);
     send({ type: 'clear-probe' });
     send({ type: 'clear-selection' });
   };
@@ -579,7 +784,7 @@ export function SimulationScreen({
     <>
       {pendingInventory && (
         <div
-          className={`inventory-cursor-ghost ghost-${pendingInventory.kind}`}
+          className="inventory-cursor-ghost"
           style={{ left: pointer.x, top: pointer.y }}
           aria-hidden="true"
         >
@@ -587,7 +792,9 @@ export function SimulationScreen({
             ? <img src={pendingInventory.assetPath} alt="" />
             : pendingInventory.kind === 'animal'
               ? <span className="ghost-shrimp" />
-              : <span className={`ghost-colony colony-${pendingInventory.speciesId}`} />}
+              : pendingInventory.kind === 'biofilm'
+                ? <span className={`ghost-biofilm biofilm-${pendingInventory.microbeGuildId}`}><i /><i /><i /></span>
+                : <span className={`ghost-colony colony-${pendingInventory.speciesId}`} />}
           <small>{pendingInventory.label}</small>
         </div>
       )}
@@ -614,7 +821,7 @@ export function SimulationScreen({
         </div>
       )}
 
-      <main className={`simulation-screen v2-screen tank-first-screen ${rightPanelVisible ? 'has-right-panel' : ''} ${inventoryPanelVisible ? 'has-inventory-panel' : ''} ${cameraFitView ? 'camera-fit-view' : ''}`}>
+      <main className={`simulation-screen v2-screen tank-first-screen ${rightPanelVisible ? 'has-right-panel' : ''} ${inventoryPanelVisible ? 'has-inventory-panel' : ''} ${snapshot.holding ? 'has-placement-toolbar' : ''} ${cameraFitView ? 'camera-fit-view' : ''}`}>
         <header className="game-header tank-hud" aria-label="수조 화면 메뉴">
           <div className="hud-tool-group hud-tool-group-left">
             <button
@@ -704,7 +911,7 @@ export function SimulationScreen({
                 <i className="hud-progress-badge">
                   {snapshot.outcome === 'success'
                     ? '✓'
-                    : progress.unit === 'adult-count'
+                    : progress.unit === 'adult-count' || progress.unit === 'population-count'
                       ? Math.round(progress.current)
                       : Math.min(99, Math.round(progress.ratio * 100))}
                 </i>
@@ -712,12 +919,12 @@ export function SimulationScreen({
             </button>
             <button
               type="button"
-              className={`hud-tool-button ${openHudPanels.observation ? 'active' : ''}`}
-              aria-label="관찰 기록"
+              className={`hud-tool-button ${openHudPanels.observation || waterQualityLayer ? 'active' : ''}`}
+              aria-label={scenario.waterCycle ? '관찰 지도' : '관찰 기록'}
               aria-expanded={openHudPanels.observation}
               aria-controls="floating-observation-panel"
-              title="관찰 기록"
-              onClick={() => toggleHudPanel('observation')}
+              title={scenario.waterCycle ? '관찰 지도' : '관찰 기록'}
+              onClick={toggleObservationMode}
             >
               <HudIcon kind="observation" />
               {(snapshot.selection || snapshot.probe) && <i className="hud-notice-dot" />}
@@ -796,10 +1003,10 @@ export function SimulationScreen({
                         className="inventory-card-main"
                         disabled={!editable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
                         onClick={(event) => {
-                          send({ type: 'clear-selection' });
                           setCatalogSpecies(null);
-                          setPointer({ x: event.clientX, y: event.clientY });
+                          rememberInventoryActivationPoint(event);
                           setPendingInventory({
+                            requestId: ++pendingInventoryRequestIdRef.current,
                             kind: 'structure',
                             label: definition.label,
                             assetPath: definition.assetPath,
@@ -832,9 +1039,13 @@ export function SimulationScreen({
                       className="inventory-card-main"
                       disabled={!unlocked || !editable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
                       onClick={(event) => {
-                        send({ type: 'clear-selection' });
-                        setPointer({ x: event.clientX, y: event.clientY });
-                        setPendingInventory({ kind: 'seed', label: species.shortName, speciesId });
+                        rememberInventoryActivationPoint(event);
+                        setPendingInventory({
+                          requestId: ++pendingInventoryRequestIdRef.current,
+                          kind: 'seed',
+                          label: species.shortName,
+                          speciesId,
+                        });
                         setCatalogSpecies(speciesId);
                         setActiveTool('move');
                       }}
@@ -863,11 +1074,11 @@ export function SimulationScreen({
                         className="inventory-card-main"
                         disabled={!editable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
                         onClick={(event) => {
-                          send({ type: 'clear-selection' });
                           setCatalogSpecies(null);
                           setCatalogAnimal(null);
-                          setPointer({ x: event.clientX, y: event.clientY });
+                          rememberInventoryActivationPoint(event);
                           setPendingInventory({
+                            requestId: ++pendingInventoryRequestIdRef.current,
                             kind: 'animal',
                             label: animal.displayName,
                             animalSpeciesId: speciesId,
@@ -885,6 +1096,42 @@ export function SimulationScreen({
                         </span>
                       </button>
                       <button type="button" className="info-chip" disabled={Boolean(snapshot.holding) || Boolean(pendingInventory)} onClick={() => showCatalogAnimal(speciesId)}>정보</button>
+                    </article>
+                  );
+                })}
+
+              {inventoryCategory === 'organisms' && scenario.waterCycle && MICROBE_IDS
+                .filter((guildId) => scenario.waterCycle?.allowedMicrobes.includes(guildId))
+                .map((guildId) => {
+                  const microbe = MICROBES[guildId];
+                  const remaining = snapshot.remainingMicrobes[guildId];
+                  return (
+                    <article className={`inventory-card organism-card biofilm-card biofilm-${guildId}`} key={guildId}>
+                      <button
+                        type="button"
+                        className="inventory-card-main"
+                        disabled={!biofilmEditable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
+                        onClick={(event) => {
+                          setCatalogSpecies(null);
+                          setCatalogAnimal(null);
+                          rememberInventoryActivationPoint(event);
+                          setPendingInventory({
+                            requestId: ++pendingInventoryRequestIdRef.current,
+                            kind: 'biofilm',
+                            label: microbe.displayName,
+                            microbeGuildId: guildId,
+                          });
+                          enableWaterQualityLayer(guildId);
+                          setActiveTool('move');
+                        }}
+                      >
+                        <span className="inventory-thumb biofilm-thumb" aria-hidden="true"><i /><i /><i /><i /></span>
+                        <span className="inventory-copy">
+                          <strong>{microbe.displayName}</strong>
+                          <small>{microbe.foodLabel} → {microbe.productLabel}</small>
+                          <em>{biofilmEditable ? countLabel(remaining) : '일시정지 후 접종 가능'}</em>
+                        </span>
+                      </button>
                     </article>
                   );
                 })}
@@ -921,6 +1168,25 @@ export function SimulationScreen({
                       </span>
                     </button>
                   </article>
+                  {scenario.waterCycle && (
+                    <article className="inventory-card instrument-card water-quality-card">
+                      <button
+                        type="button"
+                        className={`inventory-card-main ${activeTool === 'water-quality-probe' ? 'active' : ''}`}
+                        disabled={Boolean(snapshot.holding) || Boolean(pendingInventory)}
+                        onClick={() => toggleMeasurementTool('water-quality-probe')}
+                      >
+                        <span className="inventory-thumb water-quality-thumb" aria-hidden="true">
+                          <MeasurementIcon kind="water-quality" />
+                        </span>
+                        <span className="inventory-copy">
+                          <strong>수질 탐침</strong>
+                          <small>포인터에서 여섯 값을 미리 보고 지점 설치</small>
+                          <em>{activeTool === 'water-quality-probe' ? '설치 위치 선택 중 · 다시 눌러 해제' : '6개 수질 값'}</em>
+                        </span>
+                      </button>
+                    </article>
+                  )}
                   {snapshot.measurements.length > 0 && (
                     <div className="installed-measurements">
                       <strong>설치된 측정점 · {snapshot.measurements.length}</strong>
@@ -934,14 +1200,25 @@ export function SimulationScreen({
                             setActiveTool('select');
                             send({ type: 'clear-probe' });
                             send({ type: 'select-measurement', id: measurement.id });
+                            if (measurement.kind === 'water-quality') {
+                              setWaterQualityLayers((current) => current.length
+                                ? current
+                                : ['organicMatter']);
+                            } else {
+                              setWaterQualityLayers([]);
+                            }
                             setOpenHudPanels((current) => ({ ...current, observation: true }));
                           }}
                         >
                           <span className="measurement-list-label">
                             <MeasurementIcon kind={measurement.kind} compact />
-                            {measurement.kind === 'light' ? '광량' : '수온'} {index + 1}
+                            {measurement.kind === 'light' ? '광량' : measurement.kind === 'temperature' ? '수온' : '수질'} {index + 1}
                           </span>
-                          <strong>{measurement.kind === 'light' ? Math.round(measurement.light) : `${measurement.temperature.toFixed(1)}°C`}</strong>
+                          <strong>{measurement.kind === 'light'
+                            ? Math.round(measurement.light)
+                            : measurement.kind === 'temperature'
+                              ? `${measurement.temperature.toFixed(1)}°C`
+                              : '6개 항목'}</strong>
                         </button>
                       ))}
                     </div>
@@ -967,20 +1244,52 @@ export function SimulationScreen({
                     activeTool={activeTool}
                     selectionFilter={selectionFilter}
                     send={send}
-                    editable={editable}
+                    editable={canvasEditable}
                     hasPendingInventory={Boolean(pendingInventory)}
+                    pendingInventoryKey={pendingInventory ? String(pendingInventory.requestId) : null}
                     onConsumePendingInventory={consumePendingInventory}
                     onPendingInventoryReady={finishPendingInventoryHandoff}
-                    onToolComplete={returnToSelection}
+                    onToolComplete={completeCanvasInteraction}
                     onCameraChange={setCameraTransform}
                     cameraResetToken={cameraResetToken}
                     showGoalGuide={showGoalGuide}
+                    waterQualityLayers={waterQualityLayers}
                   />
+
+                  {biologicalPlacementMarker && (
+                    <span
+                      className={`tank-biological-placement-marker marker-${biologicalPlacementMarker.kind} ${biologicalPlacementMarker.valid ? 'valid' : 'invalid'}`}
+                      style={biologicalPlacementMarker.style}
+                      aria-hidden="true"
+                    >
+                      <i /><i /><i /><i /><i /><i />
+                    </span>
+                  )}
+
+                  {scenario.waterCycle && openHudPanels.observation && (
+                    <AnalysisOverlayToolbar
+                      snapshot={snapshot}
+                      layers={waterQualityLayers}
+                      onLayerToggle={toggleWaterQualityLayer}
+                      onClose={closeObservationMode}
+                    />
+                  )}
 
                   {snapshot.probe && !openHudPanels.observation && (
                     <div className="tank-probe-readout" aria-live="polite">
-                      <span>광량 <strong>{Math.round(snapshot.probe.light)}</strong></span>
-                      <span>수온 <strong>{snapshot.probe.temperature.toFixed(1)}°C</strong></span>
+                      {activeTool === 'water-quality-probe' && waterQualityLayer ? (
+                        <span>{waterQualityChannel(waterQualityLayer)?.shortLabel}{' '}
+                          <strong>{formatWaterQualityValue(
+                            waterQualityLayer,
+                            waterQualityValue(snapshot.probe, waterQualityLayer),
+                          )}</strong>
+                        </span>
+                      ) : (
+                        <>
+                          <span>광량 <strong>{Math.round(snapshot.probe.light)}</strong></span>
+                          <span>수온 <strong>{snapshot.probe.temperature.toFixed(1)}°C</strong></span>
+                        </>
+                      )}
                     </div>
                   )}
 
@@ -1033,9 +1342,9 @@ export function SimulationScreen({
                   </div>
                   <div className="progress-track"><span style={{ width: `${Math.min(100, progress.ratio * 100)}%` }} /></div>
                   {snapshot.outcome === 'pending' &&
-                    (snapshot.currentTargetMet || progress.unit === 'adult-count') && (
+                    (snapshot.currentTargetMet || progress.unit === 'adult-count' || progress.unit === 'population-count') && (
                     <>
-                      {progress.unit === 'adult-count' && (
+                      {(progress.unit === 'adult-count' || progress.unit === 'population-count') && (
                         <div className="progress-track hold-progress-track">
                           <span style={{ width: `${Math.min(100, (progress.holdCurrent / progress.holdTarget) * 100)}%` }} />
                         </div>
@@ -1061,17 +1370,44 @@ export function SimulationScreen({
             {openHudPanels.observation && (
             <div id="floating-observation-panel" className="floating-observation-content">
               <section className="paper-panel floating-observation-heading">
-                <div><span className="panel-label">관찰 기록</span><strong>{snapshot.selection?.ownerLabel ?? '수조 전체'}</strong></div>
-                <button type="button" className="floating-note-close" aria-label="관찰 기록 닫기" onClick={() => closeHudPanel('observation')}>×</button>
+                <div><span className="panel-label">{scenario.waterCycle ? '관찰 지도' : '관찰 기록'}</span><strong>{snapshot.selection?.ownerLabel ?? '수조 전체'}</strong></div>
+                <button type="button" className="floating-note-close" aria-label="관찰 지도 닫기" onClick={closeObservationMode}>×</button>
               </section>
 
             {!selectedMeasurement && !inspectedAnimalSpecies && (
               <section className="paper-panel environment-panel">
                 <div className="panel-row">
-                  <span className="panel-label">포인터 미리보기</span>
+                  <span className="panel-label">
+                    {activeTool === 'light-probe'
+                      ? '광량 탐침 미리보기'
+                      : activeTool === 'temperature-probe'
+                        ? '수온계 미리보기'
+                        : scenario.waterCycle
+                          ? '수질 지도 · 위치별 값'
+                          : '포인터 미리보기'}
+                  </span>
                   {snapshot.probe && <button type="button" onClick={() => send({ type: 'clear-probe' })}>미리보기 닫기</button>}
                 </div>
-                {snapshot.probe ? (
+                {scenario.waterCycle && activeTool !== 'light-probe' && activeTool !== 'temperature-probe' ? (
+                  <>
+                    <WaterQualityReadout
+                      sample={snapshot.probe}
+                      layers={waterQualityLayers}
+                      onLayerToggle={toggleWaterQualityLayer}
+                    />
+                    <p className="probe-location">
+                      {snapshot.probe
+                        ? activeTool === 'water-quality-probe'
+                          ? `${snapshot.probe.locationLabel} · 클릭하면 수질 측정점 설치`
+                          : `${snapshot.probe.locationLabel} · 포인터 위치의 현재 값`
+                        : activeTool === 'water-quality-probe'
+                          ? '수조 위로 포인터를 옮기면 그 위치의 여섯 값이 표시됩니다.'
+                          : waterQualityLayers.length
+                            ? '지도는 수조 전체 분포만 표시합니다. 정확한 값은 수질 탐침으로 확인할 수 있습니다.'
+                            : '위에서 관찰할 항목을 고르거나 수질 탐침을 설치해 정확한 값을 확인하세요.'}
+                    </p>
+                  </>
+                ) : snapshot.probe ? (
                   <>
                     <div className="environment-readouts">
                       <div><span>광량</span><strong>{Math.round(snapshot.probe.light)}</strong></div>
@@ -1086,7 +1422,7 @@ export function SimulationScreen({
                       : '측정 도구를 고르면 포인터 위치의 값이 실시간으로 표시됩니다.'}
                   </p>
                 )}
-                {selectedProbeTrend && inspectedSpecies && (
+                {activeTool !== 'water-quality-probe' && selectedProbeTrend && inspectedSpecies && (
                   <div className={`species-trend ${trendCopy[selectedProbeTrend].className}`}>
                     <b><TrendIcon trend={selectedProbeTrend} /></b>
                     <span>{SPECIES[inspectedSpecies].shortName}<strong>{trendCopy[selectedProbeTrend].label}</strong></span>
@@ -1104,7 +1440,12 @@ export function SimulationScreen({
                 onRetrieve={() => send({ type: 'retrieve-structure', id: selectedStructure.id })}
               />
             ) : selectedMeasurement ? (
-              <MeasurementInspector measurement={selectedMeasurement} send={send} />
+              <MeasurementInspector
+                measurement={selectedMeasurement}
+                send={send}
+                waterQualityLayers={waterQualityLayers}
+                onWaterQualityLayerToggle={toggleWaterQualityLayer}
+              />
             ) : selectedAnimal ? (
               <AnimalInspector
                 animal={selectedAnimal}
@@ -1169,12 +1510,13 @@ export function SimulationScreen({
               <dl>
                 {(scenario.allowedAnimals.length || snapshot.animals.length) && (
                   <>
-                    <div><dt><i className="species-dot cherry-shrimp" />체리새우 성체</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adults}마리</dd></div>
+                    <div><dt><i className="species-dot cherry-shrimp" />성체 암컷</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adultFemales}마리</dd></div>
+                    <div><dt>성체 수컷</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adultMales}마리</dd></div>
                     <div><dt>어린 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].juveniles}마리</dd></div>
                     <div><dt>전체 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].total}마리</dd></div>
-                    {snapshot.carcasses.length > 0 && (
-                      <div className="carcass-total"><dt>죽은 새우</dt><dd>{snapshot.carcasses.length}마리</dd></div>
-                    )}
+                    <div className="birth-total"><dt>누적 출생</dt><dd>{snapshot.animalPopulationEventTotals.births}마리</dd></div>
+                    <div className="carcass-total"><dt>누적 사망</dt><dd>{snapshot.animalPopulationEventTotals.deaths}마리</dd></div>
+                    {snapshot.carcasses.length > 0 && <div><dt>현재 남은 사체</dt><dd>{snapshot.carcasses.length}마리</dd></div>}
                     <div className="consumption-total"><dt>새우가 먹은 조류</dt><dd>{snapshot.totalAlgaeConsumed.toFixed(1)}</dd></div>
                   </>
                 )}
@@ -1184,13 +1526,34 @@ export function SimulationScreen({
                 {(scenario.allowedSpecies.includes('nitzschia') || snapshot.totalBiomass.nitzschia > 0) && (
                   <div><dt><i className="species-dot nitzschia" />규조류 총량</dt><dd>{snapshot.totalBiomass.nitzschia.toFixed(1)}</dd></div>
                 )}
+                {scenario.waterCycle && (
+                  <>
+                    <div className="water-record-divider"><dt>평균 유기물</dt><dd>{snapshot.biogeochemistry.average.organicMatter.toFixed(2)}</dd></div>
+                    <div><dt>평균 암모니아성 노폐물</dt><dd>{snapshot.biogeochemistry.average.toxicWaste.toFixed(2)}</dd></div>
+                    <div><dt>평균 영양염</dt><dd>{snapshot.biogeochemistry.average.nutrients.toFixed(2)}</dd></div>
+                    <div><dt>평균 용존산소</dt><dd>{snapshot.biogeochemistry.average.oxygen.toFixed(2)}</dd></div>
+                    <div><dt>고형 유기 찌꺼기</dt><dd>{snapshot.biogeochemistry.detritusMass.toFixed(2)}</dd></div>
+                    <div><dt><i className="species-dot decomposer" />분해균 필름 총량</dt><dd>{snapshot.biogeochemistry.biofilmTotals.decomposer.toFixed(2)}</dd></div>
+                    <div><dt><i className="species-dot nitrifier" />질산화균 필름 총량</dt><dd>{snapshot.biogeochemistry.biofilmTotals.nitrifier.toFixed(2)}</dd></div>
+                    <div className="water-record-divider"><dt>물속 무기탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.dissolvedInorganicCarbon.toFixed(2)}</dd></div>
+                    <div><dt>공기층 이산화탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceCarbonDioxide.toFixed(2)}</dd></div>
+                    <div><dt>공기층 산소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceOxygen.toFixed(2)}</dd></div>
+                    <div className="material-ledger-row"><dt>질소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalNitrogen.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.nitrogenDriftRatio)}</small></dd></div>
+                    <div className="material-ledger-row"><dt>탄소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalCarbon.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.carbonDriftRatio)}</small></dd></div>
+                  </>
+                )}
                 {!scenario.allowedAnimals.length && !snapshot.animals.length && (
                   <div><dt>{snapshot.mode === 'challenge' ? '판정 표면 점유' : '전체 표면 점유'}</dt><dd>{Math.round(snapshot.coverageRatio * 100)}%</dd></div>
                 )}
               </dl>
               {(scenario.allowedAnimals.length > 0 || snapshot.animals.length > 0) && (
-                <EcologyHistoryChart points={ecologyHistory} />
+                <>
+                  <EcologyHistoryChart points={ecologyHistory} />
+                  <AnimalPopulationEventLog snapshot={snapshot} />
+                </>
               )}
+              {scenario.waterCycle && <WaterCycleHistoryChart points={ecologyHistory} />}
+              {scenario.waterCycle && <ClosedCycleHistoryChart points={ecologyHistory} />}
             </section>
 
             {snapshot.mode === 'laboratory' && (
@@ -1220,7 +1583,9 @@ export function SimulationScreen({
                     ? heldStructure?.label
                     : snapshot.holding.kind === 'animal'
                       ? ANIMALS[snapshot.holding.animalSpeciesId!].displayName
-                      : SPECIES[snapshot.holding.speciesId!].shortName}
+                      : snapshot.holding.kind === 'biofilm'
+                        ? MICROBES[snapshot.holding.microbeGuildId!].displayName
+                        : SPECIES[snapshot.holding.speciesId!].shortName}
                 </strong>
               </div>
               <small>
@@ -1228,12 +1593,14 @@ export function SimulationScreen({
                   ? 'Q/E 또는 휠로 회전 · 수조를 클릭해 놓기'
                   : snapshot.holding.kind === 'animal'
                     ? '수면 아래 원하는 위치를 클릭해 방류'
-                    : '표면을 클릭해 접종'}
+                    : snapshot.holding.kind === 'biofilm'
+                      ? '수치를 확인한 표면을 클릭해 균 필름 접종'
+                      : '표면을 클릭해 접종'}
               </small>
               <div className="placement-toolbar-actions">
                 <button type="button" onClick={() => {
                   send({ type: 'cancel-held' });
-                  returnToSelection();
+                  completeCanvasInteraction('move');
                 }}>
                   {snapshot.holding.source === 'existing' ? '원래 자리' : '배치 취소'}
                 </button>
@@ -1242,7 +1609,7 @@ export function SimulationScreen({
                     send({
                       type: snapshot.holding?.kind === 'structure' ? 'remove-held-structure' : 'retrieve-held',
                     });
-                    returnToSelection();
+                    completeCanvasInteraction('move');
                   }}>보유 목록으로</button>
                 )}
               </div>
@@ -1294,31 +1661,182 @@ function StructureInspector({
   );
 }
 
+function AnalysisOverlayToolbar({
+  snapshot,
+  layers,
+  onLayerToggle,
+  onClose,
+}: {
+  snapshot: SimulationSnapshot;
+  layers: readonly WaterQualityLayer[];
+  onLayerToggle: (layer: WaterQualityLayer) => void;
+  onClose: () => void;
+}) {
+  const dissolvedLayerCount = layers.filter((layer) =>
+    layer !== 'decomposer' && layer !== 'nitrifier').length;
+
+  return (
+    <section
+      className="tank-analysis-toolbar analysis-multiple"
+      aria-label="겹쳐 보는 관찰 지도"
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <div className="tank-analysis-heading">
+        <span>관찰 지도</span>
+        <strong>{layers.length ? `${layers.length}개 겹쳐 보기` : '표시 없음'}</strong>
+        <button type="button" onClick={onClose} aria-label="관찰 지도 닫기">×</button>
+      </div>
+      <div className="tank-analysis-selected-layers">
+        {layers.map((layer) => {
+          const channel = waterQualityChannel(layer)!;
+          const statistics = analysisLayerStatistics(snapshot, layer);
+          const isBiofilm = layer === 'decomposer' || layer === 'nitrifier';
+          const formatValue = (value: number): string => isBiofilm
+            ? `${value.toFixed(1)}%`
+            : value.toFixed(1);
+          const displayMode = isBiofilm
+            ? '표면 얼룩'
+            : dissolvedLayerCount === 1
+              ? '색 지도'
+              : '등치선';
+          return (
+            <div className={`tank-analysis-selected-row channel-${layer}`} key={layer}>
+              <i aria-hidden="true" />
+              <strong>{channel.shortLabel}</strong>
+              <span>{displayMode}</span>
+              <small>평균 {formatValue(statistics.average)} · 최고 {formatValue(statistics.maximum)}</small>
+            </div>
+          );
+        })}
+      </div>
+      <small className="tank-analysis-method">
+        {layers.length
+          ? '수질 한 항목은 색 지도로, 여러 항목은 같은 기준의 등치선으로 겹칩니다. 균 필름은 표면 얼룩입니다.'
+          : '아래에서 보고 싶은 수질이나 균 필름을 고르세요. 지도 창은 그대로 유지됩니다.'}
+      </small>
+      <div className="tank-analysis-channel-strip" role="group" aria-label="색 지도 채널">
+        {WATER_QUALITY_CHANNELS.map((item) => (
+          <button
+            type="button"
+            key={item.id}
+            className={`channel-${item.id} ${layers.includes(item.id) ? 'active' : ''}`}
+            aria-pressed={layers.includes(item.id)}
+            onClick={() => onLayerToggle(item.id)}
+          >
+            <i aria-hidden="true" />{layers.includes(item.id) ? '✓ ' : ''}{item.shortLabel}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function WaterQualityReadout({
+  sample,
+  layers,
+  onLayerToggle,
+}: {
+  sample: NonNullable<SimulationSnapshot['probe']> | null;
+  layers: readonly WaterQualityLayer[];
+  onLayerToggle: (layer: WaterQualityLayer) => void;
+}) {
+  const growthRate = (guildId: MicrobeGuildId): string => {
+    if (!sample) return '—';
+    const percentPerSecond = sample.microbeNetGrowth[guildId] * 100;
+    return `${percentPerSecond >= 0 ? '+' : ''}${percentPerSecond.toFixed(3)}%/초`;
+  };
+
+  return (
+    <div className="water-quality-readout">
+      <div className="water-quality-channels" role="group" aria-label="수질 관찰 채널">
+        {WATER_QUALITY_CHANNELS.map((channel) => {
+          const value = sample ? waterQualityValue(sample, channel.id) : null;
+          return (
+            <button
+              type="button"
+              key={channel.id}
+              className={`water-quality-channel channel-${channel.id} ${layers.includes(channel.id) ? 'active' : ''}`}
+              aria-pressed={layers.includes(channel.id)}
+              onClick={() => onLayerToggle(channel.id)}
+              title={layers.includes(channel.id) ? '지도에서 끄기' : '현재 지도에 겹치기'}
+            >
+              <span><i aria-hidden="true" />{layers.includes(channel.id) ? '✓ ' : ''}{channel.label}</span>
+              <strong>{value === null ? '—' : formatWaterQualityValue(channel.id, value)}</strong>
+            </button>
+          );
+        })}
+      </div>
+      {sample && (
+        <div className="microbe-growth-readout">
+          <div className="microbe-growth-heading">
+            <span>이 위치의 예상 순성장률</span>
+            <small>먹이·산소·빈 표면 반영</small>
+          </div>
+          {MICROBE_IDS.map((guildId) => {
+            const netGrowth = sample.microbeNetGrowth[guildId];
+            return (
+              <div key={guildId} className={netGrowth >= 0 ? 'positive' : 'negative'}>
+                <span>{MICROBES[guildId].displayName}</span>
+                <strong>{growthRate(guildId)}</strong>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MeasurementInspector({
   measurement,
   send,
+  waterQualityLayers,
+  onWaterQualityLayerToggle,
 }: {
   measurement: SimulationSnapshot['measurements'][number];
   send: (command: SimulationCommand) => void;
+  waterQualityLayers: readonly WaterQualityLayer[];
+  onWaterQualityLayerToggle: (layer: WaterQualityLayer) => void;
 }) {
+  const isWaterQuality = measurement.kind === 'water-quality';
+  const activeWaterLayer = waterQualityLayers[0] ?? 'organicMatter';
   return (
     <section className="paper-panel measurement-inspector">
       <div className="measurement-inspector-heading">
         <span aria-hidden="true"><MeasurementIcon kind={measurement.kind} /></span>
         <div>
           <span className="panel-label">선택한 측정점</span>
-          <h3>{measurement.kind === 'light' ? '광량 탐침' : '수온계'}</h3>
+          <h3>{measurement.kind === 'light' ? '광량 탐침' : measurement.kind === 'temperature' ? '수온계' : '수질 측정점'}</h3>
         </div>
       </div>
-      <div className="measurement-primary">
-        <span>{measurement.kind === 'light' ? '현재 광량' : '현재 수온'}</span>
-        <strong>{measurement.kind === 'light' ? Math.round(measurement.light) : `${measurement.temperature.toFixed(1)}°C`}</strong>
-      </div>
+      {isWaterQuality ? (
+        <>
+          <div className="measurement-primary water-quality-primary">
+            <span>{waterQualityChannel(activeWaterLayer)?.label}</span>
+            <strong>{formatWaterQualityValue(
+              activeWaterLayer,
+              waterQualityValue(measurement, activeWaterLayer),
+            )}</strong>
+          </div>
+          <WaterQualityReadout
+            sample={measurement}
+            layers={waterQualityLayers}
+            onLayerToggle={onWaterQualityLayerToggle}
+          />
+        </>
+      ) : (
+        <div className="measurement-primary">
+          <span>{measurement.kind === 'light' ? '현재 광량' : '현재 수온'}</span>
+          <strong>{measurement.kind === 'light' ? Math.round(measurement.light) : `${measurement.temperature.toFixed(1)}°C`}</strong>
+        </div>
+      )}
       <dl className="species-facts">
         <div><dt>설치 위치</dt><dd>{measurement.locationLabel}</dd></div>
         {measurement.kind === 'light'
           ? <div><dt>함께 기록</dt><dd>수온 {measurement.temperature.toFixed(1)}°C</dd></div>
-          : <div><dt>함께 기록</dt><dd>광량 {Math.round(measurement.light)} / 100</dd></div>}
+          : measurement.kind === 'temperature'
+            ? <div><dt>함께 기록</dt><dd>광량 {Math.round(measurement.light)} / 100</dd></div>
+            : <div><dt>관찰 범위</dt><dd>네 수질 · 두 균 필름</dd></div>}
         <div><dt>기록 방식</dt><dd>시뮬레이션 중 실시간 갱신</dd></div>
       </dl>
       <button type="button" className="remove-measurement" onClick={() => send({ type: 'remove-measurement', id: measurement.id })}>측정점 회수</button>
@@ -1333,6 +1851,13 @@ const animalBehaviorLabel: Record<SimulationSnapshot['animals'][number]['behavio
   grazing: '조류를 뜯어 먹는 중',
   resting: '쉬며 몸을 다듬는 중',
   starving: '먹이가 부족해 쇠약함',
+};
+
+const animalDeathCauseLabel: Record<SimulationSnapshot['carcasses'][number]['cause'], string> = {
+  starvation: '먹이 부족으로 에너지 고갈',
+  'old-age': '수명을 다해 자연사',
+  hypoxia: '용존산소 부족',
+  toxicity: '암모니아 독성 누적',
 };
 
 function AnimalInspector({
@@ -1413,10 +1938,17 @@ function AnimalCarcassInspector({
       <dl className="species-facts">
         <div><dt>상태</dt><dd>죽은 개체</dd></div>
         <div><dt>생활 단계</dt><dd>{carcass.lifeStage === 'adult' ? '성체' : '어린 새우'}</dd></div>
-        <div><dt>사망 원인</dt><dd>{carcass.cause === 'starvation' ? '먹이 부족으로 에너지 고갈' : '수명을 다해 자연사'}</dd></div>
+        <div><dt>사망 원인</dt><dd>{animalDeathCauseLabel[carcass.cause]}</dd></div>
+        {carcass.waterAtDeath && (
+          <>
+            <div><dt>사망 당시 암모니아</dt><dd>{carcass.waterAtDeath.toxicWaste.toFixed(2)} / 피해 시작 {SHRIMP_ECOLOGY_RULES.toxicWasteStressStart}</dd></div>
+            <div><dt>사망 당시 산소</dt><dd>{carcass.waterAtDeath.oxygen.toFixed(2)} / 피해 시작 {SHRIMP_ECOLOGY_RULES.oxygenStressStart} 미만</dd></div>
+            <div><dt>사망 당시 유기물</dt><dd>{carcass.waterAtDeath.organicMatter.toFixed(2)}</dd></div>
+          </>
+        )}
         <div><dt>죽은 뒤</dt><dd>{formatTime(carcass.ageSeconds)}</dd></div>
       </dl>
-      <p className="animal-note">사망 질량은 수조의 유기물 기록에 남습니다. 분해와 수질 영향은 아직 활성화하지 않았습니다.</p>
+      <p className="animal-note">수질 순환이 활성화된 실험에서는 죽은 개체가 유기물로 남아 분해균의 먹이가 됩니다.</p>
     </section>
   );
 }
@@ -1450,6 +1982,68 @@ function AnimalGroupInspector({
   );
 }
 
+const animalPopulationEventLabel: Record<AnimalPopulationEventSnapshot['kind'], string> = {
+  introduced: '수조에 방류',
+  removed: '수조에서 회수',
+  birth: '새끼 출생',
+  matured: '성체로 성장',
+  death: '개체 사망',
+};
+
+function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }) {
+  const totals = snapshot.animalPopulationEventTotals;
+  const recentEvents = snapshot.animalPopulationEvents.slice(-10).reverse();
+  const population = snapshot.animalPopulation['cherry-shrimp'];
+
+  const eventDetail = (event: AnimalPopulationEventSnapshot): string => {
+    const sex = event.sex === 'female' ? '암컷' : '수컷';
+    const stage = event.lifeStage === 'adult' ? '성체' : '어린 새우';
+    if (event.kind === 'death' && event.cause) {
+      const water = event.water
+        ? ` · 산소 ${event.water.oxygen.toFixed(1)} · 암모니아 ${event.water.toxicWaste.toFixed(1)}`
+        : '';
+      return `${sex} ${stage} · ${animalDeathCauseLabel[event.cause]}${water}`;
+    }
+    if (event.kind === 'birth') return `${sex} 새끼 · 어미 개체에서 태어남`;
+    return `${sex} ${stage}`;
+  };
+
+  return (
+    <div className="animal-event-log">
+      <div className="animal-event-heading">
+        <div><strong>개체군 변화 기록</strong><small>최근 사건 10건 · 누계는 전체 실험</small></div>
+        <span>현재 ♀ {population.adultFemales} · ♂ {population.adultMales}</span>
+      </div>
+      <div className="animal-event-totals" aria-label="새우 누적 변화">
+        <div><span>출생</span><strong>{totals.births}</strong></div>
+        <div><span>성체 전환</span><strong>{totals.maturations}</strong></div>
+        <div><span>사망</span><strong>{totals.deaths}</strong></div>
+        <div><span>방류/회수</span><strong>{totals.introduced}/{totals.removed}</strong></div>
+      </div>
+      {totals.deaths > 0 && (
+        <div className="animal-death-breakdown" aria-label="사망 원인 누계">
+          <span>먹이 부족 <b>{totals.deathsByCause.starvation}</b></span>
+          <span>자연사 <b>{totals.deathsByCause['old-age']}</b></span>
+          <span>산소 부족 <b>{totals.deathsByCause.hypoxia}</b></span>
+          <span>암모니아 <b>{totals.deathsByCause.toxicity}</b></span>
+        </div>
+      )}
+      {recentEvents.length ? (
+        <ol className="animal-event-list">
+          {recentEvents.map((event) => (
+            <li key={event.sequence} className={`event-${event.kind}`}>
+              <time>{formatTime(event.elapsedSeconds)}</time>
+              <span><strong>{animalPopulationEventLabel[event.kind]}</strong><small>{eventDetail(event)}</small></span>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="animal-event-empty">시뮬레이션을 시작하면 방류·출생·성장·사망이 여기에 남습니다.</p>
+      )}
+    </div>
+  );
+}
+
 function EcologyHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
   const sparkPoints = (
     values: number[],
@@ -1466,11 +2060,41 @@ function EcologyHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
   };
+  const populationPoints = (values: number[], maximum: number): string => values.map((value, index) => {
+    const x = values.length === 1 ? 116 : 43 + (index / (values.length - 1)) * 146;
+    const y = 65 - (value / Math.max(1, maximum)) * 22;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
   const algaeValues = points.map((point) => point.algaeBiomass);
   const shrimpValues = points.map((point) => point.shrimpCount);
-  const latest = points.at(-1) ?? { elapsedSeconds: 0, algaeBiomass: 0, shrimpCount: 0 };
+  const femaleValues = points.map((point) => point.shrimpAdultFemales);
+  const maleValues = points.map((point) => point.shrimpAdultMales);
+  const juvenileValues = points.map((point) => point.shrimpJuveniles);
+  const maximumShrimpCount = Math.max(1, ...shrimpValues);
+  const latest = points.at(-1) ?? {
+    elapsedSeconds: 0,
+    algaeBiomass: 0,
+    shrimpCount: 0,
+    shrimpAdultFemales: 0,
+    shrimpAdultMales: 0,
+    shrimpJuveniles: 0,
+    cumulativeBirths: 0,
+    cumulativeDeaths: 0,
+    organicMatter: 0,
+    toxicWaste: 0,
+    nutrients: 0,
+    oxygen: 0,
+    decomposer: 0,
+    nitrifier: 0,
+    dissolvedInorganicCarbon: 0,
+    headspaceCarbonDioxide: 0,
+    headspaceOxygen: 0,
+  };
   const algaePoints = sparkPoints(algaeValues, 4, 28);
-  const shrimpPoints = sparkPoints(shrimpValues, 40, 28);
+  const shrimpPoints = populationPoints(shrimpValues, maximumShrimpCount);
+  const femalePoints = populationPoints(femaleValues, maximumShrimpCount);
+  const malePoints = populationPoints(maleValues, maximumShrimpCount);
+  const juvenilePoints = populationPoints(juvenileValues, maximumShrimpCount);
 
   return (
     <div className="ecology-history">
@@ -1483,17 +2107,116 @@ function EcologyHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
         <text x="5" y="12">조류</text>
         <text x="5" y="48">새우</text>
         {algaePoints && <polyline className="ecology-history-line algae" points={algaePoints} />}
-        {shrimpPoints && <polyline className="ecology-history-line shrimp" points={shrimpPoints} />}
+        {shrimpPoints && <polyline className="ecology-history-line shrimp-total" points={shrimpPoints} />}
+        {femalePoints && <polyline className="ecology-history-line shrimp-female" points={femalePoints} />}
+        {malePoints && <polyline className="ecology-history-line shrimp-male" points={malePoints} />}
+        {juvenilePoints && <polyline className="ecology-history-line shrimp-juvenile" points={juvenilePoints} />}
         <text className="ecology-history-value algae" x="235" y="12" textAnchor="end">{latest.algaeBiomass.toFixed(1)}</text>
         <text className="ecology-history-value shrimp" x="235" y="48" textAnchor="end">{latest.shrimpCount}마리</text>
       </svg>
-      <small className="ecology-history-note">새우가 먹은 양은 조류 총량에 바로 반영됩니다.</small>
+      <div className="population-history-legend">
+        <span className="female">성체 ♀ <b>{latest.shrimpAdultFemales}</b></span>
+        <span className="male">성체 ♂ <b>{latest.shrimpAdultMales}</b></span>
+        <span className="juvenile">어린 새우 <b>{latest.shrimpJuveniles}</b></span>
+      </div>
+      <small className="ecology-history-note">모든 개체군 선은 0부터 같은 눈금을 사용합니다.</small>
+    </div>
+  );
+}
+
+function WaterCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
+  const line = (values: number[], top: number): string => {
+    if (!values.length) return '';
+    const minimum = Math.min(...values);
+    const maximum = Math.max(...values);
+    const range = Math.max(maximum - minimum, maximum * 0.08, 0.05);
+    return values.map((value, index) => {
+      const x = values.length === 1 ? 119 : 49 + (index / (values.length - 1)) * 137;
+      const y = top + 18 - ((value - minimum) / range) * 14;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+  };
+  const latest = points.at(-1);
+  const rows = [
+    { key: 'organic', label: '유기물', value: latest?.organicMatter ?? 0, values: points.map((point) => point.organicMatter) },
+    { key: 'decomposer', label: '분해균', value: latest?.decomposer ?? 0, values: points.map((point) => point.decomposer) },
+    { key: 'toxic', label: '암모니아', value: latest?.toxicWaste ?? 0, values: points.map((point) => point.toxicWaste) },
+    { key: 'nitrifier', label: '질산화균', value: latest?.nitrifier ?? 0, values: points.map((point) => point.nitrifier) },
+  ] as const;
+  return (
+    <div className="water-cycle-history">
+      <div className="ecology-history-heading">
+        <strong>미생물 순환</strong>
+        <small>최근 {points.length ? formatTime(points.at(-1)!.elapsedSeconds - points[0].elapsedSeconds) : '00:00'}</small>
+      </div>
+      <svg viewBox="0 0 240 94" role="img" aria-label="유기물과 분해균, 암모니아성 노폐물과 질산화균의 시간 변화">
+        {rows.map((row, index) => {
+          const top = 2 + index * 23;
+          const pointsText = line(row.values, top);
+          return (
+            <g key={row.key}>
+              <path className="ecology-history-guide" d={`M49 ${top + 20}H186`} />
+              <text x="4" y={top + 11}>{row.label}</text>
+              {pointsText && <polyline className={`water-cycle-history-line ${row.key}`} points={pointsText} />}
+              <text className={`water-cycle-history-value ${row.key}`} x="236" y={top + 11} textAnchor="end">{row.value.toFixed(2)}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <small className="ecology-history-note">먹이가 먼저 변하고, 뒤따라 균 필름량이 반응합니다.</small>
+    </div>
+  );
+}
+
+function ClosedCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
+  const line = (values: number[], top: number): string => {
+    if (!values.length) return '';
+    const minimum = Math.min(...values);
+    const maximum = Math.max(...values);
+    const range = Math.max(maximum - minimum, maximum * 0.06, 0.05);
+    return values.map((value, index) => {
+      const x = values.length === 1 ? 119 : 49 + (index / (values.length - 1)) * 137;
+      const y = top + 18 - ((value - minimum) / range) * 14;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+  };
+  const latest = points.at(-1);
+  const rows = [
+    { key: 'nutrient', label: '영양염', value: latest?.nutrients ?? 0, values: points.map((point) => point.nutrients) },
+    { key: 'dic', label: '무기탄소', value: latest?.dissolvedInorganicCarbon ?? 0, values: points.map((point) => point.dissolvedInorganicCarbon) },
+    { key: 'oxygen', label: '용존산소', value: latest?.oxygen ?? 0, values: points.map((point) => point.oxygen) },
+  ] as const;
+  return (
+    <div className="water-cycle-history closed-cycle-history">
+      <div className="ecology-history-heading">
+        <strong>닫힌 물질·기체 순환</strong>
+        <small>빛만 외부에서 들어옴</small>
+      </div>
+      <svg viewBox="0 0 240 72" role="img" aria-label="영양염과 물속 무기탄소, 용존산소의 시간 변화">
+        {rows.map((row, index) => {
+          const top = 2 + index * 23;
+          const pointsText = line(row.values, top);
+          return (
+            <g key={row.key}>
+              <path className="ecology-history-guide" d={`M49 ${top + 20}H186`} />
+              <text x="4" y={top + 11}>{row.label}</text>
+              {pointsText && <polyline className={`water-cycle-history-line ${row.key}`} points={pointsText} />}
+              <text className={`water-cycle-history-value ${row.key}`} x="236" y={top + 11} textAnchor="end">{row.value.toFixed(2)}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <small className="ecology-history-note">광합성은 유한한 무기탄소를 쓰고, 호흡·분해가 다시 돌려놓습니다.</small>
     </div>
   );
 }
 
 function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
   const definition = ANIMALS[speciesId];
+  const adultMaintenance = WATER_CYCLE_RULES.shrimp.adultMaintenanceBiomassPerSecond;
+  const juvenileMaintenance = WATER_CYCLE_RULES.shrimp.juvenileMaintenanceBiomassPerSecond;
+  const oxygenPerAdultSecond = adultMaintenance * WATER_CYCLE_RULES.biomassCarbon *
+    WATER_CYCLE_RULES.shrimp.oxygenPerRespiredCarbon;
   return (
     <section className="paper-panel animal-inspector animal-guide">
       <div className="animal-inspector-heading">
@@ -1508,6 +2231,20 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
         <div><dt>성체 크기</dt><dd>{definition.adultLength}</dd></div>
         <div><dt>번식</dt><dd>충분히 먹은 성체 암수가 번식합니다. 먹이가 부족해지면 번식과 성장이 멈추고, 오래 굶으면 죽습니다.</dd></div>
       </dl>
+      <section className="ecology-rules-card">
+        <div className="ecology-rules-heading"><strong>게임 생존·수질 기준</strong><span>수질 농도 0–100</span></div>
+        <dl>
+          <div><dt>용존산소</dt><dd><b>{SHRIMP_ECOLOGY_RULES.oxygenStressStart} 이상</b>은 저산소 피해 없음. 그 아래부터 피해가 커져 0에서 체력 <b>{(SHRIMP_ECOLOGY_RULES.oxygenMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
+          <div><dt>암모니아성 노폐물</dt><dd><b>{SHRIMP_ECOLOGY_RULES.toxicWasteStressStart} 이하</b>는 독성 피해 없음. {SHRIMP_ECOLOGY_RULES.toxicWasteStressStart}–{SHRIMP_ECOLOGY_RULES.toxicWasteFullStress}에서 증가해 {SHRIMP_ECOLOGY_RULES.toxicWasteFullStress} 이상이면 체력 <b>{(SHRIMP_ECOLOGY_RULES.toxicMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
+          <div><dt>회복</dt><dd>두 스트레스가 없을 때 체력 <b>{(SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 저산소와 독성 피해는 합산됩니다.</dd></div>
+          <div><dt>먹이의 행방</dt><dd>먹은 조류의 <b>{Math.round(WATER_CYCLE_RULES.shrimp.assimilationFraction * 100)}%</b>는 몸과 번식 자원, <b>{Math.round(WATER_CYCLE_RULES.shrimp.fecesFraction * 100)}%</b>는 유기성 찌꺼기, 나머지는 호흡·배설로 돌아갑니다.</dd></div>
+          <div><dt>기초 대사</dt><dd>성체는 몸·저장량 <b>{adultMaintenance.toFixed(6)}</b>, 어린 새우는 <b>{juvenileMaintenance.toFixed(6)}</b> /마리·초를 사용합니다.</dd></div>
+          <div><dt>산소 소비</dt><dd>성체 기초 대사만으로 약 <b>{oxygenPerAdultSecond.toFixed(6)}</b> /마리·초를 소비하며, 먹이 호흡분도 같은 질량 장부로 계산됩니다.</dd></div>
+          <div><dt>사체·배설물</dt><dd>먹지 못하고 남은 몸과 저장량, 배설물은 유기성 찌꺼기가 되어 분해균의 먹이로 되돌아갑니다.</dd></div>
+          <div><dt>굶주림</dt><dd>성체 에너지는 기본 <b>{(SHRIMP_ECOLOGY_RULES.adultBaseMetabolismPerSecond * 100).toFixed(1)}/초</b>와 행동 비용만큼 줄고, 조류 1.0을 먹으면 <b>{(SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass * 100).toFixed(0)}</b> 회복. 에너지 0이면 죽습니다.</dd></div>
+          <div><dt>수명</dt><dd>성체 기준 약 <b>{formatTime(SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds)}–{formatTime(SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds)}</b>.</dd></div>
+        </dl>
+      </section>
     </section>
   );
 }
@@ -1589,6 +2326,17 @@ function SpeciesGuide({
         <div><dt>빛의 틈새</dt><dd>{species.niche}</dd></div>
         <div><dt>수온 반응</dt><dd>{species.temperatureSummary}</dd></div>
       </dl>
+      <section className="ecology-rules-card algae-rules-card">
+        <div className="ecology-rules-heading"><strong>게임 생존·수질 기준</strong><span>표면 군락량 1.0 기준</span></div>
+        <dl>
+          <div><dt>직접 생존 조건</dt><dd>현재 모델에서 용존산소·유기물·암모니아성 노폐물은 조류를 직접 죽이지 않습니다. 빛·수온·영양염·경쟁·섭식이 양을 결정합니다.</dd></div>
+          <div><dt>무기질소</dt><dd>암모니아성 노폐물과 영양염 합계 N에 <b>N ÷ ({WATER_CYCLE_RULES.mineralNutrientHalfSaturation} + N)</b>을 곱합니다. 새 군락은 필요한 질소 중 암모니아를 최대 <b>{Math.round(WATER_CYCLE_RULES.algae.ammoniumPreference * 100)}%</b> 우선 흡수하고, 부족분은 영양염에서 가져옵니다.</dd></div>
+          <div><dt>무기탄소</dt><dd>유한한 물속 무기탄소 C에 <b>C ÷ ({WATER_CYCLE_RULES.carbonHalfSaturation} + C)</b>을 곱합니다. 새 군락 1.0에 탄소 <b>{WATER_CYCLE_RULES.biomassCarbon}</b>가 실제로 들어갑니다.</dd></div>
+          <div><dt>산소 생산</dt><dd>고정한 탄소 1.0당 산소 <b>{WATER_CYCLE_RULES.oxygenPerFixedCarbon}</b>를 만들며, 넘친 산소는 닫힌 공기층으로 이동합니다.</dd></div>
+          <div><dt>질소 소비</dt><dd>새 군락 1.0당 무기질소 <b>{WATER_CYCLE_RULES.biomassNitrogen}</b>를 흡수합니다. 죽거나 먹힌 군락은 찌꺼기와 생물 몸을 거쳐 다시 순환합니다.</dd></div>
+          <div><dt>자연 소실</dt><dd>그래프의 환경 성장률 계산 뒤에 군락량의 <b>0.18%/초</b>가 추가로 줄며, 다른 종의 경쟁과 새우 섭식도 별도로 적용됩니다.</dd></div>
+        </dl>
+      </section>
       <div className="response-chart">
         <div>
           <strong>광량에 따른 성장 잠재력</strong>

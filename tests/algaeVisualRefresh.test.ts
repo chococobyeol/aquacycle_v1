@@ -43,6 +43,7 @@ const matureCell = (
     oedogonium: 0.72,
     nitzschia: 0.16,
   },
+  biofilm: { decomposer: 0, nitrifier: 0 },
   targetEligible: true,
   ...overrides,
 });

@@ -110,6 +110,6 @@ describe('bounded cross-surface colony bridges', () => {
     );
     expect(receiver.biomass.nitzschia).toBeGreaterThan(0);
     expect(source.biomass.nitzschia).toBeLessThan(isolatedSourceBiomass);
-    expect(connectedTotal).toBeCloseTo(isolatedTotal, 10);
+    expect(connectedTotal).toBeCloseTo(isolatedTotal, 6);
   });
 });

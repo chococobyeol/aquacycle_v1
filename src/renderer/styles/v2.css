@@ -282,7 +282,7 @@
   background-size: contain;
 }
 .aquarium-canvas.tool-select { cursor: default; }
-.aquarium-canvas.tool-select.is-holding { cursor: none; }
+.aquarium-canvas.tool-select.is-holding { cursor: grabbing; }
 .aquarium-canvas.tool-probe { cursor: crosshair; }
 
 .v2-info-panel { gap: 8px; padding-right: 3px; }
@@ -407,6 +407,35 @@
 }
 .species-facts dt { color: #54746e; }
 .species-facts dd { margin: 0; color: #69736e; }
+.ecology-rules-card {
+  margin-top: 10px;
+  padding: 9px 10px 8px;
+  border: 1.5px solid rgba(66, 91, 86, 0.55);
+  border-radius: 8px 11px 7px 10px;
+  background: rgba(207, 226, 211, 0.34);
+}
+.ecology-rules-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+.ecology-rules-heading strong { color: #405d58; font-size: 12px; }
+.ecology-rules-heading span { color: #75817b; font-family: "Apple SD Gothic Neo", sans-serif; font-size: 9px; }
+.ecology-rules-card dl { margin: 0; }
+.ecology-rules-card dl > div {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 6px;
+  padding: 5px 0;
+  border-top: 1px dashed rgba(48, 60, 58, 0.18);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.ecology-rules-card dt { color: #4f706a; }
+.ecology-rules-card dd { margin: 0; color: #5d6964; }
+.ecology-rules-card dd b { color: #344946; font-family: "Apple SD Gothic Neo", sans-serif; }
 .response-chart { margin-top: 7px; padding-top: 6px; border-top: 1.5px solid rgba(48, 60, 58, 0.28); }
 .response-chart > div { display: flex; align-items: baseline; justify-content: space-between; }
 .response-chart > div strong { font-size: 9px; }
@@ -529,7 +558,7 @@
 }
 .aquarium-canvas.tool-select { cursor: default; }
 .aquarium-canvas.tool-move { cursor: grab; }
-.aquarium-canvas.tool-move.is-holding { cursor: none; }
+.aquarium-canvas.tool-move.is-holding { cursor: grabbing; }
 .aquarium-canvas.tool-light-probe { cursor: crosshair; }
 .aquarium-canvas.tool-temperature-probe { cursor: crosshair; }
 .tank-help p { font-size: 14px; line-height: 1.35; }
@@ -551,6 +580,50 @@
 }
 .inventory-cursor-ghost img { display: block; max-width: 88px; max-height: 48px; object-fit: contain; }
 .inventory-cursor-ghost small { color: #405c57; font-size: 13px; }
+
+/* A DOM marker mirrors the Pixi seed/biofilm preview. It follows the camera
+   transform and remains visible while the worker/Pixi handoff catches up. */
+.tank-biological-placement-marker {
+  position: absolute;
+  z-index: 34;
+  width: 34px;
+  height: 34px;
+  border: 4px solid var(--placement-color);
+  border-radius: 50%;
+  background: rgba(249, 242, 217, 0.58);
+  box-shadow: 0 0 0 4px rgba(249, 242, 217, 0.62), 2px 3px 0 rgba(37, 55, 52, 0.2);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+.tank-biological-placement-marker.invalid {
+  --placement-color: #c65250 !important;
+  border-style: dashed;
+}
+.tank-biological-placement-marker i {
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--placement-color);
+}
+.tank-biological-placement-marker i:nth-child(1) { left: 7px; top: 7px; }
+.tank-biological-placement-marker i:nth-child(2) { left: 18px; top: 6px; }
+.tank-biological-placement-marker i:nth-child(3) { left: 12px; top: 14px; }
+.tank-biological-placement-marker i:nth-child(4) { left: 21px; top: 17px; }
+.tank-biological-placement-marker i:nth-child(5) { left: 6px; top: 20px; }
+.tank-biological-placement-marker i:nth-child(6) { left: 15px; top: 23px; }
+.tank-biological-placement-marker.marker-seed i {
+  width: 3px;
+  height: 16px;
+  border-radius: 60% 40% 55% 45%;
+  transform-origin: bottom center;
+}
+.tank-biological-placement-marker.marker-seed i:nth-child(1) { left: 7px; top: 7px; transform: rotate(-23deg); }
+.tank-biological-placement-marker.marker-seed i:nth-child(2) { left: 13px; top: 5px; transform: rotate(-8deg); }
+.tank-biological-placement-marker.marker-seed i:nth-child(3) { left: 19px; top: 6px; transform: rotate(11deg); }
+.tank-biological-placement-marker.marker-seed i:nth-child(4) { left: 24px; top: 9px; transform: rotate(25deg); }
+.tank-biological-placement-marker.marker-seed i:nth-child(5),
+.tank-biological-placement-marker.marker-seed i:nth-child(6) { display: none; }
 .ghost-colony {
   display: block;
   width: 52px;
@@ -1675,8 +1748,7 @@
   .hud-back-button span { display: none; }
 }
 
-/* Compact ecology trace: two independently scaled rows make both algae loss
-   and shrimp population change readable without turning the note into a dashboard. */
+/* Compact ecology trace and persistent population ledger. */
 .compact-observation .consumption-total {
   margin-top: 2px;
   border-top: 1.5px dashed rgba(48, 60, 58, 0.32);
@@ -1685,6 +1757,8 @@
 .compact-observation .consumption-total dd { color: #426c63; font-weight: 800; }
 .compact-observation .carcass-total { color: #7b6d65; }
 .compact-observation .carcass-total dd { color: #725f58; font-weight: 800; }
+.compact-observation .birth-total { color: #52735c; }
+.compact-observation .birth-total dd { color: #467052; font-weight: 800; }
 .ecology-history {
   display: grid;
   gap: 5px;
@@ -1730,9 +1804,31 @@
   vector-effect: non-scaling-stroke;
 }
 .ecology-history-line.algae { stroke: #5f8a57; }
-.ecology-history-line.shrimp { stroke: #c86f62; }
+.ecology-history-line.shrimp-total { stroke: rgba(65, 71, 68, 0.44); stroke-width: 1.5; stroke-dasharray: 3 2; }
+.ecology-history-line.shrimp-female { stroke: #c86f62; }
+.ecology-history-line.shrimp-male { stroke: #588a91; }
+.ecology-history-line.shrimp-juvenile { stroke: #bd974b; }
 .ecology-history-value.algae { fill: #4f794b; }
 .ecology-history-value.shrimp { fill: #a85d54; }
+.population-history-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: #65736d;
+  font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-size: 10px;
+}
+.population-history-legend span::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  margin-right: 4px;
+  border-top: 2px solid currentColor;
+  vertical-align: 3px;
+}
+.population-history-legend .female { color: #ad6158; }
+.population-history-legend .male { color: #4d7d84; }
+.population-history-legend .juvenile { color: #9b7a38; }
 .ecology-history-note {
   color: #718078;
   font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
@@ -1740,8 +1836,534 @@
   line-height: 1.35;
 }
 
+.animal-event-log {
+  display: grid;
+  gap: 7px;
+  margin-top: 9px;
+  padding: 9px;
+  border: 1.5px solid rgba(48, 60, 58, 0.36);
+  border-radius: 10px 7px 11px 8px;
+  background: rgba(248, 239, 207, 0.54);
+}
+.animal-event-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 8px;
+}
+.animal-event-heading > div { display: grid; gap: 1px; }
+.animal-event-heading strong { font-size: 13px; }
+.animal-event-heading small,
+.animal-event-heading > span {
+  color: #6e7a74;
+  font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-size: 9px;
+}
+.animal-event-heading > span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.animal-event-totals {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+.animal-event-totals > div {
+  display: grid;
+  gap: 1px;
+  padding: 5px 4px;
+  border: 1px solid rgba(55, 72, 68, 0.22);
+  border-radius: 6px;
+  background: rgba(255, 250, 229, 0.58);
+  text-align: center;
+}
+.animal-event-totals span { color: #728078; font-size: 9px; }
+.animal-event-totals strong { font-size: 13px; font-variant-numeric: tabular-nums; }
+.animal-death-breakdown {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 8px;
+  padding: 6px 8px;
+  border-left: 3px solid rgba(167, 92, 82, 0.58);
+  background: rgba(190, 105, 92, 0.08);
+  color: #6f6b65;
+  font-size: 9px;
+}
+.animal-death-breakdown span { display: flex; justify-content: space-between; }
+.animal-event-list {
+  display: grid;
+  max-height: 196px;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.animal-event-list li {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 7px;
+  padding: 6px 2px;
+  border-top: 1px dashed rgba(48, 60, 58, 0.22);
+}
+.animal-event-list time {
+  color: #778079;
+  font-family: "Apple SD Gothic Neo", sans-serif;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.animal-event-list li > span { display: grid; min-width: 0; gap: 1px; }
+.animal-event-list strong { font-size: 10px; }
+.animal-event-list small { color: #6e746f; font-size: 9px; line-height: 1.35; }
+.animal-event-list .event-death strong { color: #9c5b54; }
+.animal-event-list .event-birth strong { color: #4f795a; }
+.animal-event-empty { margin: 2px 0; color: #778079; font-size: 10px; line-height: 1.4; }
+
+.water-cycle-history {
+  margin-top: 9px;
+  padding: 8px 9px 7px;
+  border: 1px solid rgba(49, 65, 63, 0.24);
+  border-radius: 10px;
+  background: rgba(247, 243, 219, 0.56);
+}
+
+.water-cycle-history svg {
+  display: block;
+  width: 100%;
+  height: 112px;
+  overflow: visible;
+}
+
+.water-cycle-history svg text {
+  font-size: 9px;
+  fill: #5d6965;
+}
+
+.water-cycle-history-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.water-cycle-history-line.organic { stroke: #9b7751; }
+.water-cycle-history-line.decomposer { stroke: #c98246; }
+.water-cycle-history-line.toxic { stroke: #b85f5e; }
+.water-cycle-history-line.nitrifier { stroke: #40928b; }
+.water-cycle-history-value { font-weight: 800; }
+.water-cycle-history-value.organic { fill: #836342; }
+.water-cycle-history-value.decomposer { fill: #a96535; }
+.water-cycle-history-value.toxic { fill: #9e4e4e; }
+.water-cycle-history-value.nitrifier { fill: #347d77; }
+.water-cycle-history.closed-cycle-history svg { height: 86px; }
+.water-cycle-history-line.nutrient { stroke: #718d4d; }
+.water-cycle-history-line.dic { stroke: #607f98; }
+.water-cycle-history-line.oxygen { stroke: #4aa3b0; }
+.water-cycle-history-value.nutrient { fill: #5f7840; }
+.water-cycle-history-value.dic { fill: #506f89; }
+.water-cycle-history-value.oxygen { fill: #348b98; }
+.compact-observation .material-ledger-row small {
+  margin-left: 4px;
+  color: #708079;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 1080px), (max-height: 720px) {
   .ecology-history { padding: 7px 8px 6px; }
   .ecology-history svg { height: 66px; }
   .ecology-history-note { display: none; }
+}
+
+/* Mission 5: a compact doodle of two microbial guilds completing a water cycle. */
+.mission-card.mission-five { background: rgba(239, 243, 219, 0.92); }
+.mission-illustration.microbe-cycle { right: 16px; width: 154px; }
+.mini-microbe,
+.mini-shrimp-water,
+.mini-cycle-arrow { position: absolute; display: block; }
+.mini-microbe {
+  width: 42px;
+  height: 30px;
+  border: 3px solid #354744;
+  border-radius: 48% 42% 52% 39%;
+  box-shadow: inset 0 0 0 4px rgba(247, 240, 217, 0.32);
+  transform: rotate(-8deg);
+}
+.mini-microbe::before,
+.mini-microbe::after {
+  content: "";
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(247, 240, 217, 0.72);
+  box-shadow: 13px 6px 0 rgba(247, 240, 217, 0.55), 24px -2px 0 rgba(247, 240, 217, 0.45);
+}
+.mini-microbe::before { top: 8px; left: 7px; }
+.mini-microbe::after { right: 8px; bottom: 5px; transform: scale(0.72); }
+.mini-microbe.decomposer { top: 25px; left: 12px; background: #927957; }
+.mini-microbe.nitrifier { right: 7px; bottom: 14px; background: #558a83; transform: rotate(9deg); }
+.mini-shrimp-water {
+  top: 55px;
+  left: 56px;
+  width: 44px;
+  height: 20px;
+  border: 3px solid #4a4842;
+  border-radius: 55% 43% 48% 52%;
+  background: #cf7567;
+  transform: rotate(-5deg);
+}
+.mini-shrimp-water::before {
+  content: "";
+  position: absolute;
+  top: 1px;
+  right: -12px;
+  width: 14px;
+  height: 14px;
+  border: 3px solid #4a4842;
+  border-left: 0;
+  border-radius: 0 70% 48% 0;
+  background: #d98373;
+}
+.mini-cycle-arrow {
+  width: 42px;
+  height: 26px;
+  border: 3px solid #58736e;
+  border-right-color: transparent;
+  border-bottom-color: transparent;
+  border-radius: 50%;
+}
+.mini-cycle-arrow::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  border-top: 3px solid #58736e;
+  border-right: 3px solid #58736e;
+  transform: rotate(20deg);
+}
+.mini-cycle-arrow.cycle-a { top: 10px; right: 29px; transform: rotate(12deg); }
+.mini-cycle-arrow.cycle-a::after { top: -5px; right: -2px; }
+.mini-cycle-arrow.cycle-b { bottom: 4px; left: 35px; transform: rotate(190deg); }
+.mini-cycle-arrow.cycle-b::after { top: -5px; right: -2px; }
+
+/* Biofilm cards stay visually quiet: the ordinary view shows stains, while
+   the water-quality overlay supplies the saturated analytical colour. */
+.biofilm-card .inventory-card-main { padding-right: 7px; }
+.biofilm-thumb {
+  background:
+    radial-gradient(ellipse at 24% 64%, rgba(98, 107, 86, 0.2) 0 18%, transparent 21%),
+    radial-gradient(ellipse at 68% 37%, rgba(98, 107, 86, 0.18) 0 22%, transparent 25%),
+    rgba(112, 157, 151, 0.12);
+}
+.biofilm-thumb i,
+.ghost-biofilm i {
+  position: absolute;
+  display: block;
+  width: 9px;
+  height: 7px;
+  border-radius: 53% 44% 57% 38%;
+  background: #8b7657;
+  box-shadow: 16px 6px 0 rgba(139, 118, 87, 0.62), 31px -3px 0 rgba(139, 118, 87, 0.48);
+  opacity: 0.76;
+}
+.biofilm-thumb i:nth-child(1) { top: 15px; left: 10px; transform: rotate(-10deg); }
+.biofilm-thumb i:nth-child(2) { top: 34px; left: 18px; transform: scale(0.75) rotate(9deg); }
+.biofilm-thumb i:nth-child(3) { top: 26px; left: 38px; transform: scale(0.62) rotate(-6deg); }
+.biofilm-thumb i:nth-child(4) { top: 10px; right: 13px; transform: scale(0.48); }
+.biofilm-nitrifier .biofilm-thumb i { background: #4f827d; box-shadow: 16px 6px 0 rgba(79, 130, 125, 0.62), 31px -3px 0 rgba(79, 130, 125, 0.48); }
+.ghost-biofilm {
+  position: relative;
+  display: block;
+  width: 58px;
+  height: 38px;
+  border: 1.5px dashed rgba(60, 79, 75, 0.5);
+  border-radius: 48%;
+  background: rgba(139, 118, 87, 0.12);
+}
+.ghost-biofilm i:nth-child(1) { top: 8px; left: 7px; }
+.ghost-biofilm i:nth-child(2) { top: 21px; left: 19px; transform: scale(0.72); }
+.ghost-biofilm i:nth-child(3) { top: 12px; right: 12px; transform: scale(0.58); }
+.ghost-biofilm.biofilm-nitrifier { background: rgba(79, 130, 125, 0.13); }
+.ghost-biofilm.biofilm-nitrifier i { background: #4f827d; box-shadow: 16px 6px 0 rgba(79, 130, 125, 0.58), 31px -3px 0 rgba(79, 130, 125, 0.44); }
+
+.water-quality-thumb { color: #426e68; background: rgba(89, 142, 135, 0.18); }
+.water-quality-thumb .measurement-icon { width: 36px; height: 36px; }
+.aquarium-canvas.tool-water-quality-probe { cursor: crosshair; }
+
+.water-quality-readout { display: grid; gap: 9px; margin-top: 9px; }
+.water-quality-channels {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.water-quality-channel {
+  display: grid;
+  min-width: 0;
+  min-height: 52px;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1.5px solid rgba(55, 76, 72, 0.34);
+  border-radius: 8px 6px 9px 7px;
+  background: rgba(247, 240, 217, 0.62);
+  color: #435651;
+  text-align: left;
+  cursor: pointer;
+}
+.water-quality-channel:hover,
+.water-quality-channel.active { border-color: #49766f; background: rgba(202, 226, 211, 0.76); }
+.water-quality-channel.primary {
+  box-shadow: inset 0 0 0 2px rgba(64, 103, 95, 0.34);
+}
+.water-quality-channel span { display: flex; min-width: 0; align-items: center; gap: 5px; font-size: 11px; white-space: nowrap; }
+.water-quality-channel span i,
+.species-dot.decomposer,
+.species-dot.nitrifier {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(47, 61, 57, 0.66);
+  border-radius: 50%;
+  background: #71847b;
+}
+.water-quality-channel strong {
+  overflow: hidden;
+  font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+}
+.channel-organicMatter span i { background: #8a7356; }
+.channel-toxicWaste span i { background: #b36f63; }
+.channel-nutrients span i { background: #b6964e; }
+.channel-oxygen span i { background: #588ba6; }
+.channel-decomposer span i,
+.species-dot.decomposer { background: #8b7657; }
+.channel-nitrifier span i,
+.species-dot.nitrifier { background: #4f827d; }
+
+.microbe-growth-readout {
+  display: grid;
+  gap: 0;
+  padding: 8px 9px;
+  border: 1.5px dashed rgba(54, 78, 73, 0.42);
+  border-radius: 8px 10px 7px 9px;
+  background: rgba(224, 230, 203, 0.34);
+}
+.microbe-growth-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 7px; padding-bottom: 4px; }
+.microbe-growth-heading > span { font-size: 12px; font-weight: 800; }
+.microbe-growth-heading small { color: #758079; font-size: 9px; white-space: nowrap; }
+.microbe-growth-readout > div:not(.microbe-growth-heading) {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 0;
+  border-top: 1px dashed rgba(48, 60, 58, 0.2);
+  font-size: 11px;
+}
+.microbe-growth-readout strong { font-family: "Apple SD Gothic Neo", sans-serif; font-variant-numeric: tabular-nums; }
+.microbe-growth-readout .positive strong { color: #477854; }
+.microbe-growth-readout .negative strong { color: #a35c55; }
+.water-quality-primary { margin-bottom: 4px; }
+
+.tank-analysis-toolbar {
+  position: absolute;
+  z-index: 48;
+  top: 68px;
+  left: 50%;
+  display: grid;
+  width: min(620px, calc(100% - 56px));
+  gap: 5px;
+  padding: 8px 10px 9px;
+  border: 2px solid rgba(42, 59, 56, 0.86);
+  border-radius: 8px 11px 7px 10px;
+  background: rgba(248, 241, 216, 0.94);
+  box-shadow: 4px 5px 0 rgba(37, 53, 50, 0.2);
+  color: #344844;
+  transform: translateX(-50%);
+  pointer-events: auto;
+}
+.tank-first-screen.has-placement-toolbar .tank-analysis-toolbar { top: 142px; }
+.tank-first-screen.has-right-panel .tank-analysis-toolbar {
+  left: calc(50% - clamp(150px, 13.5vw, 186px) - 10px);
+  width: min(620px, calc(100% - clamp(300px, 27vw, 372px) - 56px));
+}
+.tank-first-screen.has-inventory-panel.has-right-panel .tank-analysis-toolbar {
+  left: 50%;
+  width: min(
+    620px,
+    calc(100% - clamp(276px, 25vw, 346px) - clamp(300px, 27vw, 372px) - 62px)
+  );
+}
+.tank-analysis-heading {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+}
+.tank-analysis-heading > span {
+  color: #6b7e78;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+.tank-analysis-heading strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.tank-analysis-heading strong i,
+.tank-analysis-channel-strip button i {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(42, 59, 56, 0.56);
+  border-radius: 50%;
+  background: #71847b;
+}
+.tank-analysis-heading button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0 0 2px;
+  place-items: center;
+  border: 1.5px solid rgba(47, 64, 60, 0.68);
+  border-radius: 50%;
+  background: rgba(255, 249, 226, 0.82);
+  color: #485b56;
+  font-size: 18px;
+  line-height: 1;
+}
+.tank-analysis-selected-layers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-height: 112px;
+  gap: 4px;
+  overflow-y: auto;
+}
+.tank-analysis-selected-row {
+  display: grid;
+  grid-template-columns: 9px auto auto minmax(0, 1fr);
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 5px;
+  border: 1px solid rgba(50, 70, 65, 0.2);
+  border-radius: 5px 7px 5px 6px;
+  background: rgba(255, 249, 226, 0.46);
+}
+.tank-analysis-selected-row > i {
+  width: 8px;
+  height: 8px;
+  border: 1px solid rgba(42, 59, 56, 0.5);
+  border-radius: 50%;
+  background: #71847b;
+}
+.tank-analysis-selected-row > strong { font-size: 10px; }
+.tank-analysis-selected-row > span { color: #64736d; font-size: 8px; white-space: nowrap; }
+.tank-analysis-selected-row > small {
+  min-width: 0;
+  overflow: hidden;
+  color: #68766f;
+  font-family: "Apple SD Gothic Neo", sans-serif;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tank-analysis-selected-row.channel-organicMatter > i { background: #8a7356; }
+.tank-analysis-selected-row.channel-toxicWaste > i { background: #b85f5e; }
+.tank-analysis-selected-row.channel-nutrients > i { background: #7c9f55; }
+.tank-analysis-selected-row.channel-oxygen > i { background: #5babc0; }
+.tank-analysis-selected-row.channel-decomposer > i { background: #c98246; }
+.tank-analysis-selected-row.channel-nitrifier > i { background: #49a49c; }
+.tank-analysis-scale {
+  height: 9px;
+  border: 1px solid rgba(42, 59, 56, 0.56);
+  border-radius: 999px;
+  background: linear-gradient(90deg, #e5dfc9, #71847b);
+}
+.tank-analysis-scale.channel-organicMatter { background: linear-gradient(90deg, #e8ddc0, #8a5836); }
+.tank-analysis-scale.channel-toxicWaste { background: linear-gradient(90deg, #e2d8d0, #c14f5f); }
+.tank-analysis-scale.channel-nutrients { background: linear-gradient(90deg, #e6dfb8, #6d9f5b); }
+.tank-analysis-scale.channel-oxygen { background: linear-gradient(90deg, #3f6173, #65c7cf); }
+.tank-analysis-scale.channel-decomposer { background: linear-gradient(90deg, #eee2c7, #c98246); }
+.tank-analysis-scale.channel-nitrifier { background: linear-gradient(90deg, #dce7d8, #49a49c); }
+.tank-analysis-values {
+  display: flex;
+  min-height: 14px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #5d706a;
+  font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.tank-analysis-values > strong { width: 100%; color: #7c6552; text-align: center; }
+.tank-analysis-values b { color: #304943; }
+.tank-analysis-method {
+  display: block;
+  margin: 2px 0 5px;
+  color: #65736e;
+  font-family: "Apple SD Gothic Neo", sans-serif;
+  font-size: 9px;
+  text-align: center;
+}
+.tank-analysis-channel-strip {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 4px;
+}
+.tank-analysis-channel-strip button {
+  display: flex;
+  min-width: 0;
+  min-height: 27px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px;
+  overflow: hidden;
+  border: 1px solid rgba(50, 70, 65, 0.32);
+  border-radius: 6px 8px 5px 7px;
+  background: rgba(255, 249, 226, 0.5);
+  color: #53645f;
+  font-size: 9px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tank-analysis-channel-strip button.active {
+  border-color: #315f58;
+  background: #cfe4d8;
+  box-shadow: inset 0 0 0 1px rgba(255, 251, 233, 0.72);
+  color: #284b46;
+}
+.tank-analysis-toolbar.analysis-organicMatter .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-organicMatter i { background: #8a7356; }
+.tank-analysis-toolbar.analysis-toxicWaste .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-toxicWaste i { background: #b85f5e; }
+.tank-analysis-toolbar.analysis-nutrients .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-nutrients i { background: #7c9f55; }
+.tank-analysis-toolbar.analysis-oxygen .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-oxygen i { background: #5babc0; }
+.tank-analysis-toolbar.analysis-decomposer .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-decomposer i { background: #c98246; }
+.tank-analysis-toolbar.analysis-nitrifier .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-nitrifier i { background: #49a49c; }
+
+@media (max-width: 860px) {
+  .tank-analysis-toolbar { top: 62px; width: calc(100% - 32px); }
+  .tank-analysis-selected-layers { grid-template-columns: 1fr; max-height: 92px; }
+  .tank-analysis-channel-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.water-quality-primary strong { font-size: 21px; }
+
+.compact-observation .water-record-divider {
+  margin-top: 3px;
+  border-top: 1.5px dashed rgba(48, 60, 58, 0.34);
+}
+.compact-observation .species-dot.decomposer,
+.compact-observation .species-dot.nitrifier { display: inline-block; margin-right: 6px; vertical-align: 1px; }
+
+@media (max-height: 720px) {
+  .water-quality-channel { min-height: 44px; padding: 5px 7px; }
+  .microbe-growth-readout { padding: 6px 8px; }
 }

@@ -104,6 +104,7 @@ export const commandRebasesMotion = (command: SimulationCommand): boolean => {
     case 'pick-structure':
     case 'pick-seed':
     case 'pick-animal':
+    case 'pick-biofilm':
     case 'pick-at':
     case 'rotate-held':
     case 'retrieve-structure':
@@ -124,6 +125,7 @@ const sameHoldingIdentity = (
     case 'structure': return first.structureId === second.structureId;
     case 'animal': return first.animalId === second.animalId;
     case 'seed': return first.speciesId === second.speciesId;
+    case 'biofilm': return first.microbeGuildId === second.microbeGuildId;
   }
 };
 

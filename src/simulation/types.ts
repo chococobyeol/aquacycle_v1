@@ -13,7 +13,13 @@ export const GROUND_Y = 646;
 export const MOTION_SAMPLE_RATE_HZ = 30;
 export const MOTION_SAMPLE_INTERVAL_MS = 1000 / MOTION_SAMPLE_RATE_HZ;
 
-export type ScenarioId = 'mission-1' | 'mission-2' | 'mission-3' | 'mission-4' | 'laboratory';
+export type ScenarioId =
+  | 'mission-1'
+  | 'mission-2'
+  | 'mission-3'
+  | 'mission-4'
+  | 'mission-5'
+  | 'laboratory';
 export type SimulationMode = 'challenge' | 'laboratory';
 export type SimulationPhase = 'setup' | 'running' | 'paused';
 export type MissionOutcome = 'pending' | 'success' | 'failure';
@@ -29,12 +35,20 @@ export type AnimalBehavior =
   | 'resting'
   | 'starving';
 export type AnimalReproductiveState = 'none' | 'ready' | 'berried';
-export type AnimalDeathCause = 'starvation' | 'old-age';
+export type AnimalDeathCause = 'starvation' | 'old-age' | 'hypoxia' | 'toxicity';
+export type AnimalPopulationEventKind = 'introduced' | 'removed' | 'birth' | 'matured' | 'death';
 export type StructureDefinitionId = 'flat-stone' | 'round-stone' | 'tall-stone';
-export type InteractionTool = 'select' | 'move' | 'light-probe' | 'temperature-probe';
+export type MicrobeGuildId = 'decomposer' | 'nitrifier';
+export type WaterQualityVariable = 'organicMatter' | 'toxicWaste' | 'nutrients' | 'oxygen';
+export type InteractionTool =
+  | 'select'
+  | 'move'
+  | 'light-probe'
+  | 'temperature-probe'
+  | 'water-quality-probe';
 export type InventoryCategory = 'structures' | 'organisms' | 'instruments';
 export type SelectionFilter = 'all' | 'structure' | 'organism' | 'measurement';
-export type MeasurementKind = 'light' | 'temperature';
+export type MeasurementKind = 'light' | 'temperature' | 'water-quality';
 export type GrowthTrend = 'growing' | 'stable' | 'declining';
 export type SurfaceKind = 'structure-face' | 'substrate';
 
@@ -46,6 +60,18 @@ export interface Vec2 {
 export interface SpeciesBiomass {
   oedogonium: number;
   nitzschia: number;
+}
+
+export interface BiofilmBiomass {
+  decomposer: number;
+  nitrifier: number;
+}
+
+export interface WaterQualityValues {
+  organicMatter: number;
+  toxicWaste: number;
+  nutrients: number;
+  oxygen: number;
 }
 
 export interface StructureSnapshot {
@@ -75,6 +101,7 @@ export interface SurfaceCellSnapshot {
   cellSize: number;
   light: number;
   biomass: SpeciesBiomass;
+  biofilm: BiofilmBiomass;
   targetEligible: boolean;
 }
 
@@ -110,9 +137,9 @@ export interface AnimalSnapshot {
 }
 
 /**
- * A short-lived visual record of an animal's death. The body chemistry is
- * recorded separately; this snapshot only preserves the pose needed to draw
- * the carcass and its visual lifetime.
+ * A short-lived visual and diagnostic record of an animal's death. It keeps
+ * the pose needed to draw the carcass together with the local water sample at
+ * the instant of death; decomposition chemistry is still tracked separately.
  */
 export interface AnimalCarcassSnapshot {
   id: string;
@@ -125,6 +152,7 @@ export interface AnimalCarcassSnapshot {
   bodyLength: number;
   lifeStage: AnimalLifeStage;
   cause: AnimalDeathCause;
+  waterAtDeath: WaterQualityValues | null;
   ageSeconds: number;
   lifetimeSeconds: number;
   progress: number;
@@ -134,18 +162,79 @@ export interface AnimalPopulationSnapshot {
   total: number;
   adults: number;
   juveniles: number;
+  adultFemales: number;
+  adultMales: number;
+  juvenileFemales: number;
+  juvenileMales: number;
+}
+
+/**
+ * Persistent diagnostic record. Unlike a carcass, this remains available
+ * after the visual body has decomposed so a long-running extinction can be
+ * reconstructed from sex, life stage, cause and local water conditions.
+ */
+export interface AnimalPopulationEventSnapshot {
+  sequence: number;
+  kind: AnimalPopulationEventKind;
+  elapsedSeconds: number;
+  animalId: string;
+  speciesId: AnimalSpeciesId;
+  lifeStage: AnimalLifeStage;
+  sex: AnimalSex;
+  x: number;
+  y: number;
+  ageSeconds: number;
+  energy: number;
+  cause: AnimalDeathCause | null;
+  parentId: string | null;
+  water: WaterQualityValues | null;
+}
+
+export interface AnimalPopulationEventTotals {
+  introduced: number;
+  removed: number;
+  births: number;
+  maturations: number;
+  deaths: number;
+  deathsByCause: Record<AnimalDeathCause, number>;
+}
+
+export interface WaterQualityFieldSnapshot {
+  columns: number;
+  rows: number;
+  organicMatter: number[];
+  toxicWaste: number[];
+  nutrients: number[];
+  oxygen: number[];
+  revision: number;
 }
 
 export interface BiogeochemistrySnapshot {
-  effectsEnabled: false;
+  effectsEnabled: boolean;
   potentialOxygenProduction: number;
   potentialOxygenDemand: number;
   dissolvedWasteProduced: number;
   detritusMass: number;
+  water: WaterQualityFieldSnapshot;
+  average: WaterQualityValues;
+  biofilmTotals: BiofilmBiomass;
+  carbonCycle: {
+    dissolvedInorganicCarbon: number;
+    headspaceCarbonDioxide: number;
+    headspaceOxygen: number;
+  };
+  materialBalance: {
+    totalNitrogen: number;
+    totalCarbon: number;
+    referenceNitrogen: number | null;
+    referenceCarbon: number | null;
+    nitrogenDriftRatio: number;
+    carbonDriftRatio: number;
+  };
 }
 
 export interface HoldingSnapshot {
-  kind: 'structure' | 'seed' | 'animal';
+  kind: 'structure' | 'seed' | 'animal' | 'biofilm';
   source: 'inventory' | 'existing';
   valid: boolean;
   x: number;
@@ -155,6 +244,7 @@ export interface HoldingSnapshot {
   speciesId?: SpeciesId;
   animalId?: string;
   animalSpeciesId?: AnimalSpeciesId;
+  microbeGuildId?: MicrobeGuildId;
 }
 
 export interface LightFieldSnapshot {
@@ -172,6 +262,9 @@ export interface ProbeSnapshot {
   locationLabel: string;
   surfaceCellId?: string;
   trends: Record<SpeciesId, GrowthTrend>;
+  water: WaterQualityValues;
+  biofilm: BiofilmBiomass;
+  microbeNetGrowth: Record<MicrobeGuildId, number>;
 }
 
 export interface MeasurementSnapshot extends ProbeSnapshot {
@@ -203,7 +296,7 @@ export interface SelectionSnapshot {
 export interface MissionProgressSnapshot {
   current: number;
   target: number;
-  unit: 'coverage' | 'habitat-coverage' | 'biomass' | 'adult-count';
+  unit: 'coverage' | 'habitat-coverage' | 'biomass' | 'adult-count' | 'population-count';
   label: string;
   ratio: number;
   holdCurrent: number;
@@ -236,10 +329,13 @@ export interface SimulationSnapshot {
   selection: SelectionSnapshot | null;
   remainingSeeds: Record<SpeciesId, number | null>;
   remainingAnimals: Record<AnimalSpeciesId, number | null>;
+  remainingMicrobes: Record<MicrobeGuildId, number | null>;
   remainingStructures: Record<StructureDefinitionId, number | null>;
   totalBiomass: SpeciesBiomass;
   totalAlgaeConsumed: number;
   animalPopulation: Record<AnimalSpeciesId, AnimalPopulationSnapshot>;
+  animalPopulationEvents: AnimalPopulationEventSnapshot[];
+  animalPopulationEventTotals: AnimalPopulationEventTotals;
   biogeochemistry: BiogeochemistrySnapshot;
   coverageRatio: number;
   missionProgress: MissionProgressSnapshot | null;
@@ -258,6 +354,7 @@ export type SimulationCommand =
   | { type: 'pick-structure'; definitionId: StructureDefinitionId; point?: Vec2 }
   | { type: 'pick-seed'; speciesId: SpeciesId; point?: Vec2 }
   | { type: 'pick-animal'; speciesId: AnimalSpeciesId; point?: Vec2 }
+  | { type: 'pick-biofilm'; guildId: MicrobeGuildId; point?: Vec2 }
   | { type: 'pick-at'; point: Vec2 }
   | { type: 'select-at'; point: Vec2; filter: SelectionFilter }
   | { type: 'select-region'; from: Vec2; to: Vec2; filter: 'organism' }

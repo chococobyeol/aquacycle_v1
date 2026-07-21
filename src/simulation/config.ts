@@ -1,9 +1,11 @@
 import type {
   AnimalSpeciesId,
+  MicrobeGuildId,
   ScenarioId,
   SpeciesId,
   StructureDefinitionId,
   Vec2,
+  WaterQualityValues,
 } from './types';
 
 // This is the lowest biomass that is actually drawn as a colony in the tank.
@@ -31,6 +33,187 @@ export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
     adultLength: '성체 약 2~3cm',
     color: 0xcf6f61,
     accentColor: '#cf6f61',
+  },
+};
+
+/**
+ * Player-facing ecology constants. Keeping the numbers used by the simulation
+ * and the numbers printed in the guide in one module prevents the handbook
+ * from silently drifting away from the actual model.
+ */
+export const WATER_CYCLE_RULES = {
+  // All living and dead biomass uses one gameplay matter unit with a fixed
+  // carbon:nitrogen composition.  This is deliberately simpler than a full
+  // C/N/P model, but it lets every transformation close an auditable carbon
+  // and nitrogen balance instead of creating water-quality values from time.
+  biomassNitrogen: 0.08,
+  biomassCarbon: 0.32,
+  initialDissolvedInorganicCarbon: 58,
+  initialHeadspaceCarbonDioxide: 22,
+  initialHeadspaceOxygen: 76,
+  carbonHalfSaturation: 8,
+  mineralNutrientHalfSaturation: 3.5,
+  detritusSolubilizationRate: 0.009,
+  closedGasExchangeRate: 0.018,
+  // Includes the oxygen margin needed to close the compressed decomposition,
+  // animal respiration and nitrification loop. At 0.92 each complete matter
+  // cycle lost oxygen; 1.12 balances multi-generation four-hour runs while a
+  // consumer-heavy or poorly lit tank can still become hypoxic.
+  oxygenPerFixedCarbon: 1.12,
+  algae: {
+    // Ammonium is used first, with nitrate/other mineral nutrients filling the
+    // remainder.  Uptake is charged only for newly fixed biomass.
+    ammoniumPreference: 0.72,
+  },
+  shrimp: {
+    assimilationFraction: 0.30,
+    fecesFraction: 0.42,
+    respirationFraction: 0.28,
+    adultMaintenanceBiomassPerSecond: 0.000055,
+    juvenileMaintenanceBiomassPerSecond: 0.000032,
+    oxygenPerRespiredCarbon: 0.86,
+    adultStructuralBiomass: 1,
+    juvenileBirthBiomass: 0.16,
+    suppliedReserveBiomass: 0.08,
+    juvenileBodyScale: 0.58,
+    // Adults cannot retain every bite indefinitely. Excess assimilation is
+    // returned to detritus, so a well-fed male does not become a permanent
+    // carbon/nitrogen sink and an eventual oversized pollution pulse.
+    adultReserveBiomass: 0.72,
+    juvenileReserveBiomass: 1.05,
+  },
+} as const;
+
+/**
+ * Unresolved water motion.  The grid still preserves local hot spots, but a
+ * small conservative whole-tank exchange represents convection, animal
+ * movement and ordinary circulation that would otherwise require a full
+ * fluid solver.
+ */
+export const WATER_TRANSPORT_RULES = {
+  localDiffusionPerSecond: {
+    organicMatter: 0.045,
+    toxicWaste: 0.09,
+    nutrients: 0.07,
+    oxygen: 0.12,
+  },
+  bulkMixingPerSecond: {
+    organicMatter: 0.008,
+    toxicWaste: 0.022,
+    nutrients: 0.011,
+    oxygen: 0.022,
+  },
+} as const;
+
+/**
+ * Compressed Monod-style film kinetics.  Heterotrophs respond faster to an
+ * organic pulse and also lose active biomass faster when starved.  Nitrifiers
+ * grow more slowly, have a lower yield and persist longer at low loading.
+ * The rates are deliberately gameplay-compressed, but retain those measured
+ * relative behaviours rather than treating both guilds as interchangeable.
+ */
+export const MICROBE_ECOLOGY_RULES = {
+  decomposer: {
+    substrate: 'organicMatter',
+    halfSaturation: 4,
+    oxygenHalfSaturation: 14,
+    // biomass-equivalent organic matter consumed per unit film and second
+    maximumUptake: 0.11,
+    biomassYield: 0.42,
+    maintenanceDecayRate: 0.0022,
+    starvationDecayRate: 0.013,
+    oxygenPerSubstrate: 0.21,
+    surfaceSpreadRate: 0.025,
+    waterborneExportRate: 0.0007,
+    suspendedDecayRate: 0.025,
+  },
+  nitrifier: {
+    substrate: 'toxicWaste',
+    halfSaturation: 5,
+    oxygenHalfSaturation: 24,
+    // toxic nitrogen consumed per unit film and second; biomassYield is the
+    // fraction of processed nitrogen retained in new film.
+    maximumUptake: 0.025,
+    biomassYield: 0.11,
+    maintenanceDecayRate: 0.0012,
+    starvationDecayRate: 0.0035,
+    oxygenPerSubstrate: 0.72,
+    surfaceSpreadRate: 0.012,
+    waterborneExportRate: 0.00035,
+    suspendedDecayRate: 0.008,
+  },
+  settlementAttemptsPerSecond: 8,
+  settlementFractionPerAttempt: 0.16,
+  minimumSettlement: 0.00035,
+} as const;
+
+export const SHRIMP_ECOLOGY_RULES = {
+  minimumLifespanSeconds: 900,
+  maximumLifespanSeconds: 1350,
+  // Inventory shrimp arrive as young adults. The individual ID may seed the
+  // variation, but its magnitude must never make later introductions older.
+  suppliedAdultMinimumAgeSeconds: 180,
+  suppliedAdultMaximumAgeSeconds: 300,
+  adultBaseMetabolismPerSecond: 0.005,
+  juvenileBaseMetabolismPerSecond: 0.003,
+  restingActivityCostPerSecond: 0.0002,
+  grazingActivityCostPerSecond: 0.0008,
+  travelingActivityCostPerSecond: 0.0018,
+  // A bite that is large enough to fill the physical reserve must also cover
+  // ordinary movement/metabolism. The former 0.08 value let well-fed animals
+  // reach the reserve cap while their abstract hunger meter still hit zero.
+  energyPerConsumedBiomass: 0.18,
+  maximumBiteBiomassPerSecond: 0.375,
+  oxygenStressStart: 30,
+  oxygenMaximumDamagePerSecond: 0.025,
+  toxicWasteStressStart: 6,
+  toxicWasteFullStress: 24,
+  toxicMaximumDamagePerSecond: 0.032,
+  healthyWaterRecoveryPerSecond: 0.004,
+  reproductionEnergy: 0.34,
+  maleReproductionEnergy: 0.34,
+  gestationEnergy: 0.30,
+  matingRecentFeedingSeconds: 12,
+  gestationRecentFeedingSeconds: 24,
+  maturationSeconds: 180,
+  // The visual population represents a compressed colony. Every completed
+  // brood therefore contains at least one individual of each sex (IDs are
+  // assigned alternately), avoiding a one-offspring demographic dead end.
+  minimumClutchSize: 2,
+  maximumClutchSize: 3,
+} as const;
+
+export interface MicrobeDefinition {
+  id: MicrobeGuildId;
+  displayName: string;
+  scientificRole: string;
+  color: number;
+  accentColor: string;
+  description: string;
+  foodLabel: string;
+  productLabel: string;
+}
+
+export const MICROBES: Record<MicrobeGuildId, MicrobeDefinition> = {
+  decomposer: {
+    id: 'decomposer',
+    displayName: '분해균 필름',
+    scientificRole: '종속영양 분해자 군집',
+    color: 0x8b7657,
+    accentColor: '#8b7657',
+    description: '표면에 붙어 유기물을 분해합니다. 유기물이 늘면 빠르게 증가하고, 고갈되면 다시 줄어듭니다.',
+    foodLabel: '유기물 + 산소',
+    productLabel: '암모니아성 노폐물',
+  },
+  nitrifier: {
+    id: 'nitrifier',
+    displayName: '질산화균 필름',
+    scientificRole: '통합 질산화 군집',
+    color: 0x4f827d,
+    accentColor: '#4f827d',
+    description: '산소를 사용해 암모니아성 노폐물을 영양염으로 바꿉니다. 분해균보다 느리게 늘지만 먹이가 적어도 더 오래 유지됩니다.',
+    foodLabel: '암모니아성 노폐물 + 산소',
+    productLabel: '영양염',
   },
 };
 
@@ -248,6 +431,11 @@ export interface ScenarioDefinition {
   requiredSeedSpecies: SpeciesId[];
   allowedAnimals: AnimalSpeciesId[];
   allowedStructures: StructureDefinitionId[];
+  waterCycle: {
+    initial: WaterQualityValues;
+    microbeBudget: Record<MicrobeGuildId, number | null>;
+    allowedMicrobes: MicrobeGuildId[];
+  } | null;
   target:
     | {
         type: 'coverage';
@@ -274,6 +462,13 @@ export interface ScenarioDefinition {
       }
     | {
         type: 'adult-population';
+        speciesId: AnimalSpeciesId;
+        count: number;
+        holdSeconds: number;
+        label: string;
+      }
+    | {
+        type: 'population-survival';
         speciesId: AnimalSpeciesId;
         count: number;
         holdSeconds: number;
@@ -307,6 +502,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     requiredSeedSpecies: ['oedogonium'],
     allowedAnimals: [],
     allowedStructures: ['flat-stone'],
+    waterCycle: null,
     target: { type: 'coverage', ratio: 0.32, holdSeconds: 3, label: '붓뚜껑말 표면 점유' },
     targetIncludesSubstrate: false,
   },
@@ -333,6 +529,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     requiredSeedSpecies: ['nitzschia'],
     allowedAnimals: [],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    waterCycle: null,
     target: {
       type: 'habitat-coverage',
       speciesId: 'nitzschia',
@@ -368,6 +565,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     requiredSeedSpecies: ['oedogonium'],
     allowedAnimals: [],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    waterCycle: null,
     target: {
       type: 'biomass',
       speciesId: 'oedogonium',
@@ -399,6 +597,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     requiredSeedSpecies: [],
     allowedAnimals: ['cherry-shrimp'],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    waterCycle: null,
     target: {
       type: 'adult-population',
       speciesId: 'cherry-shrimp',
@@ -408,18 +607,59 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     targetIncludesSubstrate: true,
   },
+  'mission-5': {
+    id: 'mission-5',
+    mode: 'challenge',
+    title: '다섯 번째 실험 · 보이지 않는 순환',
+    subtitle: '체리새우 군집의 장기 생존',
+    instruction: '수조의 변화를 관찰하며 체리새우 군집이 끊기지 않도록 오래 유지하세요.',
+    briefing: {
+      question: '눈에 잘 보이지 않는 분해자들이 수조의 장기 생존을 어떻게 바꿀까요?',
+      goal: '체리새우 군집이 한 번도 사라지지 않은 상태로 15분의 시뮬레이션 시간을 유지하세요.',
+      success: '수질 수치나 접종 방법은 채점하지 않으며, 살아 있는 체리새우가 계속 존재하면 생존 시간이 누적됩니다.',
+      supplied: '체리새우 성체 4마리 · 두 조류 접종 각 4회 · 세 종류의 구조물 무제한 · 두 균 필름 접종 · 수질 탐침',
+    },
+    timeLimitSeconds: 1_200,
+    lightOutput: 88,
+    seedBudget: { oedogonium: 4, nitzschia: 4 },
+    animalBudget: { 'cherry-shrimp': 4 },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    requiredStructures: {},
+    allowedSpecies: ['oedogonium', 'nitzschia'],
+    requiredSeedSpecies: [],
+    allowedAnimals: ['cherry-shrimp'],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    waterCycle: {
+      initial: {
+        organicMatter: 1.5,
+        toxicWaste: 0.8,
+        nutrients: 46,
+        oxygen: 76,
+      },
+      microbeBudget: { decomposer: null, nitrifier: null },
+      allowedMicrobes: ['decomposer', 'nitrifier'],
+    },
+    target: {
+      type: 'population-survival',
+      speciesId: 'cherry-shrimp',
+      count: 1,
+      holdSeconds: 900,
+      label: '체리새우 군집 생존',
+    },
+    targetIncludesSubstrate: true,
+  },
   laboratory: {
     id: 'laboratory',
     mode: 'laboratory',
     title: '실험실',
-    subtitle: '조류와 체리새우 자유 실험',
+    subtitle: '수중 생태계 자유 실험',
     instruction:
-      '돌, 두 조류, 체리새우와 광원을 자유롭게 시험하세요. 실행한 뒤에는 일시정지해야 배치를 다시 바꿀 수 있습니다.',
+      '돌, 조류, 체리새우, 균막과 수질 순환을 자유롭게 시험하세요. 실행한 뒤에는 일시정지해야 배치를 다시 바꿀 수 있습니다.',
     briefing: {
       question: '자유 실험실에서 어떤 수중 환경을 만들고 싶나요?',
       goal: '정해진 성공 조건 없이 구조, 빛, 온도, 군락과 개체군 변화를 관찰합니다.',
       success: '실험실에는 성공·실패 판정이 없습니다.',
-      supplied: '모든 구조물 · 두 조류 · 체리새우 · 광량 탐침 · 수온계 · 광원 출력 조절',
+      supplied: '모든 구조물 · 두 조류 · 체리새우 · 두 균 필름 · 수질 탐침 · 광원 출력 조절',
     },
     timeLimitSeconds: null,
     lightOutput: 90,
@@ -431,6 +671,16 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     requiredSeedSpecies: [],
     allowedAnimals: ['cherry-shrimp'],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    waterCycle: {
+      initial: {
+        organicMatter: 3,
+        toxicWaste: 1.5,
+        nutrients: 50,
+        oxygen: 76,
+      },
+      microbeBudget: { decomposer: null, nitrifier: null },
+      allowedMicrobes: ['decomposer', 'nitrifier'],
+    },
     target: null,
     targetIncludesSubstrate: true,
   },

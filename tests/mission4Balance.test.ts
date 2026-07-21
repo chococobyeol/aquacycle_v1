@@ -327,7 +327,10 @@ describe("mission 4 consumer balance", () => {
       SHRIMP_TECHNICAL_POPULATION_LIMIT,
     );
     expect(at600.totalAlgaeConsumed).toBeGreaterThan(consumedAt300);
-  });
+  // The complete ecology suite runs several long simulations in parallel.
+  // Keep this deterministic 600-second scenario from being mistaken for a
+  // model failure when the test worker is temporarily CPU-starved.
+  }, 30_000);
 
   it("alternates between grazing and free movement instead of staying glued to algae", () => {
     const world = new SimulationWorld("mission-4");

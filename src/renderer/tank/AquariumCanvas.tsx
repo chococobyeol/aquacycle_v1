@@ -7,10 +7,12 @@ import {
   Sprite,
   Texture,
   Ticker,
+  UPDATE_PRIORITY,
 } from 'pixi.js';
 import { useEffect, useRef, useState } from 'react';
 import {
   ALGAE_VISIBLE_BIOMASS,
+  MICROBES,
   SCENARIOS,
   SPECIES,
   STRUCTURES,
@@ -24,12 +26,14 @@ import {
   type AnimalCarcassSnapshot,
   type AnimalSnapshot,
   type InteractionTool,
+  type MicrobeGuildId,
   type SelectionFilter,
   type SimulationCommand,
   type SimulationSnapshot,
   type StructureSnapshot,
   type SurfaceCellSnapshot,
   type Vec2,
+  type WaterQualityVariable,
 } from '../../simulation/types';
 import {
   structureAuthoredPolygonToWorld,
@@ -73,6 +77,13 @@ import {
   reconcileMotionWithSnapshot,
   reconcileStructureMotionWithSnapshot,
 } from './motionInterpolation';
+import {
+  normalizeWaterQualityForDisplay,
+  normalizeWaterQualityValue,
+  waterQualityVisualRange,
+  waterQualityOverlayAlpha,
+  type WaterQualityLayer,
+} from './waterQualityOverlay';
 
 interface AquariumCanvasProps {
   snapshot: SimulationSnapshot;
@@ -82,12 +93,14 @@ interface AquariumCanvasProps {
   send: (command: SimulationCommand) => void;
   editable: boolean;
   hasPendingInventory: boolean;
+  pendingInventoryKey: string | null;
   onConsumePendingInventory: (point: Vec2) => void;
   onPendingInventoryReady: () => void;
-  onToolComplete: () => void;
+  onToolComplete: (completedTool: InteractionTool) => void;
   onCameraChange?: (transform: AquariumCameraTransform) => void;
   cameraResetToken?: number;
   showGoalGuide?: boolean;
+  waterQualityLayers: readonly WaterQualityLayer[];
 }
 
 export interface AquariumCameraTransform {
@@ -156,6 +169,9 @@ export const isSecondaryPointerGesture = (
   button: number,
   ctrlKey: boolean,
 ): boolean => button === 2 || (button === 0 && ctrlKey);
+
+const isProbeInteractionTool = (tool: InteractionTool): boolean =>
+  tool === 'light-probe' || tool === 'temperature-probe' || tool === 'water-quality-probe';
 
 const algaeKeyNumber = (value: number): number => Math.round(value * 1000) / 1000;
 
@@ -298,6 +314,7 @@ interface AquariumLayers {
   foreground: Graphics;
   structures: Container;
   algae: Container;
+  analysis: Sprite;
   animals: Container;
   goalGuide: Graphics;
   seeds: Graphics;
@@ -316,6 +333,13 @@ interface RasterSurface {
 }
 
 const rasterSurfaces = new WeakMap<Sprite, RasterSurface>();
+
+interface AnalysisGridSurface {
+  canvas: HTMLCanvasElement;
+  context: CanvasRenderingContext2D;
+}
+
+const analysisGridSurfaces = new WeakMap<Sprite, AnalysisGridSurface>();
 
 const getRasterSurface = (layer: Sprite, width: number, height: number): RasterSurface | null => {
   const existing = rasterSurfaces.get(layer);
@@ -342,6 +366,29 @@ const releaseRasterSurface = (layer: Sprite): void => {
   const surface = rasterSurfaces.get(layer);
   if (surface && !surface.texture.destroyed) surface.texture.destroy(true);
   rasterSurfaces.delete(layer);
+};
+
+const getAnalysisGridSurface = (
+  layer: Sprite,
+  width: number,
+  height: number,
+): AnalysisGridSurface | null => {
+  const existing = analysisGridSurfaces.get(layer);
+  if (existing && existing.canvas.width === width && existing.canvas.height === height) {
+    return existing;
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  const surface = { canvas, context };
+  analysisGridSurfaces.set(layer, surface);
+  return surface;
+};
+
+const releaseAnalysisGridSurface = (layer: Sprite): void => {
+  analysisGridSurfaces.delete(layer);
 };
 
 const rasterizeStructureTexture = async (
@@ -552,6 +599,286 @@ const drawLightField = (
   texture.source.update();
   layer.position.set(0, WATER_TOP);
   layer.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+};
+
+const ANALYSIS_RASTER_SCALE = 0.5;
+
+const WATER_QUALITY_PALETTES: Record<WaterQualityVariable, {
+  low: number;
+  high: number;
+}> = {
+  organicMatter: { low: 0xf1e2b4, high: 0x6b341d },
+  toxicWaste: { low: 0xd4e2dc, high: 0xd53b4f },
+  nutrients: { low: 0xead58d, high: 0x348c50 },
+  oxygen: { low: 0x3f6173, high: 0x55cad5 },
+};
+
+const isMicrobeLayer = (
+  layer: WaterQualityVariable | MicrobeGuildId | null,
+): layer is MicrobeGuildId => layer === 'decomposer' || layer === 'nitrifier';
+
+const SECONDARY_WATER_COLORS: Record<WaterQualityVariable, string> = {
+  organicMatter: '#6f4c2f',
+  toxicWaste: '#c64358',
+  nutrients: '#5c914c',
+  oxygen: '#49a9c1',
+};
+
+const WATER_QUALITY_DRAW_ORDER: readonly WaterQualityVariable[] = [
+  'organicMatter',
+  'toxicWaste',
+  'nutrients',
+  'oxygen',
+];
+
+interface ContourPoint {
+  x: number;
+  y: number;
+}
+
+const contourCrossing = (
+  first: ContourPoint,
+  second: ContourPoint,
+  firstValue: number,
+  secondValue: number,
+  threshold: number,
+): ContourPoint | null => {
+  if ((firstValue < threshold) === (secondValue < threshold)) return null;
+  const difference = secondValue - firstValue;
+  const ratio = Math.abs(difference) < 0.000001
+    ? 0.5
+    : Math.max(0, Math.min(1, (threshold - firstValue) / difference));
+  return {
+    x: first.x + (second.x - first.x) * ratio,
+    y: first.y + (second.y - first.y) * ratio,
+  };
+};
+
+/**
+ * When several dissolved fields are selected, every field is drawn as the
+ * same kind of contour line. This makes the result independent of click order
+ * and avoids implying that a hatch direction is a biological property.
+ */
+const drawWaterQualityContours = (
+  context: CanvasRenderingContext2D,
+  snapshot: SimulationSnapshot,
+  selectedLayer: WaterQualityVariable,
+  rasterWidth: number,
+  rasterHeight: number,
+): void => {
+  const water = snapshot.biogeochemistry.water;
+  if (water.columns < 2 || water.rows < 2) return;
+  const values = water[selectedLayer];
+  const visualRange = waterQualityVisualRange(selectedLayer, values);
+  const normalizedValues = values.map((value) =>
+    normalizeWaterQualityForDisplay(selectedLayer, value, visualRange));
+  const pointAt = (column: number, row: number): ContourPoint => ({
+    x: ((column + 0.5) / water.columns) * rasterWidth,
+    y: ((row + 0.5) / water.rows) * rasterHeight,
+  });
+  const valueAt = (column: number, row: number): number =>
+    normalizedValues[row * water.columns + column] ?? 0;
+  const drawSegment = (first: ContourPoint, second: ContourPoint): void => {
+    context.moveTo(first.x, first.y);
+    context.lineTo(second.x, second.y);
+  };
+
+  context.save();
+  context.strokeStyle = SECONDARY_WATER_COLORS[selectedLayer];
+  context.lineWidth = 1.15;
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+  for (const [thresholdIndex, threshold] of [0.28, 0.52, 0.76].entries()) {
+    context.globalAlpha = 0.48 + thresholdIndex * 0.12;
+    context.setLineDash(thresholdIndex === 0 ? [3.5, 2.5] : []);
+    context.beginPath();
+    for (let row = 0; row < water.rows - 1; row += 1) {
+      for (let column = 0; column < water.columns - 1; column += 1) {
+        const points = [
+          pointAt(column, row),
+          pointAt(column + 1, row),
+          pointAt(column + 1, row + 1),
+          pointAt(column, row + 1),
+        ];
+        const samples = [
+          valueAt(column, row),
+          valueAt(column + 1, row),
+          valueAt(column + 1, row + 1),
+          valueAt(column, row + 1),
+        ];
+        const crossings = [
+          contourCrossing(points[0], points[1], samples[0], samples[1], threshold),
+          contourCrossing(points[1], points[2], samples[1], samples[2], threshold),
+          contourCrossing(points[2], points[3], samples[2], samples[3], threshold),
+          contourCrossing(points[3], points[0], samples[3], samples[0], threshold),
+        ].filter((point): point is ContourPoint => Boolean(point));
+        if (crossings.length === 2) {
+          drawSegment(crossings[0], crossings[1]);
+        } else if (crossings.length === 4) {
+          // Saddle cells are split consistently from their centre value, so
+          // contours never depend on iteration or selection order.
+          const centre = samples.reduce((sum, value) => sum + value, 0) / 4;
+          if (centre >= threshold) {
+            drawSegment(crossings[0], crossings[3]);
+            drawSegment(crossings[1], crossings[2]);
+          } else {
+            drawSegment(crossings[0], crossings[1]);
+            drawSegment(crossings[2], crossings[3]);
+          }
+        }
+      }
+    }
+    context.stroke();
+  }
+  context.restore();
+};
+
+const drawBiofilmStain = (
+  context: CanvasRenderingContext2D,
+  cell: SurfaceCellSnapshot,
+  guildId: MicrobeGuildId,
+  biomass: number,
+  selected: boolean,
+  scaleX: number,
+  scaleY: number,
+): void => {
+  if (!Number.isFinite(biomass) || biomass < 0.001) return;
+  // Observation mode must reveal a sparse film without making 1% coverage
+  // look like a solid carpet.  A gentler power curve keeps low values visible
+  // while preserving a truthful difference between 1%, 10% and 100%.
+  const amount = Math.pow(Math.max(0, Math.min(1, biomass)), 0.68);
+  const seed = stringHash(`${cell.id}:${guildId}`);
+  const centerX = cell.x * scaleX;
+  // Substrate cells sit exactly on the sediment boundary. Pull the stain a
+  // little into the water so a newly inoculated film is not clipped or lost
+  // among the gravel dots.
+  const surfaceLift = cell.surfaceKind === 'substrate' ? cell.cellSize * 0.22 : 0;
+  const centerY = (cell.y - WATER_TOP - surfaceLift) * scaleY;
+  const radius = cell.cellSize * (0.34 + amount * 0.52) * (selected ? 1.28 : 1);
+  const color = selected
+    ? guildId === 'decomposer' ? 0xc98246 : 0x49a49c
+    : MICROBES[guildId].color;
+  context.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
+
+  // Several overlapping, seeded washes read as a continuous natural stain.
+  // Their centres deliberately cross cell boundaries so the ecology grid is
+  // never exposed, while their very low idle opacity keeps biofilm subtle.
+  const washCount = selected ? 5 : 4;
+  for (let index = 0; index < washCount; index += 1) {
+    const offsetX = (hash01(seed + index * 47 + 11) - 0.5) * cell.cellSize * 0.86;
+    const offsetY = (hash01(seed + index * 61 + 23) - 0.5) * cell.cellSize * 0.72;
+    const radiusX = radius * (0.58 + hash01(seed + index * 73 + 31) * 0.48);
+    const radiusY = radius * (0.42 + hash01(seed + index * 89 + 43) * 0.44);
+    context.globalAlpha = selected
+      ? 0.08 + amount * 0.72
+      : 0.006 + amount * 0.017;
+    context.beginPath();
+    context.ellipse(
+      centerX + offsetX * scaleX,
+      centerY + offsetY * scaleY,
+      Math.max(0.5, radiusX * scaleX),
+      Math.max(0.4, radiusY * scaleY),
+      hash01(seed + index * 101 + 59) * Math.PI,
+      0,
+      Math.PI * 2,
+    );
+    context.fill();
+  }
+  context.globalAlpha = 1;
+};
+
+/**
+ * Draws the selected 36 x 20 dissolved field and both surface-attached films
+ * into one independent raster. The light texture remains untouched, so
+ * switching observation channels cannot disturb normal tank shading.
+ */
+const drawAnalysisOverlay = (
+  layer: Sprite,
+  snapshot: SimulationSnapshot,
+  selectedLayers: readonly WaterQualityLayer[],
+): void => {
+  const rasterWidth = Math.round(TANK_WIDTH * ANALYSIS_RASTER_SCALE);
+  const rasterHeight = Math.round((GROUND_Y - WATER_TOP) * ANALYSIS_RASTER_SCALE);
+  const surface = getRasterSurface(layer, rasterWidth, rasterHeight);
+  if (!surface) return;
+  const { context, texture } = surface;
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.clearRect(0, 0, rasterWidth, rasterHeight);
+
+  const selectedWaterLayerSet = new Set(selectedLayers.filter(
+    (selectedLayer): selectedLayer is WaterQualityVariable => !isMicrobeLayer(selectedLayer),
+  ));
+  const selectedWaterLayers = WATER_QUALITY_DRAW_ORDER.filter((layerId) =>
+    selectedWaterLayerSet.has(layerId));
+  const primaryWaterLayer = selectedWaterLayers.length === 1 ? selectedWaterLayers[0] : null;
+  if (primaryWaterLayer) {
+    const water = snapshot.biogeochemistry.water;
+    const grid = getAnalysisGridSurface(layer, water.columns, water.rows);
+    if (grid) {
+      const values = water[primaryWaterLayer];
+      const palette = WATER_QUALITY_PALETTES[primaryWaterLayer];
+      const visualRange = waterQualityVisualRange(primaryWaterLayer, values);
+      const pixels = grid.context.createImageData(water.columns, water.rows);
+      for (let index = 0; index < water.columns * water.rows; index += 1) {
+        const value = values[index] ?? 0;
+        const normalized = normalizeWaterQualityForDisplay(
+          primaryWaterLayer,
+          value,
+          visualRange,
+        );
+        const color = primaryWaterLayer === 'oxygen' && value < 30
+          ? mixColor(0xc54b50, palette.low, value / 30)
+          : mixColor(palette.low, palette.high, normalized);
+        const offset = index * 4;
+        pixels.data[offset] = (color >> 16) & 0xff;
+        pixels.data[offset + 1] = (color >> 8) & 0xff;
+        pixels.data[offset + 2] = color & 0xff;
+        pixels.data[offset + 3] = Math.round(
+          waterQualityOverlayAlpha(primaryWaterLayer, value, normalized) * 255,
+        );
+      }
+      grid.context.putImageData(pixels, 0, 0);
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.drawImage(grid.canvas, 0, 0, rasterWidth, rasterHeight);
+    }
+  }
+
+  for (const contourLayer of selectedWaterLayers.length > 1 ? selectedWaterLayers : []) {
+    drawWaterQualityContours(
+      context,
+      snapshot,
+      contourLayer,
+      rasterWidth,
+      rasterHeight,
+    );
+  }
+
+  const selectedGuilds = new Set(selectedLayers.filter(isMicrobeLayer));
+  const scaleX = rasterWidth / TANK_WIDTH;
+  const scaleY = rasterHeight / (GROUND_Y - WATER_TOP);
+  let hasVisibleBiofilm = false;
+  for (const cell of snapshot.cells) {
+    if (cell.y < WATER_TOP - cell.cellSize || cell.y > GROUND_Y + cell.cellSize) continue;
+    for (const guildId of ['decomposer', 'nitrifier'] as const) {
+      const biomass = cell.biofilm[guildId];
+      if (biomass >= 0.001) hasVisibleBiofilm = true;
+      drawBiofilmStain(
+        context,
+        cell,
+        guildId,
+        biomass,
+        selectedGuilds.has(guildId),
+        scaleX,
+        scaleY,
+      );
+    }
+  }
+
+  texture.source.update();
+  layer.position.set(0, WATER_TOP);
+  layer.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+  layer.visible = selectedLayers.length > 0 || hasVisibleBiofilm;
 };
 
 const polygonPoints = (points: Vec2[]): number[] =>
@@ -1272,7 +1599,6 @@ interface AlgaeSpeciesDensityLayer {
   densityContext: CanvasRenderingContext2D;
   densityTexture: Texture;
   densitySprite: Sprite;
-  detailMaskSprite: Sprite;
   detailGraphics: Graphics;
   detailContext: GraphicsContext;
   detailGeometryKey: string;
@@ -1536,8 +1862,8 @@ const createAlgaeParticleLayer = (
     const densitySprite = new Sprite(densityTexture);
     densitySprite.width = TANK_WIDTH;
     densitySprite.height = TANK_HEIGHT;
-    // Keep the density texture opaque enough to mask crisp details, while the
-    // visible wash itself stays as light as the earlier hand-drawn colonies.
+    // Keep the density wash opaque enough to anchor the crisp detail strokes,
+    // while the colony stays as light as the earlier hand-drawn version.
     densitySprite.alpha = speciesId === 'oedogonium'
       ? 0.86
       : surfaceKind === 'substrate'
@@ -1550,15 +1876,14 @@ const createAlgaeParticleLayer = (
     const detailGraphics = new Graphics();
     const detailContext = detailGraphics.context;
     styleAlgaeDetailContext(detailContext);
-    const detailMaskSprite = new Sprite(densityTexture);
-    detailMaskSprite.width = TANK_WIDTH;
-    detailMaskSprite.height = TANK_HEIGHT;
-    detailGraphics.setMask({
-      mask: detailMaskSprite,
-      channel: 'alpha',
-      inverse: false,
-    });
-    container.addChild(densitySprite, detailGraphics, detailMaskSprite);
+    // Do not clip these strokes with a Sprite alpha mask. Pixi pools the
+    // MaskFilter globally; after an application/resource teardown that pool can
+    // hand a destroyed shader bind group to a later frame. The resulting
+    // AlphaMaskPipe exception aborts Pixi's ticker before the tank frame and
+    // held-object preview are drawn. Details are already generated only for
+    // biologically active cells, so drawing them directly preserves the colony
+    // shape without the fragile GPU filter path.
+    container.addChild(densitySprite, detailGraphics);
     content.addChild(container);
     return {
       container,
@@ -1566,7 +1891,6 @@ const createAlgaeParticleLayer = (
       densityContext,
       densityTexture,
       densitySprite,
-      detailMaskSprite,
       detailGraphics,
       detailContext,
       detailGeometryKey: '',
@@ -2020,28 +2344,61 @@ const drawInteraction = (
 ): void => {
   layer.clear();
   const held = snapshot.holding;
-  if (!held || held.kind !== 'seed' || !held.speciesId ||
-    (suppressInventoryHolding && held.source === 'inventory')) return;
-  const color = held.valid ? SPECIES[held.speciesId].color : 0xcf5f5a;
-  layer
-    .circle(held.x, held.y, 11)
-    .fill({ color: 0xf9f2d9, alpha: 0.7 })
-    .stroke({ color, width: 4, alpha: 0.95 });
-  layer.circle(held.x, held.y, 4).fill({ color, alpha: 0.95 });
+  if (!held || (suppressInventoryHolding && held.source === 'inventory')) return;
+  if (held.kind === 'seed' && held.speciesId) {
+    const color = held.valid ? SPECIES[held.speciesId].color : 0xcf5f5a;
+    layer
+      .circle(held.x, held.y, 11)
+      .fill({ color: 0xf9f2d9, alpha: 0.7 })
+      .stroke({ color, width: 4, alpha: 0.95 });
+    layer.circle(held.x, held.y, 4).fill({ color, alpha: 0.95 });
+    return;
+  }
+  if (held.kind !== 'biofilm' || !held.microbeGuildId) return;
+
+  const color = held.valid ? MICROBES[held.microbeGuildId].color : 0xcf5f5a;
+  layer.circle(held.x, held.y, 15)
+    .fill({ color: 0xf9f2d9, alpha: 0.5 })
+    .stroke({ color, width: 3, alpha: 0.92 });
+  for (let index = 0; index < 6; index += 1) {
+    const angle = index / 6 * Math.PI * 2 + 0.25;
+    const distance = index % 2 === 0 ? 5.2 : 7.5;
+    const radius = index % 3 === 0 ? 3.5 : 2.6;
+    layer.circle(
+      held.x + Math.cos(angle) * distance,
+      held.y + Math.sin(angle) * distance * 0.72,
+      radius,
+    ).fill({ color, alpha: 0.82 });
+  }
 };
 
 const drawProbe = (
   layer: Graphics,
   snapshot: SimulationSnapshot,
   activeTool: InteractionTool,
+  selectedLayer: WaterQualityVariable | MicrobeGuildId | null,
 ): void => {
   layer.clear();
   if (!snapshot.probe) return;
   const { x, y, light } = snapshot.probe;
   const isTemperature = activeTool === 'temperature-probe';
+  const isWaterQuality = activeTool === 'water-quality-probe';
+  const waterValue = selectedLayer && !isMicrobeLayer(selectedLayer)
+    ? snapshot.probe.water[selectedLayer]
+    : 0;
   const color = isTemperature
     ? 0xc86958
-    : mixColor(0x315d78, 0xe3ba56, light / 100);
+    : isWaterQuality
+      ? selectedLayer
+        ? isMicrobeLayer(selectedLayer)
+          ? MICROBES[selectedLayer].color
+          : mixColor(
+            WATER_QUALITY_PALETTES[selectedLayer].low,
+            WATER_QUALITY_PALETTES[selectedLayer].high,
+            normalizeWaterQualityValue(selectedLayer, waterValue),
+          )
+        : 0x5c8179
+      : mixColor(0x315d78, 0xe3ba56, light / 100);
   layer
     .circle(x, y, 14)
     .fill({ color: 0xf8f2dc, alpha: 0.64 })
@@ -2049,6 +2406,16 @@ const drawProbe = (
   if (isTemperature) {
     layer.roundRect(x - 2.5, y - 8, 5, 13, 2).stroke({ color, width: 2.4 });
     layer.circle(x, y + 6, 4.2).fill({ color, alpha: 1 });
+  } else if (isWaterQuality) {
+    const colors = [0x8a5836, 0xc14f5f, 0x6d9f5b, 0x65b9c7];
+    for (let index = 0; index < colors.length; index += 1) {
+      const angle = Math.PI / 4 + index * Math.PI / 2;
+      layer.circle(
+        x + Math.cos(angle) * 5,
+        y + Math.sin(angle) * 5,
+        2.7,
+      ).fill({ color: colors[index], alpha: 1 });
+    }
   } else {
     layer.circle(x, y, 4.5).fill({ color, alpha: 1 });
     for (let index = 0; index < 8; index += 1) {
@@ -2108,7 +2475,9 @@ const drawMeasurements = (layer: Graphics, snapshot: SimulationSnapshot): void =
       snapshot.selection.measurementId === measurement.id;
     const color = measurement.kind === 'light'
       ? mixColor(0x315d78, 0xe3ba56, measurement.light / 100)
-      : 0xc86958;
+      : measurement.kind === 'temperature'
+        ? 0xc86958
+        : 0x5c8179;
     if (selected) {
       layer.circle(measurement.x, measurement.y, 20)
         .stroke({ color: 0xf8e8aa, width: 7, alpha: 0.76 });
@@ -2129,10 +2498,20 @@ const drawMeasurements = (layer: Graphics, snapshot: SimulationSnapshot): void =
           measurement.y + Math.sin(angle) * 18,
         ).stroke({ color, width: 2 });
       }
-    } else {
+    } else if (measurement.kind === 'temperature') {
       layer.roundRect(measurement.x - 2.5, measurement.y - 8, 5, 13, 2)
         .stroke({ color, width: 2 });
       layer.circle(measurement.x, measurement.y + 6, 4).fill({ color, alpha: 1 });
+    } else {
+      const colors = [0x8a5836, 0xc14f5f, 0x6d9f5b, 0x65b9c7];
+      for (let dotIndex = 0; dotIndex < colors.length; dotIndex += 1) {
+        const angle = Math.PI / 4 + dotIndex * Math.PI / 2;
+        layer.circle(
+          measurement.x + Math.cos(angle) * 4.5,
+          measurement.y + Math.sin(angle) * 4.5,
+          2.5,
+        ).fill({ color: colors[dotIndex], alpha: 1 });
+      }
     }
     drawMeasurementNumber(layer, measurement.x, measurement.y, index);
   }
@@ -2185,12 +2564,14 @@ export function AquariumCanvas({
   send,
   editable,
   hasPendingInventory,
+  pendingInventoryKey,
   onConsumePendingInventory,
   onPendingInventoryReady,
   onToolComplete,
   onCameraChange,
   cameraResetToken = 0,
   showGoalGuide = false,
+  waterQualityLayers,
 }: AquariumCanvasProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const appRef = useRef<Application | null>(null);
@@ -2206,12 +2587,16 @@ export function AquariumCanvas({
   const animalCarcassDisplaysRef = useRef(new Map<string, AnimalCarcassDisplay>());
   const effectGenerationRef = useRef(0);
   const lastLightDrawRef = useRef('');
+  const lastAnalysisDrawRef = useRef('');
   const lastAlgaeRevisionRef = useRef(-1);
   const lastAlgaeStructureGeometryRef = useRef('');
   const lastSeedsRevisionRef = useRef(-1);
   const pendingConsumedRef = useRef(false);
   const pendingHandoffStartedAtRef = useRef<number | null>(null);
   const pendingHandoffNotifiedRef = useRef(false);
+  const pendingHandoffFinalizeRafRef = useRef<number | null>(null);
+  const pendingDropAckRevisionRef = useRef<number | null>(null);
+  const pendingInventoryKeyRef = useRef<string | null>(null);
   const latestPointerWorldRef = useRef<Vec2 | null>(null);
   const secondaryPointerCancelAtRef = useRef<number | null>(null);
   const hasPendingInventoryRef = useRef(hasPendingInventory);
@@ -2225,6 +2610,7 @@ export function AquariumCanvas({
   const applyCameraRef = useRef<() => void>(() => undefined);
   const onCameraChangeRef = useRef(onCameraChange);
   const showGoalGuideRef = useRef(showGoalGuide);
+  const waterQualityLayersRef = useRef(waterQualityLayers);
   const panPointerRef = useRef<number | null>(null);
   const panLastPointRef = useRef<Vec2 | null>(null);
   const [cameraZoom, setCameraZoom] = useState(CAMERA_COVER_ZOOM);
@@ -2233,6 +2619,7 @@ export function AquariumCanvas({
   const [cameraIsFit, setCameraIsFit] = useState(false);
   const [panMode, setPanMode] = useState(false);
   const [isPanning, setIsPanning] = useState(false);
+  const [rendererRecoveryToken, setRendererRecoveryToken] = useState(0);
 
   snapshotRef.current = snapshot;
   motionSourceRef.current = motionSource;
@@ -2241,6 +2628,18 @@ export function AquariumCanvas({
   hasPendingInventoryRef.current = hasPendingInventory;
   onPendingInventoryReadyRef.current = onPendingInventoryReady;
   showGoalGuideRef.current = showGoalGuide;
+  waterQualityLayersRef.current = waterQualityLayers;
+
+  // A new inventory request must reset the handoff state before browser
+  // pointer events can fire. A passive effect leaves a race where the first
+  // movement may be interpreted as belonging to the previous item.
+  if (pendingInventoryKeyRef.current !== pendingInventoryKey) {
+    pendingInventoryKeyRef.current = pendingInventoryKey;
+    pendingConsumedRef.current = false;
+    pendingHandoffStartedAtRef.current = null;
+    pendingHandoffNotifiedRef.current = false;
+    pendingDropAckRevisionRef.current = null;
+  }
 
   const sampleMotion = (nowMs: number) => {
     const frames = motionSourceRef.current.getFrames();
@@ -2266,13 +2665,56 @@ export function AquariumCanvas({
   };
 
   const isPendingInventoryHandoff = (): boolean =>
-    hasPendingInventoryRef.current && pendingConsumedRef.current;
+    hasPendingInventoryRef.current &&
+    pendingConsumedRef.current &&
+    !pendingHandoffNotifiedRef.current;
+
+  const finishPendingInventoryAfterPaint = (): void => {
+    if (pendingHandoffFinalizeRafRef.current !== null) return;
+    const requestKey = pendingInventoryKeyRef.current;
+    // Pixi renders on requestAnimationFrame too. Waiting across two frames
+    // guarantees that the visible Pixi preview has reached the canvas before
+    // React removes the DOM cursor preview.
+    pendingHandoffFinalizeRafRef.current = requestAnimationFrame(() => {
+      pendingHandoffFinalizeRafRef.current = requestAnimationFrame(() => {
+        pendingHandoffFinalizeRafRef.current = null;
+        if (
+          pendingHandoffNotifiedRef.current &&
+          pendingInventoryKeyRef.current === requestKey
+        ) onPendingInventoryReadyRef.current();
+      });
+    });
+  };
+
+  const revealPendingInventoryPreview = (
+    holding: SimulationSnapshot['holding'],
+  ): boolean => {
+    const layers = layersRef.current;
+    if (!layers || !holding || holding.source !== 'inventory') return false;
+    if (holding.kind === 'seed' || holding.kind === 'biofilm') {
+      drawInteraction(layers.interaction, { ...snapshotRef.current, holding }, false);
+      return true;
+    }
+    if (holding.kind === 'structure' && holding.structureId) {
+      const display = structureDisplaysRef.current.get(holding.structureId);
+      if (!display) return false;
+      display.container.visible = true;
+      return true;
+    }
+    if (holding.kind === 'animal' && holding.animalId) {
+      const display = animalDisplaysRef.current.get(holding.animalId);
+      if (!display) return false;
+      display.container.visible = true;
+      return true;
+    }
+    return false;
+  };
 
   const tryCompletePendingInventoryHandoff = (
     holding: SimulationSnapshot['holding'],
     nowMs: number,
   ): void => {
-    if (!isPendingInventoryHandoff() || pendingHandoffNotifiedRef.current) return;
+    if (!isPendingInventoryHandoff()) return;
     const startedAt = pendingHandoffStartedAtRef.current;
     const motionFrames = motionSourceRef.current.getFrames();
     const hasSettledMotionPair = motionFrames.previous?.holding?.source === 'inventory' &&
@@ -2283,17 +2725,38 @@ export function AquariumCanvas({
       nowMs - startedAt,
       hasSettledMotionPair,
     )) return;
+    // Make the Pixi preview visible first. The DOM cursor ghost may overlap it
+    // for one frame, but the player must never see an empty handoff frame.
+    if (!revealPendingInventoryPreview(holding)) return;
     pendingHandoffNotifiedRef.current = true;
-    onPendingInventoryReadyRef.current();
+    finishPendingInventoryAfterPaint();
   };
 
-  useEffect(() => {
-    if (hasPendingInventory) {
-      pendingConsumedRef.current = false;
-      pendingHandoffStartedAtRef.current = null;
-      pendingHandoffNotifiedRef.current = false;
+  const tryCompletePendingDrop = (nextSnapshot: SimulationSnapshot): boolean => {
+    const expectedRevision = pendingDropAckRevisionRef.current;
+    if (expectedRevision === null || nextSnapshot.revision < expectedRevision) return false;
+    pendingDropAckRevisionRef.current = null;
+    if (nextSnapshot.holding) {
+      // The attempted surface was invalid. Hand the still-held item to Pixi,
+      // but keep the DOM preview until Pixi has actually painted it.
+      pendingConsumedRef.current = true;
+      pendingHandoffStartedAtRef.current = performance.now() - 48;
+      tryCompletePendingInventoryHandoff(nextSnapshot.holding, performance.now());
+      return true;
     }
-  }, [hasPendingInventory]);
+    // A null holding state at the acknowledgement revision means the object is
+    // now present in the authoritative placed-object snapshot.
+    pendingHandoffNotifiedRef.current = true;
+    finishPendingInventoryAfterPaint();
+    return true;
+  };
+
+  useEffect(() => () => {
+    if (pendingHandoffFinalizeRafRef.current !== null) {
+      cancelAnimationFrame(pendingHandoffFinalizeRafRef.current);
+      pendingHandoffFinalizeRafRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     if (!hasPendingInventory && !snapshot.holding) return;
@@ -2332,18 +2795,25 @@ export function AquariumCanvas({
     let disposed = false;
     let appDestroyed = false;
     let ownedLayers: AquariumLayers | null = null;
+    let rendererCanvas: HTMLCanvasElement | null = null;
+    let rendererRecoveryRequested = false;
+    let rendererRecoveryFrame: number | null = null;
+    let releaseGlobalResourcesOnDestroy = false;
+    let pixiContextRestoredListener: EventListener | null = null;
     const app = new Application();
     const ownedTextures = new Map<string, Texture>();
     const ownedDisplays = new Map<string, StructureDisplay>();
     const ownedAnimalDisplays = new Map<string, AnimalDisplay>();
     const ownedAnimalCarcassDisplays = new Map<string, AnimalCarcassDisplay>();
     let animalTicker: ((ticker: Ticker) => void) | null = null;
+    let renderTicker: (() => void) | null = null;
     let syncedMotionSequence: number | null = null;
     texturesRef.current = ownedTextures;
     structureDisplaysRef.current = ownedDisplays;
     animalDisplaysRef.current = ownedAnimalDisplays;
     animalCarcassDisplaysRef.current = ownedAnimalCarcassDisplays;
     lastLightDrawRef.current = '';
+    lastAnalysisDrawRef.current = '';
     lastAlgaeRevisionRef.current = -1;
     lastAlgaeStructureGeometryRef.current = '';
     lastSeedsRevisionRef.current = -1;
@@ -2361,6 +2831,8 @@ export function AquariumCanvas({
     const releaseOwnedRasterSurfaces = (): void => {
       if (!ownedLayers) return;
       releaseRasterSurface(ownedLayers.light);
+      releaseRasterSurface(ownedLayers.analysis);
+      releaseAnalysisGridSurface(ownedLayers.analysis);
       releaseAlgaeParticleLayer(ownedLayers.substrateAlgae);
       releaseAlgaeParticleLayer(ownedLayers.algae);
     };
@@ -2371,7 +2843,7 @@ export function AquariumCanvas({
       // `true` here releases Pixi's global GPU resource registry. That can
       // invalidate textures owned by a newer React effect generation.
       app.destroy(
-        { removeView: true, releaseGlobalResources: false },
+        { removeView: true, releaseGlobalResources: releaseGlobalResourcesOnDestroy },
         { children: true },
       );
     };
@@ -2430,10 +2902,12 @@ export function AquariumCanvas({
     void app.init({
       width: host.clientWidth,
       height: host.clientHeight,
+      preference: 'webgl',
       antialias: true,
       backgroundAlpha: 0,
       resolution: Math.min(window.devicePixelRatio, 2),
       autoDensity: true,
+      autoStart: false,
     }).then(async () => {
       if (!isCurrentGeneration()) {
         destroyOwnedApp();
@@ -2441,6 +2915,14 @@ export function AquariumCanvas({
       }
       appRef.current = app;
       host.appendChild(app.canvas);
+      rendererCanvas = app.canvas;
+      pixiContextRestoredListener = (
+        app.renderer as typeof app.renderer & {
+          context?: { handleContextRestored?: EventListener };
+        }
+      ).context?.handleContextRestored ?? null;
+      rendererCanvas.addEventListener('webglcontextlost', handleWebGlContextLost);
+      rendererCanvas.addEventListener('webglcontextrestored', handleWebGlContextRestored);
       app.canvas.setAttribute('aria-label', '수조 시뮬레이션 화면');
       const layers: AquariumLayers = {
         lamp: new Graphics(),
@@ -2450,6 +2932,7 @@ export function AquariumCanvas({
         foreground: new Graphics(),
         structures: new Container(),
         algae: createAlgaeParticleLayer('structure-face'),
+        analysis: new Sprite(Texture.EMPTY),
         animals: new Container(),
         goalGuide: new Graphics(),
         seeds: new Graphics(),
@@ -2480,6 +2963,7 @@ export function AquariumCanvas({
         layers.foreground,
         layers.structures,
         layers.algae,
+        layers.analysis,
         layers.animals,
         layers.goalGuide,
         layers.seeds,
@@ -2507,6 +2991,7 @@ export function AquariumCanvas({
       const initialRenderState = reconcileMotionWithSnapshot(initialSnapshot, initialMotion);
       const initialShowsLight = activeToolRef.current === 'light-probe';
       drawLightField(layers.light, initialSnapshot, initialShowsLight);
+      drawAnalysisOverlay(layers.analysis, initialSnapshot, waterQualityLayersRef.current);
       syncStructures(
         layers.structures,
         initialSnapshot,
@@ -2543,9 +3028,20 @@ export function AquariumCanvas({
       drawSeeds(layers.seeds, initialSnapshot);
       drawInteraction(layers.interaction, initialSnapshot, isPendingInventoryHandoff());
       drawMeasurements(layers.measurements, initialSnapshot);
-      drawProbe(layers.probe, initialSnapshot, activeToolRef.current);
+      drawProbe(
+        layers.probe,
+        initialSnapshot,
+        activeToolRef.current,
+        waterQualityLayersRef.current[0] ?? null,
+      );
       drawSelection(layers.selection, initialSnapshot);
       lastLightDrawRef.current = `${initialSnapshot.lightField.revision}:${initialShowsLight}`;
+      lastAnalysisDrawRef.current = [
+        initialSnapshot.biogeochemistry.water.revision,
+        initialSnapshot.biogeochemistry.biofilmTotals.decomposer.toFixed(3),
+        initialSnapshot.biogeochemistry.biofilmTotals.nitrifier.toFixed(3),
+        waterQualityLayersRef.current.join(',') || 'none',
+      ].join(':');
       lastAlgaeRevisionRef.current = initialSnapshot.revision;
       lastAlgaeStructureGeometryRef.current = structureAlgaeGeometryKey(initialSnapshot);
       lastSeedsRevisionRef.current = initialSnapshot.revision;
@@ -2558,6 +3054,7 @@ export function AquariumCanvas({
           const reconciledStructures = reconcileStructureMotionWithSnapshot(
             currentSnapshot.structures,
             motion.structures,
+            currentSnapshot.holding,
           );
           if (motion.sequence !== syncedMotionSequence) {
             syncStructures(
@@ -2588,14 +3085,28 @@ export function AquariumCanvas({
               motion.interpolated,
             );
           }
-          tryCompletePendingInventoryHandoff(motion.holding, nowMs);
-        } else {
-          tryCompletePendingInventoryHandoff(currentSnapshot.holding, nowMs);
         }
         animateAnimals(ownedAnimalDisplays, currentSnapshot, ticker.deltaMS / 1000);
         animateAnimalCarcasses(ownedAnimalCarcassDisplays, ticker.deltaMS / 1000);
       };
       app.ticker.add(animalTicker);
+      // Ticker schedules the next RAF only after every listener returns. An
+      // uncaught renderer exception therefore freezes the last partial frame
+      // forever. Replace Pixi's raw render listener with a guarded equivalent
+      // so a renderer/resource fault requests a complete rebuild instead.
+      app.ticker.remove(app.render, app);
+      renderTicker = (): void => {
+        if (!isCurrentGeneration()) return;
+        try {
+          app.render();
+        } catch (error) {
+          console.error('[AquaCycle] Pixi render failed; rebuilding renderer.', error);
+          app.stop();
+          requestFullRendererRecovery();
+        }
+      };
+      app.ticker.add(renderTicker, undefined, UPDATE_PRIORITY.LOW);
+      app.start();
 
       await Promise.all(Object.values(STRUCTURES).map(async (definition) => {
         try {
@@ -2634,12 +3145,60 @@ export function AquariumCanvas({
       destroyOwnedApp();
     });
 
+    function requestFullRendererRecovery(): void {
+      if (!isCurrentGeneration() || rendererRecoveryRequested) return;
+      rendererRecoveryRequested = true;
+      // This generation owns invalid renderer resources, either after a lost
+      // context or after a Pixi render-pipeline exception. They must not remain
+      // in Pixi's global caches when the replacement application is created.
+      releaseGlobalResourcesOnDestroy = true;
+      // Chromium's restored event means the GPU context is usable again, but
+      // Pixi's retained masks, Graphics and canvas-backed textures still point
+      // at resources from the lost context. Wait until the restored frame has
+      // completed, then replace the whole WebGL application and rebuild every
+      // layer from the authoritative simulation snapshot.
+      rendererRecoveryFrame = requestAnimationFrame(() => {
+        rendererRecoveryFrame = requestAnimationFrame(() => {
+          rendererRecoveryFrame = null;
+          if (isCurrentGeneration()) {
+            setRendererRecoveryToken((token) => token + 1);
+          }
+        });
+      });
+    }
+
+    function handleWebGlContextLost(event: Event): void {
+      // preventDefault opts in to Chromium's context restoration. Do not create
+      // the replacement renderer here: the GPU context is still lost at this
+      // point, and doing so is what produced the intermittent half-blank scene.
+      event.preventDefault();
+      app.stop();
+      // Pixi normally rebuilds its retained WebGL resources in place on the
+      // restored event. Alpha-mask bind groups are the resource that remained
+      // stale in this scene, so prevent that partial rebuild and let our full
+      // application replacement be the only restoration path.
+      if (rendererCanvas && pixiContextRestoredListener) {
+        rendererCanvas.removeEventListener(
+          'webglcontextrestored',
+          pixiContextRestoredListener,
+        );
+      }
+    }
+
+    function handleWebGlContextRestored(): void {
+      requestFullRendererRecovery();
+    }
+
     const handleKeyDown = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') {
         pendingConsumedRef.current = false;
         send({ type: 'cancel-held' });
         if (hasPendingInventoryRef.current) onPendingInventoryReadyRef.current();
-        onToolComplete();
+        onToolComplete(
+          snapshotRef.current.holding || hasPendingInventoryRef.current
+            ? 'move'
+            : activeToolRef.current,
+        );
       }
       if (snapshotRef.current.holding?.kind === 'structure' && (event.key === 'q' || event.key === 'Q')) {
         send({ type: 'rotate-held', radians: -Math.PI / 36 });
@@ -2655,6 +3214,9 @@ export function AquariumCanvas({
       if (effectGenerationRef.current === generation) effectGenerationRef.current += 1;
       observer.disconnect();
       window.removeEventListener('keydown', handleKeyDown);
+      rendererCanvas?.removeEventListener('webglcontextlost', handleWebGlContextLost);
+      rendererCanvas?.removeEventListener('webglcontextrestored', handleWebGlContextRestored);
+      if (rendererRecoveryFrame !== null) cancelAnimationFrame(rendererRecoveryFrame);
       if (applyCameraRef.current === applyOwnedCamera) {
         applyCameraRef.current = () => undefined;
       }
@@ -2662,6 +3224,7 @@ export function AquariumCanvas({
         structureDisplaysRef.current = new Map<string, StructureDisplay>();
       }
       if (animalTicker) app.ticker.remove(animalTicker);
+      if (renderTicker) app.ticker.remove(renderTicker);
       if (animalDisplaysRef.current === ownedAnimalDisplays) {
         animalDisplaysRef.current = new Map<string, AnimalDisplay>();
       }
@@ -2680,7 +3243,7 @@ export function AquariumCanvas({
       destroyOwnedApp();
       destroyOwnedTextures();
     };
-  }, [onToolComplete, send]);
+  }, [onToolComplete, rendererRecoveryToken, send]);
 
   useEffect(() => {
     const layers = layersRef.current;
@@ -2691,6 +3254,16 @@ export function AquariumCanvas({
     if (lastLightDrawRef.current !== lightKey) {
       drawLightField(layers.light, snapshot, activeTool === 'light-probe');
       lastLightDrawRef.current = lightKey;
+    }
+    const analysisKey = [
+      snapshot.biogeochemistry.water.revision,
+      snapshot.biogeochemistry.biofilmTotals.decomposer.toFixed(3),
+      snapshot.biogeochemistry.biofilmTotals.nitrifier.toFixed(3),
+      waterQualityLayers.join(',') || 'none',
+    ].join(':');
+    if (lastAnalysisDrawRef.current !== analysisKey) {
+      drawAnalysisOverlay(layers.analysis, snapshot, waterQualityLayers);
+      lastAnalysisDrawRef.current = analysisKey;
     }
     syncStructures(
       layers.structures,
@@ -2743,10 +3316,11 @@ export function AquariumCanvas({
     drawGoalGuide(layers.goalGuide, snapshot, showGoalGuide);
     drawInteraction(layers.interaction, snapshot, isPendingInventoryHandoff());
     drawMeasurements(layers.measurements, snapshot);
-    drawProbe(layers.probe, snapshot, activeTool);
+    drawProbe(layers.probe, snapshot, activeTool, waterQualityLayers[0] ?? null);
     drawSelection(layers.selection, snapshot);
-    tryCompletePendingInventoryHandoff(renderState.holding, performance.now());
-  }, [activeTool, editable, hasPendingInventory, showGoalGuide, snapshot]);
+    tryCompletePendingDrop(snapshot);
+    tryCompletePendingInventoryHandoff(snapshot.holding, performance.now());
+  }, [activeTool, editable, hasPendingInventory, showGoalGuide, snapshot, waterQualityLayers]);
 
   const clientToViewportPoint = (clientX: number, clientY: number): Vec2 => {
     const host = hostRef.current;
@@ -2822,11 +3396,40 @@ export function AquariumCanvas({
     });
   };
 
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const handleWheel = (event: WheelEvent): void => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('.aquarium-camera-controls')) return;
+      const holding = snapshotRef.current.holding;
+      if (editable && holding?.kind === 'structure') {
+        if (event.deltaY === 0) return;
+        event.preventDefault();
+        send({ type: 'rotate-held', radians: Math.sign(event.deltaY) * (Math.PI / 36) });
+        return;
+      }
+      if (event.deltaY === 0) return;
+      event.preventDefault();
+      zoomAtClientPoint(
+        cameraRef.current.zoom * Math.exp(-event.deltaY * 0.0015),
+        event.clientX,
+        event.clientY,
+      );
+    };
+    // React delegates wheel events through a passive listener in Chromium, so
+    // calling preventDefault from onWheel only floods DevTools with warnings.
+    // A native non-passive listener keeps rotation/zoom deterministic.
+    host.addEventListener('wheel', handleWheel, { passive: false });
+    return () => host.removeEventListener('wheel', handleWheel);
+  }, [editable, send]);
+
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>): void => {
     const point = toWorldPoint(event);
     latestPointerWorldRef.current = isTankInteractionPoint(point)
       ? point
       : clampTankInteractionPoint(point);
+    if (pendingDropAckRevisionRef.current !== null) return;
     if (panPointerRef.current === event.pointerId && panLastPointRef.current) {
       const host = hostRef.current;
       if (!host) return;
@@ -2866,18 +3469,22 @@ export function AquariumCanvas({
         send({ type: 'pointer-move', point: clampTankInteractionPoint(point) });
         return;
       }
-      if (activeTool === 'light-probe' || activeTool === 'temperature-probe') {
+      if (isProbeInteractionTool(activeTool)) {
         if (snapshot.probe) send({ type: 'clear-probe' });
       }
       return;
     }
     if (snapshot.holding && editable) send({ type: 'pointer-move', point });
-    else if (activeTool === 'light-probe' || activeTool === 'temperature-probe') {
+    else if (isProbeInteractionTool(activeTool)) {
       send({ type: 'probe', point });
     }
   };
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>): void => {
+    if (pendingDropAckRevisionRef.current !== null) {
+      event.preventDefault();
+      return;
+    }
     const host = hostRef.current;
     const canPan = Boolean(host && canPanTankCamera(
       host.clientWidth,
@@ -2906,7 +3513,7 @@ export function AquariumCanvas({
       pendingConsumedRef.current = false;
       send({ type: 'cancel-held' });
       if (hasPendingInventory) onPendingInventoryReady();
-      onToolComplete();
+      onToolComplete(snapshot.holding || hasPendingInventory ? 'move' : activeTool);
       return;
     }
     if (shouldStartCameraPan(event.button, panMode, canPan)) {
@@ -2918,6 +3525,7 @@ export function AquariumCanvas({
     }
     if (!isTankInteractionPoint(point)) return;
     if (hasPendingInventory || (pendingConsumedRef.current && !snapshot.holding)) {
+      const hadAuthoritativeHolding = Boolean(snapshot.holding);
       if (!pendingConsumedRef.current) {
         pendingConsumedRef.current = true;
         pendingHandoffStartedAtRef.current = performance.now();
@@ -2927,25 +3535,34 @@ export function AquariumCanvas({
       // after the inventory pick makes this first tank click the placement
       // click too, even when no pointermove occurred or the pick snapshot has
       // not made the round trip back from the worker yet.
+      if (pendingHandoffFinalizeRafRef.current !== null) {
+        cancelAnimationFrame(pendingHandoffFinalizeRafRef.current);
+        pendingHandoffFinalizeRafRef.current = null;
+      }
+      pendingHandoffNotifiedRef.current = false;
+      pendingDropAckRevisionRef.current = snapshot.revision + (hadAuthoritativeHolding ? 1 : 2);
       send({ type: 'drop-held', point });
       pendingConsumedRef.current = false;
-      onPendingInventoryReady();
-      onToolComplete();
+      onToolComplete('move');
       return;
     }
     if (snapshot.holding) {
       send({ type: 'drop-held', point });
       pendingConsumedRef.current = false;
-      if (snapshot.holding.valid) onToolComplete();
+      if (snapshot.holding.valid) onToolComplete('move');
       return;
     }
-    if (activeTool === 'light-probe' || activeTool === 'temperature-probe') {
+    if (isProbeInteractionTool(activeTool)) {
       send({
         type: 'place-measurement',
-        kind: activeTool === 'light-probe' ? 'light' : 'temperature',
+        kind: activeTool === 'light-probe'
+          ? 'light'
+          : activeTool === 'temperature-probe'
+            ? 'temperature'
+            : 'water-quality',
         point,
       });
-      onToolComplete();
+      onToolComplete(activeTool);
       return;
     }
     if (activeTool === 'move' && editable) send({ type: 'pick-at', point });
@@ -3017,7 +3634,7 @@ export function AquariumCanvas({
         if (event.button === 1) event.preventDefault();
       }}
       onPointerLeave={() => {
-        if ((activeTool === 'light-probe' || activeTool === 'temperature-probe') && !dragStartRef.current) {
+        if (isProbeInteractionTool(activeTool) && !dragStartRef.current) {
           if (snapshot.probe) send({ type: 'clear-probe' });
         }
       }}
@@ -3029,21 +3646,7 @@ export function AquariumCanvas({
         pendingConsumedRef.current = false;
         send({ type: 'cancel-held' });
         if (hasPendingInventory) onPendingInventoryReady();
-        onToolComplete();
-      }}
-      onWheel={(event) => {
-        if (editable && snapshot.holding?.kind === 'structure') {
-          event.preventDefault();
-          send({ type: 'rotate-held', radians: Math.sign(event.deltaY) * (Math.PI / 36) });
-          return;
-        }
-        if (event.deltaY === 0) return;
-        event.preventDefault();
-        zoomAtClientPoint(
-          cameraRef.current.zoom * Math.exp(-event.deltaY * 0.0015),
-          event.clientX,
-          event.clientY,
-        );
+        onToolComplete(snapshot.holding || hasPendingInventory ? 'move' : activeTool);
       }}
     >
       <div

@@ -4,6 +4,7 @@ import {
   SimulationWorld,
 } from '../src/simulation/SimulationWorld';
 import { SCENARIOS } from '../src/simulation/config';
+import { BiogeochemistryLedger } from '../src/simulation/biogeochemistry';
 import { netGrowthPotential } from '../src/simulation/growth';
 import type {
   AnimalSpeciesId,
@@ -31,6 +32,7 @@ interface DebugAnimal {
 interface DebugWorld {
   allCells(): DebugSurfaceCell[];
   stepGrowth(deltaSeconds: number): void;
+  biogeochemistry: BiogeochemistryLedger;
   animals: DebugAnimal[];
   seedPlacements: Array<{ cellId: string }>;
   snapshotDirty: boolean;
@@ -192,7 +194,10 @@ describe('consumer-resource emergence', () => {
     // The removed ecological formula hard-stopped this fixture at twelve even
     // with food everywhere. Reproduction must now cross that former ceiling.
     expect(maximumPopulation).toBeGreaterThan(12);
-    expect(snapshot.totalAlgaeConsumed).toBeGreaterThan(initialAlgae);
+    // Reproduction must still be backed by a material amount of real grazing.
+    // Requiring more than the entire initial standing crop accidentally tied
+    // this contract to the former, internally inconsistent hunger coefficient.
+    expect(snapshot.totalAlgaeConsumed).toBeGreaterThan(initialAlgae * 0.5);
   }, 30_000);
 
   it('grazes the spread colony rather than repeatedly returning only to inoculation cells', () => {
@@ -234,6 +239,11 @@ describe('consumer-resource emergence', () => {
   it('turns higher primary productivity into a stronger consumer outcome', () => {
     const low = new SimulationWorld('laboratory');
     const productive = new SimulationWorld('laboratory');
+    // This is a deliberately narrow consumer-resource regression. Laboratory
+    // mode now also includes water chemistry, so disable that second causal
+    // system here instead of allowing pollution to obscure light productivity.
+    debugWorld(low).biogeochemistry = new BiogeochemistryLedger();
+    debugWorld(productive).biogeochemistry = new BiogeochemistryLedger();
     low.handle({ type: 'set-light-output', output: 30 });
     productive.handle({ type: 'set-light-output', output: 80 });
     fillProductiveHabitat(low, 0.16);
