@@ -35,7 +35,12 @@ export type AnimalBehavior =
   | 'resting'
   | 'starving';
 export type AnimalReproductiveState = 'none' | 'ready' | 'berried';
-export type AnimalDeathCause = 'starvation' | 'old-age' | 'hypoxia' | 'toxicity';
+export type AnimalDeathCause =
+  | 'starvation'
+  | 'old-age'
+  | 'hypoxia'
+  | 'toxicity'
+  | 'temperature';
 export type AnimalPopulationEventKind = 'introduced' | 'removed' | 'birth' | 'matured' | 'death';
 export type StructureDefinitionId = 'flat-stone' | 'round-stone' | 'tall-stone';
 export type MicrobeGuildId = 'decomposer' | 'nitrifier';
@@ -134,6 +139,10 @@ export interface AnimalSnapshot {
   reproductiveState: AnimalReproductiveState;
   recentIntake: number;
   consumedBiomass: number;
+  temperature: number;
+  metabolicTemperatureFactor: number;
+  reproductionTemperatureFactor: number;
+  thermalHealthSuitability: number;
 }
 
 /**
@@ -153,6 +162,7 @@ export interface AnimalCarcassSnapshot {
   lifeStage: AnimalLifeStage;
   cause: AnimalDeathCause;
   waterAtDeath: WaterQualityValues | null;
+  temperatureAtDeath: number | null;
   ageSeconds: number;
   lifetimeSeconds: number;
   progress: number;
@@ -188,6 +198,7 @@ export interface AnimalPopulationEventSnapshot {
   cause: AnimalDeathCause | null;
   parentId: string | null;
   water: WaterQualityValues | null;
+  temperature: number | null;
 }
 
 export interface AnimalPopulationEventTotals {
@@ -240,6 +251,12 @@ export interface BiogeochemistrySnapshot {
     dissolvedInorganicCarbon: number;
     headspaceCarbonDioxide: number;
     headspaceOxygen: number;
+  };
+  gasExchange: {
+    surfaceTemperature: number;
+    oxygenSolubilityMgL: number;
+    oxygenSolubilityRatio: number;
+    oxygenWaterEquilibrium: number;
   };
   materialBalance: {
     totalNitrogen: number;
@@ -456,6 +473,7 @@ export interface SavedAnimalCarcassState {
   lifeStage: AnimalLifeStage;
   cause: AnimalDeathCause;
   waterAtDeath: WaterQualityValues | null;
+  temperatureAtDeath?: number | null;
   ageSeconds: number;
 }
 

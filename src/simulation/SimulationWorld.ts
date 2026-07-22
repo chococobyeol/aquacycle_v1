@@ -40,6 +40,10 @@ import {
   type SimulationSpeed,
 } from './speed';
 import {
+  interpolateTemperatureResponse,
+  thetaTemperatureFactor,
+} from './temperatureResponse';
+import {
   GROUND_Y,
   TANK_HEIGHT,
   TANK_WIDTH,
@@ -186,6 +190,7 @@ interface AnimalCarcassState {
   lifeStage: AnimalLifeStage;
   cause: AnimalCarcassSnapshot['cause'];
   waterAtDeath: AnimalCarcassSnapshot['waterAtDeath'];
+  temperatureAtDeath: number | null;
   ageSeconds: number;
 }
 
@@ -341,6 +346,7 @@ const emptyAnimalPopulationEventTotals = (): AnimalPopulationEventTotals => ({
     'old-age': 0,
     hypoxia: 0,
     toxicity: 0,
+    temperature: 0,
   },
 });
 
@@ -1007,6 +1013,7 @@ export class SimulationWorld {
       ...carcass,
       position: { ...carcass.position },
       waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
+      temperatureAtDeath: carcass.temperatureAtDeath ?? null,
     }));
     this.measurements = data.measurements.map((measurement) => ({
       ...measurement,
@@ -1015,10 +1022,14 @@ export class SimulationWorld {
     this.animalPopulationEvents = data.animalPopulationEvents.map((event) => ({
       ...event,
       water: event.water ? { ...event.water } : null,
+      temperature: event.temperature ?? null,
     }));
     this.animalPopulationEventTotals = {
       ...data.animalPopulationEventTotals,
-      deathsByCause: { ...data.animalPopulationEventTotals.deathsByCause },
+      deathsByCause: {
+        ...data.animalPopulationEventTotals.deathsByCause,
+        temperature: data.animalPopulationEventTotals.deathsByCause.temperature ?? 0,
+      },
     };
     this.animalPopulationEventSequence = data.animalPopulationEventSequence;
     this.totalAlgaeConsumed = data.totalAlgaeConsumed;
@@ -2776,11 +2787,34 @@ export class SimulationWorld {
       oedogonium: number;
     }
     const requestsByCell = new Map<string, GrazingRequest[]>();
-    const waterDeathCauses = new Map<string, 'hypoxia' | 'toxicity'>();
+    const environmentalDeathCauses = new Map<
+      string,
+      'hypoxia' | 'toxicity' | 'temperature'
+    >();
 
     for (const animal of this.animals) {
       animal.ageSeconds += deltaSeconds;
-      animal.reproductionCooldown = Math.max(0, animal.reproductionCooldown - deltaSeconds);
+      const temperature = this.biogeochemistry.temperatureAt(animal.position);
+      const temperatureProfile = ANIMALS[animal.speciesId].temperature;
+      const metabolicTemperatureFactor = thetaTemperatureFactor(
+        temperature,
+        temperatureProfile.referenceTemperature,
+        temperatureProfile.metabolicTheta,
+        temperatureProfile.minimumMetabolicFactor,
+        temperatureProfile.maximumMetabolicFactor,
+      );
+      const reproductionTemperatureFactor = interpolateTemperatureResponse(
+        temperatureProfile.reproductionCurve,
+        temperature,
+      );
+      const thermalHealthSuitability = interpolateTemperatureResponse(
+        temperatureProfile.healthCurve,
+        temperature,
+      );
+      animal.reproductionCooldown = Math.max(
+        0,
+        animal.reproductionCooldown - deltaSeconds * reproductionTemperatureFactor,
+      );
       animal.recentIntake *= Math.exp(-deltaSeconds / 8);
       animal.secondsSinceFood += deltaSeconds;
 
@@ -2793,37 +2827,55 @@ export class SimulationWorld {
       const baseCost = animal.lifeStage === 'adult'
         ? SHRIMP_BASE_METABOLISM
         : SHRIMP_ECOLOGY_RULES.juvenileBaseMetabolismPerSecond;
-      animal.energy = Math.max(0, animal.energy - (baseCost + activityCost) * deltaSeconds);
+      animal.energy = Math.max(
+        0,
+        animal.energy - (baseCost + activityCost) *
+          metabolicTemperatureFactor * deltaSeconds,
+      );
 
-      if (this.biogeochemistry.effectsEnabled) {
-        const water = this.biogeochemistry.sampleAt(animal.position);
-        const oxygenStress = clamp(
+      const water = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.sampleAt(animal.position)
+        : null;
+      const oxygenStress = water
+        ? clamp(
           (SHRIMP_OXYGEN_STRESS_START - water.oxygen) / SHRIMP_OXYGEN_STRESS_START,
           0,
           1,
-        );
-        const toxicStress = clamp(
+        )
+        : 0;
+      const toxicStress = water
+        ? clamp(
           (water.toxicWaste - SHRIMP_TOXIC_STRESS_START) /
             (SHRIMP_TOXIC_STRESS_FULL - SHRIMP_TOXIC_STRESS_START),
           0,
           1,
+        )
+        : 0;
+      const thermalStress = clamp(1 - thermalHealthSuitability, 0, 1);
+      const damageRate =
+        Math.pow(oxygenStress, 1.35) *
+          SHRIMP_ECOLOGY_RULES.oxygenMaximumDamagePerSecond +
+        Math.pow(toxicStress, 1.25) *
+          SHRIMP_ECOLOGY_RULES.toxicMaximumDamagePerSecond +
+        Math.pow(thermalStress, 1.35) *
+          temperatureProfile.maximumThermalDamagePerSecond;
+      const recoveryRate = Math.max(
+        0,
+        1 - Math.max(oxygenStress, toxicStress, thermalStress),
+      ) * SHRIMP_WATER_RECOVERY_RATE;
+      animal.health = clamp01(
+        animal.health + (recoveryRate - damageRate) * deltaSeconds,
+      );
+      if (animal.health <= 0) {
+        const highestStress = Math.max(oxygenStress, toxicStress, thermalStress);
+        environmentalDeathCauses.set(
+          animal.id,
+          highestStress === thermalStress
+            ? 'temperature'
+            : highestStress === oxygenStress
+              ? 'hypoxia'
+              : 'toxicity',
         );
-        const damageRate =
-          Math.pow(oxygenStress, 1.35) *
-            SHRIMP_ECOLOGY_RULES.oxygenMaximumDamagePerSecond +
-          Math.pow(toxicStress, 1.25) *
-            SHRIMP_ECOLOGY_RULES.toxicMaximumDamagePerSecond;
-        const recoveryRate = Math.max(0, 1 - Math.max(oxygenStress, toxicStress)) *
-          SHRIMP_WATER_RECOVERY_RATE;
-        animal.health = clamp01(
-          animal.health + (recoveryRate - damageRate) * deltaSeconds,
-        );
-        if (animal.health <= 0) {
-          waterDeathCauses.set(
-            animal.id,
-            oxygenStress >= toxicStress ? 'hypoxia' : 'toxicity',
-          );
-        }
       }
 
       const target = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
@@ -2915,7 +2967,20 @@ export class SimulationWorld {
       const maintenanceRate = animal.lifeStage === 'adult'
         ? WATER_CYCLE_RULES.shrimp.adultMaintenanceBiomassPerSecond
         : WATER_CYCLE_RULES.shrimp.juvenileMaintenanceBiomassPerSecond;
-      const maintenanceRequest = maintenanceRate * deltaSeconds;
+      const temperature = this.biogeochemistry.temperatureAt(animal.position);
+      const temperatureProfile = ANIMALS[animal.speciesId].temperature;
+      const metabolicTemperatureFactor = thetaTemperatureFactor(
+        temperature,
+        temperatureProfile.referenceTemperature,
+        temperatureProfile.metabolicTheta,
+        temperatureProfile.minimumMetabolicFactor,
+        temperatureProfile.maximumMetabolicFactor,
+      );
+      const reproductionTemperatureFactor = interpolateTemperatureResponse(
+        temperatureProfile.reproductionCurve,
+        temperature,
+      );
+      const maintenanceRequest = maintenanceRate * metabolicTemperatureFactor * deltaSeconds;
       const reserveLoss = this.biogeochemistry.effectsEnabled
         ? Math.min(animal.storedBiomass, maintenanceRequest)
         : maintenanceRequest;
@@ -2936,9 +3001,9 @@ export class SimulationWorld {
         reserveLoss + structuralLoss,
       );
 
-      const waterDeathCause = waterDeathCauses.get(animal.id);
-      if (waterDeathCause) {
-        this.killAnimal(animal, waterDeathCause);
+      const environmentalDeathCause = environmentalDeathCauses.get(animal.id);
+      if (environmentalDeathCause) {
+        this.killAnimal(animal, environmentalDeathCause);
         continue;
       }
 
@@ -2951,7 +3016,8 @@ export class SimulationWorld {
         if (animal.energy >= 0.44 && animal.secondsSinceFood < 12) {
           const desiredProgress = Math.min(
             1,
-            animal.growthProgress + deltaSeconds / SHRIMP_MATURITY_SECONDS,
+            animal.growthProgress +
+              deltaSeconds * reproductionTemperatureFactor / SHRIMP_MATURITY_SECONDS,
           );
           const birthBiomass = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
           const adultBiomass = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
@@ -2997,7 +3063,9 @@ export class SimulationWorld {
           const gestationCanAdvance =
             animal.energy >= SHRIMP_ECOLOGY_RULES.gestationEnergy &&
             animal.secondsSinceFood <= SHRIMP_ECOLOGY_RULES.gestationRecentFeedingSeconds;
-          if (gestationCanAdvance) animal.gestationRemaining -= deltaSeconds;
+          if (gestationCanAdvance) {
+            animal.gestationRemaining -= deltaSeconds * reproductionTemperatureFactor;
+          }
           if (animal.gestationRemaining <= 0) {
             const desiredClutchSize = SHRIMP_ECOLOGY_RULES.minimumClutchSize +
               Math.floor(deterministicNoise(
@@ -3049,7 +3117,7 @@ export class SimulationWorld {
             candidate.reproductionCooldown <= 0,
           );
           animal.matingAccumulator = eligibleMale
-            ? animal.matingAccumulator + deltaSeconds
+            ? animal.matingAccumulator + deltaSeconds * reproductionTemperatureFactor
             : Math.max(0, animal.matingAccumulator - deltaSeconds);
           if (animal.matingAccumulator >= SHRIMP_MATING_SECONDS) {
             animal.gestationRemaining = SHRIMP_GESTATION_SECONDS;
@@ -3065,7 +3133,14 @@ export class SimulationWorld {
       }
 
       if (!this.biogeochemistry.effectsEnabled) {
-        animal.health = clamp01(animal.energy / SHRIMP_WEAK_ENERGY);
+        // Earlier missions still use energy as their simple health ceiling,
+        // but it must not erase thermal damage accumulated from the shared
+        // water-temperature field. Safe water can heal that damage gradually
+        // on later steps; depleted energy can only lower the current health.
+        animal.health = Math.min(
+          animal.health,
+          clamp01(animal.energy / SHRIMP_WEAK_ENERGY),
+        );
       }
       if (animal.energy <= 0) {
         this.killAnimal(animal, 'starvation');
@@ -3081,6 +3156,7 @@ export class SimulationWorld {
     const waterAtDeath = this.biogeochemistry.effectsEnabled
       ? this.biogeochemistry.sampleAt(animal.position)
       : null;
+    const temperatureAtDeath = this.biogeochemistry.temperatureAt(animal.position);
     this.recordAnimalPopulationEvent('death', animal, { cause, water: waterAtDeath });
     this.carcasses.push({
       id: `carcass:${animal.id}`,
@@ -3093,6 +3169,7 @@ export class SimulationWorld {
       lifeStage: animal.lifeStage,
       cause,
       waterAtDeath,
+      temperatureAtDeath,
       ageSeconds: 0,
     });
     this.biogeochemistry.recordDeath(
@@ -3517,6 +3594,23 @@ export class SimulationWorld {
           : 'none';
       snapshot.recentIntake = animal.recentIntake;
       snapshot.consumedBiomass = animal.consumedBiomass;
+      snapshot.temperature = this.biogeochemistry.temperatureAt(animal.position);
+      const temperatureProfile = ANIMALS[animal.speciesId].temperature;
+      snapshot.metabolicTemperatureFactor = thetaTemperatureFactor(
+        snapshot.temperature,
+        temperatureProfile.referenceTemperature,
+        temperatureProfile.metabolicTheta,
+        temperatureProfile.minimumMetabolicFactor,
+        temperatureProfile.maximumMetabolicFactor,
+      );
+      snapshot.reproductionTemperatureFactor = interpolateTemperatureResponse(
+        temperatureProfile.reproductionCurve,
+        snapshot.temperature,
+      );
+      snapshot.thermalHealthSuitability = interpolateTemperatureResponse(
+        temperatureProfile.healthCurve,
+        snapshot.temperature,
+      );
       snapshots[index] = snapshot;
     }
     snapshots.length = this.animals.length;
@@ -3536,6 +3630,7 @@ export class SimulationWorld {
       lifeStage: carcass.lifeStage,
       cause: carcass.cause,
       waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
+      temperatureAtDeath: carcass.temperatureAtDeath,
       ageSeconds: carcass.ageSeconds,
       lifetimeSeconds: SHRIMP_CARCASS_LIFETIME_SECONDS,
       progress: clamp01(carcass.ageSeconds / SHRIMP_CARCASS_LIFETIME_SECONDS),
@@ -3602,6 +3697,7 @@ export class SimulationWorld {
       cause,
       parentId: options?.parentId ?? null,
       water: water ? { ...water } : null,
+      temperature: this.biogeochemistry.temperatureAt(animal.position),
     });
     if (this.animalPopulationEvents.length > MAX_ANIMAL_POPULATION_EVENTS) {
       this.animalPopulationEvents.splice(

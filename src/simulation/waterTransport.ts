@@ -195,6 +195,15 @@ export class WaterTransportGrid {
     return totalCapacity > 0 ? totalEnergy / totalCapacity : mean(this.temperature);
   }
 
+  /** Mean temperature of the water cells touching the closed headspace. */
+  public surfaceTemperature(): number {
+    let total = 0;
+    for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
+      total += this.temperature[column];
+    }
+    return total / TRANSPORT_COLUMNS;
+  }
+
   /**
    * Moves a dissolved concentration with the already projected water flux.
    * Every internal edge is evaluated once, then donor and receiver limiters

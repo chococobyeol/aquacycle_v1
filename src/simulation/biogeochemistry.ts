@@ -19,6 +19,12 @@ import {
   WaterTransportGrid,
   type WaterTransportObstacle,
 } from './waterTransport';
+import {
+  closedOxygenWaterEquilibrium,
+  freshwaterOxygenSolubilityMgL,
+  relativeOxygenSolubility,
+} from './gasExchange';
+import { thetaTemperatureFactor } from './temperatureResponse';
 
 export const WATER_COLUMNS = 36;
 export const WATER_ROWS = 20;
@@ -123,6 +129,10 @@ export class BiogeochemistryLedger {
 
   public averageTemperature(): number {
     return this.transport.averageTemperature();
+  }
+
+  public surfaceTemperature(): number {
+    return this.transport.surfaceTemperature();
   }
 
   /** Kept as a step boundary for the worker; material is now booked directly. */
@@ -357,6 +367,11 @@ export class BiogeochemistryLedger {
     const food = quality[kinetics.substrate];
     const activity = saturation(food, kinetics.halfSaturation) *
       saturation(quality.oxygen, kinetics.oxygenHalfSaturation);
+    const temperatureFactor = thetaTemperatureFactor(
+      this.temperatureAt(point),
+      kinetics.referenceTemperature,
+      kinetics.temperatureCoefficient,
+    );
     const freeSurface = clamp(1 - occupiedFraction, 0, 1);
     const uptake = kinetics.maximumUptake * activity;
     const growth = guildId === 'decomposer'
@@ -364,7 +379,7 @@ export class BiogeochemistryLedger {
       : uptake * kinetics.biomassYield / WATER_CYCLE_RULES.biomassNitrogen * freeSurface;
     const decay = kinetics.maintenanceDecayRate +
       kinetics.starvationDecayRate * (1 - activity);
-    return growth - decay;
+    return (growth - decay) * temperatureFactor;
   }
 
   public materialState(): ClosedMaterialState {
@@ -477,6 +492,7 @@ export class BiogeochemistryLedger {
         headspaceCarbonDioxide: material.headspaceCarbonDioxide,
         headspaceOxygen: material.headspaceOxygen,
       },
+      gasExchange: this.gasExchangeState(material),
       materialBalance: {
         totalNitrogen,
         totalCarbon,
@@ -501,9 +517,15 @@ export class BiogeochemistryLedger {
         const quality = this.sampleAt(site.point);
         const activity = saturation(quality[kinetics.substrate], kinetics.halfSaturation) *
           saturation(quality.oxygen, kinetics.oxygenHalfSaturation);
+        const temperatureFactor = thetaTemperatureFactor(
+          this.temperatureAt(site.point),
+          kinetics.referenceTemperature,
+          kinetics.temperatureCoefficient,
+        );
         const occupied = site.biofilm.decomposer + site.biofilm.nitrifier;
         const freeSurface = clamp(1 - occupied, 0, 1);
-        const requested = biomass * kinetics.maximumUptake * activity * deltaSeconds;
+        const requested = biomass * kinetics.maximumUptake * activity *
+          temperatureFactor * deltaSeconds;
         const foodField = guildId === 'decomposer' ? this.organicMatter : this.toxicWaste;
         const foodAvailable = this.massAround(foodField, index);
         const oxygenAvailable = this.massAround(this.oxygen, index);
@@ -573,8 +595,10 @@ export class BiogeochemistryLedger {
         const realizedActivity = requested > 0
           ? activity * clamp(consumed / requested, 0, 1)
           : 0;
-        const decayRate = kinetics.maintenanceDecayRate +
-          kinetics.starvationDecayRate * (1 - realizedActivity);
+        const decayRate = (
+          kinetics.maintenanceDecayRate +
+          kinetics.starvationDecayRate * (1 - realizedActivity)
+        ) * temperatureFactor;
         const decay = biomass * (1 - Math.exp(-decayRate * deltaSeconds));
         const crowded = clamp((occupied - 0.88) / 0.12, 0, 1);
         const slough = Math.max(0, biomass + growth - decay) *
@@ -608,7 +632,10 @@ export class BiogeochemistryLedger {
   private exchangeClosedHeadspace(deltaSeconds: number): void {
     const response = 1 - Math.exp(-WATER_CYCLE_RULES.closedGasExchangeRate * deltaSeconds);
     const waterOxygen = this.fieldMass(this.oxygen);
-    const oxygenEquilibrium = (waterOxygen + this.headspaceOxygen) / 2;
+    const oxygenEquilibrium = closedOxygenWaterEquilibrium(
+      waterOxygen + this.headspaceOxygen,
+      this.surfaceTemperature(),
+    );
     const oxygenTransfer = (oxygenEquilibrium - waterOxygen) * response;
     if (oxygenTransfer > 0) {
       const dissolved = this.addMassToIndices(
@@ -644,6 +671,19 @@ export class BiogeochemistryLedger {
       );
       this.headspaceCarbonDioxide += moved;
     }
+  }
+
+  private gasExchangeState(material = this.materialState()): BiogeochemistrySnapshot['gasExchange'] {
+    const surfaceTemperature = this.surfaceTemperature();
+    return {
+      surfaceTemperature,
+      oxygenSolubilityMgL: freshwaterOxygenSolubilityMgL(surfaceTemperature),
+      oxygenSolubilityRatio: relativeOxygenSolubility(surfaceTemperature),
+      oxygenWaterEquilibrium: closedOxygenWaterEquilibrium(
+        material.dissolvedOxygen + material.headspaceOxygen,
+        surfaceTemperature,
+      ),
+    };
   }
 
   private fieldMass(field: Float32Array): number {

@@ -11,6 +11,7 @@ import {
 import {
   ALGAE_VISIBLE_BIOMASS,
   ANIMALS,
+  MICROBE_ECOLOGY_RULES,
   MICROBES,
   SCENARIOS,
   SHRIMP_ECOLOGY_RULES,
@@ -20,6 +21,7 @@ import {
 } from '../../simulation/config';
 import { growthTrend, netGrowthPotential } from '../../simulation/growth';
 import { SIMULATION_SPEED_OPTIONS, type SimulationSpeed } from '../../simulation/speed';
+import { thetaTemperatureFactor } from '../../simulation/temperatureResponse';
 import type {
   AnimalPopulationEventSnapshot,
   AnimalSpeciesId,
@@ -2409,11 +2411,15 @@ function ObservationSectionContent({
   }
 
   if (section === 'ledger') {
+    const gas = snapshot.biogeochemistry.gasExchange;
     return (
       <dl>
         <div><dt>물속 무기탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.dissolvedInorganicCarbon.toFixed(2)}</dd></div>
         <div><dt>공기층 이산화탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceCarbonDioxide.toFixed(2)}</dd></div>
         <div><dt>공기층 산소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceOxygen.toFixed(2)}</dd></div>
+        <div><dt>수면 수온</dt><dd>{gas.surfaceTemperature.toFixed(1)}°C</dd></div>
+        <div><dt>담수 산소 포화도</dt><dd>{gas.oxygenSolubilityMgL.toFixed(2)}mg/L <small>1기압 환산</small></dd></div>
+        <div><dt>현재 수온의 물쪽 산소 목표</dt><dd>{gas.oxygenWaterEquilibrium.toFixed(2)}</dd></div>
         <div className="material-ledger-row"><dt>질소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalNitrogen.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.nitrogenDriftRatio)}</small></dd></div>
         <div className="material-ledger-row"><dt>탄소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalCarbon.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.carbonDriftRatio)}</small></dd></div>
       </dl>
@@ -2550,6 +2556,17 @@ function SurfaceCommunityInspector({
     };
   }, { temperature: 0, speed: 0 });
   const owners = [...new Set(cells.map((cell) => cell.ownerLabel))];
+  const averageTemperature = transport.temperature / count;
+  const decomposerTemperatureFactor = thetaTemperatureFactor(
+    averageTemperature,
+    MICROBE_ECOLOGY_RULES.decomposer.referenceTemperature,
+    MICROBE_ECOLOGY_RULES.decomposer.temperatureCoefficient,
+  );
+  const nitrifierTemperatureFactor = thetaTemperatureFactor(
+    averageTemperature,
+    MICROBE_ECOLOGY_RULES.nitrifier.referenceTemperature,
+    MICROBE_ECOLOGY_RULES.nitrifier.temperatureCoefficient,
+  );
 
   return (
     <section className="paper-panel surface-community-inspector">
@@ -2565,7 +2582,9 @@ function SurfaceCommunityInspector({
         <div><dt><i className="species-dot decomposer" />분해균 필름</dt><dd>평균 {(decomposer / count * 100).toFixed(1)}%</dd></div>
         <div><dt><i className="species-dot nitrifier" />질산화균 필름</dt><dd>평균 {(nitrifier / count * 100).toFixed(1)}%</dd></div>
         <div><dt>광량</dt><dd>평균 {averageLight.toFixed(1)} / 100</dd></div>
-        <div><dt>수온</dt><dd>평균 {(transport.temperature / count).toFixed(1)}°C</dd></div>
+        <div><dt>수온</dt><dd>평균 {averageTemperature.toFixed(1)}°C</dd></div>
+        <div><dt>분해 반응 수온 보정</dt><dd>×{decomposerTemperatureFactor.toFixed(2)}</dd></div>
+        <div><dt>질산화 반응 수온 보정</dt><dd>×{nitrifierTemperatureFactor.toFixed(2)}</dd></div>
         <div><dt>물 흐름</dt><dd>평균 {(transport.speed / count).toFixed(3)}칸/초</dd></div>
         <div><dt>유기물</dt><dd>{(water.organicMatter / count).toFixed(2)}</dd></div>
         <div><dt>암모니아성 노폐물</dt><dd>{(water.toxicWaste / count).toFixed(2)}</dd></div>
@@ -2862,7 +2881,7 @@ function WaterQualityReadout({
         <div className="microbe-growth-readout">
           <div className="microbe-growth-heading">
             <span>이 위치의 예상 순성장률</span>
-            <small>먹이·산소·빈 표면 반영</small>
+            <small>먹이·산소·수온·빈 표면 반영</small>
           </div>
           {MICROBE_IDS.map((guildId) => {
             const netGrowth = sample.microbeNetGrowth[guildId];
@@ -2947,6 +2966,7 @@ const animalDeathCauseLabel: Record<SimulationSnapshot['carcasses'][number]['cau
   'old-age': '수명을 다해 자연사',
   hypoxia: '용존산소 부족',
   toxicity: '암모니아 독성 누적',
+  temperature: '생존 범위를 벗어난 수온',
 };
 
 function AnimalInspector({
@@ -2994,6 +3014,10 @@ function AnimalInspector({
         <div><dt>최근 섭식</dt><dd>{feedingState}</dd></div>
         <div><dt>먹은 조류</dt><dd>누적 {animal.consumedBiomass.toFixed(1)}</dd></div>
         <div><dt>번식 상태</dt><dd>{animal.lifeStage === 'juvenile' ? '아직 성장 중' : reproduction}</dd></div>
+        <div><dt>현재 수온</dt><dd>{animal.temperature.toFixed(1)}°C</dd></div>
+        <div><dt>대사 속도</dt><dd>24°C 기준 ×{animal.metabolicTemperatureFactor.toFixed(2)}</dd></div>
+        <div><dt>성장·번식 속도</dt><dd>24°C 기준 ×{animal.reproductionTemperatureFactor.toFixed(2)}</dd></div>
+        <div><dt>수온 생존 적합도</dt><dd>{Math.round(animal.thermalHealthSuitability * 100)} / 100</dd></div>
       </dl>
       <p className="animal-note">실제로 먹은 만큼 표면의 조류가 줄고, 확보한 에너지가 생존·성장·번식에 사용됩니다.</p>
       {canRetrieve && onRetrieve && (
@@ -3034,6 +3058,9 @@ function AnimalCarcassInspector({
             <div><dt>사망 당시 산소</dt><dd>{carcass.waterAtDeath.oxygen.toFixed(2)} / 피해 시작 {SHRIMP_ECOLOGY_RULES.oxygenStressStart} 미만</dd></div>
             <div><dt>사망 당시 유기물</dt><dd>{carcass.waterAtDeath.organicMatter.toFixed(2)}</dd></div>
           </>
+        )}
+        {carcass.temperatureAtDeath != null && (
+          <div><dt>사망 당시 수온</dt><dd>{carcass.temperatureAtDeath.toFixed(1)}°C</dd></div>
         )}
         <div><dt>죽은 뒤</dt><dd>{formatTime(carcass.ageSeconds)}</dd></div>
       </dl>
@@ -3091,7 +3118,10 @@ function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }
       const water = event.water
         ? ` · 산소 ${event.water.oxygen.toFixed(1)} · 암모니아 ${event.water.toxicWaste.toFixed(1)}`
         : '';
-      return `${sex} ${stage} · ${animalDeathCauseLabel[event.cause]}${water}`;
+      const temperature = event.temperature == null
+        ? ''
+        : ` · 수온 ${event.temperature.toFixed(1)}°C`;
+      return `${sex} ${stage} · ${animalDeathCauseLabel[event.cause]}${water}${temperature}`;
     }
     if (event.kind === 'birth') return `${sex} 새끼 · 어미 개체에서 태어남`;
     return `${sex} ${stage}`;
@@ -3115,6 +3145,7 @@ function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }
           <span>자연사 <b>{totals.deathsByCause['old-age']}</b></span>
           <span>산소 부족 <b>{totals.deathsByCause.hypoxia}</b></span>
           <span>암모니아 <b>{totals.deathsByCause.toxicity}</b></span>
+          <span>수온 <b>{totals.deathsByCause.temperature}</b></span>
         </div>
       )}
       {recentEvents.length ? (
@@ -3343,13 +3374,15 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
         <div><dt>먹이</dt><dd>{definition.diet}</dd></div>
         <div><dt>성체 크기</dt><dd>{definition.adultLength}</dd></div>
         <div><dt>번식</dt><dd>충분히 먹은 성체 암수가 번식합니다. 먹이가 부족해지면 번식과 성장이 멈추고, 오래 굶으면 죽습니다.</dd></div>
+        <div><dt>수온 반응</dt><dd>{definition.temperature.summary}</dd></div>
       </dl>
       <section className="ecology-rules-card">
         <div className="ecology-rules-heading"><strong>게임 생존·수질 기준</strong><span>수질 농도 0–100</span></div>
         <dl>
           <div><dt>용존산소</dt><dd><b>{SHRIMP_ECOLOGY_RULES.oxygenStressStart} 이상</b>은 저산소 피해 없음. 그 아래부터 피해가 커져 0에서 체력 <b>{(SHRIMP_ECOLOGY_RULES.oxygenMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
           <div><dt>암모니아성 노폐물</dt><dd><b>{SHRIMP_ECOLOGY_RULES.toxicWasteStressStart} 이하</b>는 독성 피해 없음. {SHRIMP_ECOLOGY_RULES.toxicWasteStressStart}–{SHRIMP_ECOLOGY_RULES.toxicWasteFullStress}에서 증가해 {SHRIMP_ECOLOGY_RULES.toxicWasteFullStress} 이상이면 체력 <b>{(SHRIMP_ECOLOGY_RULES.toxicMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
-          <div><dt>회복</dt><dd>두 스트레스가 없을 때 체력 <b>{(SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 저산소와 독성 피해는 합산됩니다.</dd></div>
+          <div><dt>수온</dt><dd><b>{definition.temperature.referenceTemperature}°C</b> 기준 대사율에 1°C당 <b>×{definition.temperature.metabolicTheta}</b>를 적용합니다. 성장·번식은 별도 종 곡선을 사용하며 33°C에서는 번식 진행이 멈춥니다.</dd></div>
+          <div><dt>회복</dt><dd>저산소·독성·수온 스트레스가 없을 때 체력 <b>{(SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 세 피해는 합산됩니다.</dd></div>
           <div><dt>먹이의 행방</dt><dd>먹은 조류의 <b>{Math.round(WATER_CYCLE_RULES.shrimp.assimilationFraction * 100)}%</b>는 몸과 번식 자원, <b>{Math.round(WATER_CYCLE_RULES.shrimp.fecesFraction * 100)}%</b>는 유기성 찌꺼기, 나머지는 호흡·배설로 돌아갑니다.</dd></div>
           <div><dt>기초 대사</dt><dd>성체는 몸·저장량 <b>{adultMaintenance.toFixed(6)}</b>, 어린 새우는 <b>{juvenileMaintenance.toFixed(6)}</b> /마리·초를 사용합니다.</dd></div>
           <div><dt>산소 소비</dt><dd>성체 기초 대사만으로 약 <b>{oxygenPerAdultSecond.toFixed(6)}</b> /마리·초를 소비하며, 먹이 호흡분도 같은 질량 장부로 계산됩니다.</dd></div>

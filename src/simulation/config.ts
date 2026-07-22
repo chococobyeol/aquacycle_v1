@@ -7,6 +7,7 @@ import type {
   Vec2,
   WaterQualityValues,
 } from './types';
+import type { TemperatureResponsePoint } from './temperatureResponse';
 
 // This is the lowest biomass that is actually drawn as a colony in the tank.
 // Selection and removal use the same value so anything visible can be cleaned.
@@ -25,6 +26,16 @@ export interface AnimalDefinition {
   adultLength: string;
   color: number;
   accentColor: string;
+  temperature: {
+    referenceTemperature: number;
+    metabolicTheta: number;
+    minimumMetabolicFactor: number;
+    maximumMetabolicFactor: number;
+    reproductionCurve: TemperatureResponsePoint[];
+    healthCurve: TemperatureResponsePoint[];
+    maximumThermalDamagePerSecond: number;
+    summary: string;
+  };
 }
 
 export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
@@ -37,6 +48,34 @@ export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
     adultLength: '성체 약 2~3cm',
     color: 0xcf6f61,
     accentColor: '#cf6f61',
+    temperature: {
+      referenceTemperature: 24,
+      metabolicTheta: 1.07,
+      minimumMetabolicFactor: 0.55,
+      maximumMetabolicFactor: 1.65,
+      reproductionCurve: [
+        { temperature: 8, response: 0 },
+        { temperature: 16, response: 0.35 },
+        { temperature: 20, response: 0.78 },
+        { temperature: 24, response: 1 },
+        { temperature: 28, response: 1.08 },
+        { temperature: 32, response: 0.28 },
+        { temperature: 33, response: 0 },
+        { temperature: 40, response: 0 },
+      ],
+      healthCurve: [
+        { temperature: 4, response: 0 },
+        { temperature: 10, response: 0.35 },
+        { temperature: 16, response: 0.85 },
+        { temperature: 20, response: 1 },
+        { temperature: 28, response: 1 },
+        { temperature: 32, response: 0.72 },
+        { temperature: 36, response: 0 },
+        { temperature: 40, response: 0 },
+      ],
+      maximumThermalDamagePerSecond: 0.006,
+      summary: '20~28°C에서는 생존·번식이 안정적입니다. 낮은 수온은 대사와 발생을 늦추고, 33°C에서는 번식이 멈추며 극단적인 고·저온은 장기 생존을 해칩니다.',
+    },
   },
 };
 
@@ -121,6 +160,8 @@ export const MICROBE_ECOLOGY_RULES = {
     surfaceSpreadRate: 0.025,
     waterborneExportRate: 0.0007,
     suspendedDecayRate: 0.025,
+    referenceTemperature: 24,
+    temperatureCoefficient: 1.08,
   },
   nitrifier: {
     substrate: 'toxicWaste',
@@ -136,6 +177,8 @@ export const MICROBE_ECOLOGY_RULES = {
     surfaceSpreadRate: 0.012,
     waterborneExportRate: 0.00035,
     suspendedDecayRate: 0.008,
+    referenceTemperature: 24,
+    temperatureCoefficient: 1.08,
   },
   settlementAttemptsPerSecond: 8,
   settlementFractionPerAttempt: 0.16,
@@ -187,6 +230,7 @@ export interface MicrobeDefinition {
   description: string;
   foodLabel: string;
   productLabel: string;
+  temperatureSummary: string;
 }
 
 export const MICROBES: Record<MicrobeGuildId, MicrobeDefinition> = {
@@ -199,6 +243,7 @@ export const MICROBES: Record<MicrobeGuildId, MicrobeDefinition> = {
     description: '표면에 붙어 유기물을 분해합니다. 유기물이 늘면 빠르게 증가하고, 고갈되면 다시 줄어듭니다.',
     foodLabel: '유기물 + 산소',
     productLabel: '암모니아성 노폐물',
+    temperatureSummary: '24°C 기준 반응률에 수온 1°C당 1.08의 보정을 적용합니다. 낮은 수온에서는 분해와 증감이 함께 느려집니다.',
   },
   nitrifier: {
     id: 'nitrifier',
@@ -209,6 +254,7 @@ export const MICROBES: Record<MicrobeGuildId, MicrobeDefinition> = {
     description: '산소를 사용해 암모니아성 노폐물을 영양염으로 바꿉니다. 분해균보다 느리게 늘지만 먹이가 적어도 더 오래 유지됩니다.',
     foodLabel: '암모니아성 노폐물 + 산소',
     productLabel: '영양염',
+    temperatureSummary: '24°C 기준 반응률에 수온 1°C당 1.08의 보정을 적용합니다. 먹이와 산소가 같아도 차가운 곳에서는 전환이 느립니다.',
   },
 };
 

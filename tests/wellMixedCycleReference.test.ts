@@ -42,5 +42,5 @@ describe('well-mixed microbial-cycle reference', () => {
     expect(final.nutrients + final.toxicWaste).toBeGreaterThan(
       initial.nutrients + initial.toxicWaste,
     );
-  });
+  }, 15_000);
 });

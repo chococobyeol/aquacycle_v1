@@ -30,6 +30,10 @@ const animal = (id: string, x: number, y: number): AnimalSnapshot => ({
   reproductiveState: 'none',
   recentIntake: 0.1,
   consumedBiomass: 4,
+  temperature: 24,
+  metabolicTemperatureFactor: 1,
+  reproductionTemperatureFactor: 1,
+  thermalHealthSuitability: 1,
 });
 
 const structure = (x: number, angle: number): StructureSnapshot => ({

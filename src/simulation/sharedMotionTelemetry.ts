@@ -156,6 +156,10 @@ const emptyAnimal = (): AnimalSnapshot => ({
   reproductiveState: 'none',
   recentIntake: 0,
   consumedBiomass: 0,
+  temperature: 24,
+  metabolicTemperatureFactor: 1,
+  reproductionTemperatureFactor: 1,
+  thermalHealthSuitability: 1,
 });
 
 const emptyMessage = (): WorkerMotionMessage => ({
