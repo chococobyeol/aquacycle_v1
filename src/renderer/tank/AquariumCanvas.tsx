@@ -73,9 +73,8 @@ import {
   TANK_VISUAL_WATER_TOP,
 } from './tankVisualGeometry';
 import {
-  interpolateMotionFrames,
+  createReusableMotionInterpolator,
   reconcileMotionWithSnapshot,
-  reconcileStructureMotionWithSnapshot,
 } from './motionInterpolation';
 import {
   normalizeWaterQualityForDisplay,
@@ -340,6 +339,19 @@ interface AnalysisGridSurface {
 }
 
 const analysisGridSurfaces = new WeakMap<Sprite, AnalysisGridSurface>();
+const reusableImageData = new WeakMap<CanvasRenderingContext2D, ImageData>();
+
+const getReusableImageData = (
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+): ImageData => {
+  const existing = reusableImageData.get(context);
+  if (existing && existing.width === width && existing.height === height) return existing;
+  const pixels = context.createImageData(width, height);
+  reusableImageData.set(context, pixels);
+  return pixels;
+};
 
 const getRasterSurface = (layer: Sprite, width: number, height: number): RasterSurface | null => {
   const existing = rasterSurfaces.get(layer);
@@ -579,7 +591,7 @@ const drawLightField = (
   const surface = getRasterSurface(layer, columns, rows);
   if (!surface) return;
   const { context, texture } = surface;
-  const pixels = context.createImageData(columns, rows);
+  const pixels = getReusableImageData(context, columns, rows);
   for (let row = 0; row < rows; row += 1) {
     for (let column = 0; column < columns; column += 1) {
       const value = values[row * columns + column] ?? 0;
@@ -614,7 +626,7 @@ const WATER_QUALITY_PALETTES: Record<WaterQualityVariable, {
 };
 
 const isMicrobeLayer = (
-  layer: WaterQualityVariable | MicrobeGuildId | null,
+  layer: WaterQualityLayer | null,
 ): layer is MicrobeGuildId => layer === 'decomposer' || layer === 'nitrifier';
 
 const SECONDARY_WATER_COLORS: Record<WaterQualityVariable, string> = {
@@ -630,6 +642,26 @@ const WATER_QUALITY_DRAW_ORDER: readonly WaterQualityVariable[] = [
   'nutrients',
   'oxygen',
 ];
+
+const isDissolvedLayer = (layer: WaterQualityLayer): layer is WaterQualityVariable =>
+  WATER_QUALITY_DRAW_ORDER.includes(layer as WaterQualityVariable);
+
+const analysisOverlayKey = (
+  snapshot: SimulationSnapshot,
+  selectedLayers: readonly WaterQualityLayer[],
+): string => {
+  const needsDissolvedGrid = selectedLayers.some(isDissolvedLayer);
+  const needsTransportGrid = selectedLayers.includes('temperature') ||
+    selectedLayers.includes('flow');
+  const { decomposer, nitrifier } = snapshot.biogeochemistry.biofilmTotals;
+  return [
+    needsDissolvedGrid ? snapshot.biogeochemistry.water.revision : 'water-idle',
+    needsTransportGrid ? snapshot.biogeochemistry.transport.revision : 'transport-idle',
+    decomposer.toFixed(3),
+    nitrifier.toFixed(3),
+    selectedLayers.join(',') || 'none',
+  ].join(':');
+};
 
 interface ContourPoint {
   x: number;
@@ -733,6 +765,122 @@ const drawWaterQualityContours = (
   context.restore();
 };
 
+const drawTemperatureContours = (
+  context: CanvasRenderingContext2D,
+  snapshot: SimulationSnapshot,
+  rasterWidth: number,
+  rasterHeight: number,
+): void => {
+  const transport = snapshot.biogeochemistry.transport;
+  if (transport.columns < 2 || transport.rows < 2) return;
+  const span = Math.max(0.001, transport.maximumTemperature - transport.minimumTemperature);
+  const normalized = transport.temperature.map((value) =>
+    Math.max(0, Math.min(1, (value - transport.minimumTemperature) / span)));
+  const pointAt = (column: number, row: number): ContourPoint => ({
+    x: ((column + 0.5) / transport.columns) * rasterWidth,
+    y: ((row + 0.5) / transport.rows) * rasterHeight,
+  });
+  const valueAt = (column: number, row: number): number =>
+    normalized[row * transport.columns + column] ?? 0;
+
+  context.save();
+  context.strokeStyle = '#d47c4d';
+  context.lineWidth = 1.25;
+  context.lineCap = 'round';
+  for (const [thresholdIndex, threshold] of [0.3, 0.55, 0.8].entries()) {
+    context.globalAlpha = 0.52 + thresholdIndex * 0.13;
+    context.beginPath();
+    for (let row = 0; row < transport.rows - 1; row += 1) {
+      for (let column = 0; column < transport.columns - 1; column += 1) {
+        const points = [
+          pointAt(column, row),
+          pointAt(column + 1, row),
+          pointAt(column + 1, row + 1),
+          pointAt(column, row + 1),
+        ];
+        const samples = [
+          valueAt(column, row),
+          valueAt(column + 1, row),
+          valueAt(column + 1, row + 1),
+          valueAt(column, row + 1),
+        ];
+        const crossings = [
+          contourCrossing(points[0], points[1], samples[0], samples[1], threshold),
+          contourCrossing(points[1], points[2], samples[1], samples[2], threshold),
+          contourCrossing(points[2], points[3], samples[2], samples[3], threshold),
+          contourCrossing(points[3], points[0], samples[3], samples[0], threshold),
+        ].filter((point): point is ContourPoint => Boolean(point));
+        if (crossings.length === 2) {
+          context.moveTo(crossings[0].x, crossings[0].y);
+          context.lineTo(crossings[1].x, crossings[1].y);
+        } else if (crossings.length === 4) {
+          context.moveTo(crossings[0].x, crossings[0].y);
+          context.lineTo(crossings[1].x, crossings[1].y);
+          context.moveTo(crossings[2].x, crossings[2].y);
+          context.lineTo(crossings[3].x, crossings[3].y);
+        }
+      }
+    }
+    context.stroke();
+  }
+  context.restore();
+};
+
+const drawFlowArrows = (
+  context: CanvasRenderingContext2D,
+  snapshot: SimulationSnapshot,
+  rasterWidth: number,
+  rasterHeight: number,
+): void => {
+  const transport = snapshot.biogeochemistry.transport;
+  const maximumSpeed = Math.max(0.0001, transport.maximumSpeed);
+  context.save();
+  context.strokeStyle = '#d8f0e3';
+  context.fillStyle = '#d8f0e3';
+  context.lineWidth = 1.2;
+  context.lineCap = 'round';
+  context.globalAlpha = 0.76;
+  // A 36×20 arrow at every other cell overwhelms the hand-drawn tank.  The
+  // coarser visual sampling leaves the underlying temperature and organisms
+  // readable while still exposing the circulation topology.
+  for (let row = 1; row < transport.rows - 1; row += 3) {
+    for (let column = 1; column < transport.columns - 1; column += 3) {
+      const index = row * transport.columns + column;
+      const velocityX = transport.velocityX[index] ?? 0;
+      const velocityY = transport.velocityY[index] ?? 0;
+      const speed = Math.hypot(velocityX, velocityY);
+      if (speed < maximumSpeed * 0.045 || speed < 0.0002) continue;
+      const normalized = Math.min(1, speed / maximumSpeed);
+      const length = 2.8 + normalized * 7.5;
+      const directionX = velocityX / speed;
+      const directionY = velocityY / speed;
+      const centerX = ((column + 0.5) / transport.columns) * rasterWidth;
+      const centerY = ((row + 0.5) / transport.rows) * rasterHeight;
+      const endX = centerX + directionX * length;
+      const endY = centerY + directionY * length;
+      context.beginPath();
+      context.moveTo(centerX - directionX * length * 0.34, centerY - directionY * length * 0.34);
+      context.lineTo(endX, endY);
+      context.stroke();
+      const sideX = -directionY;
+      const sideY = directionX;
+      context.beginPath();
+      context.moveTo(endX, endY);
+      context.lineTo(
+        endX - directionX * 2.8 + sideX * 1.8,
+        endY - directionY * 2.8 + sideY * 1.8,
+      );
+      context.lineTo(
+        endX - directionX * 2.8 - sideX * 1.8,
+        endY - directionY * 2.8 - sideY * 1.8,
+      );
+      context.closePath();
+      context.fill();
+    }
+  }
+  context.restore();
+};
+
 const drawBiofilmStain = (
   context: CanvasRenderingContext2D,
   cell: SurfaceCellSnapshot,
@@ -805,12 +953,15 @@ const drawAnalysisOverlay = (
   context.setTransform(1, 0, 0, 1, 0, 0);
   context.clearRect(0, 0, rasterWidth, rasterHeight);
 
-  const selectedWaterLayerSet = new Set(selectedLayers.filter(
-    (selectedLayer): selectedLayer is WaterQualityVariable => !isMicrobeLayer(selectedLayer),
-  ));
+  const selectedWaterLayerSet = new Set(selectedLayers.filter(isDissolvedLayer));
   const selectedWaterLayers = WATER_QUALITY_DRAW_ORDER.filter((layerId) =>
     selectedWaterLayerSet.has(layerId));
-  const primaryWaterLayer = selectedWaterLayers.length === 1 ? selectedWaterLayers[0] : null;
+  const temperatureSelected = selectedLayers.includes('temperature');
+  const flowSelected = selectedLayers.includes('flow');
+  const scalarLayerCount = selectedWaterLayers.length + (temperatureSelected ? 1 : 0);
+  const primaryWaterLayer = scalarLayerCount === 1 && selectedWaterLayers.length === 1
+    ? selectedWaterLayers[0]
+    : null;
   if (primaryWaterLayer) {
     const water = snapshot.biogeochemistry.water;
     const grid = getAnalysisGridSurface(layer, water.columns, water.rows);
@@ -818,7 +969,7 @@ const drawAnalysisOverlay = (
       const values = water[primaryWaterLayer];
       const palette = WATER_QUALITY_PALETTES[primaryWaterLayer];
       const visualRange = waterQualityVisualRange(primaryWaterLayer, values);
-      const pixels = grid.context.createImageData(water.columns, water.rows);
+      const pixels = getReusableImageData(grid.context, water.columns, water.rows);
       for (let index = 0; index < water.columns * water.rows; index += 1) {
         const value = values[index] ?? 0;
         const normalized = normalizeWaterQualityForDisplay(
@@ -844,7 +995,33 @@ const drawAnalysisOverlay = (
     }
   }
 
-  for (const contourLayer of selectedWaterLayers.length > 1 ? selectedWaterLayers : []) {
+  if (scalarLayerCount === 1 && temperatureSelected) {
+    const transport = snapshot.biogeochemistry.transport;
+    const grid = getAnalysisGridSurface(layer, transport.columns, transport.rows);
+    if (grid) {
+      const span = Math.max(0.08, transport.maximumTemperature - transport.minimumTemperature);
+      const pixels = getReusableImageData(grid.context, transport.columns, transport.rows);
+      for (let index = 0; index < transport.columns * transport.rows; index += 1) {
+        const value = transport.temperature[index] ?? transport.averageTemperature;
+        const normalized = Math.max(
+          0,
+          Math.min(1, (value - transport.minimumTemperature) / span),
+        );
+        const color = mixColor(0x416f84, 0xd88852, normalized);
+        const offset = index * 4;
+        pixels.data[offset] = (color >> 16) & 0xff;
+        pixels.data[offset + 1] = (color >> 8) & 0xff;
+        pixels.data[offset + 2] = color & 0xff;
+        pixels.data[offset + 3] = Math.round((0.4 + normalized * 0.24) * 255);
+      }
+      grid.context.putImageData(pixels, 0, 0);
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.drawImage(grid.canvas, 0, 0, rasterWidth, rasterHeight);
+    }
+  }
+
+  for (const contourLayer of scalarLayerCount > 1 ? selectedWaterLayers : []) {
     drawWaterQualityContours(
       context,
       snapshot,
@@ -853,6 +1030,10 @@ const drawAnalysisOverlay = (
       rasterHeight,
     );
   }
+  if (scalarLayerCount > 1 && temperatureSelected) {
+    drawTemperatureContours(context, snapshot, rasterWidth, rasterHeight);
+  }
+  if (flowSelected) drawFlowArrows(context, snapshot, rasterWidth, rasterHeight);
 
   const selectedGuilds = new Set(selectedLayers.filter(isMicrobeLayer));
   const scaleX = rasterWidth / TANK_WIDTH;
@@ -963,11 +1144,32 @@ const updateStructureDisplay = (
 
 const applyStructureMotion = (
   displays: Map<string, StructureDisplay>,
+  snapshotStructures: readonly StructureSnapshot[],
   structures: StructureSnapshot[],
+  holding: SimulationSnapshot['holding'],
 ): void => {
   for (const structure of structures) {
     const display = displays.get(structure.id);
     if (!display) continue;
+    let authoritative: StructureSnapshot | undefined;
+    for (const candidate of snapshotStructures) {
+      if (candidate.id === structure.id) {
+        authoritative = candidate;
+        break;
+      }
+    }
+    const activelyHeld = Boolean(
+      structure.isHeld &&
+      holding?.kind === 'structure' &&
+      holding.structureId === structure.id,
+    );
+    if (
+      !authoritative ||
+      authoritative.locked ||
+      (structure.isHeld && !activelyHeld) ||
+      (!structure.isHeld && authoritative.isHeld) ||
+      (authoritative.isSleeping && !activelyHeld)
+    ) continue;
     display.container.position.set(structure.x, structure.y);
     display.container.rotation = structure.angle;
   }
@@ -1197,7 +1399,7 @@ const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisp
     renderFacing: target.facing,
     renderPoseAngle: target.poseAngle,
     renderBodyLength: target.bodyLength,
-    renderMotion: { ...animalMotion(target.behavior) },
+    renderMotion: { ...ANIMAL_MOTION_PROFILES[target.behavior] },
     grazingWeight: target.behavior === 'grazing' ? 1 : 0,
     phase: 0,
     phaseOffset,
@@ -1372,45 +1574,40 @@ const applyAnimalMotion = (
   for (const animal of animals) {
     const display = displays.get(animal.id);
     if (!display) continue;
-    Object.assign(display.target, {
-      x: animal.x,
-      y: animal.y,
-      facing: animal.facing,
-      poseAngle: animal.poseAngle,
-      bodyLength: animal.bodyLength,
-      behavior: animal.behavior,
-      health: animal.health,
-      held: false,
-      placementValid: true,
-      reproductiveState: animal.reproductiveState,
-      interpolatedPosition,
-    });
+    const target = display.target;
+    target.x = animal.x;
+    target.y = animal.y;
+    target.facing = animal.facing;
+    target.poseAngle = animal.poseAngle;
+    target.bodyLength = animal.bodyLength;
+    target.behavior = animal.behavior;
+    target.health = animal.health;
+    target.held = false;
+    target.placementValid = true;
+    target.reproductiveState = animal.reproductiveState;
+    target.interpolatedPosition = interpolatedPosition;
   }
 
   const held = holding?.kind === 'animal' ? holding : null;
   if (!held?.animalId) return;
   const display = displays.get(held.animalId);
   if (!display) return;
-  Object.assign(display.target, {
-    x: held.x,
-    y: held.y,
-    held: true,
-    placementValid: held.valid,
-    behavior: 'held' as const,
-    interpolatedPosition,
-  });
+  display.target.x = held.x;
+  display.target.y = held.y;
+  display.target.held = true;
+  display.target.placementValid = held.valid;
+  display.target.behavior = 'held';
+  display.target.interpolatedPosition = interpolatedPosition;
 };
 
-function animalMotion(behavior: AnimalSnapshot['behavior']): AnimalMotionProfile {
-  switch (behavior) {
-    case 'traveling': return { rate: 7.4, bend: 0.08, bob: 0.7, head: 0.025, legs: 0.1 };
-    case 'exploring': return { rate: 5.2, bend: 0.055, bob: 0.46, head: 0.04, legs: 0.075 };
-    case 'grazing': return { rate: 8.2, bend: 0.022, bob: 0.12, head: 0.075, legs: 0.115 };
-    case 'resting': return { rate: 1.6, bend: 0.018, bob: 0.12, head: 0.018, legs: 0.018 };
-    case 'starving': return { rate: 1.05, bend: 0.012, bob: 0.08, head: 0.012, legs: 0.01 };
-    case 'held': return { rate: 2.3, bend: 0.026, bob: 0.28, head: 0.025, legs: 0.03 };
-  }
-}
+const ANIMAL_MOTION_PROFILES: Record<AnimalSnapshot['behavior'], AnimalMotionProfile> = {
+  traveling: { rate: 7.4, bend: 0.08, bob: 0.7, head: 0.025, legs: 0.1 },
+  exploring: { rate: 5.2, bend: 0.055, bob: 0.46, head: 0.04, legs: 0.075 },
+  grazing: { rate: 8.2, bend: 0.022, bob: 0.12, head: 0.075, legs: 0.115 },
+  resting: { rate: 1.6, bend: 0.018, bob: 0.12, head: 0.018, legs: 0.018 },
+  starving: { rate: 1.05, bend: 0.012, bob: 0.08, head: 0.012, legs: 0.01 },
+  held: { rate: 2.3, bend: 0.026, bob: 0.28, head: 0.025, legs: 0.03 },
+};
 
 const animateAnimals = (
   displays: Map<string, AnimalDisplay>,
@@ -1439,7 +1636,7 @@ const animateAnimals = (
     display.renderBodyLength += (target.bodyLength - display.renderBodyLength) * poseEase;
 
     const movingPose = snapshot.phase === 'running' || target.held;
-    const desiredMotion = animalMotion(target.behavior);
+    const desiredMotion = ANIMAL_MOTION_PROFILES[target.behavior];
     const behaviorEase = 1 - Math.exp(-delta * 8);
     display.renderMotion.rate += (desiredMotion.rate - display.renderMotion.rate) * behaviorEase;
     display.renderMotion.bend += (desiredMotion.bend - display.renderMotion.bend) * behaviorEase;
@@ -1485,7 +1682,8 @@ const animateAnimals = (
       display.head.position.set(tug * 0.75, tug * 0.08);
       display.grazingMouth.scale.set(0.92 + tug * 0.13, 0.76 + tug * 0.32);
       display.grazingMouth.alpha = 0.72 + Math.min(1, tug) * 0.28;
-      display.grazingFlecks.forEach((fleck, index) => {
+      for (let index = 0; index < display.grazingFlecks.length; index += 1) {
+        const fleck = display.grazingFlecks[index];
         const progress = (phase * 0.36 + index / display.grazingFlecks.length) % 1;
         const inward = 1 - progress;
         fleck.position.set(
@@ -1496,17 +1694,18 @@ const animateAnimals = (
         fleck.scale.set(fleckScale);
         fleck.alpha = Math.sin(progress * Math.PI) * 0.88;
         fleck.rotation = phase * 0.18 * (index % 2 === 0 ? 1 : -1);
-      });
+      }
     } else {
       display.head.position.set(0, 0);
     }
 
-    display.abdomen.forEach((segment, index) => {
+    for (let index = 0; index < display.abdomen.length; index += 1) {
+      const segment = display.abdomen[index];
       const tailRatio = (index + 1) / display.abdomen.length;
       const wave = Math.sin(phase - index * 0.62);
       segment.position.set(SHRIMP_ABDOMEN_X[index], wave * motion.bend * 9 * tailRatio);
       segment.rotation = wave * motion.bend * tailRatio;
-    });
+    }
     display.tail.position.set(-21, Math.sin(phase - 2.65) * motion.bend * 10);
     display.tail.rotation = Math.sin(phase - 2.7) * motion.bend * 1.45;
     display.head.rotation = Math.sin(phase * 0.58 + 0.4) * motion.head;
@@ -2376,14 +2575,14 @@ const drawProbe = (
   layer: Graphics,
   snapshot: SimulationSnapshot,
   activeTool: InteractionTool,
-  selectedLayer: WaterQualityVariable | MicrobeGuildId | null,
+  selectedLayer: WaterQualityLayer | null,
 ): void => {
   layer.clear();
   if (!snapshot.probe) return;
   const { x, y, light } = snapshot.probe;
   const isTemperature = activeTool === 'temperature-probe';
   const isWaterQuality = activeTool === 'water-quality-probe';
-  const waterValue = selectedLayer && !isMicrobeLayer(selectedLayer)
+  const waterValue = selectedLayer && isDissolvedLayer(selectedLayer)
     ? snapshot.probe.water[selectedLayer]
     : 0;
   const color = isTemperature
@@ -2392,11 +2591,15 @@ const drawProbe = (
       ? selectedLayer
         ? isMicrobeLayer(selectedLayer)
           ? MICROBES[selectedLayer].color
-          : mixColor(
-            WATER_QUALITY_PALETTES[selectedLayer].low,
-            WATER_QUALITY_PALETTES[selectedLayer].high,
-            normalizeWaterQualityValue(selectedLayer, waterValue),
-          )
+          : selectedLayer === 'temperature'
+            ? 0xd47c4d
+            : selectedLayer === 'flow'
+              ? 0x58a697
+              : mixColor(
+                WATER_QUALITY_PALETTES[selectedLayer].low,
+                WATER_QUALITY_PALETTES[selectedLayer].high,
+                normalizeWaterQualityValue(selectedLayer, waterValue),
+              )
         : 0x5c8179
       : mixColor(0x315d78, 0xe3ba56, light / 100);
   layer
@@ -2577,6 +2780,8 @@ export function AquariumCanvas({
   const appRef = useRef<Application | null>(null);
   const snapshotRef = useRef(snapshot);
   const motionSourceRef = useRef(motionSource);
+  const motionInterpolatorRef = useRef<ReturnType<typeof createReusableMotionInterpolator> | null>(null);
+  motionInterpolatorRef.current ??= createReusableMotionInterpolator();
   const lastMotionSequenceRef = useRef<number | null>(null);
   const rebasedMotionSequenceRef = useRef<number | null>(null);
   const activeToolRef = useRef(activeTool);
@@ -2590,7 +2795,12 @@ export function AquariumCanvas({
   const lastAnalysisDrawRef = useRef('');
   const lastAlgaeRevisionRef = useRef(-1);
   const lastAlgaeStructureGeometryRef = useRef('');
-  const lastSeedsRevisionRef = useRef(-1);
+  const lastSeedsDrawRef = useRef('');
+  const lastGoalGuideDrawRef = useRef('');
+  const lastInteractionDrawRef = useRef('');
+  const lastMeasurementsDrawRef = useRef('');
+  const lastProbeDrawRef = useRef('');
+  const lastSelectionDrawRef = useRef('');
   const pendingConsumedRef = useRef(false);
   const pendingHandoffStartedAtRef = useRef<number | null>(null);
   const pendingHandoffNotifiedRef = useRef(false);
@@ -2656,7 +2866,7 @@ export function AquariumCanvas({
         : null;
       lastMotionSequenceRef.current = sequence;
     }
-    return interpolateMotionFrames(
+    return motionInterpolatorRef.current!.sample(
       rebasedMotionSequenceRef.current === sequence
         ? { previous: null, current: frames.current }
         : frames,
@@ -2807,7 +3017,6 @@ export function AquariumCanvas({
     const ownedAnimalCarcassDisplays = new Map<string, AnimalCarcassDisplay>();
     let animalTicker: ((ticker: Ticker) => void) | null = null;
     let renderTicker: (() => void) | null = null;
-    let syncedMotionSequence: number | null = null;
     texturesRef.current = ownedTextures;
     structureDisplaysRef.current = ownedDisplays;
     animalDisplaysRef.current = ownedAnimalDisplays;
@@ -2816,7 +3025,12 @@ export function AquariumCanvas({
     lastAnalysisDrawRef.current = '';
     lastAlgaeRevisionRef.current = -1;
     lastAlgaeStructureGeometryRef.current = '';
-    lastSeedsRevisionRef.current = -1;
+    lastSeedsDrawRef.current = '';
+    lastGoalGuideDrawRef.current = '';
+    lastInteractionDrawRef.current = '';
+    lastMeasurementsDrawRef.current = '';
+    lastProbeDrawRef.current = '';
+    lastSelectionDrawRef.current = '';
 
     const isCurrentGeneration = (): boolean =>
       !disposed && effectGenerationRef.current === generation;
@@ -3022,7 +3236,6 @@ export function AquariumCanvas({
         true,
         isPendingInventoryHandoff(),
       );
-      syncedMotionSequence = initialMotion?.sequence ?? null;
       syncAnimalCarcasses(layers.animals, initialSnapshot, ownedAnimalCarcassDisplays);
       drawGoalGuide(layers.goalGuide, initialSnapshot, showGoalGuideRef.current);
       drawSeeds(layers.seeds, initialSnapshot);
@@ -3036,55 +3249,38 @@ export function AquariumCanvas({
       );
       drawSelection(layers.selection, initialSnapshot);
       lastLightDrawRef.current = `${initialSnapshot.lightField.revision}:${initialShowsLight}`;
-      lastAnalysisDrawRef.current = [
-        initialSnapshot.biogeochemistry.water.revision,
-        initialSnapshot.biogeochemistry.biofilmTotals.decomposer.toFixed(3),
-        initialSnapshot.biogeochemistry.biofilmTotals.nitrifier.toFixed(3),
-        waterQualityLayersRef.current.join(',') || 'none',
-      ].join(':');
+      lastAnalysisDrawRef.current = analysisOverlayKey(
+        initialSnapshot,
+        waterQualityLayersRef.current,
+      );
       lastAlgaeRevisionRef.current = initialSnapshot.revision;
       lastAlgaeStructureGeometryRef.current = structureAlgaeGeometryKey(initialSnapshot);
-      lastSeedsRevisionRef.current = initialSnapshot.revision;
+      lastSeedsDrawRef.current = JSON.stringify(initialSnapshot.seeds);
+      lastGoalGuideDrawRef.current = showGoalGuideRef.current
+        ? `visible:${initialSnapshot.revision}`
+        : 'hidden';
+      lastInteractionDrawRef.current = `${hasPendingInventoryRef.current}:${JSON.stringify(initialSnapshot.holding)}`;
+      lastMeasurementsDrawRef.current = JSON.stringify(initialSnapshot.measurements);
+      lastProbeDrawRef.current = `${activeToolRef.current}:${waterQualityLayersRef.current[0] ?? ''}:${JSON.stringify(initialSnapshot.probe)}`;
+      lastSelectionDrawRef.current = JSON.stringify(initialSnapshot.selection);
       animalTicker = (ticker: Ticker): void => {
         if (!isCurrentGeneration()) return;
         const currentSnapshot = snapshotRef.current;
         const nowMs = performance.now();
         const motion = sampleMotion(nowMs);
         if (motion) {
-          const reconciledStructures = reconcileStructureMotionWithSnapshot(
+          applyStructureMotion(
+            ownedDisplays,
             currentSnapshot.structures,
             motion.structures,
             currentSnapshot.holding,
           );
-          if (motion.sequence !== syncedMotionSequence) {
-            syncStructures(
-              layers.structures,
-              currentSnapshot,
-              ownedTextures,
-              ownedDisplays,
-              reconciledStructures,
-              isPendingInventoryHandoff(),
-            );
-            syncAnimals(
-              layers.animals,
-              currentSnapshot,
-              ownedAnimalDisplays,
-              motion.animals,
-              motion.holding,
-              motion.interpolated,
-              false,
-              isPendingInventoryHandoff(),
-            );
-            syncedMotionSequence = motion.sequence;
-          } else {
-            applyStructureMotion(ownedDisplays, reconciledStructures);
-            applyAnimalMotion(
-              ownedAnimalDisplays,
-              motion.animals,
-              motion.holding,
-              motion.interpolated,
-            );
-          }
+          applyAnimalMotion(
+            ownedAnimalDisplays,
+            motion.animals,
+            motion.holding,
+            motion.interpolated,
+          );
         }
         animateAnimals(ownedAnimalDisplays, currentSnapshot, ticker.deltaMS / 1000);
         animateAnimalCarcasses(ownedAnimalCarcassDisplays, ticker.deltaMS / 1000);
@@ -3255,12 +3451,7 @@ export function AquariumCanvas({
       drawLightField(layers.light, snapshot, activeTool === 'light-probe');
       lastLightDrawRef.current = lightKey;
     }
-    const analysisKey = [
-      snapshot.biogeochemistry.water.revision,
-      snapshot.biogeochemistry.biofilmTotals.decomposer.toFixed(3),
-      snapshot.biogeochemistry.biofilmTotals.nitrifier.toFixed(3),
-      waterQualityLayers.join(',') || 'none',
-    ].join(':');
+    const analysisKey = analysisOverlayKey(snapshot, waterQualityLayers);
     if (lastAnalysisDrawRef.current !== analysisKey) {
       drawAnalysisOverlay(layers.analysis, snapshot, waterQualityLayers);
       lastAnalysisDrawRef.current = analysisKey;
@@ -3309,15 +3500,36 @@ export function AquariumCanvas({
       lastAlgaeRevisionRef.current = snapshot.revision;
       lastAlgaeStructureGeometryRef.current = structureGeometryKey;
     }
-    if (lastSeedsRevisionRef.current !== snapshot.revision) {
+    const seedsKey = JSON.stringify(snapshot.seeds);
+    if (lastSeedsDrawRef.current !== seedsKey) {
       drawSeeds(layers.seeds, snapshot);
-      lastSeedsRevisionRef.current = snapshot.revision;
+      lastSeedsDrawRef.current = seedsKey;
     }
-    drawGoalGuide(layers.goalGuide, snapshot, showGoalGuide);
-    drawInteraction(layers.interaction, snapshot, isPendingInventoryHandoff());
-    drawMeasurements(layers.measurements, snapshot);
-    drawProbe(layers.probe, snapshot, activeTool, waterQualityLayers[0] ?? null);
-    drawSelection(layers.selection, snapshot);
+    const goalGuideKey = showGoalGuide ? `visible:${snapshot.revision}` : 'hidden';
+    if (lastGoalGuideDrawRef.current !== goalGuideKey) {
+      drawGoalGuide(layers.goalGuide, snapshot, showGoalGuide);
+      lastGoalGuideDrawRef.current = goalGuideKey;
+    }
+    const interactionKey = `${hasPendingInventory}:${JSON.stringify(snapshot.holding)}`;
+    if (lastInteractionDrawRef.current !== interactionKey) {
+      drawInteraction(layers.interaction, snapshot, isPendingInventoryHandoff());
+      lastInteractionDrawRef.current = interactionKey;
+    }
+    const measurementsKey = JSON.stringify(snapshot.measurements);
+    if (lastMeasurementsDrawRef.current !== measurementsKey) {
+      drawMeasurements(layers.measurements, snapshot);
+      lastMeasurementsDrawRef.current = measurementsKey;
+    }
+    const probeKey = `${activeTool}:${waterQualityLayers[0] ?? ''}:${JSON.stringify(snapshot.probe)}`;
+    if (lastProbeDrawRef.current !== probeKey) {
+      drawProbe(layers.probe, snapshot, activeTool, waterQualityLayers[0] ?? null);
+      lastProbeDrawRef.current = probeKey;
+    }
+    const selectionKey = JSON.stringify(snapshot.selection);
+    if (lastSelectionDrawRef.current !== selectionKey) {
+      drawSelection(layers.selection, snapshot);
+      lastSelectionDrawRef.current = selectionKey;
+    }
     tryCompletePendingDrop(snapshot);
     tryCompletePendingInventoryHandoff(snapshot.holding, performance.now());
   }, [activeTool, editable, hasPendingInventory, showGoalGuide, snapshot, waterQualityLayers]);

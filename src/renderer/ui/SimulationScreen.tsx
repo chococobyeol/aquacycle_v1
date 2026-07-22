@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useRef,
@@ -49,6 +50,14 @@ import {
   type WaterQualityLayer,
 } from '../tank/waterQualityOverlay';
 import { CloseGlyph } from './CloseGlyph';
+import {
+  appendRollingHistory,
+  ECOLOGY_HISTORY_WINDOW_SECONDS,
+  ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS,
+  historyPointsInWindow,
+  historyTimeBounds,
+  historyTimeX,
+} from './ecologyHistory';
 
 interface SimulationScreenProps {
   scenarioId: ScenarioId;
@@ -213,6 +222,8 @@ const WATER_QUALITY_CHANNELS: readonly {
   { id: 'toxicWaste', label: '암모니아성 노폐물', shortLabel: '암모니아' },
   { id: 'nutrients', label: '영양염', shortLabel: '영양염' },
   { id: 'oxygen', label: '용존산소', shortLabel: '산소' },
+  { id: 'temperature', label: '수온', shortLabel: '수온' },
+  { id: 'flow', label: '물 흐름', shortLabel: '흐름' },
   { id: 'decomposer', label: '분해균 필름', shortLabel: '분해균' },
   { id: 'nitrifier', label: '질산화균 필름', shortLabel: '질산화균' },
 ];
@@ -225,12 +236,20 @@ const waterQualityValue = (
   layer: WaterQualityLayer,
 ): number => layer === 'decomposer' || layer === 'nitrifier'
   ? sample.biofilm[layer] * 100
-  : sample.water[layer];
+  : layer === 'temperature'
+    ? sample.temperature
+    : layer === 'flow'
+      ? sample.waterSpeed
+      : sample.water[layer];
 
 const formatWaterQualityValue = (layer: WaterQualityLayer, value: number): string =>
   layer === 'decomposer' || layer === 'nitrifier'
     ? `${value.toFixed(2)}%`
-    : value.toFixed(2);
+    : layer === 'temperature'
+      ? `${value.toFixed(1)}°C`
+      : layer === 'flow'
+        ? `${value.toFixed(3)}칸/초`
+        : value.toFixed(2);
 
 const formatTime = (seconds: number): string => {
   const safeSeconds = Math.max(0, Math.floor(seconds));
@@ -451,6 +470,9 @@ export function SimulationScreen({
   const detachedPanelInteractionRef = useRef<DetachedPanelInteractionState | null>(null);
   const rightPanelResizeRef = useRef<RightPanelResizeState | null>(null);
   const [ecologyHistory, setEcologyHistory] = useState<EcologyHistoryPoint[]>([]);
+  const [ecologyHistoryWindowSeconds, setEcologyHistoryWindowSeconds] = useState(
+    ECOLOGY_HISTORY_WINDOW_SECONDS,
+  );
   pendingInventoryRef.current = pendingInventory;
 
   const observationSelectionKey = snapshot?.selection
@@ -505,6 +527,7 @@ export function SimulationScreen({
     setShowMissionBriefing(SCENARIOS[scenarioId].mode === 'challenge');
     lastEcologySampleAt.current = Number.NEGATIVE_INFINITY;
     setEcologyHistory([]);
+    setEcologyHistoryWindowSeconds(ECOLOGY_HISTORY_WINDOW_SECONDS);
   }, [scenarioId]);
 
   useEffect(() => {
@@ -578,7 +601,7 @@ export function SimulationScreen({
     if (elapsedSeconds - lastEcologySampleAt.current < 2) return;
 
     lastEcologySampleAt.current = elapsedSeconds;
-    setEcologyHistory((current) => [...current, point].slice(-120));
+    setEcologyHistory((current) => appendRollingHistory(current, point));
   }, [
     snapshot?.elapsedSeconds,
     snapshot?.totalBiomass.oedogonium,
@@ -762,7 +785,7 @@ export function SimulationScreen({
       {
         id: 'water' as const,
         title: '수질·미생물',
-        summary: `산소 ${snapshot.biogeochemistry.average.oxygen.toFixed(1)} · 노폐물 ${snapshot.biogeochemistry.average.toxicWaste.toFixed(1)}`,
+        summary: `수온 ${snapshot.biogeochemistry.transport.averageTemperature.toFixed(1)}°C · 산소 ${snapshot.biogeochemistry.average.oxygen.toFixed(1)}`,
       },
       {
         id: 'ledger' as const,
@@ -915,6 +938,22 @@ export function SimulationScreen({
     setOpenObservationSections((current) => current.includes(section)
       ? current.filter((item) => item !== section)
       : [...current, section]);
+  };
+
+  const changeEcologyHistoryWindow = (direction: -1 | 1): void => {
+    setEcologyHistoryWindowSeconds((current) => {
+      const currentIndex = ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS.indexOf(
+        current as (typeof ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS)[number],
+      );
+      const nextIndex = Math.max(
+        0,
+        Math.min(
+          ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS.length - 1,
+          (currentIndex < 0 ? 2 : currentIndex) + direction,
+        ),
+      );
+      return ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS[nextIndex];
+    });
   };
 
   const detachObservationSection = (section: ObservationSection): void => {
@@ -2117,6 +2156,9 @@ export function SimulationScreen({
                               section={section.id}
                               snapshot={snapshot}
                               ecologyHistory={ecologyHistory}
+                              historyWindowSeconds={ecologyHistoryWindowSeconds}
+                              onHistoryWindowDecrease={() => changeEcologyHistoryWindow(-1)}
+                              onHistoryWindowIncrease={() => changeEcologyHistoryWindow(1)}
                             />
                           </div>
                         )}
@@ -2212,6 +2254,9 @@ export function SimulationScreen({
                         section={section.id}
                         snapshot={snapshot}
                         ecologyHistory={ecologyHistory}
+                        historyWindowSeconds={ecologyHistoryWindowSeconds}
+                        onHistoryWindowDecrease={() => changeEcologyHistoryWindow(-1)}
+                        onHistoryWindowIncrease={() => changeEcologyHistoryWindow(1)}
                       />
                     </div>
                     <button
@@ -2295,10 +2340,16 @@ function ObservationSectionContent({
   section,
   snapshot,
   ecologyHistory,
+  historyWindowSeconds,
+  onHistoryWindowDecrease,
+  onHistoryWindowIncrease,
 }: {
   section: ObservationSection;
   snapshot: SimulationSnapshot;
   ecologyHistory: EcologyHistoryPoint[];
+  historyWindowSeconds: number;
+  onHistoryWindowDecrease: () => void;
+  onHistoryWindowIncrease: () => void;
 }) {
   const scenario = SCENARIOS[snapshot.scenarioId];
   const hasShrimpRecord = snapshot.animalPopulation['cherry-shrimp'].total > 0 ||
@@ -2340,8 +2391,12 @@ function ObservationSectionContent({
   }
 
   if (section === 'water') {
+    const transport = snapshot.biogeochemistry.transport;
     return (
       <dl>
+        <div><dt>평균 수온</dt><dd>{transport.averageTemperature.toFixed(1)}°C</dd></div>
+        <div><dt>수온 범위</dt><dd>{transport.minimumTemperature.toFixed(1)}–{transport.maximumTemperature.toFixed(1)}°C</dd></div>
+        <div><dt>가장 빠른 물 흐름</dt><dd>{transport.maximumSpeed.toFixed(3)}칸/초</dd></div>
         <div><dt>평균 유기물</dt><dd>{snapshot.biogeochemistry.average.organicMatter.toFixed(2)}</dd></div>
         <div><dt>평균 암모니아성 노폐물</dt><dd>{snapshot.biogeochemistry.average.toxicWaste.toFixed(2)}</dd></div>
         <div><dt>평균 영양염</dt><dd>{snapshot.biogeochemistry.average.nutrients.toFixed(2)}</dd></div>
@@ -2365,16 +2420,56 @@ function ObservationSectionContent({
     );
   }
 
+  const visibleEcologyHistory = historyPointsInWindow(
+    ecologyHistory,
+    historyWindowSeconds,
+  );
+  const shortestHistoryWindow = ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS[0];
+  const longestHistoryWindow = ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS.at(-1)!;
+
   return (
     <>
+      <div className="history-window-control" role="group" aria-label="그래프 표시 시간 조절">
+        <span>표시 구간</span>
+        <div>
+          <button
+            type="button"
+            aria-label="더 짧은 시간 구간 보기"
+            title="더 짧게 보기"
+            disabled={historyWindowSeconds <= shortestHistoryWindow}
+            onClick={onHistoryWindowDecrease}
+          >−</button>
+          <strong>{formatTime(historyWindowSeconds)}</strong>
+          <button
+            type="button"
+            aria-label="더 긴 시간 구간 보기"
+            title="더 길게 보기"
+            disabled={historyWindowSeconds >= longestHistoryWindow}
+            onClick={onHistoryWindowIncrease}
+          >+</button>
+        </div>
+      </div>
       {(hasShrimpRecord || scenario.allowedAnimals.length > 0) && (
         <>
-          <EcologyHistoryChart points={ecologyHistory} />
+          <EcologyHistoryChart
+            points={visibleEcologyHistory}
+            windowSeconds={historyWindowSeconds}
+          />
           <AnimalPopulationEventLog snapshot={snapshot} />
         </>
       )}
-      {scenario.waterCycle && <WaterCycleHistoryChart points={ecologyHistory} />}
-      {scenario.waterCycle && <ClosedCycleHistoryChart points={ecologyHistory} />}
+      {scenario.waterCycle && (
+        <WaterCycleHistoryChart
+          points={visibleEcologyHistory}
+          windowSeconds={historyWindowSeconds}
+        />
+      )}
+      {scenario.waterCycle && (
+        <ClosedCycleHistoryChart
+          points={visibleEcologyHistory}
+          windowSeconds={historyWindowSeconds}
+        />
+      )}
       {!scenario.waterCycle && !hasShrimpRecord && (
         <p className="observation-empty-copy">기록할 변화가 생기면 여기에 표시됩니다.</p>
       )}
@@ -2405,6 +2500,28 @@ const waterAtSurfaceCell = (
   };
 };
 
+const transportAtPoint = (
+  snapshot: SimulationSnapshot,
+  point: Vec2,
+) => {
+  const transport = snapshot.biogeochemistry.transport;
+  const column = Math.max(0, Math.min(
+    transport.columns - 1,
+    Math.floor((point.x / TANK_WIDTH) * transport.columns),
+  ));
+  const row = Math.max(0, Math.min(
+    transport.rows - 1,
+    Math.floor(((point.y - WATER_TOP) / (GROUND_Y - WATER_TOP)) * transport.rows),
+  ));
+  const index = row * transport.columns + column;
+  const velocityX = transport.velocityX[index] ?? 0;
+  const velocityY = transport.velocityY[index] ?? 0;
+  return {
+    temperature: transport.temperature[index] ?? transport.averageTemperature,
+    speed: Math.hypot(velocityX, velocityY),
+  };
+};
+
 function SurfaceCommunityInspector({
   cells,
   snapshot,
@@ -2425,6 +2542,13 @@ function SurfaceCommunityInspector({
       oxygen: sum.oxygen + local.oxygen,
     };
   }, { organicMatter: 0, toxicWaste: 0, nutrients: 0, oxygen: 0 });
+  const transport = cells.reduce((sum, cell) => {
+    const local = transportAtPoint(snapshot, cell);
+    return {
+      temperature: sum.temperature + local.temperature,
+      speed: sum.speed + local.speed,
+    };
+  }, { temperature: 0, speed: 0 });
   const owners = [...new Set(cells.map((cell) => cell.ownerLabel))];
 
   return (
@@ -2441,7 +2565,8 @@ function SurfaceCommunityInspector({
         <div><dt><i className="species-dot decomposer" />분해균 필름</dt><dd>평균 {(decomposer / count * 100).toFixed(1)}%</dd></div>
         <div><dt><i className="species-dot nitrifier" />질산화균 필름</dt><dd>평균 {(nitrifier / count * 100).toFixed(1)}%</dd></div>
         <div><dt>광량</dt><dd>평균 {averageLight.toFixed(1)} / 100</dd></div>
-        <div><dt>수온</dt><dd>{snapshot.waterTemperature.toFixed(1)}°C</dd></div>
+        <div><dt>수온</dt><dd>평균 {(transport.temperature / count).toFixed(1)}°C</dd></div>
+        <div><dt>물 흐름</dt><dd>평균 {(transport.speed / count).toFixed(3)}칸/초</dd></div>
         <div><dt>유기물</dt><dd>{(water.organicMatter / count).toFixed(2)}</dd></div>
         <div><dt>암모니아성 노폐물</dt><dd>{(water.toxicWaste / count).toFixed(2)}</dd></div>
         <div><dt>영양염</dt><dd>{(water.nutrients / count).toFixed(2)}</dd></div>
@@ -2504,10 +2629,16 @@ function RegionSelectionInspector({
               (sum, cell) => sum + cell.biofilm.decomposer + cell.biofilm.nitrifier,
               0,
             );
+            const localTemperature = surfaceCells.length
+              ? surfaceCells.reduce(
+                (sum, cell) => sum + transportAtPoint(snapshot, cell).temperature,
+                0,
+              ) / surfaceCells.length
+              : snapshot.biogeochemistry.transport.averageTemperature;
             return (
               <div className="region-structure-row" key={structure.id}>
                 <img src={definition.assetPath} alt="" />
-                <div><strong>{definition.label}</strong><small>수온 {snapshot.waterTemperature.toFixed(1)}°C · 조류 {surfaceAlgae.toFixed(1)} · 균 {surfaceBiofilm.toFixed(1)}</small></div>
+                <div><strong>{definition.label}</strong><small>수온 {localTemperature.toFixed(1)}°C · 조류 {surfaceAlgae.toFixed(1)} · 균 {surfaceBiofilm.toFixed(1)}</small></div>
                 <span>빛 {minimum.toFixed(0)}–{maximum.toFixed(0)}<b>평균 {average.toFixed(0)}</b></span>
               </div>
             );
@@ -2564,6 +2695,12 @@ function StructureInspector({
   const averageLight = cells.length
     ? cells.reduce((total, cell) => total + cell.light, 0) / cells.length
     : 0;
+  const averageTemperature = cells.length
+    ? cells.reduce(
+      (total, cell) => total + transportAtPoint(snapshot, cell).temperature,
+      0,
+    ) / cells.length
+    : snapshot.biogeochemistry.transport.averageTemperature;
   return (
     <section className="paper-panel structure-inspector">
       <div className="structure-inspector-heading">
@@ -2573,7 +2710,7 @@ function StructureInspector({
       <dl className="species-facts">
         <div><dt>재질</dt><dd>{definition.material}</dd></div>
         <div><dt>평균 광량</dt><dd>{isHeld ? '배치 후 계산' : `${Math.round(averageLight)} / 100`}</dd></div>
-        <div><dt>수온</dt><dd>{snapshot.waterTemperature.toFixed(1)}°C</dd></div>
+        <div><dt>수온</dt><dd>{averageTemperature.toFixed(1)}°C</dd></div>
         <div><dt>상태</dt><dd>{isHeld ? '배치 중' : structure.isSleeping ? '안정됨' : '움직이는 중'}</dd></div>
       </dl>
       {canRetrieve && onRetrieve && (
@@ -2601,8 +2738,8 @@ function AnalysisOverlayToolbar({
   onToggleCollapsed: () => void;
   onClose: () => void;
 }) {
-  const dissolvedLayerCount = layers.filter((layer) =>
-    layer !== 'decomposer' && layer !== 'nitrifier').length;
+  const scalarLayerCount = layers.filter((layer) =>
+    layer !== 'decomposer' && layer !== 'nitrifier' && layer !== 'flow').length;
 
   return (
     <section
@@ -2640,10 +2777,16 @@ function AnalysisOverlayToolbar({
               const isBiofilm = layer === 'decomposer' || layer === 'nitrifier';
               const formatValue = (value: number): string => isBiofilm
                 ? `${value.toFixed(1)}%`
-                : value.toFixed(1);
+                : layer === 'temperature'
+                  ? `${value.toFixed(1)}°C`
+                : layer === 'flow'
+                    ? `${value.toFixed(3)}칸/초`
+                    : value.toFixed(1);
               const displayMode = isBiofilm
                 ? '표면 얼룩'
-                : dissolvedLayerCount === 1
+                : layer === 'flow'
+                  ? '방향 화살표'
+                  : scalarLayerCount === 1
                   ? '색 지도'
                   : '등치선';
               return (
@@ -2658,8 +2801,8 @@ function AnalysisOverlayToolbar({
           </div>
           <small className="tank-analysis-method">
             {layers.length
-              ? '수질 한 항목은 색 지도로, 여러 항목은 같은 기준의 등치선으로 겹칩니다. 균 필름은 표면 얼룩입니다.'
-              : '아래에서 보고 싶은 수질이나 균 필름을 고르세요. 지도 창은 그대로 유지됩니다.'}
+              ? '수질·수온은 색 또는 등치선으로, 물 흐름은 방향 화살표로 겹칩니다. 균 필름은 표면 얼룩입니다.'
+              : '아래에서 보고 싶은 수질·수온·흐름이나 균 필름을 고르세요. 지도 창은 그대로 유지됩니다.'}
           </small>
           <div className="tank-analysis-channel-strip" role="group" aria-label="색 지도 채널">
             {WATER_QUALITY_CHANNELS.map((item) => (
@@ -2990,7 +3133,15 @@ function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }
   );
 }
 
-function EcologyHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
+const EcologyHistoryChart = memo(function EcologyHistoryChart({
+  points,
+  windowSeconds,
+}: {
+  points: EcologyHistoryPoint[];
+  windowSeconds: number;
+}) {
+  const latestElapsedSeconds = points.at(-1)?.elapsedSeconds ?? 0;
+  const timeBounds = historyTimeBounds(latestElapsedSeconds, windowSeconds);
   const sparkPoints = (
     values: number[],
     top: number,
@@ -3001,13 +3152,13 @@ function EcologyHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
     const maximum = Math.max(...values);
     const range = Math.max(maximum - minimum, maximum * 0.08, 0.25);
     return values.map((value, index) => {
-      const x = values.length === 1 ? 116 : 43 + (index / (values.length - 1)) * 146;
+      const x = historyTimeX(points[index]?.elapsedSeconds ?? 0, timeBounds, 43, 189);
       const y = top + height - 3 - ((value - minimum) / range) * (height - 6);
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
   };
   const populationPoints = (values: number[], maximum: number): string => values.map((value, index) => {
-    const x = values.length === 1 ? 116 : 43 + (index / (values.length - 1)) * 146;
+    const x = historyTimeX(points[index]?.elapsedSeconds ?? 0, timeBounds, 43, 189);
     const y = 65 - (value / Math.max(1, maximum)) * 22;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
@@ -3046,7 +3197,7 @@ function EcologyHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
     <div className="ecology-history">
       <div className="ecology-history-heading">
         <strong>시간에 따른 변화</strong>
-        <small>{points.length > 1 ? `${formatTime(points[0].elapsedSeconds)}–${formatTime(latest.elapsedSeconds)}` : '관찰 대기 중'}</small>
+        <small>{points.length > 1 ? `${formatTime(timeBounds.start)}–${formatTime(timeBounds.end)}` : '관찰 대기 중'}</small>
       </div>
       <svg viewBox="0 0 240 72" role="img" aria-label="조류 총량과 새우 개체 수의 시간 변화">
         <path className="ecology-history-guide" d="M43 32H189M43 68H189" />
@@ -3068,16 +3219,24 @@ function EcologyHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
       <small className="ecology-history-note">모든 개체군 선은 0부터 같은 눈금을 사용합니다.</small>
     </div>
   );
-}
+});
 
-function WaterCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
+const WaterCycleHistoryChart = memo(function WaterCycleHistoryChart({
+  points,
+  windowSeconds,
+}: {
+  points: EcologyHistoryPoint[];
+  windowSeconds: number;
+}) {
+  const latestElapsedSeconds = points.at(-1)?.elapsedSeconds ?? 0;
+  const timeBounds = historyTimeBounds(latestElapsedSeconds, windowSeconds);
   const line = (values: number[], top: number): string => {
     if (!values.length) return '';
     const minimum = Math.min(...values);
     const maximum = Math.max(...values);
     const range = Math.max(maximum - minimum, maximum * 0.08, 0.05);
     return values.map((value, index) => {
-      const x = values.length === 1 ? 119 : 49 + (index / (values.length - 1)) * 137;
+      const x = historyTimeX(points[index]?.elapsedSeconds ?? 0, timeBounds, 49, 186);
       const y = top + 18 - ((value - minimum) / range) * 14;
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
@@ -3093,7 +3252,7 @@ function WaterCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
     <div className="water-cycle-history">
       <div className="ecology-history-heading">
         <strong>미생물 순환</strong>
-        <small>최근 {points.length ? formatTime(points.at(-1)!.elapsedSeconds - points[0].elapsedSeconds) : '00:00'}</small>
+        <small>최근 {formatTime(windowSeconds)}</small>
       </div>
       <svg viewBox="0 0 240 94" role="img" aria-label="유기물과 분해균, 암모니아성 노폐물과 질산화균의 시간 변화">
         {rows.map((row, index) => {
@@ -3112,16 +3271,24 @@ function WaterCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
       <small className="ecology-history-note">먹이가 먼저 변하고, 뒤따라 균 필름량이 반응합니다.</small>
     </div>
   );
-}
+});
 
-function ClosedCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) {
+const ClosedCycleHistoryChart = memo(function ClosedCycleHistoryChart({
+  points,
+  windowSeconds,
+}: {
+  points: EcologyHistoryPoint[];
+  windowSeconds: number;
+}) {
+  const latestElapsedSeconds = points.at(-1)?.elapsedSeconds ?? 0;
+  const timeBounds = historyTimeBounds(latestElapsedSeconds, windowSeconds);
   const line = (values: number[], top: number): string => {
     if (!values.length) return '';
     const minimum = Math.min(...values);
     const maximum = Math.max(...values);
     const range = Math.max(maximum - minimum, maximum * 0.06, 0.05);
     return values.map((value, index) => {
-      const x = values.length === 1 ? 119 : 49 + (index / (values.length - 1)) * 137;
+      const x = historyTimeX(points[index]?.elapsedSeconds ?? 0, timeBounds, 49, 186);
       const y = top + 18 - ((value - minimum) / range) * 14;
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
@@ -3136,7 +3303,7 @@ function ClosedCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) 
     <div className="water-cycle-history closed-cycle-history">
       <div className="ecology-history-heading">
         <strong>닫힌 물질·기체 순환</strong>
-        <small>빛만 외부에서 들어옴</small>
+        <small>최근 {formatTime(windowSeconds)}</small>
       </div>
       <svg viewBox="0 0 240 72" role="img" aria-label="영양염과 물속 무기탄소, 용존산소의 시간 변화">
         {rows.map((row, index) => {
@@ -3155,7 +3322,7 @@ function ClosedCycleHistoryChart({ points }: { points: EcologyHistoryPoint[] }) 
       <small className="ecology-history-note">광합성은 유한한 무기탄소를 쓰고, 호흡·분해가 다시 돌려놓습니다.</small>
     </div>
   );
-}
+});
 
 function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
   const definition = ANIMALS[speciesId];

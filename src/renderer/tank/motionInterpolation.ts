@@ -234,3 +234,134 @@ export const interpolateMotionFrames = (
     probe,
   };
 };
+
+export interface ReusableMotionInterpolator {
+  sample: (
+    frames: SimulationMotionFrames,
+    nowMs: number,
+  ) => InterpolatedMotionState | null;
+}
+
+const findById = <T extends { id: string }>(items: readonly T[], id: string): T | undefined => {
+  for (const item of items) {
+    if (item.id === id) return item;
+  }
+  return undefined;
+};
+
+/**
+ * Allocation-free counterpart used by the live Pixi ticker. The exported pure
+ * helper above remains useful for deterministic unit tests, while this sampler
+ * mutates one retained output graph instead of creating Maps, arrays and
+ * interpolated objects on every display frame.
+ */
+export const createReusableMotionInterpolator = (): ReusableMotionInterpolator => {
+  const output: InterpolatedMotionState = {
+    sequence: 0,
+    interpolated: true,
+    structures: [],
+    animals: [],
+    holding: null,
+    probe: null,
+  };
+  let holdingBuffer: HoldingSnapshot | null = null;
+  let probeBuffer: ProbeSnapshot | null = null;
+
+  return {
+    sample: (frames, nowMs) => {
+      const current = frames.current;
+      if (!current) return null;
+      const previous = frames.previous;
+      if (!previous || current.sequence !== previous.sequence + 1) {
+        return {
+          sequence: current.sequence,
+          interpolated: false,
+          structures: current.structures,
+          animals: current.animals,
+          holding: current.holding,
+          probe: current.probe,
+        };
+      }
+
+      const sampledDuration = current.sampledAtMs - previous.sampledAtMs;
+      const receivedDuration = current.receivedAtMs - previous.receivedAtMs;
+      const rawDuration = Number.isFinite(sampledDuration) && sampledDuration > 0
+        ? sampledDuration
+        : receivedDuration;
+      const durationMs = Math.max(
+        MIN_SAMPLE_DURATION_MS,
+        Math.min(MAX_SAMPLE_DURATION_MS, rawDuration),
+      );
+      const ratio = clamp01((nowMs - current.receivedAtMs) / durationMs);
+
+      output.sequence = current.sequence;
+      output.interpolated = true;
+      for (let index = 0; index < current.structures.length; index += 1) {
+        const after = current.structures[index];
+        const before = findById(previous.structures, after.id);
+        const target = output.structures[index] ?? { ...after };
+        Object.assign(target, after);
+        if (before && before.isHeld === after.isHeld) {
+          target.x = lerp(before.x, after.x, ratio);
+          target.y = lerp(before.y, after.y, ratio);
+          target.angle = lerpAngle(before.angle, after.angle, ratio);
+        }
+        output.structures[index] = target;
+      }
+      output.structures.length = current.structures.length;
+
+      for (let index = 0; index < current.animals.length; index += 1) {
+        const after = current.animals[index];
+        const before = findById(previous.animals, after.id);
+        const target = output.animals[index] ?? { ...after };
+        Object.assign(target, after);
+        if (before) {
+          target.x = lerp(before.x, after.x, ratio);
+          target.y = lerp(before.y, after.y, ratio);
+          target.vx = lerp(before.vx, after.vx, ratio);
+          target.vy = lerp(before.vy, after.vy, ratio);
+          target.poseAngle = lerpAngle(before.poseAngle, after.poseAngle, ratio);
+          target.bodyLength = lerp(before.bodyLength, after.bodyLength, ratio);
+          target.ageSeconds = lerp(before.ageSeconds, after.ageSeconds, ratio);
+          target.energy = lerp(before.energy, after.energy, ratio);
+          target.health = lerp(before.health, after.health, ratio);
+          target.recentIntake = lerp(before.recentIntake, after.recentIntake, ratio);
+          target.consumedBiomass = lerp(
+            before.consumedBiomass,
+            after.consumedBiomass,
+            ratio,
+          );
+        }
+        output.animals[index] = target;
+      }
+      output.animals.length = current.animals.length;
+
+      if (matchingHolding(previous.holding, current.holding)) {
+        holdingBuffer ??= { ...current.holding! };
+        Object.assign(holdingBuffer, current.holding);
+        holdingBuffer.x = lerp(previous.holding!.x, current.holding!.x, ratio);
+        holdingBuffer.y = lerp(previous.holding!.y, current.holding!.y, ratio);
+        output.holding = holdingBuffer;
+      } else {
+        output.holding = current.holding;
+      }
+
+      if (previous.probe && current.probe) {
+        probeBuffer ??= { ...current.probe };
+        Object.assign(probeBuffer, current.probe);
+        probeBuffer.x = lerp(previous.probe.x, current.probe.x, ratio);
+        probeBuffer.y = lerp(previous.probe.y, current.probe.y, ratio);
+        probeBuffer.light = lerp(previous.probe.light, current.probe.light, ratio);
+        probeBuffer.temperature = lerp(
+          previous.probe.temperature,
+          current.probe.temperature,
+          ratio,
+        );
+        output.probe = probeBuffer;
+      } else {
+        output.probe = current.probe;
+      }
+      return output;
+    },
+  };
+};

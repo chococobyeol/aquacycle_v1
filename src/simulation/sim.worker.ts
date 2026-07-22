@@ -1,6 +1,14 @@
 /// <reference lib="webworker" />
 
 import { SimulationWorld } from './SimulationWorld';
+import {
+  SharedTelemetryWriter,
+  type SharedTelemetryChannel,
+} from './sharedTelemetry';
+import {
+  SharedMotionWriter,
+  type SharedMotionChannel,
+} from './sharedMotionTelemetry';
 import type {
   SimulationCommand,
   WorkerMotionMessage,
@@ -14,28 +22,56 @@ const world = new SimulationWorld('mission-1');
 let lastTick = performance.now();
 let motionSequence = 0;
 let interactiveMotionDirty = false;
+let snapshotTelemetry: SharedTelemetryWriter | null = null;
+let motionTelemetry: SharedTelemetryWriter | null = null;
+let binaryMotionTelemetry: SharedMotionWriter | null = null;
+let reusableMotion = world.motionSnapshot();
+
+interface ConnectTelemetryCommand {
+  type: 'connect-telemetry';
+  snapshot: SharedTelemetryChannel;
+  motion: SharedTelemetryChannel;
+  binaryMotion: SharedMotionChannel;
+}
+
+type WorkerCommand = SimulationCommand | ConnectTelemetryCommand;
 
 const publish = (): void => {
   const message: WorkerSnapshotMessage = {
     type: 'snapshot',
     snapshot: world.snapshot(),
   };
-  scope.postMessage(message);
+  if (snapshotTelemetry) snapshotTelemetry.publish(message);
+  else scope.postMessage(message);
 };
 
 const publishMotion = (): void => {
   const sampledAtMs = performance.now();
-  const motion = world.motionSnapshot();
+  const motion = world.motionSnapshot(reusableMotion);
+  reusableMotion = motion;
   const message: WorkerMotionMessage = {
     type: 'motion',
     sequence: motionSequence += 1,
     sampledAtMs,
     ...motion,
   };
-  scope.postMessage(message);
+  const binaryPublished = binaryMotionTelemetry?.publish(message) ?? false;
+  // Holding/probe packets contain labels and diagnostic records that are not
+  // part of the fixed numeric motion layout. They are short-lived interactive
+  // traffic; autonomous animals and settling structures stay allocation-free.
+  if (message.holding || message.probe || !binaryPublished) {
+    if (motionTelemetry) motionTelemetry.publish(message);
+    else scope.postMessage(message);
+  }
 };
 
-scope.addEventListener('message', (event: MessageEvent<SimulationCommand>) => {
+scope.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
+  if (event.data.type === 'connect-telemetry') {
+    snapshotTelemetry = new SharedTelemetryWriter(event.data.snapshot);
+    motionTelemetry = new SharedTelemetryWriter(event.data.motion);
+    binaryMotionTelemetry = new SharedMotionWriter(event.data.binaryMotion);
+    return;
+  }
   if (event.data.type === 'export-save') {
     const message: WorkerSaveMessage = {
       type: 'save-data',

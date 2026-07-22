@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { app, BrowserWindow, screen, shell } from 'electron';
+import { app, BrowserWindow, screen, session, shell } from 'electron';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
@@ -51,6 +51,18 @@ const createMainWindow = (): BrowserWindow => {
 };
 
 app.whenReady().then(() => {
+  // SharedArrayBuffer is used for the long-running simulation telemetry
+  // channels. Apply the same cross-origin isolation policy to packaged file
+  // pages that the Vite development server supplies over HTTP.
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Cross-Origin-Opener-Policy': ['same-origin'],
+        'Cross-Origin-Embedder-Policy': ['require-corp'],
+      },
+    });
+  });
   createMainWindow();
 
   app.on('activate', () => {

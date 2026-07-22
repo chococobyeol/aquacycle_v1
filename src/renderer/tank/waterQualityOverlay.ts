@@ -4,7 +4,7 @@ import type {
   WaterQualityVariable,
 } from '../../simulation/types';
 
-export type WaterQualityLayer = WaterQualityVariable | MicrobeGuildId;
+export type WaterQualityLayer = WaterQualityVariable | MicrobeGuildId | 'temperature' | 'flow';
 
 /**
  * Dissolved channels do not share one useful ecological scale. In particular,
@@ -94,7 +94,12 @@ export const analysisLayerStatistics = (
 ): AnalysisLayerStatistics => {
   const values = layer === 'decomposer' || layer === 'nitrifier'
     ? snapshot.cells.map((cell) => cell.biofilm[layer] * 100)
-    : snapshot.biogeochemistry.water[layer];
+    : layer === 'temperature'
+      ? snapshot.biogeochemistry.transport.temperature
+      : layer === 'flow'
+        ? snapshot.biogeochemistry.transport.velocityX.map((x, index) =>
+          Math.hypot(x, snapshot.biogeochemistry.transport.velocityY[index] ?? 0))
+        : snapshot.biogeochemistry.water[layer];
 
   if (values.length === 0) {
     return { minimum: 0, average: 0, maximum: 0, total: 0, sampleCount: 0 };

@@ -3,7 +3,10 @@ import {
   SHRIMP_TECHNICAL_POPULATION_LIMIT,
   SimulationWorld,
 } from '../src/simulation/SimulationWorld';
-import { SCENARIOS } from '../src/simulation/config';
+import {
+  initialWaterTemperatureForLight,
+  SCENARIOS,
+} from '../src/simulation/config';
 import { BiogeochemistryLedger } from '../src/simulation/biogeochemistry';
 import { netGrowthPotential } from '../src/simulation/growth';
 import type {
@@ -138,7 +141,7 @@ describe('consumer-resource emergence', () => {
 
     internals.stepGrowth(1);
 
-    const temperature = 22 + SCENARIOS['mission-1'].lightOutput * 0.018;
+    const temperature = initialWaterTemperatureForLight(SCENARIOS['mission-1'].lightOutput);
     const rate = netGrowthPotential('oedogonium', 45, temperature);
     const expectedBiomass = initialBiomass +
       initialBiomass * rate * (1 - initialBiomass) -

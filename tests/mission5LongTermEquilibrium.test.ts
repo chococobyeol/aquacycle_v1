@@ -76,16 +76,16 @@ it('keeps a closed mission-5 ecosystem alive through several shrimp generations'
   const samples: ReturnType<SimulationWorld['snapshot']>[] = [];
   const seenCarcasses = new Set<string>();
   const deathCauses = new Set<AnimalCarcassSnapshot['cause']>();
+  let snapshot = world.snapshot();
 
-  while (world.snapshot().elapsedSeconds < 7_200) {
-    const before = world.snapshot();
-    if (!didDecomposer && before.elapsedSeconds >= 90) {
+  while (snapshot.elapsedSeconds < 7_200) {
+    if (!didDecomposer && snapshot.elapsedSeconds >= 90) {
       world.handle({ type: 'pause' });
       inoculate(world, 'decomposer', 10);
       world.handle({ type: 'resume' });
       didDecomposer = true;
     }
-    if (!didNitrifier && before.elapsedSeconds >= 190) {
+    if (!didNitrifier && snapshot.elapsedSeconds >= 190) {
       world.handle({ type: 'pause' });
       inoculate(world, 'nitrifier', 10);
       world.handle({ type: 'resume' });
@@ -93,7 +93,7 @@ it('keeps a closed mission-5 ecosystem alive through several shrimp generations'
     }
 
     world.tick(0.1);
-    const snapshot = world.snapshot();
+    snapshot = world.snapshot();
     for (const carcass of snapshot.carcasses) {
       if (seenCarcasses.has(carcass.id)) continue;
       seenCarcasses.add(carcass.id);
@@ -110,17 +110,52 @@ it('keeps a closed mission-5 ecosystem alive through several shrimp generations'
     sample.animalPopulation['cherry-shrimp'].total);
   const algae = samples.map((sample) =>
     sample.totalBiomass.oedogonium + sample.totalBiomass.nitzschia);
+  const chemistry = samples.map((sample) => ({
+    time: sample.elapsedSeconds,
+    organic: sample.biogeochemistry.average.organicMatter,
+    nutrients: sample.biogeochemistry.average.nutrients,
+    inorganicCarbon: sample.biogeochemistry.carbonCycle.dissolvedInorganicCarbon,
+  }));
+  const hasRiseAndFall = (
+    key: 'organic' | 'nutrients' | 'inorganicCarbon',
+    epsilon = 0.01,
+  ): boolean => {
+    const values = chemistry.map((sample) => sample[key]);
+    const differences = values.slice(1).map((value, index) => value - values[index]);
+    return differences.some((difference) => difference > epsilon) &&
+      differences.some((difference) => difference < -epsilon);
+  };
+  const tailStart = chemistry[Math.max(0, chemistry.length - 31)];
+  const finalChemistry = chemistry.at(-1)!;
 
   expect(final.outcome).toBe('success');
   expect(final.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
   expect(Math.max(...population) - Math.min(...population)).toBeGreaterThanOrEqual(3);
-  expect(Math.max(...algae) - Math.min(...algae)).toBeGreaterThan(20);
+  // Cooler, spatially transported water softens the old globally mixed
+  // algae swing, but the producer population must still visibly respond.
+  expect(Math.max(...algae) - Math.min(...algae)).toBeGreaterThan(15);
   expect(Math.min(...samples.map((sample) => sample.biogeochemistry.average.oxygen)))
     .toBeGreaterThan(30);
   expect(Math.max(...samples.map((sample) => sample.biogeochemistry.average.toxicWaste)))
     .toBeLessThan(6);
   expect(final.biogeochemistry.biofilmTotals.decomposer).toBeGreaterThan(0);
   expect(final.biogeochemistry.biofilmTotals.nitrifier).toBeGreaterThan(0);
+  expect(finalChemistry.organic).toBeLessThan(5);
+  expect(Math.abs(finalChemistry.organic - tailStart.organic)).toBeLessThan(0.6);
+  expect(Math.abs(finalChemistry.nutrients - tailStart.nutrients)).toBeLessThan(2);
+  expect(Math.abs(finalChemistry.inorganicCarbon - tailStart.inorganicCarbon)).toBeLessThan(3);
+  // The mission now starts with a deliberately finite nutrient reserve so an
+  // untreated tank cannot coast through the objective. A treated tank should
+  // recycle enough to remain near/above the 3.5 half-saturation point rather
+  // than preserving the former oversized starting reservoir.
+  expect(finalChemistry.nutrients).toBeGreaterThan(3.5);
+  expect(finalChemistry.inorganicCarbon).toBeGreaterThan(12);
+  expect(hasRiseAndFall('organic')).toBe(true);
+  expect(hasRiseAndFall('nutrients')).toBe(true);
+  expect(hasRiseAndFall('inorganicCarbon')).toBe(true);
+  expect(final.biogeochemistry.transport.averageTemperature).toBeGreaterThan(21.5);
+  expect(final.biogeochemistry.transport.averageTemperature).toBeLessThan(27);
+  expect(final.biogeochemistry.transport.maximumTemperature).toBeLessThan(31);
   expect(deathCauses.has('hypoxia')).toBe(false);
   expect(deathCauses.has('toxicity')).toBe(false);
   expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio))

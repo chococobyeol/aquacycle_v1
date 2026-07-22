@@ -1,13 +1,16 @@
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import type { SpeciesId, SurfaceCellSnapshot, Vec2 } from '../src/simulation/types';
+import {
+  ECOLOGY_HISTORY_MAX_POINTS,
+  ECOLOGY_HISTORY_RETENTION_SECONDS,
+} from '../src/renderer/ui/ecologyHistory';
 
 type WorldSnapshot = ReturnType<SimulationWorld['snapshot']>;
 
 const LONG_RUN_SECONDS = 1_800;
 const REAL_FRAME_SECONDS = 0.1;
+const FULL_SNAPSHOT_REAL_SECONDS = 1;
 const MAX_STABLE_ARRAY_ENTRY_DRIFT = 32;
 const MAX_DIAGNOSTIC_ANIMAL_EVENTS = 240;
 
@@ -182,23 +185,26 @@ describe('mission 4 long-run performance contract', () => {
       LONG_RUN_SECONDS / (64 * REAL_FRAME_SECONDS),
     );
     expect(realFrames).toBeGreaterThanOrEqual(expectedFrames);
-    expect(realFrames).toBeLessThanOrEqual(expectedFrames + 2);
-    expect(publishedSnapshots).toBeGreaterThan(100);
+    // Full ecology state now travels at 1 Hz while animal/structure motion has
+    // its own 30 Hz binary channel. The loop can therefore observe the target
+    // up to one full-snapshot interval after the exact crossing frame.
+    const snapshotFrameSlack = Math.ceil(
+      FULL_SNAPSHOT_REAL_SECONDS / REAL_FRAME_SECONDS,
+    );
+    expect(realFrames).toBeLessThanOrEqual(expectedFrames + snapshotFrameSlack);
+    expect(publishedSnapshots).toBeGreaterThanOrEqual(
+      Math.floor(LONG_RUN_SECONDS / 64 / FULL_SNAPSHOT_REAL_SECONDS) - 1,
+    );
     expect(publishedSnapshots).toBeLessThanOrEqual(realFrames);
     expect(snapshot.elapsedSeconds).toBeGreaterThanOrEqual(LONG_RUN_SECONDS);
     assertBoundedMissionFourSnapshot(snapshot, baselineArrayEntries);
   }, 30_000);
 
   it('keeps the renderer ecology trace explicitly bounded', () => {
-    const screenPath = fileURLToPath(
-      new URL('../src/renderer/ui/SimulationScreen.tsx', import.meta.url),
-    );
-    const source = readFileSync(screenPath, 'utf8');
-    const boundedUpdate = source.match(
-      /setEcologyHistory\(\(current\)\s*=>\s*\[\.\.\.current,\s*point\]\.slice\(-([1-9]\d*)\)\)/,
-    );
-
-    expect(boundedUpdate).not.toBeNull();
-    expect(Number(boundedUpdate?.[1])).toBeLessThanOrEqual(240);
+    // Two-second samples need 1,801 entries for a complete 60-minute view.
+    // Keep modest slack without allowing an experiment-long unbounded trace.
+    expect(ECOLOGY_HISTORY_RETENTION_SECONDS).toBe(60 * 60);
+    expect(ECOLOGY_HISTORY_MAX_POINTS).toBeGreaterThanOrEqual(1_801);
+    expect(ECOLOGY_HISTORY_MAX_POINTS).toBeLessThanOrEqual(2_000);
   });
 });

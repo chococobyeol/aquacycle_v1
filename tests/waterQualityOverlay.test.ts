@@ -20,6 +20,11 @@ const overlaySnapshot = {
       nutrients: [20, 40, 60],
       oxygen: [30, 60, 90],
     },
+    transport: {
+      temperature: [22, 23, 25],
+      velocityX: [0, 0.3, 0],
+      velocityY: [0.4, 0.4, 0],
+    },
   },
 } as SimulationSnapshot;
 
@@ -66,5 +71,13 @@ describe('water-quality analysis overlay', () => {
     expect(stats.minimum).toBe(0);
     expect(stats.average).toBeCloseTo(9);
     expect(stats.maximum).toBeCloseTo(18);
+  });
+
+  it('reports spatial temperature and water speed for the same legend', () => {
+    expect(analysisLayerStatistics(overlaySnapshot, 'temperature').average)
+      .toBeCloseTo(70 / 3);
+    const flow = analysisLayerStatistics(overlaySnapshot, 'flow');
+    expect(flow.minimum).toBe(0);
+    expect(flow.maximum).toBeCloseTo(0.5);
   });
 });

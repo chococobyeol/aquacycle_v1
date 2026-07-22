@@ -206,6 +206,23 @@ export interface WaterQualityFieldSnapshot {
   toxicWaste: number[];
   nutrients: number[];
   oxygen: number[];
+  dissolvedInorganicCarbon: number[];
+  revision: number;
+}
+
+export interface WaterTransportSnapshot {
+  columns: number;
+  rows: number;
+  temperature: number[];
+  velocityX: number[];
+  velocityY: number[];
+  solidFraction: number[];
+  flowResistance: number[];
+  averageTemperature: number;
+  minimumTemperature: number;
+  maximumTemperature: number;
+  maximumSpeed: number;
+  cumulativeExternalHeat: number;
   revision: number;
 }
 
@@ -216,6 +233,7 @@ export interface BiogeochemistrySnapshot {
   dissolvedWasteProduced: number;
   detritusMass: number;
   water: WaterQualityFieldSnapshot;
+  transport: WaterTransportSnapshot;
   average: WaterQualityValues;
   biofilmTotals: BiofilmBiomass;
   carbonCycle: {
@@ -259,6 +277,8 @@ export interface ProbeSnapshot {
   y: number;
   light: number;
   temperature: number;
+  waterVelocity: Vec2;
+  waterSpeed: number;
   locationLabel: string;
   surfaceCellId?: string;
   trends: Record<SpeciesId, GrowthTrend>;
@@ -354,12 +374,23 @@ export interface BiogeochemistrySaveState {
   nutrients: number[];
   oxygen: number[];
   dissolvedInorganicCarbon: number;
+  dissolvedInorganicCarbonField?: number[];
   headspaceCarbonDioxide: number;
   headspaceOxygen: number;
   cumulativeOxygenProduction: number;
   cumulativeOxygenDemand: number;
   cumulativeDissolvedWaste: number;
   fieldRevision: number;
+  /** Optional so existing version-1 frozen aquariums remain loadable. */
+  transport?: WaterTransportSaveState;
+}
+
+export interface WaterTransportSaveState {
+  temperature: number[];
+  velocityX: number[];
+  velocityY: number[];
+  cumulativeExternalHeat: number;
+  revision: number;
 }
 
 export interface SavedSurfaceCellBiology {

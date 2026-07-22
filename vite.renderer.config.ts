@@ -7,6 +7,18 @@ export default defineConfig({
   root: path.resolve(__dirname, 'src/renderer'),
   publicDir: path.resolve(__dirname, 'src/renderer/public'),
   plugins: [react()],
+  server: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+  preview: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
   optimizeDeps: {
     include: ['pixi.js', 'eventemitter3'],
   },

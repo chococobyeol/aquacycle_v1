@@ -11,6 +11,15 @@ import type {
   WorkerMotionMessage,
   WorkerMessage,
 } from '../../simulation/types';
+import {
+  createSharedTelemetryChannel,
+  SharedTelemetryReader,
+  sharedTelemetryAvailable,
+} from '../../simulation/sharedTelemetry';
+import {
+  createSharedMotionChannel,
+  SharedMotionReader,
+} from '../../simulation/sharedMotionTelemetry';
 
 export interface SimulationMotionFrame {
   sequence: number;
@@ -55,14 +64,15 @@ const EMPTY_MOTION_FRAMES: SimulationMotionFrames = {
  * rejects delayed/out-of-order packets.
  */
 export const createSimulationMotionStore = (): SimulationMotionStore => {
-  let frames = EMPTY_MOTION_FRAMES;
+  const frames: SimulationMotionFrames = { ...EMPTY_MOTION_FRAMES };
   let highestSequence = 0;
   const listeners = new Set<() => void>();
 
   const publishEmptyFrames = (): void => {
     if (!frames.current && !frames.previous) return;
-    frames = EMPTY_MOTION_FRAMES;
-    for (const listener of [...listeners]) listener();
+    frames.previous = null;
+    frames.current = null;
+    for (const listener of listeners) listener();
   };
 
   return {
@@ -74,10 +84,11 @@ export const createSimulationMotionStore = (): SimulationMotionStore => {
     accept: (message, receivedAtMs) => {
       if (message.sequence <= highestSequence) return false;
       highestSequence = message.sequence;
-      const { type: _type, ...sample } = message;
-      const current: SimulationMotionFrame = { ...sample, receivedAtMs };
-      frames = { previous: frames.current, current };
-      for (const listener of [...listeners]) listener();
+      const current = message as WorkerMotionMessage & { receivedAtMs: number };
+      current.receivedAtMs = receivedAtMs;
+      frames.previous = frames.current;
+      frames.current = current;
+      for (const listener of listeners) listener();
       return true;
     },
     clear: publishEmptyFrames,
@@ -151,24 +162,25 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
     );
     workerRef.current = worker;
     motionStore.clear();
+    let telemetryAnimationFrame: number | null = null;
 
-    const receiveSnapshot = (event: MessageEvent<WorkerMessage>): void => {
-      if (event.data.type === 'snapshot') {
-        if (event.data.snapshot.scenarioId !== scenarioId) return;
+    const receiveWorkerMessage = (message: WorkerMessage): void => {
+      if (message.type === 'snapshot') {
+        if (message.snapshot.scenarioId !== scenarioId) return;
         const bufferedHolding = motionStore.getFrames().current?.holding ?? null;
-        if (!sameHoldingIdentity(bufferedHolding, event.data.snapshot.holding)) {
+        if (!sameHoldingIdentity(bufferedHolding, message.snapshot.holding)) {
           // A full snapshot is the acknowledgement for pick/drop/cancel. Motion
           // from the prior holding state must never repaint an older cursor pose.
           motionStore.clear();
         }
-        setSnapshot(event.data.snapshot);
-      } else if (event.data.type === 'save-data') {
-        const pending = saveRequests.current.get(event.data.requestId);
+        setSnapshot(message.snapshot);
+      } else if (message.type === 'save-data') {
+        const pending = saveRequests.current.get(message.requestId);
         if (!pending) return;
-        saveRequests.current.delete(event.data.requestId);
-        pending.resolve(event.data.data);
+        saveRequests.current.delete(message.requestId);
+        pending.resolve(message.data);
       } else {
-        const motion = event.data;
+        const motion = message;
         motionStore.accept(motion, performance.now());
 
         // These two values are also rendered by small DOM overlays outside the
@@ -184,11 +196,54 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
       }
     };
 
-    worker.addEventListener('message', receiveSnapshot);
+    const receivePostedMessage = (event: MessageEvent<WorkerMessage>): void => {
+      receiveWorkerMessage(event.data);
+    };
+
+    worker.addEventListener('message', receivePostedMessage);
+    if (sharedTelemetryAvailable()) {
+      try {
+        const snapshotChannel = createSharedTelemetryChannel();
+        const interactiveMotionChannel = createSharedTelemetryChannel();
+        const binaryMotionChannel = createSharedMotionChannel();
+        const snapshotReader = new SharedTelemetryReader<WorkerMessage>(snapshotChannel);
+        const interactiveMotionReader = new SharedTelemetryReader<WorkerMessage>(
+          interactiveMotionChannel,
+        );
+        const binaryMotionReader = new SharedMotionReader(binaryMotionChannel);
+        worker.postMessage({
+          type: 'connect-telemetry',
+          snapshot: snapshotChannel,
+          motion: interactiveMotionChannel,
+          binaryMotion: binaryMotionChannel,
+        });
+
+        const pollTelemetry = (): void => {
+          // Apply topology first, then the newest motion for that topology. Both
+          // channels coalesce naturally when a busy frame cannot keep up.
+          const snapshotMessage = snapshotReader.readLatest();
+          if (snapshotMessage) receiveWorkerMessage(snapshotMessage);
+          // Interactive packets contain the pointer-held item or probe and
+          // intentionally win when both channels carry the same sequence.
+          const interactiveMotionMessage = interactiveMotionReader.readLatest();
+          if (interactiveMotionMessage) receiveWorkerMessage(interactiveMotionMessage);
+          const binaryMotionMessage = binaryMotionReader.readLatest();
+          if (binaryMotionMessage) receiveWorkerMessage(binaryMotionMessage);
+          telemetryAnimationFrame = requestAnimationFrame(pollTelemetry);
+        };
+        telemetryAnimationFrame = requestAnimationFrame(pollTelemetry);
+      } catch (error) {
+        // Development servers without cross-origin isolation hide or reject
+        // SharedArrayBuffer. The ordinary worker channel remains a functional
+        // fallback instead of leaving the aquarium uninitialized.
+        console.warn('[AquaCycle] Shared telemetry unavailable; using worker messages.', error);
+      }
+    }
     worker.postMessage({ type: 'initialize', scenarioId } satisfies SimulationCommand);
 
     return () => {
-      worker.removeEventListener('message', receiveSnapshot);
+      worker.removeEventListener('message', receivePostedMessage);
+      if (telemetryAnimationFrame !== null) cancelAnimationFrame(telemetryAnimationFrame);
       worker.terminate();
       workerRef.current = null;
       for (const pending of saveRequests.current.values()) {

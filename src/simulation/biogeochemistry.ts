@@ -15,6 +15,10 @@ import {
   WATER_CYCLE_RULES,
   WATER_TRANSPORT_RULES,
 } from './config';
+import {
+  WaterTransportGrid,
+  type WaterTransportObstacle,
+} from './waterTransport';
 
 export const WATER_COLUMNS = 36;
 export const WATER_ROWS = 20;
@@ -70,28 +74,55 @@ export class BiogeochemistryLedger {
   private readonly toxicWaste = new Float32Array(CELL_COUNT);
   private readonly nutrients = new Float32Array(CELL_COUNT);
   private readonly oxygen = new Float32Array(CELL_COUNT);
-  private readonly diffusionScratch = new Float64Array(CELL_COUNT);
+  private readonly dissolvedInorganicCarbon = new Float32Array(CELL_COUNT);
+  private readonly transport: WaterTransportGrid;
 
-  private dissolvedInorganicCarbon: number = WATER_CYCLE_RULES.initialDissolvedInorganicCarbon;
   private headspaceCarbonDioxide: number = WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide;
   private headspaceOxygen: number = WATER_CYCLE_RULES.initialHeadspaceOxygen;
   private cumulativeOxygenProduction = 0;
   private cumulativeOxygenDemand = 0;
   private cumulativeDissolvedWaste = 0;
   private fieldRevision = 0;
+  private dissolvedAdvectionAccumulator = 0;
   private biofilmTotals = emptyBiofilm();
 
   public constructor(options?: {
     effectsEnabled?: boolean;
     initial?: Partial<WaterQualityValues>;
+    initialTemperature?: number;
   }) {
     this.effectsEnabled = options?.effectsEnabled ?? false;
+    this.transport = new WaterTransportGrid(options?.initialTemperature ?? 23.5);
     const initial = { ...DEFAULT_WATER, ...options?.initial };
     this.organicMatter.fill(finiteConcentration(initial.organicMatter));
     this.toxicWaste.fill(finiteConcentration(initial.toxicWaste));
     this.nutrients.fill(finiteConcentration(initial.nutrients));
     this.oxygen.fill(finiteConcentration(initial.oxygen));
+    this.dissolvedInorganicCarbon.fill(WATER_CYCLE_RULES.initialDissolvedInorganicCarbon);
     this.headspaceOxygen = finiteConcentration(initial.oxygen);
+  }
+
+  public setTransportEnvironment(
+    light: ArrayLike<number>,
+    obstacles: WaterTransportObstacle[],
+  ): void {
+    this.transport.setEnvironment(light, obstacles);
+  }
+
+  public advanceTemperature(deltaSeconds: number, ambientTemperature = 22): void {
+    this.transport.advanceHeat(deltaSeconds, ambientTemperature);
+  }
+
+  public temperatureAt(point: Vec2): number {
+    return this.transport.sampleTemperatureAt(point);
+  }
+
+  public velocityAt(point: Vec2): Vec2 {
+    return this.transport.sampleVelocityAt(point);
+  }
+
+  public averageTemperature(): number {
+    return this.transport.averageTemperature();
   }
 
   /** Kept as a step boundary for the worker; material is now booked directly. */
@@ -105,8 +136,9 @@ export class BiogeochemistryLedger {
     if (!this.effectsEnabled) return 1;
     const quality = this.sampleAt(point);
     const mineralNitrogen = quality.toxicWaste + quality.nutrients;
+    const carbon = this.dissolvedInorganicCarbon[this.indexAt(point)];
     return saturation(mineralNitrogen, WATER_CYCLE_RULES.mineralNutrientHalfSaturation) *
-      saturation(this.dissolvedInorganicCarbon, WATER_CYCLE_RULES.carbonHalfSaturation);
+      saturation(carbon, WATER_CYCLE_RULES.carbonHalfSaturation);
   }
 
   /**
@@ -123,7 +155,8 @@ export class BiogeochemistryLedger {
     const availableAmmonium = this.massAround(this.toxicWaste, index);
     const availableNutrients = this.massAround(this.nutrients, index);
     const nitrogenLimit = (availableAmmonium + availableNutrients) / nitrogenPerBiomass;
-    const carbonLimit = this.dissolvedInorganicCarbon / carbonPerBiomass;
+    const availableCarbon = this.massAround(this.dissolvedInorganicCarbon, index);
+    const carbonLimit = availableCarbon / carbonPerBiomass;
     const actual = Math.min(requested, nitrogenLimit, carbonLimit);
     if (actual <= 0) return 0;
 
@@ -148,7 +181,7 @@ export class BiogeochemistryLedger {
     const paidNitrogen = removedAmmonium + removedNutrients;
     const paidBiomass = Math.min(actual, paidNitrogen / nitrogenPerBiomass);
     const fixedCarbon = paidBiomass * carbonPerBiomass;
-    this.dissolvedInorganicCarbon = Math.max(0, this.dissolvedInorganicCarbon - fixedCarbon);
+    this.removeMassAround(this.dissolvedInorganicCarbon, index, fixedCarbon);
     const oxygenProduced = fixedCarbon * WATER_CYCLE_RULES.oxygenPerFixedCarbon;
     const dissolved = this.addMassAround(this.oxygen, index, oxygenProduced);
     this.headspaceOxygen += oxygenProduced - dissolved;
@@ -259,14 +292,41 @@ export class BiogeochemistryLedger {
     }
 
     this.applyBiofilmReactions(dt, sites);
-    this.diffuse(this.organicMatter, WATER_TRANSPORT_RULES.localDiffusionPerSecond.organicMatter, dt);
-    this.diffuse(this.toxicWaste, WATER_TRANSPORT_RULES.localDiffusionPerSecond.toxicWaste, dt);
-    this.diffuse(this.nutrients, WATER_TRANSPORT_RULES.localDiffusionPerSecond.nutrients, dt);
-    this.diffuse(this.oxygen, WATER_TRANSPORT_RULES.localDiffusionPerSecond.oxygen, dt);
-    this.mixBulk(this.organicMatter, WATER_TRANSPORT_RULES.bulkMixingPerSecond.organicMatter, dt);
-    this.mixBulk(this.toxicWaste, WATER_TRANSPORT_RULES.bulkMixingPerSecond.toxicWaste, dt);
-    this.mixBulk(this.nutrients, WATER_TRANSPORT_RULES.bulkMixingPerSecond.nutrients, dt);
-    this.mixBulk(this.oxygen, WATER_TRANSPORT_RULES.bulkMixingPerSecond.oxygen, dt);
+    this.transport.disperseConservativeField(
+      this.organicMatter,
+      dt,
+      WATER_TRANSPORT_RULES.localDiffusionPerSecond.organicMatter,
+    );
+    this.transport.disperseConservativeField(
+      this.toxicWaste,
+      dt,
+      WATER_TRANSPORT_RULES.localDiffusionPerSecond.toxicWaste,
+    );
+    this.transport.disperseConservativeField(
+      this.nutrients,
+      dt,
+      WATER_TRANSPORT_RULES.localDiffusionPerSecond.nutrients,
+    );
+    this.transport.disperseConservativeField(
+      this.oxygen,
+      dt,
+      WATER_TRANSPORT_RULES.localDiffusionPerSecond.oxygen,
+    );
+    this.transport.disperseConservativeField(
+      this.dissolvedInorganicCarbon,
+      dt,
+      WATER_TRANSPORT_RULES.localDiffusionPerSecond.dissolvedInorganicCarbon,
+    );
+    this.dissolvedAdvectionAccumulator += dt;
+    if (this.dissolvedAdvectionAccumulator + 1e-9 >= 1) {
+      const transportSeconds = this.dissolvedAdvectionAccumulator;
+      this.transport.advectConservativeField(this.organicMatter, transportSeconds);
+      this.transport.advectConservativeField(this.toxicWaste, transportSeconds);
+      this.transport.advectConservativeField(this.nutrients, transportSeconds);
+      this.transport.advectConservativeField(this.oxygen, transportSeconds);
+      this.transport.advectConservativeField(this.dissolvedInorganicCarbon, transportSeconds);
+      this.dissolvedAdvectionAccumulator = 0;
+    }
     this.exchangeClosedHeadspace(dt);
 
     this.biofilmTotals = sites.reduce<BiofilmBiomass>((total, site) => ({
@@ -314,7 +374,7 @@ export class BiogeochemistryLedger {
       nutrients: this.fieldMass(this.nutrients),
       dissolvedOxygen: this.fieldMass(this.oxygen),
       detritus: this.detritus.reduce((sum, value) => sum + value, 0),
-      dissolvedInorganicCarbon: this.dissolvedInorganicCarbon,
+      dissolvedInorganicCarbon: this.fieldMass(this.dissolvedInorganicCarbon),
       headspaceCarbonDioxide: this.headspaceCarbonDioxide,
       headspaceOxygen: this.headspaceOxygen,
     };
@@ -327,17 +387,19 @@ export class BiogeochemistryLedger {
       toxicWaste: Array.from(this.toxicWaste),
       nutrients: Array.from(this.nutrients),
       oxygen: Array.from(this.oxygen),
-      dissolvedInorganicCarbon: this.dissolvedInorganicCarbon,
+      dissolvedInorganicCarbon: this.fieldMass(this.dissolvedInorganicCarbon),
+      dissolvedInorganicCarbonField: Array.from(this.dissolvedInorganicCarbon),
       headspaceCarbonDioxide: this.headspaceCarbonDioxide,
       headspaceOxygen: this.headspaceOxygen,
       cumulativeOxygenProduction: this.cumulativeOxygenProduction,
       cumulativeOxygenDemand: this.cumulativeOxygenDemand,
       cumulativeDissolvedWaste: this.cumulativeDissolvedWaste,
       fieldRevision: this.fieldRevision,
+      transport: this.transport.exportSaveState(),
     };
   }
 
-  public restoreSaveState(state: BiogeochemistrySaveState): void {
+  public restoreSaveState(state: BiogeochemistrySaveState, fallbackTemperature = 23.5): void {
     const restoreField = (target: Float32Array | Float64Array, source: number[]): void => {
       for (let index = 0; index < target.length; index += 1) {
         const value = source[index];
@@ -349,13 +411,21 @@ export class BiogeochemistryLedger {
     restoreField(this.toxicWaste, state.toxicWaste);
     restoreField(this.nutrients, state.nutrients);
     restoreField(this.oxygen, state.oxygen);
-    this.dissolvedInorganicCarbon = Math.max(0, state.dissolvedInorganicCarbon);
+    if (state.dissolvedInorganicCarbonField?.length === CELL_COUNT) {
+      restoreField(this.dissolvedInorganicCarbon, state.dissolvedInorganicCarbonField);
+    } else {
+      this.dissolvedInorganicCarbon.fill(
+        finiteConcentration(state.dissolvedInorganicCarbon),
+      );
+    }
     this.headspaceCarbonDioxide = Math.max(0, state.headspaceCarbonDioxide);
     this.headspaceOxygen = Math.max(0, state.headspaceOxygen);
     this.cumulativeOxygenProduction = Math.max(0, state.cumulativeOxygenProduction);
     this.cumulativeOxygenDemand = Math.max(0, state.cumulativeOxygenDemand);
     this.cumulativeDissolvedWaste = Math.max(0, state.cumulativeDissolvedWaste);
     this.fieldRevision = Math.max(0, Math.floor(state.fieldRevision));
+    this.dissolvedAdvectionAccumulator = 0;
+    this.transport.restoreSaveState(state.transport, fallbackTemperature);
   }
 
   public snapshot(): BiogeochemistrySnapshot {
@@ -386,6 +456,7 @@ export class BiogeochemistryLedger {
           toxicWaste: Array.from(this.toxicWaste),
           nutrients: Array.from(this.nutrients),
           oxygen: Array.from(this.oxygen),
+          dissolvedInorganicCarbon: Array.from(this.dissolvedInorganicCarbon),
           revision: this.fieldRevision,
         }
         : {
@@ -395,8 +466,10 @@ export class BiogeochemistryLedger {
           toxicWaste: [],
           nutrients: [],
           oxygen: [],
+          dissolvedInorganicCarbon: [],
           revision: this.fieldRevision,
         },
+      transport: this.transport.snapshot(),
       average,
       biofilmTotals: { ...this.biofilmTotals },
       carbonCycle: {
@@ -469,20 +542,26 @@ export class BiogeochemistryLedger {
             index,
             mineralized * WATER_CYCLE_RULES.biomassNitrogen,
           );
-          this.dissolvedInorganicCarbon += mineralized * WATER_CYCLE_RULES.biomassCarbon;
+          this.addMassAround(
+            this.dissolvedInorganicCarbon,
+            index,
+            mineralized * WATER_CYCLE_RULES.biomassCarbon,
+          );
           this.cumulativeDissolvedWaste += mineralized * WATER_CYCLE_RULES.biomassNitrogen;
         } else {
           const retainedNitrogen = consumed * kinetics.biomassYield * freeSurface;
           const potentialGrowth = retainedNitrogen / WATER_CYCLE_RULES.biomassNitrogen;
+          const availableCarbon = this.massAround(this.dissolvedInorganicCarbon, index);
           const carbonLimitedGrowth = Math.min(
             potentialGrowth,
-            this.dissolvedInorganicCarbon / WATER_CYCLE_RULES.biomassCarbon,
+            availableCarbon / WATER_CYCLE_RULES.biomassCarbon,
           );
           growth = carbonLimitedGrowth;
           const actualRetainedNitrogen = growth * WATER_CYCLE_RULES.biomassNitrogen;
-          this.dissolvedInorganicCarbon = Math.max(
-            0,
-            this.dissolvedInorganicCarbon - growth * WATER_CYCLE_RULES.biomassCarbon,
+          this.removeMassAround(
+            this.dissolvedInorganicCarbon,
+            index,
+            growth * WATER_CYCLE_RULES.biomassCarbon,
           );
           this.addMassAround(
             this.nutrients,
@@ -519,7 +598,7 @@ export class BiogeochemistryLedger {
     const carbon = biomass * WATER_CYCLE_RULES.biomassCarbon;
     const nitrogen = biomass * WATER_CYCLE_RULES.biomassNitrogen;
     const oxygenDemand = carbon * WATER_CYCLE_RULES.shrimp.oxygenPerRespiredCarbon;
-    this.dissolvedInorganicCarbon += carbon;
+    this.addMassAround(this.dissolvedInorganicCarbon, index, carbon);
     this.addMassAround(this.toxicWaste, index, nitrogen);
     this.removeMassAround(this.oxygen, index, oxygenDemand);
     this.cumulativeOxygenDemand += oxygenDemand;
@@ -547,56 +626,23 @@ export class BiogeochemistryLedger {
       this.headspaceOxygen += released;
     }
 
-    const carbonEquilibrium = (this.dissolvedInorganicCarbon + this.headspaceCarbonDioxide) / 2;
-    const carbonTransfer = (carbonEquilibrium - this.dissolvedInorganicCarbon) * response * 0.45;
+    const waterCarbon = this.fieldMass(this.dissolvedInorganicCarbon);
+    const carbonEquilibrium = (waterCarbon + this.headspaceCarbonDioxide) / 2;
+    const carbonTransfer = (carbonEquilibrium - waterCarbon) * response * 0.45;
     if (carbonTransfer > 0) {
-      const moved = Math.min(carbonTransfer, this.headspaceCarbonDioxide);
+      const moved = this.addMassToIndices(
+        this.dissolvedInorganicCarbon,
+        this.topRowIndices(),
+        Math.min(carbonTransfer, this.headspaceCarbonDioxide),
+      );
       this.headspaceCarbonDioxide -= moved;
-      this.dissolvedInorganicCarbon += moved;
     } else {
-      const moved = Math.min(-carbonTransfer, this.dissolvedInorganicCarbon);
-      this.dissolvedInorganicCarbon -= moved;
+      const moved = this.removeMassFromIndices(
+        this.dissolvedInorganicCarbon,
+        this.topRowIndices(),
+        -carbonTransfer,
+      );
       this.headspaceCarbonDioxide += moved;
-    }
-  }
-
-  private diffuse(field: Float32Array, rate: number, deltaSeconds: number): void {
-    if (rate <= 0 || deltaSeconds <= 0) return;
-    // Pairwise edge fluxes preserve the exact field sum. Dividing the response
-    // by four keeps the explicit 2-D update positive even for large fast-forward
-    // steps, while each right/down edge is processed exactly once.
-    const response = (1 - Math.exp(-rate * deltaSeconds)) / 4;
-    for (let index = 0; index < CELL_COUNT; index += 1) {
-      this.diffusionScratch[index] = field[index];
-    }
-    for (let row = 0; row < WATER_ROWS; row += 1) {
-      for (let column = 0; column < WATER_COLUMNS; column += 1) {
-        const index = row * WATER_COLUMNS + column;
-        if (column + 1 < WATER_COLUMNS) {
-          const neighbor = index + 1;
-          const transfer = (field[neighbor] - field[index]) * response;
-          this.diffusionScratch[index] += transfer;
-          this.diffusionScratch[neighbor] -= transfer;
-        }
-        if (row + 1 < WATER_ROWS) {
-          const neighbor = index + WATER_COLUMNS;
-          const transfer = (field[neighbor] - field[index]) * response;
-          this.diffusionScratch[index] += transfer;
-          this.diffusionScratch[neighbor] -= transfer;
-        }
-      }
-    }
-    for (let index = 0; index < CELL_COUNT; index += 1) {
-      field[index] = finiteConcentration(this.diffusionScratch[index]);
-    }
-  }
-
-  private mixBulk(field: Float32Array, rate: number, deltaSeconds: number): void {
-    if (rate <= 0 || deltaSeconds <= 0) return;
-    const mean = this.fieldMass(field);
-    const response = 1 - Math.exp(-rate * deltaSeconds);
-    for (let index = 0; index < CELL_COUNT; index += 1) {
-      field[index] = finiteConcentration(field[index] + (mean - field[index]) * response);
     }
   }
 

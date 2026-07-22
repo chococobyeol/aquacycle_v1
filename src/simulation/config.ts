@@ -12,6 +12,10 @@ import type {
 // Selection and removal use the same value so anything visible can be cleaned.
 export const ALGAE_VISIBLE_BIOMASS = 0.001;
 
+/** Starting temperature of a tank whose fixed lamp was already running. */
+export const initialWaterTemperatureForLight = (lightOutput: number): number =>
+  22 + 1.2 + (lightOutput / 120) * 1.8;
+
 export interface AnimalDefinition {
   id: AnimalSpeciesId;
   displayName: string;
@@ -84,24 +88,15 @@ export const WATER_CYCLE_RULES = {
   },
 } as const;
 
-/**
- * Unresolved water motion.  The grid still preserves local hot spots, but a
- * small conservative whole-tank exchange represents convection, animal
- * movement and ordinary circulation that would otherwise require a full
- * fluid solver.
- */
+/** Molecular and unresolved sub-cell mixing. Directed tank circulation is
+ * now supplied by the shared buoyant water-transport grid. */
 export const WATER_TRANSPORT_RULES = {
   localDiffusionPerSecond: {
     organicMatter: 0.045,
     toxicWaste: 0.09,
     nutrients: 0.07,
     oxygen: 0.12,
-  },
-  bulkMixingPerSecond: {
-    organicMatter: 0.008,
-    toxicWaste: 0.022,
-    nutrients: 0.011,
-    oxygen: 0.022,
+    dissolvedInorganicCarbon: 0.1,
   },
 } as const;
 
@@ -615,11 +610,11 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     instruction: '수조의 변화를 관찰하며 체리새우 군집이 끊기지 않도록 오래 유지하세요.',
     briefing: {
       question: '눈에 잘 보이지 않는 분해자들이 수조의 장기 생존을 어떻게 바꿀까요?',
-      goal: '체리새우 군집이 한 번도 사라지지 않은 상태로 15분의 시뮬레이션 시간을 유지하세요.',
+      goal: '체리새우 군집이 한 번도 사라지지 않은 상태로 25분의 시뮬레이션 시간을 유지하세요.',
       success: '수질 수치나 접종 방법은 채점하지 않으며, 살아 있는 체리새우가 계속 존재하면 생존 시간이 누적됩니다.',
       supplied: '체리새우 성체 4마리 · 두 조류 접종 각 4회 · 세 종류의 구조물 무제한 · 두 균 필름 접종 · 수질 탐침',
     },
-    timeLimitSeconds: 1_200,
+    timeLimitSeconds: 1_800,
     lightOutput: 88,
     seedBudget: { oedogonium: 4, nitzschia: 4 },
     animalBudget: { 'cherry-shrimp': 4 },
@@ -633,7 +628,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       initial: {
         organicMatter: 1.5,
         toxicWaste: 0.8,
-        nutrients: 46,
+        nutrients: 12,
         oxygen: 76,
       },
       microbeBudget: { decomposer: null, nitrifier: null },
@@ -643,7 +638,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       type: 'population-survival',
       speciesId: 'cherry-shrimp',
       count: 1,
-      holdSeconds: 900,
+      holdSeconds: 1_500,
       label: '체리새우 군집 생존',
     },
     targetIncludesSubstrate: true,

@@ -2,6 +2,7 @@ import Matter, { type Body as MatterBody } from 'matter-js';
 import {
   ALGAE_VISIBLE_BIOMASS,
   ANIMALS,
+  initialWaterTemperatureForLight,
   MICROBE_ECOLOGY_RULES,
   MICROBES,
   SCENARIOS,
@@ -29,7 +30,10 @@ import {
   sampleSubstrate,
   type LocalSurfaceCell,
 } from './surfaces';
-import { structureAuthoredPointToWorld } from './structureGeometry';
+import {
+  structureAuthoredPointToWorld,
+  structureAuthoredPolygonToWorld,
+} from './structureGeometry';
 import {
   DEFAULT_SIMULATION_SPEED,
   normalizeSimulationSpeed,
@@ -215,10 +219,11 @@ const DIRECT_LIGHT_HALF_ANGLE = Math.PI * 0.49;
 // source geometry now truthfully lives outside the glass.
 const DIRECT_LIGHT_SCALE = 2.85;
 const REFLECTED_LIGHT_LIMIT = 6;
-// Full snapshots clone the fixed ecology and light grids. Five publishes per
-// second keeps HUD values responsive while motion is delivered separately at
-// a higher rate by the worker.
-const SNAPSHOT_INTERVAL_SECONDS = 0.2;
+// Full ecology snapshots contain the complete surface and water grids. Motion
+// has its own 30 Hz shared channel, so publishing this large immutable graph
+// more than once per real second only churns V8 heap pages without making
+// animals or settling stones look smoother.
+const SNAPSHOT_INTERVAL_SECONDS = 1;
 const PHYSICS_STEP_MS = 1000 / 60;
 const MAX_PHYSICS_STEPS = 4;
 const GROWTH_STEP_SECONDS = 0.25;
@@ -462,12 +467,16 @@ export class SimulationWorld {
     this.suspendedBiofilm = emptyBiofilm();
     this.biofilmSettlementCursor = 0;
     this.materialReference = null;
+    this.lightOutput = this.scenario.lightOutput;
+    // A challenge tank is presented after its fixed lamp has already been on,
+    // so begin near the former well-mixed lamp equilibrium instead of making
+    // every mission spend its short time limit warming from room temperature.
+    this.waterTemperature = initialWaterTemperatureForLight(this.lightOutput);
     this.biogeochemistry = new BiogeochemistryLedger({
       effectsEnabled: Boolean(this.scenario.waterCycle),
       initial: this.scenario.waterCycle?.initial,
+      initialTemperature: this.waterTemperature,
     });
-    this.lightOutput = this.scenario.lightOutput;
-    this.waterTemperature = 22 + this.lightOutput * 0.018;
     this.lightDirty = true;
     this.lightReflectionSources = [];
     this.crossConnectionsDirty = true;
@@ -720,7 +729,10 @@ export class SimulationWorld {
       this.snapshotAccumulator >= SNAPSHOT_INTERVAL_SECONDS &&
       (this.phase === 'running' || this.snapshotDirty)
     ) {
-      this.snapshotAccumulator = 0;
+      // Keep the fractional remainder. Resetting to zero makes a nominal 1 Hz
+      // cadence drift toward 0.9 Hz with 60/10 Hz timer quantisation.
+      this.snapshotAccumulator -= SNAPSHOT_INTERVAL_SECONDS;
+      if (Math.abs(this.snapshotAccumulator) < 1e-10) this.snapshotAccumulator = 0;
       return true;
     }
     return false;
@@ -832,13 +844,40 @@ export class SimulationWorld {
     animals: AnimalSnapshot[];
     holding: HoldingSnapshot | null;
     probe: ProbeSnapshot | null;
+  };
+  public motionSnapshot(reuse: {
+    structures: StructureSnapshot[];
+    animals: AnimalSnapshot[];
+    holding: HoldingSnapshot | null;
+    probe: ProbeSnapshot | null;
+  }): {
+    structures: StructureSnapshot[];
+    animals: AnimalSnapshot[];
+    holding: HoldingSnapshot | null;
+    probe: ProbeSnapshot | null;
+  };
+  public motionSnapshot(reuse?: {
+    structures: StructureSnapshot[];
+    animals: AnimalSnapshot[];
+    holding: HoldingSnapshot | null;
+    probe: ProbeSnapshot | null;
+  }): {
+    structures: StructureSnapshot[];
+    animals: AnimalSnapshot[];
+    holding: HoldingSnapshot | null;
+    probe: ProbeSnapshot | null;
   } {
-    return {
-      structures: this.structureSnapshots(),
-      animals: this.animalSnapshots(),
-      holding: this.holdingSnapshot(),
-      probe: this.probe ? { ...this.probe, trends: { ...this.probe.trends } } : null,
+    const target = reuse ?? {
+      structures: [],
+      animals: [],
+      holding: null,
+      probe: null,
     };
+    target.structures = this.structureSnapshots(target.structures);
+    target.animals = this.animalSnapshots(target.animals);
+    target.holding = this.holdingSnapshot();
+    target.probe = this.probe ? { ...this.probe, trends: { ...this.probe.trends } } : null;
+    return target;
   }
 
   public exportSaveData(): SimulationSaveData {
@@ -988,7 +1027,8 @@ export class SimulationWorld {
     this.suspendedBiofilm = { ...data.suspendedBiofilm };
     this.biofilmSettlementCursor = data.biofilmSettlementCursor;
     this.materialReference = data.materialReference ? { ...data.materialReference } : null;
-    this.biogeochemistry.restoreSaveState(data.biogeochemistry);
+    this.biogeochemistry.restoreSaveState(data.biogeochemistry, data.waterTemperature);
+    this.waterTemperature = this.biogeochemistry.averageTemperature();
 
     this.held = null;
     this.probe = null;
@@ -2001,7 +2041,14 @@ export class SimulationWorld {
       // there are no physical structures, publish the transition back to the
       // settled state so the setup button cannot remain stuck on the stale
       // "waiting to settle" snapshot.
-      if (settlementChanged) this.snapshotDirty = true;
+      if (settlementChanged) {
+        this.snapshotDirty = true;
+        // User-visible placement readiness must not wait for the low-frequency
+        // ecology snapshot cadence. Advance only this transition to the next
+        // publish boundary; continuously changing animal/ecology state remains
+        // rate-limited below.
+        this.snapshotAccumulator = SNAPSHOT_INTERVAL_SECONDS;
+      }
       return;
     }
     const stable = this.structures.every(({ body }) =>
@@ -2088,11 +2135,15 @@ export class SimulationWorld {
     const light = onSurface ? onSurface.cell.light : this.lightAt(exact);
     const measuredPoint = onSurface ? this.cellWorldPoint(onSurface.cell) : exact;
     const biofilm = onSurface ? { ...onSurface.cell.biofilm } : emptyBiofilm();
+    const localTemperature = this.biogeochemistry.temperatureAt(measuredPoint);
+    const waterVelocity = this.biogeochemistry.velocityAt(measuredPoint);
     const occupiedBiofilm = biofilm.decomposer + biofilm.nitrifier;
     return {
       ...exact,
       light,
-      temperature: this.waterTemperature,
+      temperature: localTemperature,
+      waterVelocity,
+      waterSpeed: Math.hypot(waterVelocity.x, waterVelocity.y),
       locationLabel: onSurface
         ? onSurface.cell.surfaceKind === 'substrate'
           ? '바닥재 표면'
@@ -2100,8 +2151,8 @@ export class SimulationWorld {
         : '수중',
       surfaceCellId: onSurface?.cell.id,
       trends: {
-        oedogonium: growthTrend('oedogonium', light, this.waterTemperature),
-        nitzschia: growthTrend('nitzschia', light, this.waterTemperature),
+        oedogonium: growthTrend('oedogonium', light, localTemperature),
+        nitzschia: growthTrend('nitzschia', light, localTemperature),
       },
       water: this.biogeochemistry.sampleAt(measuredPoint),
       biofilm,
@@ -2168,6 +2219,22 @@ export class SimulationWorld {
       values,
       revision: this.lightRevision,
     };
+    this.biogeochemistry.setTransportEnvironment(
+      values,
+      this.structures
+        .filter((structure) => !this.isHeldStructure(structure.id))
+        .map((structure) => {
+          const definition = STRUCTURES[structure.definitionId];
+          return {
+            polygon: structureAuthoredPolygonToWorld(
+              definition.collisionPolygon,
+              definition.collisionPolygon,
+              structure.body.position,
+              structure.body.angle,
+            ),
+          };
+        }),
+    );
 
     for (const cell of this.allCells()) {
       const ownerBodyId = cell.surfaceKind === 'structure-face'
@@ -3109,13 +3176,15 @@ export class SimulationWorld {
       const current = original.get(cell.id)!;
       const total = current.oedogonium + current.nitzschia;
       const freeCapacity = clamp01(1 - total);
+      const cellPoint = this.cellWorldPoint(cell);
+      const localTemperature = this.biogeochemistry.temperatureAt(cellPoint);
       const rates: SpeciesBiomass = {
-        oedogonium: netGrowthPotential('oedogonium', cell.light, this.waterTemperature),
-        nitzschia: netGrowthPotential('nitzschia', cell.light, this.waterTemperature),
+        oedogonium: netGrowthPotential('oedogonium', cell.light, localTemperature),
+        nitzschia: netGrowthPotential('nitzschia', cell.light, localTemperature),
       };
       if (this.biogeochemistry.effectsEnabled) {
         const resourceFactor = this.biogeochemistry.algaeResourceFactor(
-          this.cellWorldPoint(cell),
+          cellPoint,
         );
         if (rates.oedogonium > 0) rates.oedogonium *= resourceFactor;
         if (rates.nitzschia > 0) rates.nitzschia *= resourceFactor;
@@ -3135,7 +3204,7 @@ export class SimulationWorld {
         const requestedExpansion = amount * rate * (rate > 0 ? freeCapacity : 1) * deltaSeconds;
         const expansion = requestedExpansion > 0
           ? this.biogeochemistry.commitAlgaeProduction(
-            this.cellWorldPoint(cell),
+            cellPoint,
             requestedExpansion,
           )
           : requestedExpansion;
@@ -3158,7 +3227,7 @@ export class SimulationWorld {
         0,
         total + fixedBiomass - result.oedogonium - result.nitzschia,
       );
-      this.biogeochemistry.recordAlgaeTurnover(this.cellWorldPoint(cell), localLoss);
+      this.biogeochemistry.recordAlgaeTurnover(cellPoint, localLoss);
       next.set(cell.id, result);
     }
 
@@ -3187,7 +3256,7 @@ export class SimulationWorld {
           const suitability = habitatSuitability(
             speciesId,
             neighbor.light,
-            this.waterTemperature,
+            this.biogeochemistry.temperatureAt(this.cellWorldPoint(neighbor)),
           );
           if (suitability <= 0.01) continue;
           const recruitment =
@@ -3266,11 +3335,8 @@ export class SimulationWorld {
   }
 
   private stepTemperature(deltaSeconds: number): void {
-    const ambientTemperature = 22;
-    const lampHeating = 1.2 + (this.lightOutput / 120) * 1.8;
-    const targetTemperature = ambientTemperature + lampHeating;
-    const response = 1 - Math.exp(-deltaSeconds / 55);
-    this.waterTemperature += (targetTemperature - this.waterTemperature) * response;
+    this.biogeochemistry.advanceTemperature(deltaSeconds, 22);
+    this.waterTemperature = this.biogeochemistry.averageTemperature();
     if (this.probe) this.setProbe(this.probe);
   }
 
@@ -3382,29 +3448,35 @@ export class SimulationWorld {
     return progress ? progress.current >= progress.target : false;
   }
 
-  private structureSnapshots(): StructureSnapshot[] {
-    return this.structures.map((structure) => {
+  private structureSnapshots(reuse?: StructureSnapshot[]): StructureSnapshot[] {
+    const snapshots = reuse ?? [];
+    for (let index = 0; index < this.structures.length; index += 1) {
+      const structure = this.structures[index];
       const definition = STRUCTURES[structure.definitionId];
       const isHeld = this.isHeldStructure(structure.id);
-      return {
-        id: structure.id,
-        definitionId: structure.definitionId,
-        label: definition.label,
-        assetPath: definition.assetPath,
-        x: structure.body.position.x,
-        y: structure.body.position.y,
-        angle: structure.body.angle,
-        width: definition.width,
-        height: definition.height,
-        locked: structure.locked,
-        isSleeping: structure.body.isSleeping,
-        isHeld,
-        placementValid: isHeld && this.held?.kind === 'structure' ? this.held.valid : true,
-      };
-    });
+      const snapshot = snapshots[index] ?? {} as StructureSnapshot;
+      snapshot.id = structure.id;
+      snapshot.definitionId = structure.definitionId;
+      snapshot.label = definition.label;
+      snapshot.assetPath = definition.assetPath;
+      snapshot.x = structure.body.position.x;
+      snapshot.y = structure.body.position.y;
+      snapshot.angle = structure.body.angle;
+      snapshot.width = definition.width;
+      snapshot.height = definition.height;
+      snapshot.locked = structure.locked;
+      snapshot.isSleeping = structure.body.isSleeping;
+      snapshot.isHeld = isHeld;
+      snapshot.placementValid = isHeld && this.held?.kind === 'structure'
+        ? this.held.valid
+        : true;
+      snapshots[index] = snapshot;
+    }
+    snapshots.length = this.structures.length;
+    return snapshots;
   }
 
-  private animalSnapshots(): AnimalSnapshot[] {
+  private animalSnapshots(reuse?: AnimalSnapshot[]): AnimalSnapshot[] {
     if (this.selection?.kind === 'animal' && this.selection.animalId) {
       const selected = this.animals.find((animal) => animal.id === this.selection?.animalId);
       if (selected) {
@@ -3412,26 +3484,29 @@ export class SimulationWorld {
         this.selection.y = selected.position.y;
       }
     }
-    return this.animals.map((animal) => ({
-      id: animal.id,
-      speciesId: animal.speciesId,
-      x: animal.position.x,
-      y: animal.position.y,
-      vx: animal.velocity.x,
-      vy: animal.velocity.y,
-      facing: animal.facing,
-      poseAngle: animal.poseAngle,
-      bodyLength: animal.bodyLength,
-      lifeStage: animal.lifeStage,
-      sex: animal.sex,
-      ageSeconds: animal.ageSeconds,
-      lifespanSeconds: animal.lifespanSeconds,
-      energy: animal.energy,
-      health: animal.health,
-      behavior: this.held?.kind === 'animal' && this.held.animalId === animal.id
+    const snapshots = reuse ?? [];
+    for (let index = 0; index < this.animals.length; index += 1) {
+      const animal = this.animals[index];
+      const snapshot = snapshots[index] ?? {} as AnimalSnapshot;
+      snapshot.id = animal.id;
+      snapshot.speciesId = animal.speciesId;
+      snapshot.x = animal.position.x;
+      snapshot.y = animal.position.y;
+      snapshot.vx = animal.velocity.x;
+      snapshot.vy = animal.velocity.y;
+      snapshot.facing = animal.facing;
+      snapshot.poseAngle = animal.poseAngle;
+      snapshot.bodyLength = animal.bodyLength;
+      snapshot.lifeStage = animal.lifeStage;
+      snapshot.sex = animal.sex;
+      snapshot.ageSeconds = animal.ageSeconds;
+      snapshot.lifespanSeconds = animal.lifespanSeconds;
+      snapshot.energy = animal.energy;
+      snapshot.health = animal.health;
+      snapshot.behavior = this.held?.kind === 'animal' && this.held.animalId === animal.id
         ? 'held'
-        : animal.behavior,
-      reproductiveState: animal.gestationRemaining !== null
+        : animal.behavior;
+      snapshot.reproductiveState = animal.gestationRemaining !== null
         ? 'berried'
         : animal.lifeStage === 'adult' &&
           animal.reproductionCooldown <= 0 &&
@@ -3439,10 +3514,13 @@ export class SimulationWorld {
           animal.secondsSinceFood < 8 &&
           this.animals.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
           ? 'ready'
-          : 'none',
-      recentIntake: animal.recentIntake,
-      consumedBiomass: animal.consumedBiomass,
-    }));
+          : 'none';
+      snapshot.recentIntake = animal.recentIntake;
+      snapshot.consumedBiomass = animal.consumedBiomass;
+      snapshots[index] = snapshot;
+    }
+    snapshots.length = this.animals.length;
+    return snapshots;
   }
 
   private carcassSnapshots(): AnimalCarcassSnapshot[] {

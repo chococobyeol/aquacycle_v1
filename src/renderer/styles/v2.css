@@ -2330,6 +2330,58 @@
 .compact-observation .carcass-total dd { color: #725f58; font-weight: 800; }
 .compact-observation .birth-total { color: #52735c; }
 .compact-observation .birth-total dd { color: #467052; font-weight: 800; }
+.history-window-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 2px 0 8px;
+  padding: 6px 7px 6px 10px;
+  border: 1.5px solid rgba(48, 60, 58, 0.32);
+  border-radius: 9px 7px 10px 8px;
+  background: rgba(248, 241, 211, 0.52);
+}
+.history-window-control > span {
+  color: #66756f;
+  font-size: 11px;
+  font-weight: 800;
+}
+.history-window-control > div {
+  display: grid;
+  grid-template-columns: 28px minmax(48px, auto) 28px;
+  align-items: center;
+  overflow: hidden;
+  border: 1.5px solid #66756f;
+  border-radius: 8px;
+  background: rgba(255, 251, 230, 0.76);
+}
+.history-window-control button {
+  width: 28px;
+  height: 27px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #405852;
+  font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+}
+.history-window-control button:first-child { border-right: 1px solid rgba(48, 60, 58, 0.22); }
+.history-window-control button:last-child { border-left: 1px solid rgba(48, 60, 58, 0.22); }
+.history-window-control button:hover:not(:disabled) { background: rgba(174, 210, 194, 0.42); }
+.history-window-control button:disabled { color: rgba(64, 88, 82, 0.28); cursor: default; }
+.history-window-control strong {
+  min-width: 48px;
+  padding: 0 5px;
+  text-align: center;
+  font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.history-window-control + .ecology-history,
+.history-window-control + .water-cycle-history { margin-top: 0; }
 .ecology-history {
   display: grid;
   gap: 5px;
@@ -2705,6 +2757,8 @@
 .channel-toxicWaste span i { background: #b36f63; }
 .channel-nutrients span i { background: #b6964e; }
 .channel-oxygen span i { background: #588ba6; }
+.channel-temperature span i { background: #d47c4d; }
+.channel-flow span i { background: #58a697; }
 .channel-decomposer span i,
 .species-dot.decomposer { background: #8b7657; }
 .channel-nitrifier span i,
@@ -2879,6 +2933,8 @@
 .tank-analysis-selected-row.channel-toxicWaste > i { background: #b85f5e; }
 .tank-analysis-selected-row.channel-nutrients > i { background: #7c9f55; }
 .tank-analysis-selected-row.channel-oxygen > i { background: #5babc0; }
+.tank-analysis-selected-row.channel-temperature > i { background: #d47c4d; }
+.tank-analysis-selected-row.channel-flow > i { background: #58a697; }
 .tank-analysis-selected-row.channel-decomposer > i { background: #c98246; }
 .tank-analysis-selected-row.channel-nitrifier > i { background: #49a49c; }
 .tank-analysis-scale {
@@ -2891,6 +2947,8 @@
 .tank-analysis-scale.channel-toxicWaste { background: linear-gradient(90deg, #e2d8d0, #c14f5f); }
 .tank-analysis-scale.channel-nutrients { background: linear-gradient(90deg, #e6dfb8, #6d9f5b); }
 .tank-analysis-scale.channel-oxygen { background: linear-gradient(90deg, #3f6173, #65c7cf); }
+.tank-analysis-scale.channel-temperature { background: linear-gradient(90deg, #416f84, #d88852); }
+.tank-analysis-scale.channel-flow { background: linear-gradient(90deg, #d8f0e3, #3b8277); }
 .tank-analysis-scale.channel-decomposer { background: linear-gradient(90deg, #eee2c7, #c98246); }
 .tank-analysis-scale.channel-nitrifier { background: linear-gradient(90deg, #dce7d8, #49a49c); }
 .tank-analysis-values {
@@ -2916,7 +2974,7 @@
 }
 .tank-analysis-channel-strip {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
 }
 .tank-analysis-channel-strip button {
@@ -2951,6 +3009,10 @@
 .tank-analysis-channel-strip .channel-nutrients i { background: #7c9f55; }
 .tank-analysis-toolbar.analysis-oxygen .tank-analysis-heading strong i,
 .tank-analysis-channel-strip .channel-oxygen i { background: #5babc0; }
+.tank-analysis-toolbar.analysis-temperature .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-temperature i { background: #d47c4d; }
+.tank-analysis-toolbar.analysis-flow .tank-analysis-heading strong i,
+.tank-analysis-channel-strip .channel-flow i { background: #58a697; }
 .tank-analysis-toolbar.analysis-decomposer .tank-analysis-heading strong i,
 .tank-analysis-channel-strip .channel-decomposer i { background: #c98246; }
 .tank-analysis-toolbar.analysis-nitrifier .tank-analysis-heading strong i,

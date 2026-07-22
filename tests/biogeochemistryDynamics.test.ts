@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   BiogeochemistryLedger,
+  WATER_COLUMNS,
+  WATER_ROWS,
   type BiofilmReactionSite,
 } from '../src/simulation/biogeochemistry';
 
@@ -155,12 +157,17 @@ describe('active biogeochemistry', () => {
     });
     const bottom = { x: 600, y: 620 };
     const top = { x: 600, y: 90 };
+    const light = Array.from({ length: WATER_COLUMNS * WATER_ROWS }, () => 0);
+    light[(WATER_ROWS - 2) * WATER_COLUMNS + Math.floor(WATER_COLUMNS / 2)] = 100;
+    ledger.setTransportEnvironment(light, []);
 
     ledger.beginStep();
     ledger.recordAnimalMetabolism(bottom, 0, 10, 1);
+    ledger.advanceTemperature(1, 22);
     ledger.advance(1, []);
-    for (let second = 0; second < 59; second += 1) {
+    for (let second = 0; second < 119; second += 1) {
       ledger.beginStep();
+      ledger.advanceTemperature(1, 22);
       ledger.advance(1, []);
     }
 

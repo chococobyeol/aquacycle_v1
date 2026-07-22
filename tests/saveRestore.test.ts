@@ -43,6 +43,12 @@ describe('frozen aquarium saves', () => {
       .toBeCloseTo(before.biogeochemistry.average.oxygen, 5);
     expect(after.biogeochemistry.average.toxicWaste)
       .toBeCloseTo(before.biogeochemistry.average.toxicWaste, 5);
+    expect(after.biogeochemistry.transport.averageTemperature)
+      .toBeCloseTo(before.biogeochemistry.transport.averageTemperature, 5);
+    expect(after.biogeochemistry.transport.temperature)
+      .toEqual(before.biogeochemistry.transport.temperature);
+    expect(after.biogeochemistry.water.dissolvedInorganicCarbon)
+      .toEqual(before.biogeochemistry.water.dissolvedInorganicCarbon);
   });
 
   it('selects structures, measurements, organisms, and microbial films in one region', () => {
@@ -76,4 +82,3 @@ describe('frozen aquarium saves', () => {
     });
   });
 });
-

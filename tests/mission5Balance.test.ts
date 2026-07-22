@@ -188,10 +188,23 @@ describe('mission 5 microbial cycle', () => {
       unit: 'population-count',
       current: snapshot.animalPopulation['cherry-shrimp'].total,
       target: 1,
-      holdTarget: 900,
+      holdTarget: 1_500,
     });
     expect(snapshot.missionProgress?.holdCurrent).toBeGreaterThan(0);
   });
+
+  it('cannot sustain an untreated colony from its finite starting nutrients', () => {
+    const world = new SimulationWorld('mission-5');
+    populateTank(world);
+    world.handle({ type: 'start' });
+    const final = advanceTo(world, 1_800);
+
+    expect(final.biogeochemistry.biofilmTotals.decomposer).toBe(0);
+    expect(final.biogeochemistry.biofilmTotals.nitrifier).toBe(0);
+    expect(final.animalPopulation['cherry-shrimp'].total).toBe(0);
+    expect(final.missionProgress?.holdCurrent).toBeLessThan(1_500);
+    expect(final.outcome).toBe('failure');
+  }, 45_000);
 
   it('preserves the local water reading that caused a toxicity death', () => {
     const world = new SimulationWorld('mission-5');
@@ -222,7 +235,7 @@ describe('mission 5 microbial cycle', () => {
     treated.handle({ type: 'resume' });
     const samples = [280, 370, 460, 550, 640, 730, 820, 910, 1_000, 1_090, 1_180]
       .map((time) => advanceTo(treated, time));
-    const treatedFinal = samples.at(-1)!;
+    const treatedFinal = advanceTo(treated, 1_600);
     const range = (values: number[]): number => Math.max(...values) - Math.min(...values);
     const hasRiseAndFall = (values: number[], epsilon: number): boolean => {
       const differences = values.slice(1).map((value, index) => value - values[index]);
@@ -245,7 +258,9 @@ describe('mission 5 microbial cycle', () => {
     expect(range(decomposers)).toBeGreaterThan(0.5);
     expect(range(nitrifiers)).toBeGreaterThan(0.1);
     expect(hasRiseAndFall(organics, 0.02)).toBe(true);
-    expect(hasRiseAndFall(toxic, 0.02)).toBe(true);
+    // Shared turbulent dispersion smooths the former sharp local ammonium
+    // swing, but the tank must still show both production and consumption.
+    expect(hasRiseAndFall(toxic, 0.01)).toBe(true);
     expect(Math.abs(treatedFinal.biogeochemistry.materialBalance.nitrogenDriftRatio))
       .toBeLessThan(0.0001);
     expect(Math.abs(treatedFinal.biogeochemistry.materialBalance.carbonDriftRatio))
@@ -271,4 +286,5 @@ describe('mission 5 microbial cycle', () => {
     expect(established.biogeochemistry.biofilmTotals.nitrifier).toBeGreaterThan(0);
     expect(Math.max(...established.biogeochemistry.water.toxicWaste)).toBeLessThan(24);
   }, 30_000);
+
 });
