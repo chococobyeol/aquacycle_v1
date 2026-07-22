@@ -2540,34 +2540,49 @@ const drawSeeds = (layer: Graphics, snapshot: SimulationSnapshot): void => {
 
 const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   layer.clear();
+  const plantsByCell = new Map(snapshot.plants.map((plant) => [plant.cellId, plant]));
   for (const cell of snapshot.cells) {
     const biomass = cell.biomass.vallisneria;
-    if (cell.surfaceKind !== 'substrate' || biomass <= ALGAE_VISIBLE_BIOMASS) continue;
-    // Vallisneria is a basal rosette of long ribbon leaves. Biomass changes
-    // every ecology step (including nightly respiration), but an established
-    // leaf does not shorten every night. Keep geometry structural and use
-    // biomass only for health/opacity; the plant disappears only after death.
+    const plant = plantsByCell.get(cell.id);
+    if (
+      cell.surfaceKind !== 'substrate' ||
+      (plant ? biomass <= 0.004 : biomass <= ALGAE_VISIBLE_BIOMASS)
+    ) continue;
+    // Reserve biomass drives metabolism, while structuralScale changes slowly
+    // over a life stage. This keeps leaves stable through a single night but
+    // makes runner daughters small and old plants visibly thin and yellow.
     const plantHash = (cell.index * 0.61803398875) % 1;
-    const baseHeight = 170 + plantHash * 42;
-    const leafCount = 10;
-    const healthAlpha = 0.68 + Math.min(1, biomass / 0.28) * 0.26;
+    const structuralScale = plant?.structuralScale ?? 0.72;
+    const baseHeight = (184 + plantHash * 34) * structuralScale;
+    // A juvenile rosette should read as a few narrow strap leaves, not a
+    // radial tentacle cluster. Maturity adds leaves and height while keeping
+    // every blade anchored to the same compact crown.
+    const leafCount = Math.max(3, Math.round(2 + structuralScale * 6));
+    const health = plant?.health ?? Math.min(1, biomass / 0.28);
+    const senescent = plant?.lifeStage === 'senescent';
+    const healthAlpha = 0.48 + health * 0.46;
+    const healthyPalette = [0x557f47, 0x6f9651, 0x80a65d];
+    const oldPalette = [0x7f7441, 0x9a8750, 0xa89159];
     for (let index = 0; index < leafCount; index += 1) {
       const ratio = leafCount <= 1 ? 0.5 : index / (leafCount - 1);
       const side = ratio * 2 - 1;
       const phase = cell.index * 0.73 + index * 1.37;
-      const leafHeight = baseHeight * (0.58 + 0.42 * (0.5 + 0.5 * Math.sin(phase)));
-      const rootX = cell.x + side * 10;
-      const lean = side * (30 + Math.abs(side) * 48) + Math.sin(phase * 1.7) * 22;
+      const leafHeight = baseHeight *
+        (0.78 + (1 - Math.abs(side)) * 0.18) *
+        (0.94 + Math.sin(phase) * 0.06);
+      const rootX = cell.x + side * (3 + structuralScale * 4);
+      const lean = side * (10 + structuralScale * 24 + Math.abs(side) * 9) +
+        Math.sin(phase * 1.7) * (3 + structuralScale * 5);
       const tipX = rootX + lean;
-      const ribbonWidth = 11 + (index % 3) * 1.6;
-      const baseHalf = ribbonWidth * 0.28;
+      const ribbonWidth = 4.6 + structuralScale * 2.5 + (index % 3) * 0.35;
+      const baseHalf = ribbonWidth * 0.36;
       const midHalf = ribbonWidth / 2;
-      const swayA = Math.sin(phase * 1.11) * 25;
-      const swayB = Math.cos(phase * 0.83) * 32;
-      const controlAX = rootX + lean * 0.12 + swayA;
-      const controlBX = rootX + lean * 0.68 + swayB;
+      const swayA = Math.sin(phase * 1.11) * (3 + structuralScale * 6);
+      const swayB = Math.cos(phase * 0.83) * (4 + structuralScale * 8);
+      const controlAX = rootX + lean * 0.18 + swayA;
+      const controlBX = rootX + lean * 0.7 + swayB;
       const tipY = cell.y - leafHeight;
-      const tipHalf = ribbonWidth * 0.22;
+      const tipHalf = ribbonWidth * 0.16;
       layer
         .moveTo(rootX - baseHalf, cell.y + 8)
         .bezierCurveTo(
@@ -2589,10 +2604,10 @@ const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void 
         )
         .closePath()
         .fill({
-          color: index % 3 === 0 ? 0x557f47 : index % 3 === 1 ? 0x6f9651 : 0x80a65d,
+          color: (senescent ? oldPalette : healthyPalette)[index % 3],
           alpha: healthAlpha * (0.84 + (index % 4) * 0.045),
         })
-        .stroke({ color: 0x354b3b, width: 1.55, alpha: 0.78, join: 'round' });
+        .stroke({ color: 0x354b3b, width: 1.05, alpha: 0.72, join: 'round' });
       layer
         .moveTo(rootX - baseHalf * 0.25, cell.y + 5)
         .bezierCurveTo(
@@ -2603,13 +2618,8 @@ const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void 
           tipX - tipHalf * 0.3,
           tipY + 2,
         )
-        .stroke({ color: 0xd2d793, width: 1.15, alpha: 0.27, cap: 'round' });
+        .stroke({ color: 0xd2d793, width: 0.75, alpha: 0.24, cap: 'round' });
     }
-    // The short crown is buried by the foreground substrate layer, so the
-    // leaves read as emerging from sediment rather than a cut spring-onion.
-    layer
-      .roundRect(cell.x - 8, cell.y + 2, 16, 14, 5)
-      .fill({ color: 0x425f3e, alpha: 0.78 });
   }
 };
 

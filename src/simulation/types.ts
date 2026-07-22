@@ -124,6 +124,26 @@ export interface SeedSnapshot {
   locked: boolean;
 }
 
+export type PlantLifeStage = 'juvenile' | 'mature' | 'senescent';
+
+/** One rooted Vallisneria rosette (ramet), including runner-born daughters. */
+export interface PlantRametSnapshot {
+  id: string;
+  speciesId: 'vallisneria';
+  cellId: string;
+  x: number;
+  y: number;
+  origin: 'supplied' | 'runner';
+  parentId: string | null;
+  ageSeconds: number;
+  lifespanSeconds: number;
+  lifeStage: PlantLifeStage;
+  structuralScale: number;
+  health: number;
+  runnerProgress: number;
+  reproductionCount: number;
+}
+
 export interface AnimalSnapshot {
   id: string;
   speciesId: AnimalSpeciesId;
@@ -381,6 +401,7 @@ export interface SimulationSnapshot {
   structures: StructureSnapshot[];
   cells: SurfaceCellSnapshot[];
   seeds: SeedSnapshot[];
+  plants: PlantRametSnapshot[];
   animals: AnimalSnapshot[];
   carcasses: AnimalCarcassSnapshot[];
   holding: HoldingSnapshot | null;
@@ -525,6 +546,17 @@ export interface SimulationSaveData {
     speciesId: SpeciesId;
     cellId: string;
     locked: boolean;
+    /** Optional fields keep older version-1 frozen aquariums loadable. */
+    origin?: 'supplied' | 'runner';
+    plant?: {
+      parentId: string | null;
+      ageSeconds: number;
+      lifespanSeconds: number;
+      structuralScale: number;
+      runnerProgress: number;
+      reproductionCount: number;
+      stressSeconds: number;
+    };
   }>;
   animals: SavedAnimalState[];
   carcasses: SavedAnimalCarcassState[];

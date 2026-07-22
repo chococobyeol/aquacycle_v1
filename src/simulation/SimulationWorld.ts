@@ -67,6 +67,8 @@ import {
   type MicrobeGuildId,
   type MissionOutcome,
   type MissionProgressSnapshot,
+  type PlantLifeStage,
+  type PlantRametSnapshot,
   type ProbeSnapshot,
   type ScenarioId,
   type SelectionFilter,
@@ -113,6 +115,18 @@ interface SeedPlacementState {
   speciesId: SpeciesId;
   cellId: string;
   locked: boolean;
+  origin: 'supplied' | 'runner';
+  plant?: VallisneriaLifeState;
+}
+
+interface VallisneriaLifeState {
+  parentId: string | null;
+  ageSeconds: number;
+  lifespanSeconds: number;
+  structuralScale: number;
+  runnerProgress: number;
+  reproductionCount: number;
+  stressSeconds: number;
 }
 
 interface MeasurementState {
@@ -147,6 +161,7 @@ interface HeldSeedState {
   valid: boolean;
   originCellId?: string;
   originBiomass?: number;
+  originPlacement?: SeedPlacementState;
 }
 
 interface AnimalState {
@@ -276,6 +291,16 @@ const animalMotionStepSecondsForSpeed = (speed: SimulationSpeed): number =>
 
 const SETTLE_REQUIRED_SECONDS = 0.48;
 const SEED_BIOMASS = 0.28;
+const VALLISNERIA_JUVENILE_SECONDS = 360;
+const VALLISNERIA_MIN_LIFESPAN_SECONDS = 2_400;
+const VALLISNERIA_MAX_LIFESPAN_SECONDS = 3_300;
+const VALLISNERIA_SENESCENCE_START_RATIO = 0.82;
+const VALLISNERIA_RUNNER_INTERVAL_SECONDS = 600;
+const VALLISNERIA_RUNNER_BIOMASS = 0.16;
+const VALLISNERIA_RUNNER_MIN_DISTANCE = 42;
+const VALLISNERIA_RUNNER_MAX_DISTANCE = 170;
+const VALLISNERIA_LOW_RESERVE = 0.055;
+const VALLISNERIA_LOW_RESERVE_GRACE_SECONDS = 150;
 const BIOFILM_INOCULUM_BIOMASS = 0.18;
 const PICK_SEED_DISTANCE = 18;
 const PICK_ANIMAL_DISTANCE = 28;
@@ -382,6 +407,15 @@ const cloneAnimalState = (animal: AnimalState): AnimalState => ({
 const deterministicNoise = (seed: number): number => {
   const value = Math.sin(seed * 12.9898) * 43758.5453;
   return value - Math.floor(value);
+};
+
+const deterministicStringSeed = (value: string): number => {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
 };
 
 const countByDefinition = (
@@ -772,6 +806,7 @@ export class SimulationWorld {
           this.biogeochemistry.beginStep(growthStepSeconds);
           this.stepTemperature(growthStepSeconds);
           this.stepGrowth(growthStepSeconds);
+          this.stepVallisneriaLifecycle(growthStepSeconds);
           this.stepAnimalEcology(growthStepSeconds);
           this.stepBiofilmDispersal(growthStepSeconds);
           this.resolveBiogeochemistry(growthStepSeconds);
@@ -863,6 +898,7 @@ export class SimulationWorld {
       structures: this.structureSnapshots(),
       cells,
       seeds: this.seedSnapshots(),
+      plants: this.plantSnapshots(),
       animals: this.animalSnapshots(),
       carcasses: this.carcassSnapshots(),
       holding: this.holdingSnapshot(),
@@ -996,7 +1032,10 @@ export class SimulationWorld {
         biomass: { ...cell.biomass },
         biofilm: { ...cell.biofilm },
       })),
-      seedPlacements: this.seedPlacements.map((placement) => ({ ...placement })),
+      seedPlacements: this.seedPlacements.map((placement) => ({
+        ...placement,
+        plant: placement.plant ? { ...placement.plant } : undefined,
+      })),
       animals: this.animals.map((animal) => cloneAnimalState(animal)),
       carcasses: this.carcasses.map((carcass) => ({
         ...carcass,
@@ -1082,7 +1121,18 @@ export class SimulationWorld {
     this.seedCounter = data.seedCounter;
     this.animalCounter = data.animalCounter;
     this.measurementCounter = data.measurementCounter;
-    this.seedPlacements = data.seedPlacements.map((placement) => ({ ...placement }));
+    this.seedPlacements = data.seedPlacements.map((placement) => {
+      const origin = placement.origin ?? 'supplied';
+      return {
+        ...placement,
+        origin,
+        plant: placement.speciesId === 'vallisneria'
+          ? placement.plant
+            ? { ...placement.plant }
+            : this.createVallisneriaLifeState(placement.id, origin, null)
+          : undefined,
+      };
+    });
     this.animals = data.animals.map((animal) => cloneAnimalState(animal));
     this.carcasses = data.carcasses.map((carcass) => ({
       ...carcass,
@@ -1379,6 +1429,10 @@ export class SimulationWorld {
           valid: true,
           originCellId: placement.cellId,
           originBiomass,
+          originPlacement: {
+            ...placement,
+            plant: placement.plant ? { ...placement.plant } : undefined,
+          },
         };
         this.selection = null;
         this.message = '접종체를 옮기는 중입니다. 클릭해 다시 놓거나 회수할 수 있습니다.';
@@ -1784,12 +1838,15 @@ export class SimulationWorld {
     const cell = cellId ? this.cellById(cellId) : undefined;
     if (!cell || !cellId) return;
     cell.biomass[heldSeed.speciesId] = Math.max(cell.biomass[heldSeed.speciesId], SEED_BIOMASS);
-    this.seedPlacements.push({
-      id: heldSeed.seedId,
-      speciesId: heldSeed.speciesId,
-      cellId,
-      locked: false,
-    });
+    this.seedPlacements.push(heldSeed.originPlacement
+      ? {
+        ...heldSeed.originPlacement,
+        cellId,
+        plant: heldSeed.originPlacement.plant
+          ? { ...heldSeed.originPlacement.plant }
+          : undefined,
+      }
+      : this.createSeedPlacement(heldSeed.seedId, heldSeed.speciesId, cellId));
     this.held = null;
     this.message = `${SPECIES[heldSeed.speciesId].shortName} 접종 위치를 정했습니다.`;
   }
@@ -1822,12 +1879,19 @@ export class SimulationWorld {
     ) {
       const origin = this.cellById(this.held.originCellId);
       if (origin) origin.biomass[this.held.speciesId] = this.held.originBiomass ?? SEED_BIOMASS;
-      this.seedPlacements.push({
-        id: this.held.seedId,
-        speciesId: this.held.speciesId,
-        cellId: this.held.originCellId,
-        locked: false,
-      });
+      this.seedPlacements.push(this.held.originPlacement
+        ? {
+          ...this.held.originPlacement,
+          cellId: this.held.originCellId,
+          plant: this.held.originPlacement.plant
+            ? { ...this.held.originPlacement.plant }
+            : undefined,
+        }
+        : this.createSeedPlacement(
+          this.held.seedId,
+          this.held.speciesId,
+          this.held.originCellId,
+        ));
     }
     this.held = null;
     this.updateSettledState(SETTLE_REQUIRED_SECONDS);
@@ -2224,7 +2288,9 @@ export class SimulationWorld {
   private remainingSeeds(speciesId: SpeciesId): number | null {
     const budget = this.scenario.seedBudget[speciesId];
     if (budget === null) return null;
-    const placed = this.seedPlacements.filter((placement) => placement.speciesId === speciesId).length;
+    const placed = this.seedPlacements.filter((placement) =>
+      placement.speciesId === speciesId && placement.origin === 'supplied'
+    ).length;
     const held = this.held?.kind === 'seed' && this.held.speciesId === speciesId ? 1 : 0;
     return Math.max(0, budget - placed - held);
   }
@@ -3484,17 +3550,204 @@ export class SimulationWorld {
   ): Vec2 {
     const anchor = this.cellWorldPoint(cell);
     if (speciesId !== 'vallisneria') return anchor;
-    // Supplied Vallisneria are rooted plants, not leaves rebuilt from reserve
-    // biomass every ecology tick. Their structural canopy therefore stays at
-    // a stable, per-plant height through nightly respiration. Biomass controls
-    // health and eventual death, while both rendering and physiology sample
-    // the same fixed ribbon-leaf canopy.
+    // Structural leaf size follows the much slower ramet life cycle, not the
+    // reserve biomass lost and regained within one night/day cycle.
+    const ramet = this.seedPlacements.find((placement) =>
+      placement.speciesId === 'vallisneria' && placement.cellId === cell.id
+    );
     const plantHash = (cell.index * 0.61803398875) % 1;
-    const canopyHeight = (170 + plantHash * 42) * 0.8;
+    const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
+    const canopyHeight = (170 + plantHash * 42) * 0.8 * structuralScale;
     return {
       x: anchor.x,
       y: Math.max(WATER_TOP + 16, anchor.y - canopyHeight),
     };
+  }
+
+  private createSeedPlacement(
+    id: string,
+    speciesId: SpeciesId,
+    cellId: string,
+    origin: 'supplied' | 'runner' = 'supplied',
+    parentId: string | null = null,
+  ): SeedPlacementState {
+    return {
+      id,
+      speciesId,
+      cellId,
+      locked: false,
+      origin,
+      plant: speciesId === 'vallisneria'
+        ? this.createVallisneriaLifeState(id, origin, parentId)
+        : undefined,
+    };
+  }
+
+  private createVallisneriaLifeState(
+    id: string,
+    origin: 'supplied' | 'runner',
+    parentId: string | null,
+  ): VallisneriaLifeState {
+    const seed = deterministicStringSeed(id);
+    const lifespanSeconds = VALLISNERIA_MIN_LIFESPAN_SECONDS +
+      deterministicNoise(seed * 0.0137) *
+      (VALLISNERIA_MAX_LIFESPAN_SECONDS - VALLISNERIA_MIN_LIFESPAN_SECONDS);
+    return {
+      parentId,
+      // Inventory plants are established young rosettes, while a runner-born
+      // daughter visibly starts small and must mature before making a runner.
+      ageSeconds: origin === 'supplied'
+        ? 180 + deterministicNoise(seed * 0.0211) * 120
+        : 0,
+      lifespanSeconds,
+      structuralScale: origin === 'supplied'
+        ? 0.48 + deterministicNoise(seed * 0.0319) * 0.1
+        : 0.18,
+      runnerProgress: origin === 'supplied'
+        ? deterministicNoise(seed * 0.0473) * 0.12
+        : 0,
+      reproductionCount: 0,
+      stressSeconds: 0,
+    };
+  }
+
+  private vallisneriaLifeStage(life: VallisneriaLifeState): PlantLifeStage {
+    if (life.ageSeconds < VALLISNERIA_JUVENILE_SECONDS) return 'juvenile';
+    if (life.ageSeconds >= life.lifespanSeconds * VALLISNERIA_SENESCENCE_START_RATIO) {
+      return 'senescent';
+    }
+    return 'mature';
+  }
+
+  private vallisneriaHealth(placement: SeedPlacementState, cell: SurfaceCellState): number {
+    const life = placement.plant;
+    if (!life) return 0;
+    const reserveHealth = clamp01((cell.biomass.vallisneria - 0.018) / 0.27);
+    const stressHealth = 1 - clamp01(life.stressSeconds / VALLISNERIA_LOW_RESERVE_GRACE_SECONDS);
+    return reserveHealth * stressHealth;
+  }
+
+  private runnerDestination(parent: SeedPlacementState): SurfaceCellState | null {
+    const source = this.cellById(parent.cellId);
+    if (!source || source.surfaceKind !== 'substrate') return null;
+    const sourcePoint = this.cellWorldPoint(source);
+    const occupiedCells = new Set(this.seedPlacements
+      .filter((placement) => placement.speciesId === 'vallisneria')
+      .map((placement) => placement.cellId));
+    const parentSeed = deterministicStringSeed(parent.id) + (parent.plant?.reproductionCount ?? 0) * 97;
+    const candidates = this.substrateCells.flatMap((cell) => {
+      if (occupiedCells.has(cell.id) || cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS) return [];
+      const total = cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria;
+      if (total + VALLISNERIA_RUNNER_BIOMASS > 1) return [];
+      const distance = Math.sqrt(distanceSquared(sourcePoint, this.cellWorldPoint(cell)));
+      if (
+        distance < VALLISNERIA_RUNNER_MIN_DISTANCE ||
+        distance > VALLISNERIA_RUNNER_MAX_DISTANCE
+      ) return [];
+      // Prefer a natural runner length, with a deterministic left/right choice
+      // preventing every daughter from filling cells in array order.
+      const score = Math.abs(distance - 92) +
+        deterministicNoise(parentSeed + cell.index * 1.71) * 26;
+      return [{ cell, score }];
+    });
+    candidates.sort((left, right) => left.score - right.score);
+    return candidates[0]?.cell ?? null;
+  }
+
+  private stepVallisneriaLifecycle(deltaSeconds: number): void {
+    const deaths = new Set<string>();
+    const daughters: SeedPlacementState[] = [];
+
+    for (const placement of this.seedPlacements) {
+      if (placement.speciesId !== 'vallisneria' || !placement.plant) continue;
+      const cell = this.cellById(placement.cellId);
+      if (!cell) {
+        deaths.add(placement.id);
+        continue;
+      }
+      const life = placement.plant;
+      life.ageSeconds += deltaSeconds;
+      const biomass = cell.biomass.vallisneria;
+      life.stressSeconds = biomass < VALLISNERIA_LOW_RESERVE
+        ? life.stressSeconds + deltaSeconds
+        : Math.max(0, life.stressSeconds - deltaSeconds * 1.8);
+
+      const stage = this.vallisneriaLifeStage(life);
+      const reserveScale = 0.16 + 0.84 * clamp01((biomass - 0.02) / 0.46);
+      const juvenileLimit = stage === 'juvenile'
+        ? 0.22 + 0.78 * clamp01(life.ageSeconds / VALLISNERIA_JUVENILE_SECONDS)
+        : 1;
+      const senescenceProgress = stage === 'senescent'
+        ? clamp01(
+          (life.ageSeconds - life.lifespanSeconds * VALLISNERIA_SENESCENCE_START_RATIO) /
+          (life.lifespanSeconds * (1 - VALLISNERIA_SENESCENCE_START_RATIO)),
+        )
+        : 0;
+      const targetScale = Math.min(reserveScale, juvenileLimit) * (1 - senescenceProgress * 0.42);
+      const responseSeconds = targetScale >= life.structuralScale ? 150 : 360;
+      life.structuralScale += (targetScale - life.structuralScale) *
+        clamp01(deltaSeconds / responseSeconds);
+      life.structuralScale = clamp(life.structuralScale, 0.12, 1);
+
+      if (stage === 'senescent' && biomass > 0) {
+        const senescenceLoss = Math.min(
+          biomass,
+          biomass * (0.0008 + senescenceProgress * 0.0024) * deltaSeconds,
+        );
+        cell.biomass.vallisneria -= senescenceLoss;
+        this.biogeochemistry.recordAlgaeTurnover(this.cellWorldPoint(cell), senescenceLoss);
+      }
+
+      const expired = life.ageSeconds >= life.lifespanSeconds;
+      const reserveCollapsed = life.stressSeconds >= VALLISNERIA_LOW_RESERVE_GRACE_SECONDS;
+      if (expired || reserveCollapsed || cell.biomass.vallisneria <= 0.004) {
+        const remaining = Math.max(0, cell.biomass.vallisneria);
+        if (remaining > 0) {
+          this.biogeochemistry.recordAlgaeTurnover(this.cellWorldPoint(cell), remaining);
+          cell.biomass.vallisneria = 0;
+        }
+        deaths.add(placement.id);
+        continue;
+      }
+
+      const health = this.vallisneriaHealth(placement, cell);
+      if (stage !== 'mature' || health < 0.68 || biomass < VALLISNERIA_RUNNER_BIOMASS + 0.18) {
+        life.runnerProgress = Math.max(0, life.runnerProgress - deltaSeconds / 1_800);
+        continue;
+      }
+      const canopyLight = this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria'));
+      const temperature = this.biogeochemistry.temperatureAt(this.producerActivityPoint(cell, 'vallisneria'));
+      const suitability = habitatSuitability('vallisneria', canopyLight, temperature);
+      life.runnerProgress += deltaSeconds / VALLISNERIA_RUNNER_INTERVAL_SECONDS *
+        clamp(health * suitability * (biomass / 0.5), 0, 1.35);
+      if (life.runnerProgress < 1) continue;
+
+      const destination = this.runnerDestination(placement);
+      if (!destination) {
+        life.runnerProgress = Math.min(1, life.runnerProgress);
+        continue;
+      }
+      const transferred = Math.min(VALLISNERIA_RUNNER_BIOMASS, cell.biomass.vallisneria - 0.18);
+      if (transferred <= 0.04) continue;
+      cell.biomass.vallisneria -= transferred;
+      destination.biomass.vallisneria += transferred;
+      const daughterId = `seed-${++this.seedCounter}`;
+      daughters.push(this.createSeedPlacement(
+        daughterId,
+        'vallisneria',
+        destination.id,
+        'runner',
+        placement.id,
+      ));
+      life.runnerProgress -= 1;
+      life.reproductionCount += 1;
+    }
+
+    if (deaths.size) {
+      this.seedPlacements = this.seedPlacements.filter((placement) => !deaths.has(placement.id));
+    }
+    if (daughters.length) this.seedPlacements.push(...daughters);
+    if (deaths.size || daughters.length) this.snapshotDirty = true;
   }
 
   private stepGrowth(deltaSeconds: number): void {
@@ -4036,7 +4289,39 @@ export class SimulationWorld {
       const cell = this.cellById(placement.cellId);
       if (!cell) return [];
       const point = this.cellWorldPoint(cell);
-      return [{ ...placement, x: point.x, y: point.y }];
+      return [{
+        id: placement.id,
+        speciesId: placement.speciesId,
+        cellId: placement.cellId,
+        locked: placement.locked,
+        x: point.x,
+        y: point.y,
+      }];
+    });
+  }
+
+  private plantSnapshots(): PlantRametSnapshot[] {
+    return this.seedPlacements.flatMap((placement) => {
+      if (placement.speciesId !== 'vallisneria' || !placement.plant) return [];
+      const cell = this.cellById(placement.cellId);
+      if (!cell || cell.biomass.vallisneria <= 0.004) return [];
+      const point = this.cellWorldPoint(cell);
+      return [{
+        id: placement.id,
+        speciesId: 'vallisneria' as const,
+        cellId: placement.cellId,
+        x: point.x,
+        y: point.y,
+        origin: placement.origin,
+        parentId: placement.plant.parentId,
+        ageSeconds: placement.plant.ageSeconds,
+        lifespanSeconds: placement.plant.lifespanSeconds,
+        lifeStage: this.vallisneriaLifeStage(placement.plant),
+        structuralScale: placement.plant.structuralScale,
+        health: this.vallisneriaHealth(placement, cell),
+        runnerProgress: clamp01(placement.plant.runnerProgress),
+        reproductionCount: placement.plant.reproductionCount,
+      }];
     });
   }
 

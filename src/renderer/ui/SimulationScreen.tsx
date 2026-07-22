@@ -889,6 +889,9 @@ export function SimulationScreen({
   const selectedAverageLight = selectedCells.length
     ? selectedCells.reduce((total, cell) => total + cell.light, 0) / selectedCells.length
     : undefined;
+  const selectedPlants = selectedCells.length
+    ? snapshot.plants.filter((plant) => selectedCells.some((cell) => cell.id === plant.cellId))
+    : [];
   const selectionSpeciesIds = snapshot.selection?.kind === 'colony' || snapshot.selection?.kind === 'region'
     ? SPECIES_IDS.filter((speciesId) => selectedCells.some((cell) =>
       cell.biomass[speciesId] > ALGAE_VISIBLE_BIOMASS,
@@ -2229,6 +2232,7 @@ export function SimulationScreen({
                     availableSpecies={selectionSpeciesIds}
                     headingLabel="같은 표면의 조류"
                     scopeLabel={`선택 표면 ${selectedCells.length}곳`}
+                    plantRamets={selectedPlants}
                   />
                 )}
               </>
@@ -2244,6 +2248,7 @@ export function SimulationScreen({
                 availableSpecies={selectionSpeciesIds.length ? selectionSpeciesIds : [inspectedSpecies]}
                 headingLabel={selectionSpeciesIds.length ? '선택한 생물' : '생물 정보'}
                 scopeLabel="선택한 위치"
+                plantRamets={selectionSpeciesIds.length ? selectedPlants : snapshot.plants}
               />
             ) : (
               <section className="paper-panel empty-inspector">
@@ -3633,6 +3638,7 @@ function SpeciesGuide({
   scopeLabel,
   onRemoveFromSelection,
   removalScopeLabel,
+  plantRamets = [],
 }: {
   speciesId: SpeciesId;
   probeLight?: number;
@@ -3644,6 +3650,7 @@ function SpeciesGuide({
   scopeLabel: string;
   onRemoveFromSelection?: () => void;
   removalScopeLabel?: string;
+  plantRamets?: SimulationSnapshot['plants'];
 }) {
   const species = SPECIES[speciesId];
   const minRate = -0.045;
@@ -3701,6 +3708,29 @@ function SpeciesGuide({
         <div><dt>빛의 틈새</dt><dd>{species.niche}</dd></div>
         <div><dt>수온 반응</dt><dd>{species.temperatureSummary}</dd></div>
       </dl>
+      {speciesId === 'vallisneria' && (
+        <section className="plant-lifecycle-card">
+          <div className="ecology-rules-heading">
+            <strong>포기 생애</strong>
+            <span>{plantRamets.length ? `${plantRamets.length}포기 관찰 중` : '관찰할 포기 없음'}</span>
+          </div>
+          {plantRamets.length ? (
+            <>
+              <div className="plant-stage-summary">
+                <span>어린 포기 <b>{plantRamets.filter((plant) => plant.lifeStage === 'juvenile').length}</b></span>
+                <span>성체 <b>{plantRamets.filter((plant) => plant.lifeStage === 'mature').length}</b></span>
+                <span>노쇠 <b>{plantRamets.filter((plant) => plant.lifeStage === 'senescent').length}</b></span>
+              </div>
+              <dl>
+                <div><dt>현재 나이</dt><dd>{Math.floor(plantRamets[0].ageSeconds / 60)}분 {Math.floor(plantRamets[0].ageSeconds % 60)}초 / 예상 {Math.floor(plantRamets[0].lifespanSeconds / 60)}분</dd></div>
+                <div><dt>생장 상태</dt><dd>{plantRamets[0].lifeStage === 'juvenile' ? '어린 포기 · 잎을 키우는 중' : plantRamets[0].lifeStage === 'mature' ? '성체 · 러너 번식 가능' : '노쇠 · 잎과 저장량 감소'}</dd></div>
+                <div><dt>건강</dt><dd>{Math.round(plantRamets[0].health * 100)} / 100</dd></div>
+                <div><dt>러너 준비</dt><dd>{Math.round(plantRamets[0].runnerProgress * 100)}% · 자손 {plantRamets[0].reproductionCount}포기</dd></div>
+              </dl>
+            </>
+          ) : <p>수조에서 나사말 포기나 나사말이 있는 영역을 선택하면 나이·건강·러너 번식을 볼 수 있습니다.</p>}
+        </section>
+      )}
       <section className="ecology-rules-card algae-rules-card">
         <div className="ecology-rules-heading"><strong>게임 생존·수질 기준</strong><span>표면 군락량 1.0 기준</span></div>
         <dl>

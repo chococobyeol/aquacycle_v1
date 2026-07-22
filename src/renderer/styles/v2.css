@@ -459,6 +459,37 @@
 .ecology-rules-card dt { color: #4f706a; }
 .ecology-rules-card dd { margin: 0; color: #5d6964; }
 .ecology-rules-card dd b { color: #344946; font-family: "Apple SD Gothic Neo", sans-serif; }
+.plant-lifecycle-card {
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1.5px solid rgba(88, 112, 75, 0.55);
+  border-radius: 10px 7px 11px 8px;
+  background: rgba(218, 226, 191, 0.34);
+}
+.plant-lifecycle-card > p { margin: 4px 0 0; color: #68736a; font-size: 10px; line-height: 1.45; }
+.plant-stage-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 4px 0 6px; }
+.plant-stage-summary span {
+  padding: 5px 3px;
+  border: 1px solid rgba(71, 93, 68, 0.25);
+  border-radius: 6px;
+  background: rgba(255, 252, 228, 0.46);
+  color: #667269;
+  font-size: 9px;
+  text-align: center;
+}
+.plant-stage-summary b { display: block; margin-top: 1px; color: #40594b; font-size: 13px; }
+.plant-lifecycle-card dl { margin: 0; }
+.plant-lifecycle-card dl > div {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 6px;
+  padding: 4px 0;
+  border-top: 1px dashed rgba(48, 60, 58, 0.18);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.plant-lifecycle-card dt { color: #58705b; }
+.plant-lifecycle-card dd { margin: 0; color: #59665e; }
 .response-chart { margin-top: 7px; padding-top: 6px; border-top: 1.5px solid rgba(48, 60, 58, 0.28); }
 .response-chart > div { display: flex; align-items: baseline; justify-content: space-between; }
 .response-chart > div strong { font-size: 9px; }
