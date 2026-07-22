@@ -92,6 +92,23 @@ const MISSION_CARDS: readonly MissionCardDefinition[] = [
       </>
     ),
   },
+  {
+    id: 'mission-6',
+    stamp: '실험 6',
+    className: 'mission-six',
+    title: '밤을 건너는 수조',
+    description: '낮과 밤이 반복되는 동안 체리새우 군집을 유지하세요.',
+    tags: '낮·밤 주기 · 나사말 · 광합성·호흡 · 장기 생존',
+    illustrationClassName: 'day-night-cycle',
+    illustration: (
+      <>
+        <i className="mini-day-sun" />
+        <i className="mini-night-moon" />
+        <i className="mini-vallisneria" />
+        <i className="mini-waterline" />
+      </>
+    ),
+  },
 ];
 export const MISSION_IDS: readonly MissionId[] = MISSION_CARDS.map(({ id }) => id);
 
@@ -437,7 +454,7 @@ export function MissionMenu({
 
       <footer className="menu-footer">
         <span>현재 구현 범위 · 생산자·소비자·미생물 순환</span>
-        <span>Windows / macOS 데스크톱 프로토타입</span>
+        <span>Windows / macOS 데스크톱 버전</span>
       </footer>
     </main>
   );

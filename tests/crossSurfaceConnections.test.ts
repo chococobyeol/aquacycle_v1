@@ -86,7 +86,7 @@ describe('bounded cross-surface colony bridges', () => {
     const neighborIds = new Map(cells.map((cell) => [cell.id, [...cell.neighborIds]]));
     for (const cell of cells) {
       cell.light = 38;
-      cell.biomass = { oedogonium: 0, nitzschia: 0 };
+      cell.biomass = { oedogonium: 0, nitzschia: 0, vallisneria: 0 };
       cell.neighborIds = [];
     }
     source.biomass.nitzschia = 0.28;
@@ -98,7 +98,7 @@ describe('bounded cross-surface colony bridges', () => {
     );
 
     for (const cell of cells) {
-      cell.biomass = { oedogonium: 0, nitzschia: 0 };
+      cell.biomass = { oedogonium: 0, nitzschia: 0, vallisneria: 0 };
       cell.neighborIds = [...(neighborIds.get(cell.id) ?? [])];
     }
     source.biomass.nitzschia = 0.28;

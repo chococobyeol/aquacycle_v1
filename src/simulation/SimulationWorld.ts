@@ -17,7 +17,9 @@ import {
   emptyBiofilm,
 } from './biogeochemistry';
 import { FIXED_LAMP_WIDTH, FIXED_LAMP_X, FIXED_LAMP_Y } from './lightGeometry';
+import { dayNightStateAt, type DayNightPhase, type DayNightState } from './dayNight';
 import {
+  algaePhysiology,
   clamp01,
   emptyBiomass,
   growthTrend,
@@ -333,6 +335,7 @@ const distanceSquared = (a: Vec2, b: Vec2): number => {
 const cloneBiomass = (biomass: SpeciesBiomass): SpeciesBiomass => ({
   oedogonium: biomass.oedogonium,
   nitzschia: biomass.nitzschia,
+  vallisneria: biomass.vallisneria ?? 0,
 });
 
 const emptyAnimalPopulationEventTotals = (): AnimalPopulationEventTotals => ({
@@ -413,6 +416,8 @@ export class SimulationWorld {
   private materialReference: { nitrogen: number; carbon: number } | null = null;
   private biogeochemistry = new BiogeochemistryLedger();
   private lightOutput = 90;
+  private appliedDayNightMultiplier = 1;
+  private appliedDayNightPhase: DayNightPhase | null = null;
   private waterTemperature = 23.5;
   private lightDirty = true;
   private crossConnectionsDirty = true;
@@ -474,6 +479,9 @@ export class SimulationWorld {
     this.biofilmSettlementCursor = 0;
     this.materialReference = null;
     this.lightOutput = this.scenario.lightOutput;
+    const initialDayNight = this.currentDayNightState();
+    this.appliedDayNightMultiplier = initialDayNight?.lightMultiplier ?? 1;
+    this.appliedDayNightPhase = initialDayNight?.phase ?? null;
     // A challenge tank is presented after its fixed lamp has already been on,
     // so begin near the former well-mixed lamp equilibrium instead of making
     // every mission spend its short time limit warming from room temperature.
@@ -706,7 +714,8 @@ export class SimulationWorld {
           this.growthAccumulator -= growthStepSeconds;
           if (Math.abs(this.growthAccumulator) < 1e-10) this.growthAccumulator = 0;
           this.elapsedSeconds += growthStepSeconds;
-          this.biogeochemistry.beginStep();
+          this.updateDayNightLighting();
+          this.biogeochemistry.beginStep(growthStepSeconds);
           this.stepTemperature(growthStepSeconds);
           this.stepGrowth(growthStepSeconds);
           this.stepAnimalEcology(growthStepSeconds);
@@ -751,6 +760,7 @@ export class SimulationWorld {
       (total, cell) => ({
         oedogonium: total.oedogonium + cell.biomass.oedogonium,
         nitzschia: total.nitzschia + cell.biomass.nitzschia,
+        vallisneria: total.vallisneria + cell.biomass.vallisneria,
       }),
       emptyBiomass(),
     );
@@ -792,6 +802,7 @@ export class SimulationWorld {
       allSettled: this.allSettled,
       hasStarted: this.hasStarted,
       lightOutput: this.lightOutput,
+      dayNight: this.currentDayNightSnapshot(),
       waterTemperature: this.waterTemperature,
       structures: this.structureSnapshots(),
       cells,
@@ -811,6 +822,7 @@ export class SimulationWorld {
       remainingSeeds: {
         oedogonium: this.remainingSeeds('oedogonium'),
         nitzschia: this.remainingSeeds('nitzschia'),
+        vallisneria: this.remainingSeeds('vallisneria'),
       },
       remainingAnimals: {
         'cherry-shrimp': this.remainingAnimals('cherry-shrimp'),
@@ -963,6 +975,9 @@ export class SimulationWorld {
     this.outcome = data.outcome;
     this.outcomeAtSeconds = data.outcomeAtSeconds;
     this.elapsedSeconds = Math.max(0, data.elapsedSeconds);
+    const restoredDayNight = this.currentDayNightState();
+    this.appliedDayNightMultiplier = restoredDayNight?.lightMultiplier ?? 1;
+    this.appliedDayNightPhase = restoredDayNight?.phase ?? null;
     this.speed = normalizeSimulationSpeed(data.speed);
     this.hasStarted = data.hasStarted;
     // A thawed tank always opens paused so no ecology time passes while the
@@ -991,7 +1006,7 @@ export class SimulationWorld {
       for (const cell of structure.cells) {
         const restored = savedCells.get(cell.id);
         if (!restored) continue;
-        cell.biomass = { ...restored.biomass };
+        cell.biomass = cloneBiomass(restored.biomass);
         cell.biofilm = { ...restored.biofilm };
       }
     }
@@ -999,7 +1014,7 @@ export class SimulationWorld {
     for (const cell of this.substrateCells) {
       const restored = savedSubstrate.get(cell.id);
       if (!restored) continue;
-      cell.biomass = { ...restored.biomass };
+      cell.biomass = cloneBiomass(restored.biomass);
       cell.biofilm = { ...restored.biofilm };
     }
 
@@ -1070,7 +1085,7 @@ export class SimulationWorld {
   private computeMaterialTotals(): { nitrogen: number; carbon: number } {
     const water = this.biogeochemistry.materialState();
     const surfaceBiomass = this.allCells().reduce((sum, cell) => sum +
-      cell.biomass.oedogonium + cell.biomass.nitzschia +
+      cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria +
       cell.biofilm.decomposer + cell.biofilm.nitrifier, 0);
     const animalBiomass = this.animals.reduce(
       (sum, animal) => sum + animal.structuralBiomass + animal.storedBiomass,
@@ -1493,7 +1508,7 @@ export class SimulationWorld {
     const cells = (filter === 'organism' || filter === 'all')
       ? this.allCells().filter((cell) => {
       const point = this.cellWorldPoint(cell);
-      const algae = cell.biomass.oedogonium + cell.biomass.nitzschia;
+      const algae = cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria;
       const microbes = cell.biofilm.decomposer + cell.biofilm.nitrifier;
       return (algae > ALGAE_VISIBLE_BIOMASS || microbes >= 0.001) &&
         point.x >= bounds.minX && point.x <= bounds.maxX &&
@@ -1523,6 +1538,7 @@ export class SimulationWorld {
     const totals = cells.reduce<SpeciesBiomass>((sum, cell) => ({
       oedogonium: sum.oedogonium + cell.biomass.oedogonium,
       nitzschia: sum.nitzschia + cell.biomass.nitzschia,
+      vallisneria: sum.vallisneria + cell.biomass.vallisneria,
     }), emptyBiomass());
     const speciesIds = (Object.keys(totals) as SpeciesId[])
       .filter((speciesId) => totals[speciesId] > ALGAE_VISIBLE_BIOMASS);
@@ -1915,13 +1931,15 @@ export class SimulationWorld {
       ? Math.max(8, nearest.cell.cellSize * 0.9)
       : 0;
     const candidateCellId = nearest && nearest.distance <= validDistance ? nearest.cell.id : null;
+    const rootedOnSubstrate = held.speciesId !== 'vallisneria' ||
+      nearest?.cell.surfaceKind === 'substrate';
     const duplicate = candidateCellId
       ? this.seedPlacements.some((placement) =>
         placement.cellId === candidateCellId && placement.speciesId === held.speciesId,
       )
       : false;
     held.candidateCellId = candidateCellId;
-    held.valid = Boolean(candidateCellId) && !duplicate;
+    held.valid = Boolean(candidateCellId) && rootedOnSubstrate && !duplicate;
   }
 
   private updateHeldBiofilmCandidate(point: Vec2): void {
@@ -2164,6 +2182,7 @@ export class SimulationWorld {
       trends: {
         oedogonium: growthTrend('oedogonium', light, localTemperature),
         nitzschia: growthTrend('nitzschia', light, localTemperature),
+        vallisneria: growthTrend('vallisneria', light, localTemperature),
       },
       water: this.biogeochemistry.sampleAt(measuredPoint),
       biofilm,
@@ -2210,6 +2229,44 @@ export class SimulationWorld {
       kind: measurement.kind,
       ...this.measureAt(measurement.point),
     }));
+  }
+
+  private currentDayNightState(): DayNightState | null {
+    return this.scenario.dayNightCycle
+      ? dayNightStateAt(this.elapsedSeconds, this.scenario.dayNightCycle)
+      : null;
+  }
+
+  private currentDayNightSnapshot(): SimulationSnapshot['dayNight'] {
+    const state = this.currentDayNightState();
+    return state ? {
+      ...state,
+      effectiveLightOutput: this.lightOutput * state.lightMultiplier,
+    } : null;
+  }
+
+  /**
+   * Dawn and dusk are continuous, but the expensive occlusion field only
+   * needs perceptually meaningful steps. Phase edges are always exact and the
+   * 4% threshold bounds both chemistry error and high-speed rendering cost.
+   */
+  private updateDayNightLighting(): void {
+    const state = this.currentDayNightState();
+    const multiplier = state?.lightMultiplier ?? 1;
+    const crossedPhaseEdge = (state?.phase ?? null) !== this.appliedDayNightPhase;
+    if (
+      Math.abs(multiplier - this.appliedDayNightMultiplier) >= 0.04 ||
+      crossedPhaseEdge
+    ) {
+      this.appliedDayNightMultiplier = multiplier;
+      this.appliedDayNightPhase = state?.phase ?? null;
+      this.lightDirty = true;
+      this.recomputeLight();
+    }
+  }
+
+  private effectiveLightOutput(): number {
+    return this.lightOutput * this.appliedDayNightMultiplier;
   }
 
   private recomputeLight(): void {
@@ -2275,7 +2332,7 @@ export class SimulationWorld {
       const depth = Math.max(0, point.y - WATER_TOP);
       const waterAttenuation = Math.exp(-depth * 0.00072);
       const visible = Query.ray(occluders, lampPoint, point, 1.1).length === 0 ? 1 : 0;
-      direct += this.lightOutput * DIRECT_LIGHT_SCALE * cone * distanceFalloff * waterAttenuation * visible;
+      direct += this.effectiveLightOutput() * DIRECT_LIGHT_SCALE * cone * distanceFalloff * waterAttenuation * visible;
     }
     return direct / AREA_LIGHT_SAMPLES;
   }
@@ -2336,7 +2393,7 @@ export class SimulationWorld {
     }
     skyExposure /= AMBIENT_SKY_SAMPLES;
     const ambient =
-      (1.1 + this.lightOutput * 0.03) *
+      (1.1 * this.appliedDayNightMultiplier + this.effectiveLightOutput() * 0.03) *
       (0.35 + skyExposure * 0.65) *
       Math.exp(-depth * 0.00062);
     const reflected = this.reflectedLightAt(point, excludedBodyId, occluders);
@@ -3243,6 +3300,34 @@ export class SimulationWorld {
     return best?.cell ?? cells[0];
   }
 
+  private sampleLightField(point: Vec2): number {
+    const column = clamp(
+      Math.floor((point.x / TANK_WIDTH) * this.lightField.columns),
+      0,
+      this.lightField.columns - 1,
+    );
+    const row = clamp(
+      Math.floor(((point.y - WATER_TOP) / (GROUND_Y - WATER_TOP)) * this.lightField.rows),
+      0,
+      this.lightField.rows - 1,
+    );
+    return this.lightField.values[row * this.lightField.columns + column] ?? 0;
+  }
+
+  private producerActivityPoint(
+    cell: SurfaceCellState,
+    speciesId: SpeciesId,
+    biomass: number,
+  ): Vec2 {
+    const anchor = this.cellWorldPoint(cell);
+    if (speciesId !== 'vallisneria') return anchor;
+    const canopyHeight = 88 + clamp01(biomass) * 190;
+    return {
+      x: anchor.x,
+      y: Math.max(WATER_TOP + 16, anchor.y - canopyHeight),
+    };
+  }
+
   private stepGrowth(deltaSeconds: number): void {
     const cells = this.allCells();
     const byId = new Map(cells.map((cell) => [cell.id, cell]));
@@ -3251,46 +3336,75 @@ export class SimulationWorld {
 
     for (const cell of cells) {
       const current = original.get(cell.id)!;
-      const total = current.oedogonium + current.nitzschia;
+      const total = current.oedogonium + current.nitzschia + current.vallisneria;
       const freeCapacity = clamp01(1 - total);
       const cellPoint = this.cellWorldPoint(cell);
-      const localTemperature = this.biogeochemistry.temperatureAt(cellPoint);
-      const rates: SpeciesBiomass = {
-        oedogonium: netGrowthPotential('oedogonium', cell.light, localTemperature),
-        nitzschia: netGrowthPotential('nitzschia', cell.light, localTemperature),
-      };
-      if (this.biogeochemistry.effectsEnabled) {
-        const resourceFactor = this.biogeochemistry.algaeResourceFactor(
-          cellPoint,
-        );
-        if (rates.oedogonium > 0) rates.oedogonium *= resourceFactor;
-        if (rates.nitzschia > 0) rates.nitzschia *= resourceFactor;
+      const rates = emptyBiomass();
+      const physiology = new Map<SpeciesId, ReturnType<typeof algaePhysiology>>();
+      const resourceFactors = new Map<SpeciesId, number>();
+      for (const speciesId of this.scenario.allowedSpecies) {
+        const activityPoint = this.producerActivityPoint(cell, speciesId, current[speciesId]);
+        const activityLight = speciesId === 'vallisneria'
+          ? this.sampleLightField(activityPoint)
+          : cell.light;
+        const localTemperature = this.biogeochemistry.temperatureAt(activityPoint);
+        const response = algaePhysiology(speciesId, activityLight, localTemperature);
+        const resourceFactor = this.biogeochemistry.algaeResourceFactor(activityPoint);
+        physiology.set(speciesId, response);
+        resourceFactors.set(speciesId, resourceFactor);
+        rates[speciesId] = response.netGrowth > 0
+          ? response.netGrowth * resourceFactor
+          : response.netGrowth;
       }
       const weightedAverage = total > 0
         ? (
           current.oedogonium * rates.oedogonium +
-          current.nitzschia * rates.nitzschia
+          current.nitzschia * rates.nitzschia +
+          current.vallisneria * rates.vallisneria
         ) / total
         : 0;
       const result = emptyBiomass();
       let fixedBiomass = 0;
+      let respiredBiomass = 0;
       for (const speciesId of this.scenario.allowedSpecies) {
         const amount = current[speciesId];
         if (amount <= 0) continue;
+        const response = physiology.get(speciesId)!;
+        const activityPoint = this.producerActivityPoint(cell, speciesId, amount);
+        const resourceFactor = resourceFactors.get(speciesId) ?? 1;
         const rate = rates[speciesId];
-        const requestedExpansion = amount * rate * (rate > 0 ? freeCapacity : 1) * deltaSeconds;
-        const expansion = requestedExpansion > 0
-          ? this.biogeochemistry.commitAlgaeProduction(
-            cellPoint,
-            requestedExpansion,
-          )
-          : requestedExpansion;
-        fixedBiomass += Math.max(0, expansion);
+        // Density-dependent limitation throttles only the photosynthesis left
+        // after replacing respiration and stress losses. This preserves the
+        // established logistic net-growth curve while the ledger can still
+        // observe gross production and respiration as separate real fluxes.
+        const densityAdjustedGross = response.netGrowth > 0
+          ? response.respiration + response.lightStressTurnover +
+            response.netGrowth * resourceFactor * freeCapacity
+          : response.grossPhotosynthesis;
+        const requestedProduction = amount * densityAdjustedGross * deltaSeconds;
+        const production = this.biogeochemistry.commitAlgaeProduction(
+          activityPoint,
+          requestedProduction,
+        );
+        fixedBiomass += production;
+        const requestedRespiration = Math.min(
+          amount + production,
+          amount * response.respiration * deltaSeconds,
+        );
+        const respiration = this.biogeochemistry.commitAlgaeRespiration(
+          activityPoint,
+          requestedRespiration,
+        );
+        respiredBiomass += respiration;
+        const stressTurnover = amount * response.lightStressTurnover * deltaSeconds;
         const replacement = total > 0.04
           ? amount * (rate - weightedAverage) * total * 1.35 * deltaSeconds
           : 0;
         const naturalTurnover = amount * 0.0018 * deltaSeconds;
-        result[speciesId] = Math.max(0, amount + expansion + replacement - naturalTurnover);
+        result[speciesId] = Math.max(
+          0,
+          amount + production - requestedRespiration - stressTurnover + replacement - naturalTurnover,
+        );
       }
 
       // A developed filamentous canopy shades the low-profile diatom film below it.
@@ -3302,7 +3416,8 @@ export class SimulationWorld {
       }
       const localLoss = Math.max(
         0,
-        total + fixedBiomass - result.oedogonium - result.nitzschia,
+        total + fixedBiomass - respiredBiomass -
+          result.oedogonium - result.nitzschia - result.vallisneria,
       );
       this.biogeochemistry.recordAlgaeTurnover(cellPoint, localLoss);
       next.set(cell.id, result);
@@ -3325,10 +3440,11 @@ export class SimulationWorld {
         const neighbor = byId.get(neighborId);
         if (!neighbor) continue;
         const receiver = next.get(neighbor.id)!;
-        const receiverTotal = receiver.oedogonium + receiver.nitzschia;
+        const receiverTotal = receiver.oedogonium + receiver.nitzschia + receiver.vallisneria;
         const freeCapacity = clamp01(1 - receiverTotal);
         if (freeCapacity <= 0.0001) continue;
         for (const speciesId of this.scenario.allowedSpecies) {
+          if (SPECIES[speciesId].dispersalRate <= 0) continue;
           if (source[speciesId] < 0.012) continue;
           const suitability = habitatSuitability(
             speciesId,
@@ -3367,7 +3483,9 @@ export class SimulationWorld {
     }
     for (const transfer of recruitmentTransfers) {
       const receiver = next.get(transfer.receiverId)!;
-      const freeCapacity = clamp01(1 - receiver.oedogonium - receiver.nitzschia);
+      const freeCapacity = clamp01(
+        1 - receiver.oedogonium - receiver.nitzschia - receiver.vallisneria,
+      );
       const demand = incomingDemand.get(transfer.receiverId) ?? 0;
       if (demand > freeCapacity && demand > 0) {
         transfer.amount *= freeCapacity / demand;
@@ -3399,14 +3517,16 @@ export class SimulationWorld {
 
     for (const cell of cells) {
       const result = next.get(cell.id)!;
-      const total = result.oedogonium + result.nitzschia;
+      const total = result.oedogonium + result.nitzschia + result.vallisneria;
       if (total > 1) {
         result.oedogonium /= total;
         result.nitzschia /= total;
+        result.vallisneria /= total;
       }
       cell.biomass = {
         oedogonium: clamp01(result.oedogonium),
         nitzschia: clamp01(result.nitzschia),
+        vallisneria: clamp01(result.vallisneria),
       };
     }
   }
@@ -3730,6 +3850,9 @@ export class SimulationWorld {
         y: point.y,
         cellSize: cell.cellSize,
         light: cell.light,
+        plantCanopyLight: cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS
+          ? this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria', cell.biomass.vallisneria))
+          : null,
         biomass: cloneBiomass(cell.biomass),
         biofilm: { ...cell.biofilm },
         targetEligible:

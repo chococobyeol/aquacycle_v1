@@ -221,6 +221,17 @@
 .colony-nitzschia i:nth-child(1) { left: 10px; top: 17px; transform: rotate(-15deg); }
 .colony-nitzschia i:nth-child(2) { left: 16px; top: 30px; transform: rotate(9deg); }
 .colony-nitzschia i:nth-child(3) { left: 7px; top: 40px; transform: rotate(-4deg); }
+.colony-vallisneria i {
+  bottom: 7px;
+  width: 3px;
+  height: 39px;
+  border-radius: 80% 20% 70% 20%;
+  background: linear-gradient(90deg, #527447, #88a762);
+  transform-origin: bottom center;
+}
+.colony-vallisneria i:nth-child(1) { left: 19px; transform: rotate(-14deg); }
+.colony-vallisneria i:nth-child(2) { left: 31px; height: 44px; transform: rotate(4deg); }
+.colony-vallisneria i:nth-child(3) { left: 42px; height: 34px; transform: rotate(16deg); }
 
 .probe-thumb::before {
   content: "";
@@ -394,6 +405,18 @@
 .microscope-nitzschia i:nth-child(1) { left: 7px; top: 10px; transform: rotate(-14deg); }
 .microscope-nitzschia i:nth-child(2) { left: 23px; top: 23px; transform: rotate(17deg); }
 .microscope-nitzschia i:nth-child(3) { left: 9px; top: 33px; transform: rotate(6deg); }
+.microscope-vallisneria i {
+  position: absolute;
+  bottom: 5px;
+  width: 4px;
+  height: 48px;
+  border-radius: 80% 20% 70% 20%;
+  background: linear-gradient(90deg, #4f7447, #89a866);
+  transform-origin: bottom center;
+}
+.microscope-vallisneria i:nth-child(1) { left: 16px; transform: rotate(-14deg); }
+.microscope-vallisneria i:nth-child(2) { left: 29px; height: 55px; transform: rotate(2deg); }
+.microscope-vallisneria i:nth-child(3) { left: 42px; height: 43px; transform: rotate(15deg); }
 .species-guide > p { margin: 7px 0; color: #63706a; font-size: 9.5px; line-height: 1.38; }
 .species-facts { margin: 0; }
 .species-facts > div {
@@ -632,6 +655,15 @@
   background: radial-gradient(circle, #6f9b61 0 18%, rgba(80, 129, 73, 0.3) 20% 55%, transparent 58%);
 }
 .ghost-colony.colony-nitzschia { background: radial-gradient(circle, #a77c4f 0 18%, rgba(154, 112, 71, 0.32) 20% 55%, transparent 58%); }
+.ghost-colony.colony-vallisneria {
+  width: 44px;
+  height: 58px;
+  border-radius: 45% 45% 35% 35%;
+  background:
+    linear-gradient(74deg, transparent 41%, #547747 43% 48%, transparent 50%),
+    linear-gradient(96deg, transparent 43%, #739657 45% 50%, transparent 52%),
+    linear-gradient(112deg, transparent 43%, #5f874c 45% 50%, transparent 52%);
+}
 .ghost-shrimp {
   position: relative;
   display: block;
@@ -3035,4 +3067,91 @@
 @media (max-height: 720px) {
   .water-quality-channel { min-height: 44px; padding: 5px 7px; }
   .microbe-growth-readout { padding: 6px 8px; }
+}
+
+.day-night-readout {
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 0 5px;
+  min-width: 74px;
+  padding: 4px 8px;
+  border-right: 1.5px dashed rgba(49, 65, 63, 0.28);
+  color: #52645f;
+}
+.day-night-readout > span { grid-row: 1 / 3; font-size: 20px; line-height: 1; }
+.day-night-readout strong { font-size: 11px; line-height: 1.1; }
+.day-night-readout small { color: #77817b; font-size: 8px; line-height: 1.1; }
+.day-night-readout.phase-night { color: #4f6682; }
+.day-night-readout.phase-dawn,
+.day-night-readout.phase-dusk { color: #9a7047; }
+
+.species-dot.vallisneria { background: #6f8f51; }
+.curve-vallisneria { stroke: #6f8f51; }
+
+.day-night-history {
+  margin-top: 9px;
+  padding: 8px 9px 7px;
+  border: 1px solid rgba(49, 65, 63, 0.24);
+  border-radius: 10px;
+  background: linear-gradient(100deg, rgba(250, 229, 154, 0.2), rgba(164, 187, 211, 0.2));
+}
+.day-night-history svg { display: block; width: 100%; height: 90px; }
+.day-night-history svg text { fill: #5d6965; font-size: 9px; }
+.day-night-line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.day-night-line.light { stroke: #c99a35; }
+.day-night-line.gross { stroke: #5f8b50; }
+.day-night-line.respiration { stroke: #6d7893; }
+.day-night-history-legend { display: flex; flex-wrap: wrap; gap: 4px 10px; color: #66716d; font-size: 8px; }
+.day-night-history-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.day-night-history-legend i { width: 11px; height: 2px; border-radius: 2px; }
+.day-night-history-legend i.light { background: #c99a35; }
+.day-night-history-legend i.gross { background: #5f8b50; }
+.day-night-history-legend i.respiration { background: #6d7893; }
+
+.mission-card.mission-six { background: rgba(232, 238, 229, 0.94); }
+.mission-illustration.day-night-cycle { right: 14px; width: 158px; }
+.mini-day-sun,
+.mini-night-moon,
+.mini-vallisneria,
+.mini-waterline { position: absolute; display: block; }
+.mini-day-sun {
+  top: 17px;
+  left: 18px;
+  width: 30px;
+  height: 30px;
+  border: 3px solid #3d4b48;
+  border-radius: 50%;
+  background: #efc85f;
+  box-shadow: 0 0 0 6px rgba(239, 200, 95, 0.2);
+}
+.mini-night-moon {
+  top: 18px;
+  right: 17px;
+  width: 30px;
+  height: 30px;
+  border: 3px solid #3d4b48;
+  border-radius: 50%;
+  background: #8192ad;
+}
+.mini-night-moon::after {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: 7px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #e8eee5;
+}
+.mini-waterline { left: 8px; right: 8px; bottom: 25px; height: 3px; border-radius: 50%; background: #547f85; transform: rotate(-1deg); }
+.mini-vallisneria {
+  bottom: 24px;
+  left: 72px;
+  width: 4px;
+  height: 53px;
+  border-radius: 80% 20% 70% 20%;
+  background: #64894f;
+  box-shadow: -12px 6px 0 -1px #789a59, 12px 9px 0 -1px #507747;
+  transform: rotate(5deg);
 }

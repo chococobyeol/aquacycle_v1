@@ -88,6 +88,12 @@ export class BiogeochemistryLedger {
   private cumulativeOxygenProduction = 0;
   private cumulativeOxygenDemand = 0;
   private cumulativeDissolvedWaste = 0;
+  private stepDurationSeconds = 1;
+  private stepGrossAlgaeProduction = 0;
+  private stepAlgaeRespiration = 0;
+  private stepAlgaeTurnover = 0;
+  private stepAlgaeOxygenProduction = 0;
+  private stepAlgaeOxygenDemand = 0;
   private fieldRevision = 0;
   private dissolvedAdvectionAccumulator = 0;
   private biofilmTotals = emptyBiofilm();
@@ -135,8 +141,15 @@ export class BiogeochemistryLedger {
     return this.transport.surfaceTemperature();
   }
 
-  /** Kept as a step boundary for the worker; material is now booked directly. */
-  public beginStep(): void {}
+  /** Resets short-window flux meters without affecting cumulative ledgers. */
+  public beginStep(deltaSeconds = 1): void {
+    this.stepDurationSeconds = Math.max(1e-6, deltaSeconds);
+    this.stepGrossAlgaeProduction = 0;
+    this.stepAlgaeRespiration = 0;
+    this.stepAlgaeTurnover = 0;
+    this.stepAlgaeOxygenProduction = 0;
+    this.stepAlgaeOxygenDemand = 0;
+  }
 
   /**
    * Smooth resource response used before requesting new algal biomass. The
@@ -158,7 +171,11 @@ export class BiogeochemistryLedger {
    */
   public commitAlgaeProduction(point: Vec2, requestedBiomass: number): number {
     const requested = Math.max(0, requestedBiomass);
-    if (!this.effectsEnabled || requested <= 0) return requested;
+    if (requested <= 0) return requested;
+    if (!this.effectsEnabled) {
+      this.stepGrossAlgaeProduction += requested;
+      return requested;
+    }
     const index = this.indexAt(point);
     const nitrogenPerBiomass = WATER_CYCLE_RULES.biomassNitrogen;
     const carbonPerBiomass = WATER_CYCLE_RULES.biomassCarbon;
@@ -196,12 +213,50 @@ export class BiogeochemistryLedger {
     const dissolved = this.addMassAround(this.oxygen, index, oxygenProduced);
     this.headspaceOxygen += oxygenProduced - dissolved;
     this.cumulativeOxygenProduction += oxygenProduced;
+    this.stepGrossAlgaeProduction += paidBiomass;
+    this.stepAlgaeOxygenProduction += oxygenProduced;
     return paidBiomass;
   }
 
+  /**
+   * Aerobically returns living producer biomass to dissolved inorganic carbon
+   * and ammonium. If local and tank oxygen are exhausted, only the supported
+   * fraction respires; the caller leaves the remainder as detritus.
+   */
+  public commitAlgaeRespiration(point: Vec2, requestedBiomass: number): number {
+    const requested = Math.max(0, requestedBiomass);
+    if (requested <= 0) return 0;
+    if (!this.effectsEnabled) {
+      this.stepAlgaeRespiration += requested;
+      return requested;
+    }
+    const index = this.indexAt(point);
+    const oxygenPerBiomass = WATER_CYCLE_RULES.biomassCarbon *
+      WATER_CYCLE_RULES.oxygenPerFixedCarbon;
+    const removedOxygen = this.removeMassAround(
+      this.oxygen,
+      index,
+      requested * oxygenPerBiomass,
+    );
+    const actual = oxygenPerBiomass > 0
+      ? Math.min(requested, removedOxygen / oxygenPerBiomass)
+      : requested;
+    if (actual <= 0) return 0;
+    const carbon = actual * WATER_CYCLE_RULES.biomassCarbon;
+    const nitrogen = actual * WATER_CYCLE_RULES.biomassNitrogen;
+    this.addMassAround(this.dissolvedInorganicCarbon, index, carbon);
+    this.addMassAround(this.toxicWaste, index, nitrogen);
+    this.cumulativeOxygenDemand += removedOxygen;
+    this.cumulativeDissolvedWaste += nitrogen;
+    this.stepAlgaeRespiration += actual;
+    this.stepAlgaeOxygenDemand += removedOxygen;
+    return actual;
+  }
+
   public recordAlgaeTurnover(point: Vec2, biomass: number): void {
-    if (!this.effectsEnabled || biomass <= 0) return;
-    this.detritus[this.indexAt(point)] += biomass;
+    if (biomass <= 0) return;
+    this.stepAlgaeTurnover += biomass;
+    if (this.effectsEnabled) this.detritus[this.indexAt(point)] += biomass;
   }
 
   /** Compatibility hook for pre-cycle missions; new production books itself. */
@@ -487,6 +542,13 @@ export class BiogeochemistryLedger {
       transport: this.transport.snapshot(),
       average,
       biofilmTotals: { ...this.biofilmTotals },
+      algaeFluxes: {
+        grossProductionBiomassPerSecond: this.stepGrossAlgaeProduction / this.stepDurationSeconds,
+        respirationBiomassPerSecond: this.stepAlgaeRespiration / this.stepDurationSeconds,
+        stressTurnoverBiomassPerSecond: this.stepAlgaeTurnover / this.stepDurationSeconds,
+        oxygenProducedPerSecond: this.stepAlgaeOxygenProduction / this.stepDurationSeconds,
+        oxygenConsumedPerSecond: this.stepAlgaeOxygenDemand / this.stepDurationSeconds,
+      },
       carbonCycle: {
         dissolvedInorganicCarbon: material.dissolvedInorganicCarbon,
         headspaceCarbonDioxide: material.headspaceCarbonDioxide,

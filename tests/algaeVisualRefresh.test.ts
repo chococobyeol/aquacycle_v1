@@ -39,9 +39,11 @@ const matureCell = (
   y: 631.25,
   cellSize: 10,
   light: 64,
+  plantCanopyLight: null,
   biomass: {
     oedogonium: 0.72,
     nitzschia: 0.16,
+    vallisneria: 0,
   },
   biofilm: { decomposer: 0, nitrifier: 0 },
   targetEligible: true,
@@ -148,6 +150,7 @@ describe('algae visual refresh decisions', () => {
       biomass: {
         oedogonium: baseline.biomass.oedogonium + 0.00001,
         nitzschia: baseline.biomass.nitzschia + 0.00001,
+        vallisneria: 0,
       },
     });
 

@@ -8,6 +8,7 @@ import type {
   WaterQualityValues,
 } from './types';
 import type { TemperatureResponsePoint } from './temperatureResponse';
+import type { DayNightCycleDefinition } from './dayNight';
 
 // This is the lowest biomass that is actually drawn as a colony in the tank.
 // Selection and removal use the same value so anything visible can be cleaned.
@@ -169,7 +170,7 @@ export const MICROBE_ECOLOGY_RULES = {
     oxygenHalfSaturation: 24,
     // toxic nitrogen consumed per unit film and second; biomassYield is the
     // fraction of processed nitrogen retained in new film.
-    maximumUptake: 0.025,
+    maximumUptake: 0.027,
     biomassYield: 0.11,
     maintenanceDecayRate: 0.0012,
     starvationDecayRate: 0.0035,
@@ -282,6 +283,9 @@ export interface SpeciesDefinition {
   lightCurve: LightCurvePoint[];
   temperatureCurve: TemperatureCurvePoint[];
   temperatureSummary: string;
+  growthForm: 'surface-film' | 'rooted-macrophyte';
+  respirationRateAtReference: number;
+  respirationTheta: number;
   dispersalRate: number;
   maximumPositiveRate: number;
 }
@@ -318,6 +322,9 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
       { temperature: 36, suitability: 0.08 },
     ],
     temperatureSummary: '이 수조 계통은 20~27°C에서 안정적이며 극단적인 저온·고온에서는 성장이 둔화됩니다.',
+    growthForm: 'surface-film',
+    respirationRateAtReference: 0.012,
+    respirationTheta: 1.065,
     dispersalRate: 0.19,
     maximumPositiveRate: 0.068,
   },
@@ -353,8 +360,46 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
       { temperature: 40, suitability: 0.06 },
     ],
     temperatureSummary: '폭넓은 수온에서 유지되지만 이 게임의 계통은 22~31°C에서 가장 잘 증식합니다.',
+    growthForm: 'surface-film',
+    respirationRateAtReference: 0.009,
+    respirationTheta: 1.06,
     dispersalRate: 0.21,
     maximumPositiveRate: 0.062,
+  },
+  vallisneria: {
+    id: 'vallisneria',
+    displayName: '나사말',
+    shortName: '나사말',
+    scientificName: 'Vallisneria spiralis',
+    color: 0x6f8f51,
+    accentColor: '#6f8f51',
+    description: '바닥에 뿌리를 내리고 긴 잎을 수면 쪽으로 뻗는 침수성 수초입니다. 잎 전체가 빛을 받아 낮 동안 산소를 만들고 밤에는 호흡합니다.',
+    realScale: '잎은 수십 cm까지 자랄 수 있으며, 이 화면에서는 한 포기의 잎 다발로 축약해 표시합니다.',
+    colonyAppearance: '바닥의 생장점에서 가늘고 긴 녹색 잎이 물결치며 위로 뻗습니다.',
+    niche: '바닥에만 심을 수 있지만 잎이 위쪽의 밝은 물층까지 닿아 낮 동안 안정적인 생산자 역할을 합니다.',
+    lightCurve: [
+      { light: 0, netRate: -0.012 },
+      { light: 10, netRate: -0.005 },
+      { light: 18, netRate: 0 },
+      { light: 35, netRate: 0.018 },
+      { light: 58, netRate: 0.032 },
+      { light: 78, netRate: 0.036 },
+      { light: 100, netRate: 0.031 },
+    ],
+    temperatureCurve: [
+      { temperature: 8, suitability: 0.18 },
+      { temperature: 15, suitability: 0.62 },
+      { temperature: 21, suitability: 0.95 },
+      { temperature: 25, suitability: 1 },
+      { temperature: 30, suitability: 0.72 },
+      { temperature: 36, suitability: 0.08 },
+    ],
+    temperatureSummary: '18~28°C에서 안정적이며, 따뜻할수록 밤 호흡도 함께 빨라집니다.',
+    growthForm: 'rooted-macrophyte',
+    respirationRateAtReference: 0.006,
+    respirationTheta: 1.055,
+    dispersalRate: 0,
+    maximumPositiveRate: 0.036,
   },
 };
 
@@ -464,6 +509,7 @@ export interface ScenarioDefinition {
   };
   timeLimitSeconds: number | null;
   lightOutput: number;
+  dayNightCycle: DayNightCycleDefinition | null;
   seedBudget: Record<SpeciesId, number | null>;
   animalBudget: Record<AnimalSpeciesId, number | null>;
   structureBudget: Record<StructureDefinitionId, number | null>;
@@ -535,7 +581,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     timeLimitSeconds: 140,
     lightOutput: 92,
-    seedBudget: { oedogonium: 1, nitzschia: 0 },
+    seedBudget: { oedogonium: 1, nitzschia: 0, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0 },
     structureBudget: { 'flat-stone': 1, 'round-stone': 0, 'tall-stone': 0 },
     requiredStructures: { 'flat-stone': 1 },
@@ -544,6 +590,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     allowedAnimals: [],
     allowedStructures: ['flat-stone'],
     waterCycle: null,
+    dayNightCycle: null,
     target: { type: 'coverage', ratio: 0.32, holdSeconds: 3, label: '붓뚜껑말 표면 점유' },
     targetIncludesSubstrate: false,
   },
@@ -562,7 +609,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     timeLimitSeconds: 260,
     lightOutput: 104,
-    seedBudget: { oedogonium: 0, nitzschia: 4 },
+    seedBudget: { oedogonium: 0, nitzschia: 4, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0 },
     structureBudget: { 'flat-stone': 3, 'round-stone': 4, 'tall-stone': 3 },
     requiredStructures: {},
@@ -571,6 +618,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     allowedAnimals: [],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
     waterCycle: null,
+    dayNightCycle: null,
     target: {
       type: 'habitat-coverage',
       speciesId: 'nitzschia',
@@ -598,7 +646,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     timeLimitSeconds: 300,
     lightOutput: 60,
-    seedBudget: { oedogonium: 2, nitzschia: 0 },
+    seedBudget: { oedogonium: 2, nitzschia: 0, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
@@ -607,6 +655,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     allowedAnimals: [],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
     waterCycle: null,
+    dayNightCycle: null,
     target: {
       type: 'biomass',
       speciesId: 'oedogonium',
@@ -630,7 +679,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     timeLimitSeconds: 300,
     lightOutput: 88,
-    seedBudget: { oedogonium: 4, nitzschia: 4 },
+    seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 4 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
@@ -639,6 +688,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     allowedAnimals: ['cherry-shrimp'],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
     waterCycle: null,
+    dayNightCycle: null,
     target: {
       type: 'adult-population',
       speciesId: 'cherry-shrimp',
@@ -662,7 +712,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     timeLimitSeconds: 1_800,
     lightOutput: 88,
-    seedBudget: { oedogonium: 4, nitzschia: 4 },
+    seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 4 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
@@ -674,18 +724,70 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       initial: {
         organicMatter: 1.5,
         toxicWaste: 0.8,
-        nutrients: 12,
+        // The starting reserve supports establishment, but cannot carry the
+        // full 25-minute challenge without microbial recycling.
+        nutrients: 11.8,
         oxygen: 76,
       },
       microbeBudget: { decomposer: null, nitrifier: null },
       allowedMicrobes: ['decomposer', 'nitrifier'],
     },
+    dayNightCycle: null,
     target: {
       type: 'population-survival',
       speciesId: 'cherry-shrimp',
       count: 1,
       holdSeconds: 1_500,
       label: '체리새우 군집 생존',
+    },
+    targetIncludesSubstrate: true,
+  },
+  'mission-6': {
+    id: 'mission-6',
+    mode: 'challenge',
+    title: '여섯 번째 실험 · 밤을 건너는 수조',
+    subtitle: '낮과 밤의 산소 순환',
+    instruction: '빛이 사라지는 밤을 포함해 체리새우 군집이 세 번의 낮과 밤을 건너도록 수조를 유지하세요.',
+    briefing: {
+      question: '생산자도 함께 호흡하는 밤을 수조는 어떻게 견딜 수 있을까요?',
+      goal: '체리새우 군집이 한 번도 사라지지 않은 상태로 낮·밤 주기 3회를 연속 유지하세요.',
+      success: '특정 생물이나 배치 방법은 채점하지 않으며, 살아 있는 체리새우가 계속 존재하면 시간이 누적됩니다.',
+      supplied: '체리새우 성체 4마리 · 두 조류 접종 각 8회 · 나사말 3포기 · 구조물 무제한 · 두 균 필름 · 수질 탐침',
+    },
+    timeLimitSeconds: 1_380,
+    lightOutput: 92,
+    seedBudget: { oedogonium: 8, nitzschia: 8, vallisneria: 3 },
+    animalBudget: { 'cherry-shrimp': 4 },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    requiredStructures: {},
+    allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
+    requiredSeedSpecies: [],
+    allowedAnimals: ['cherry-shrimp'],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    waterCycle: {
+      initial: {
+        organicMatter: 1.5,
+        toxicWaste: 0.8,
+        nutrients: 16,
+        oxygen: 80,
+      },
+      microbeBudget: { decomposer: null, nitrifier: null },
+      allowedMicrobes: ['decomposer', 'nitrifier'],
+    },
+    dayNightCycle: {
+      dawnSeconds: 30,
+      daySeconds: 240,
+      duskSeconds: 30,
+      nightSeconds: 60,
+      nightLightMultiplier: 0.045,
+      startingOffsetSeconds: 30,
+    },
+    target: {
+      type: 'population-survival',
+      speciesId: 'cherry-shrimp',
+      count: 1,
+      holdSeconds: 1_080,
+      label: '낮·밤 3주기 생존',
     },
     targetIncludesSubstrate: true,
   },
@@ -700,15 +802,15 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       question: '자유 실험실에서 어떤 수중 환경을 만들고 싶나요?',
       goal: '정해진 성공 조건 없이 구조, 빛, 온도, 군락과 개체군 변화를 관찰합니다.',
       success: '실험실에는 성공·실패 판정이 없습니다.',
-      supplied: '모든 구조물 · 두 조류 · 체리새우 · 두 균 필름 · 수질 탐침 · 광원 출력 조절',
+      supplied: '모든 구조물 · 두 조류와 나사말 · 체리새우 · 두 균 필름 · 수질 탐침 · 광원 출력 조절',
     },
     timeLimitSeconds: null,
     lightOutput: 90,
-    seedBudget: { oedogonium: null, nitzschia: null },
+    seedBudget: { oedogonium: null, nitzschia: null, vallisneria: null },
     animalBudget: { 'cherry-shrimp': null },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
-    allowedSpecies: ['oedogonium', 'nitzschia'],
+    allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
     requiredSeedSpecies: [],
     allowedAnimals: ['cherry-shrimp'],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
@@ -722,6 +824,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       microbeBudget: { decomposer: null, nitrifier: null },
       allowedMicrobes: ['decomposer', 'nitrifier'],
     },
+    dayNightCycle: null,
     target: null,
     targetIncludesSubstrate: true,
   },

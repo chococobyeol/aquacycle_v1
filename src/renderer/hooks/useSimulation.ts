@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import SimulationWorker from '../../simulation/sim.worker?worker&inline';
 import type {
   HoldingSnapshot,
   ProbeSnapshot,
@@ -156,10 +157,10 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
 
   useEffect(() => {
     motionStore.reset();
-    const worker = new Worker(
-      new URL('../../simulation/sim.worker.ts', import.meta.url),
-      { type: 'module' },
-    );
+    // An inline worker becomes a same-origin Blob in packaged file:// builds.
+    // A separate worker asset is blocked by Chromium's COEP enforcement there,
+    // even though the development server can attach the required HTTP header.
+    const worker = new SimulationWorker();
     workerRef.current = worker;
     motionStore.clear();
     let telemetryAnimationFrame: number | null = null;

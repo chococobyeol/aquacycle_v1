@@ -1,14 +1,11 @@
 import { SPECIES } from './config';
 import type { GrowthTrend, SpeciesBiomass, SpeciesId } from './types';
+import { thetaTemperatureFactor } from './temperatureResponse';
 
 export const clamp01 = (value: number): number =>
   Math.max(0, Math.min(1, value));
 
-export const netGrowthPotential = (
-  speciesId: SpeciesId,
-  light: number,
-  temperature = 24,
-): number => {
+const referenceNetLightRate = (speciesId: SpeciesId, light: number): number => {
   const curve = SPECIES[speciesId].lightCurve;
   let lightRate = 0;
   if (light <= curve[0].light) lightRate = curve[0].netRate;
@@ -21,10 +18,58 @@ export const netGrowthPotential = (
     lightRate = start.netRate + (end.netRate - start.netRate) * ratio;
     break;
   }
-  const temperatureFactor = temperatureSuitability(speciesId, temperature);
-  return lightRate >= 0
-    ? lightRate * temperatureFactor
-    : lightRate - (1 - temperatureFactor) * 0.012;
+  return lightRate;
+};
+
+export interface AlgaePhysiologyRates {
+  grossPhotosynthesis: number;
+  respiration: number;
+  lightStressTurnover: number;
+  netGrowth: number;
+}
+
+/**
+ * Separates the former net light curve into observable gross photosynthesis,
+ * continuous respiration and non-respiratory light/temperature stress. At the
+ * 24°C reference the resulting net rate is exactly the established light
+ * curve, preserving the earlier mission balance while making night oxygen
+ * demand explicit and mass-conserving.
+ */
+export const algaePhysiology = (
+  speciesId: SpeciesId,
+  light: number,
+  temperature = 24,
+): AlgaePhysiologyRates => {
+  const definition = SPECIES[speciesId];
+  const referenceNet = referenceNetLightRate(speciesId, light);
+  const referenceRespiration = definition.respirationRateAtReference;
+  const referenceGross = Math.max(0, referenceNet + referenceRespiration);
+  const referenceStress = Math.max(0, -(referenceNet + referenceRespiration));
+  const suitability = temperatureSuitability(speciesId, temperature);
+  const respiration = referenceRespiration * thetaTemperatureFactor(
+    temperature,
+    24,
+    definition.respirationTheta,
+    0.42,
+    2.1,
+  );
+  const grossPhotosynthesis = referenceGross * suitability;
+  const temperatureStress = (1 - suitability) * 0.012;
+  const lightStressTurnover = referenceStress + temperatureStress;
+  return {
+    grossPhotosynthesis,
+    respiration,
+    lightStressTurnover,
+    netGrowth: grossPhotosynthesis - respiration - lightStressTurnover,
+  };
+};
+
+export const netGrowthPotential = (
+  speciesId: SpeciesId,
+  light: number,
+  temperature = 24,
+): number => {
+  return algaePhysiology(speciesId, light, temperature).netGrowth;
 };
 
 export const temperatureSuitability = (
@@ -91,7 +136,8 @@ export const stepLocalGrowth = ({
 export const emptyBiomass = (): SpeciesBiomass => ({
   oedogonium: 0,
   nitzschia: 0,
+  vallisneria: 0,
 });
 
 export const occupied = (biomass: SpeciesBiomass): boolean =>
-  biomass.oedogonium + biomass.nitzschia >= 0.08;
+  biomass.oedogonium + biomass.nitzschia + biomass.vallisneria >= 0.08;

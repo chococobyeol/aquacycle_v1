@@ -81,6 +81,10 @@ interface PendingInventoryItem {
 interface EcologyHistoryPoint {
   elapsedSeconds: number;
   algaeBiomass: number;
+  plantBiomass: number;
+  lightMultiplier: number;
+  grossPhotosynthesis: number;
+  producerRespiration: number;
   shrimpCount: number;
   shrimpAdultFemales: number;
   shrimpAdultMales: number;
@@ -211,7 +215,7 @@ const closedHudPanels = (): Record<HudPanelId, boolean> => ({
 });
 
 const STRUCTURE_IDS: StructureDefinitionId[] = ['flat-stone', 'round-stone', 'tall-stone'];
-const SPECIES_IDS: SpeciesId[] = ['oedogonium', 'nitzschia'];
+const SPECIES_IDS: SpeciesId[] = ['oedogonium', 'nitzschia', 'vallisneria'];
 const ANIMAL_IDS: AnimalSpeciesId[] = ['cherry-shrimp'];
 const MICROBE_IDS: MicrobeGuildId[] = ['decomposer', 'nitrifier'];
 
@@ -307,6 +311,13 @@ const phaseName = (snapshot: SimulationSnapshot): string => {
   if (snapshot.phase === 'running') return '관찰 중';
   return '일시정지';
 };
+
+const dayNightPhaseLabel = {
+  dawn: '새벽',
+  day: '낮',
+  dusk: '해질녘',
+  night: '밤',
+} as const;
 
 function MeasurementIcon({
   kind,
@@ -573,7 +584,12 @@ export function SimulationScreen({
     const elapsedSeconds = snapshot.elapsedSeconds;
     const point: EcologyHistoryPoint = {
       elapsedSeconds,
-      algaeBiomass: snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia,
+      algaeBiomass: snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia +
+        snapshot.totalBiomass.vallisneria,
+      plantBiomass: snapshot.totalBiomass.vallisneria,
+      lightMultiplier: snapshot.dayNight?.lightMultiplier ?? 1,
+      grossPhotosynthesis: snapshot.biogeochemistry.algaeFluxes.grossProductionBiomassPerSecond,
+      producerRespiration: snapshot.biogeochemistry.algaeFluxes.respirationBiomassPerSecond,
       shrimpCount: snapshot.animalPopulation['cherry-shrimp'].total,
       shrimpAdultFemales: snapshot.animalPopulation['cherry-shrimp'].adultFemales,
       shrimpAdultMales: snapshot.animalPopulation['cherry-shrimp'].adultMales,
@@ -608,6 +624,10 @@ export function SimulationScreen({
     snapshot?.elapsedSeconds,
     snapshot?.totalBiomass.oedogonium,
     snapshot?.totalBiomass.nitzschia,
+    snapshot?.totalBiomass.vallisneria,
+    snapshot?.dayNight?.lightMultiplier,
+    snapshot?.biogeochemistry.algaeFluxes.grossProductionBiomassPerSecond,
+    snapshot?.biogeochemistry.algaeFluxes.respirationBiomassPerSecond,
     snapshot?.animalPopulation['cherry-shrimp'].total,
     snapshot?.animalPopulation['cherry-shrimp'].adultFemales,
     snapshot?.animalPopulation['cherry-shrimp'].adultMales,
@@ -708,7 +728,7 @@ export function SimulationScreen({
   const editable = snapshot.phase === 'setup' ||
     (snapshot.mode === 'laboratory' && snapshot.phase === 'paused');
   const biofilmEditable = snapshot.phase === 'setup' ||
-    (snapshot.phase === 'paused' && (snapshot.scenarioId === 'mission-5' || snapshot.mode === 'laboratory'));
+    (snapshot.phase === 'paused' && (Boolean(scenario.waterCycle) || snapshot.mode === 'laboratory'));
   const canvasEditable = editable || (biofilmEditable && (
     pendingInventory?.kind === 'biofilm' || snapshot.holding?.kind === 'biofilm'
   ));
@@ -726,7 +746,8 @@ export function SimulationScreen({
     ? selectedCells.reduce((total, cell) => ({
       oedogonium: total.oedogonium + cell.biomass.oedogonium,
       nitzschia: total.nitzschia + cell.biomass.nitzschia,
-    }), { oedogonium: 0, nitzschia: 0 })
+      vallisneria: total.vallisneria + cell.biomass.vallisneria,
+    }), { oedogonium: 0, nitzschia: 0, vallisneria: 0 })
     : undefined;
   const selectedAverageLight = selectedCells.length
     ? selectedCells.reduce((total, cell) => total + cell.light, 0) / selectedCells.length
@@ -780,8 +801,8 @@ export function SimulationScreen({
   const observationSections: ObservationSectionDefinition[] = [
     {
       id: 'ecology',
-      title: '생물·조류',
-      summary: `조류 ${(snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia).toFixed(1)} · 새우 ${snapshot.animalPopulation['cherry-shrimp'].total}마리`,
+      title: '생물·생산자',
+      summary: `생산자 ${(snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia + snapshot.totalBiomass.vallisneria).toFixed(1)} · 새우 ${snapshot.animalPopulation['cherry-shrimp'].total}마리`,
     },
     ...(scenario.waterCycle ? [
       {
@@ -890,7 +911,7 @@ export function SimulationScreen({
   const setupReady = !pendingInventory && !snapshot.holding && snapshot.allSettled &&
     requiredStructuresReady && targetSurfaceReady && requiredSeedsReady;
   const pausedEditBlocked = snapshot.phase === 'paused' &&
-    (snapshot.mode === 'laboratory' || snapshot.scenarioId === 'mission-5') &&
+    (snapshot.mode === 'laboratory' || Boolean(scenario.waterCycle)) &&
     (Boolean(pendingInventory) || Boolean(snapshot.holding) || !snapshot.allSettled);
   const setupButtonLabel = pendingInventory || snapshot.holding
     ? '먼저 항목 놓기'
@@ -1393,6 +1414,16 @@ export function SimulationScreen({
           </div>
 
           <div className="header-readouts tank-hud-readouts">
+            {snapshot.dayNight && (
+              <div
+                className={`day-night-readout phase-${snapshot.dayNight.phase}`}
+                title={`현재 광원 ${snapshot.dayNight.effectiveLightOutput.toFixed(0)} / ${snapshot.lightOutput.toFixed(0)}`}
+              >
+                <span aria-hidden="true">{snapshot.dayNight.phase === 'night' ? '☾' : '☀'}</span>
+                <strong>{dayNightPhaseLabel[snapshot.dayNight.phase]}</strong>
+                <small>{Math.round(snapshot.dayNight.lightMultiplier * 100)}%</small>
+              </div>
+            )}
             <div className="readout">
               <span>실행</span>
               <strong>
@@ -2359,7 +2390,8 @@ function ObservationSectionContent({
     snapshot.animalPopulationEventTotals.deaths > 0 ||
     snapshot.carcasses.length > 0;
   const hasAlgaeRecord = snapshot.totalBiomass.oedogonium > ALGAE_VISIBLE_BIOMASS ||
-    snapshot.totalBiomass.nitzschia > ALGAE_VISIBLE_BIOMASS;
+    snapshot.totalBiomass.nitzschia > ALGAE_VISIBLE_BIOMASS ||
+    snapshot.totalBiomass.vallisneria > ALGAE_VISIBLE_BIOMASS;
 
   if (section === 'ecology') {
     return (
@@ -2381,6 +2413,9 @@ function ObservationSectionContent({
         )}
         {snapshot.totalBiomass.nitzschia > ALGAE_VISIBLE_BIOMASS && (
           <div><dt><i className="species-dot nitzschia" />규조류 총량</dt><dd>{snapshot.totalBiomass.nitzschia.toFixed(1)}</dd></div>
+        )}
+        {snapshot.totalBiomass.vallisneria > ALGAE_VISIBLE_BIOMASS && (
+          <div><dt><i className="species-dot vallisneria" />나사말 총량</dt><dd>{snapshot.totalBiomass.vallisneria.toFixed(1)}</dd></div>
         )}
         {!hasShrimpRecord && !hasAlgaeRecord && (
           <div className="observation-empty-row"><dt>현재 관찰되는 생물</dt><dd>없음</dd></div>
@@ -2417,6 +2452,9 @@ function ObservationSectionContent({
         <div><dt>물속 무기탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.dissolvedInorganicCarbon.toFixed(2)}</dd></div>
         <div><dt>공기층 이산화탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceCarbonDioxide.toFixed(2)}</dd></div>
         <div><dt>공기층 산소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceOxygen.toFixed(2)}</dd></div>
+        <div><dt>총광합성</dt><dd>{snapshot.biogeochemistry.algaeFluxes.grossProductionBiomassPerSecond.toFixed(3)}/초</dd></div>
+        <div><dt>생산자 호흡</dt><dd>{snapshot.biogeochemistry.algaeFluxes.respirationBiomassPerSecond.toFixed(3)}/초</dd></div>
+        <div><dt>광·수온 스트레스 소실</dt><dd>{snapshot.biogeochemistry.algaeFluxes.stressTurnoverBiomassPerSecond.toFixed(3)}/초</dd></div>
         <div><dt>수면 수온</dt><dd>{gas.surfaceTemperature.toFixed(1)}°C</dd></div>
         <div><dt>담수 산소 포화도</dt><dd>{gas.oxygenSolubilityMgL.toFixed(2)}mg/L <small>1기압 환산</small></dd></div>
         <div><dt>현재 수온의 물쪽 산소 목표</dt><dd>{gas.oxygenWaterEquilibrium.toFixed(2)}</dd></div>
@@ -2463,6 +2501,12 @@ function ObservationSectionContent({
           />
           <AnimalPopulationEventLog snapshot={snapshot} />
         </>
+      )}
+      {snapshot.dayNight && (
+        <DayNightFluxChart
+          points={visibleEcologyHistory}
+          windowSeconds={historyWindowSeconds}
+        />
       )}
       {scenario.waterCycle && (
         <WaterCycleHistoryChart
@@ -2609,7 +2653,7 @@ function RegionSelectionInspector({
   snapshot: SimulationSnapshot;
 }) {
   const algaeTotal = cells.reduce(
-    (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia,
+    (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria,
     0,
   );
   const decomposer = cells.reduce((sum, cell) => sum + cell.biofilm.decomposer, 0);
@@ -2641,7 +2685,7 @@ function RegionSelectionInspector({
               ? lights.reduce((sum, value) => sum + value, 0) / lights.length
               : 0;
             const surfaceAlgae = surfaceCells.reduce(
-              (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia,
+              (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria,
               0,
             );
             const surfaceBiofilm = surfaceCells.reduce(
@@ -3164,6 +3208,53 @@ function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }
   );
 }
 
+const DayNightFluxChart = memo(function DayNightFluxChart({
+  points,
+  windowSeconds,
+}: {
+  points: EcologyHistoryPoint[];
+  windowSeconds: number;
+}) {
+  if (!points.length) return null;
+  const latestElapsedSeconds = points.at(-1)?.elapsedSeconds ?? 0;
+  const timeBounds = historyTimeBounds(latestElapsedSeconds, windowSeconds);
+  const maxFlux = Math.max(
+    0.001,
+    ...points.map((point) => Math.max(point.grossPhotosynthesis, point.producerRespiration)),
+  );
+  const line = (values: number[], top: number, height: number, maximum: number): string =>
+    values.map((value, index) => {
+      const x = historyTimeX(points[index]?.elapsedSeconds ?? 0, timeBounds, 46, 224);
+      const y = top + height - Math.max(0, Math.min(1, value / maximum)) * height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+  const light = line(points.map((point) => point.lightMultiplier), 8, 24, 1);
+  const gross = line(points.map((point) => point.grossPhotosynthesis), 45, 25, maxFlux);
+  const respiration = line(points.map((point) => point.producerRespiration), 45, 25, maxFlux);
+  const latest = points.at(-1)!;
+  return (
+    <div className="day-night-history">
+      <div className="ecology-history-heading">
+        <strong>낮·밤 생산자 대사</strong>
+        <small>광합성과 호흡을 분리해 기록</small>
+      </div>
+      <svg viewBox="0 0 240 82" role="img" aria-label="낮과 밤의 광량, 총광합성, 생산자 호흡 변화">
+        <path className="ecology-history-guide" d="M46 32H224M46 70H224" />
+        <text x="5" y="21">빛</text>
+        <text x="5" y="58">대사</text>
+        <polyline className="day-night-line light" points={light} />
+        <polyline className="day-night-line gross" points={gross} />
+        <polyline className="day-night-line respiration" points={respiration} />
+      </svg>
+      <div className="day-night-history-legend">
+        <span><i className="light" />광원 {Math.round(latest.lightMultiplier * 100)}%</span>
+        <span><i className="gross" />총광합성 {latest.grossPhotosynthesis.toFixed(3)}</span>
+        <span><i className="respiration" />호흡 {latest.producerRespiration.toFixed(3)}</span>
+      </div>
+    </div>
+  );
+});
+
 const EcologyHistoryChart = memo(function EcologyHistoryChart({
   points,
   windowSeconds,
@@ -3202,6 +3293,10 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
   const latest = points.at(-1) ?? {
     elapsedSeconds: 0,
     algaeBiomass: 0,
+    plantBiomass: 0,
+    lightMultiplier: 1,
+    grossPhotosynthesis: 0,
+    producerRespiration: 0,
     shrimpCount: 0,
     shrimpAdultFemales: 0,
     shrimpAdultMales: 0,
@@ -3232,7 +3327,7 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
       </div>
       <svg viewBox="0 0 240 72" role="img" aria-label="조류 총량과 새우 개체 수의 시간 변화">
         <path className="ecology-history-guide" d="M43 32H189M43 68H189" />
-        <text x="5" y="12">조류</text>
+        <text x="5" y="12">생산자</text>
         <text x="5" y="48">새우</text>
         {algaePoints && <polyline className="ecology-history-line algae" points={algaePoints} />}
         {shrimpPoints && <polyline className="ecology-history-line shrimp-total" points={shrimpPoints} />}
@@ -3449,7 +3544,9 @@ function SpeciesGuide({
     : growthTrend(speciesId, probeLight, temperature);
   const xTicks = [0, 25, 50, 75, 100];
   const yTicks = [0.07, 0.04, 0, -0.04];
-  const localTotal = localBiomass ? localBiomass.oedogonium + localBiomass.nitzschia : 0;
+  const localTotal = localBiomass
+    ? localBiomass.oedogonium + localBiomass.nitzschia + localBiomass.vallisneria
+    : 0;
   const localShare = localBiomass && localTotal > 0 ? localBiomass[speciesId] / localTotal : null;
   return (
     <section className="paper-panel species-guide">
@@ -3479,6 +3576,7 @@ function SpeciesGuide({
           <div><dt>무기질소</dt><dd>암모니아성 노폐물과 영양염 합계 N에 <b>N ÷ ({WATER_CYCLE_RULES.mineralNutrientHalfSaturation} + N)</b>을 곱합니다. 새 군락은 필요한 질소 중 암모니아를 최대 <b>{Math.round(WATER_CYCLE_RULES.algae.ammoniumPreference * 100)}%</b> 우선 흡수하고, 부족분은 영양염에서 가져옵니다.</dd></div>
           <div><dt>무기탄소</dt><dd>유한한 물속 무기탄소 C에 <b>C ÷ ({WATER_CYCLE_RULES.carbonHalfSaturation} + C)</b>을 곱합니다. 새 군락 1.0에 탄소 <b>{WATER_CYCLE_RULES.biomassCarbon}</b>가 실제로 들어갑니다.</dd></div>
           <div><dt>산소 생산</dt><dd>고정한 탄소 1.0당 산소 <b>{WATER_CYCLE_RULES.oxygenPerFixedCarbon}</b>를 만들며, 넘친 산소는 닫힌 공기층으로 이동합니다.</dd></div>
+          <div><dt>낮·밤 호흡</dt><dd>빛이 없어 총광합성이 멈춰도 호흡은 계속됩니다. 24°C 기준 군락량 1.0당 <b>{(species.respirationRateAtReference * 100).toFixed(1)}%/초</b>를 호흡하며, 수온이 높을수록 빨라집니다.</dd></div>
           <div><dt>질소 소비</dt><dd>새 군락 1.0당 무기질소 <b>{WATER_CYCLE_RULES.biomassNitrogen}</b>를 흡수합니다. 죽거나 먹힌 군락은 찌꺼기와 생물 몸을 거쳐 다시 순환합니다.</dd></div>
           <div><dt>자연 소실</dt><dd>그래프의 환경 성장률 계산 뒤에 군락량의 <b>0.18%/초</b>가 추가로 줄며, 다른 종의 경쟁과 새우 섭식도 별도로 적용됩니다.</dd></div>
         </dl>

@@ -315,6 +315,8 @@ interface AquariumLayers {
   algae: Container;
   analysis: Sprite;
   animals: Container;
+  plants: Graphics;
+  nightTint: Graphics;
   goalGuide: Graphics;
   seeds: Graphics;
   interaction: Graphics;
@@ -2536,6 +2538,69 @@ const drawSeeds = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   }
 };
 
+const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void => {
+  layer.clear();
+  for (const cell of snapshot.cells) {
+    const biomass = cell.biomass.vallisneria;
+    if (cell.surfaceKind !== 'substrate' || biomass <= ALGAE_VISIBLE_BIOMASS) continue;
+    const height = 62 + Math.sqrt(Math.min(1, biomass)) * 190;
+    const spread = 10 + Math.sqrt(Math.min(1, biomass)) * 18;
+    const leafCount = Math.max(3, Math.round(4 + biomass * 6));
+    for (let index = 0; index < leafCount; index += 1) {
+      const ratio = leafCount <= 1 ? 0.5 : index / (leafCount - 1);
+      const side = ratio * 2 - 1;
+      const phase = cell.index * 0.73 + index * 1.37;
+      const leafHeight = height * (0.68 + 0.32 * (0.5 + 0.5 * Math.sin(phase)));
+      const rootX = cell.x + side * 3.5;
+      const tipX = cell.x + side * spread + Math.sin(phase * 1.7) * 8;
+      const controlX = cell.x - side * spread * 0.38 + Math.sin(phase) * 6;
+      const width = 2.2 + biomass * 2.4;
+      layer
+        .moveTo(rootX, cell.y + 2)
+        .bezierCurveTo(
+          rootX + side * 4,
+          cell.y - leafHeight * 0.34,
+          controlX,
+          cell.y - leafHeight * 0.73,
+          tipX,
+          cell.y - leafHeight,
+        )
+        .stroke({
+          color: index % 3 === 0 ? 0x486f43 : 0x6f9555,
+          width,
+          alpha: 0.72 + biomass * 0.22,
+          cap: 'round',
+        });
+      if (index % 2 === 0) {
+        layer
+          .moveTo(rootX + 1.2, cell.y)
+          .bezierCurveTo(
+            rootX + side * 4,
+            cell.y - leafHeight * 0.34,
+            controlX + 1,
+            cell.y - leafHeight * 0.72,
+            tipX + 1,
+            cell.y - leafHeight + 2,
+          )
+          .stroke({ color: 0xb8c77b, width: 0.9, alpha: 0.62, cap: 'round' });
+      }
+    }
+    layer
+      .ellipse(cell.x, cell.y + 2, 10 + biomass * 9, 4.5)
+      .fill({ color: 0x526b3b, alpha: 0.72 });
+  }
+};
+
+const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void => {
+  layer.clear();
+  const multiplier = snapshot.dayNight?.lightMultiplier ?? 1;
+  const darkness = Math.max(0, Math.min(1, 1 - multiplier));
+  if (darkness <= 0.01) return;
+  layer
+    .rect(0, WATER_TOP, TANK_WIDTH, GROUND_Y - WATER_TOP)
+    .fill({ color: 0x173349, alpha: darkness * 0.34 });
+};
+
 const drawInteraction = (
   layer: Graphics,
   snapshot: SimulationSnapshot,
@@ -3148,6 +3213,8 @@ export function AquariumCanvas({
         algae: createAlgaeParticleLayer('structure-face'),
         analysis: new Sprite(Texture.EMPTY),
         animals: new Container(),
+        plants: new Graphics(),
+        nightTint: new Graphics(),
         goalGuide: new Graphics(),
         seeds: new Graphics(),
         interaction: new Graphics(),
@@ -3177,8 +3244,10 @@ export function AquariumCanvas({
         layers.foreground,
         layers.structures,
         layers.algae,
+        layers.plants,
         layers.analysis,
         layers.animals,
+        layers.nightTint,
         layers.goalGuide,
         layers.seeds,
         layers.interaction,
@@ -3201,6 +3270,7 @@ export function AquariumCanvas({
       // complete latest frame here; otherwise a paused setup screen can keep a
       // newly-created layer generation blank until another simulation update.
       const initialSnapshot = snapshotRef.current;
+      layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(initialSnapshot.dayNight?.lightMultiplier ?? 1);
       const initialMotion = sampleMotion(performance.now());
       const initialRenderState = reconcileMotionWithSnapshot(initialSnapshot, initialMotion);
       const initialShowsLight = activeToolRef.current === 'light-probe';
@@ -3237,6 +3307,8 @@ export function AquariumCanvas({
         isPendingInventoryHandoff(),
       );
       syncAnimalCarcasses(layers.animals, initialSnapshot, ownedAnimalCarcassDisplays);
+      drawAquaticPlants(layers.plants, initialSnapshot);
+      drawDayNightTint(layers.nightTint, initialSnapshot);
       drawGoalGuide(layers.goalGuide, initialSnapshot, showGoalGuideRef.current);
       drawSeeds(layers.seeds, initialSnapshot);
       drawInteraction(layers.interaction, initialSnapshot, isPendingInventoryHandoff());
@@ -3475,6 +3547,9 @@ export function AquariumCanvas({
       isPendingInventoryHandoff(),
     );
     syncAnimalCarcasses(layers.animals, snapshot, animalCarcassDisplaysRef.current);
+    drawAquaticPlants(layers.plants, snapshot);
+    drawDayNightTint(layers.nightTint, snapshot);
+    layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(snapshot.dayNight?.lightMultiplier ?? 1);
     const structureGeometryKey = structureAlgaeGeometryKey(snapshot);
     const algaeRevisionChanged = lastAlgaeRevisionRef.current !== snapshot.revision;
     const structureGeometryChanged =

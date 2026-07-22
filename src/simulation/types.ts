@@ -1,4 +1,5 @@
 import type { SimulationSpeed } from './speed';
+import type { DayNightState } from './dayNight';
 
 export const TANK_WIDTH = 1200;
 export const TANK_HEIGHT = 720;
@@ -19,11 +20,12 @@ export type ScenarioId =
   | 'mission-3'
   | 'mission-4'
   | 'mission-5'
+  | 'mission-6'
   | 'laboratory';
 export type SimulationMode = 'challenge' | 'laboratory';
 export type SimulationPhase = 'setup' | 'running' | 'paused';
 export type MissionOutcome = 'pending' | 'success' | 'failure';
-export type SpeciesId = 'oedogonium' | 'nitzschia';
+export type SpeciesId = 'oedogonium' | 'nitzschia' | 'vallisneria';
 export type AnimalSpeciesId = 'cherry-shrimp';
 export type AnimalLifeStage = 'juvenile' | 'adult';
 export type AnimalSex = 'female' | 'male';
@@ -65,6 +67,7 @@ export interface Vec2 {
 export interface SpeciesBiomass {
   oedogonium: number;
   nitzschia: number;
+  vallisneria: number;
 }
 
 export interface BiofilmBiomass {
@@ -105,6 +108,8 @@ export interface SurfaceCellSnapshot {
   y: number;
   cellSize: number;
   light: number;
+  /** Canopy light is only meaningful for rooted macrophytes. */
+  plantCanopyLight: number | null;
   biomass: SpeciesBiomass;
   biofilm: BiofilmBiomass;
   targetEligible: boolean;
@@ -247,6 +252,13 @@ export interface BiogeochemistrySnapshot {
   transport: WaterTransportSnapshot;
   average: WaterQualityValues;
   biofilmTotals: BiofilmBiomass;
+  algaeFluxes: {
+    grossProductionBiomassPerSecond: number;
+    respirationBiomassPerSecond: number;
+    stressTurnoverBiomassPerSecond: number;
+    oxygenProducedPerSecond: number;
+    oxygenConsumedPerSecond: number;
+  };
   carbonCycle: {
     dissolvedInorganicCarbon: number;
     headspaceCarbonDioxide: number;
@@ -357,6 +369,7 @@ export interface SimulationSnapshot {
   allSettled: boolean;
   hasStarted: boolean;
   lightOutput: number;
+  dayNight: (DayNightState & { effectiveLightOutput: number }) | null;
   waterTemperature: number;
   structures: StructureSnapshot[];
   cells: SurfaceCellSnapshot[];

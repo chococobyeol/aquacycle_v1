@@ -120,8 +120,8 @@ const fillProductiveHabitat = (world: SimulationWorld, amount = 0.72): void => {
     const oedogoniumRate = netGrowthPotential('oedogonium', cell.light, 24);
     const nitzschiaRate = netGrowthPotential('nitzschia', cell.light, 24);
     cell.biomass = oedogoniumRate >= nitzschiaRate
-      ? { oedogonium: amount, nitzschia: 0 }
-      : { oedogonium: 0, nitzschia: amount };
+      ? { oedogonium: amount, nitzschia: 0, vallisneria: 0 }
+      : { oedogonium: 0, nitzschia: amount, vallisneria: 0 };
   }
   internals.snapshotDirty = true;
 };
@@ -133,7 +133,7 @@ describe('consumer-resource emergence', () => {
     const cells = internals.allCells();
     for (const cell of cells) {
       cell.light = 45;
-      cell.biomass = { oedogonium: 0, nitzschia: 0 };
+      cell.biomass = { oedogonium: 0, nitzschia: 0, vallisneria: 0 };
     }
     const source = cells[Math.floor(cells.length / 2)];
     const initialBiomass = 0.28;
