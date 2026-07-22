@@ -97,8 +97,8 @@ const MISSION_CARDS: readonly MissionCardDefinition[] = [
     stamp: '실험 6',
     className: 'mission-six',
     title: '밤을 건너는 수조',
-    description: '낮과 밤이 반복되는 동안 체리새우 군집을 유지하세요.',
-    tags: '낮·밤 주기 · 나사말 · 광합성·호흡 · 장기 생존',
+    description: '전등 없는 자연광 수조에서 낮과 밤이 반복되는 동안 체리새우 군집을 유지하세요.',
+    tags: '자연광 · 낮·밤 주기 · 나사말 · 광합성·호흡 · 장기 생존',
     illustrationClassName: 'day-night-cycle',
     illustration: (
       <>

@@ -39,6 +39,7 @@ export const algaePhysiology = (
   speciesId: SpeciesId,
   light: number,
   temperature = 24,
+  darkAcclimation = 0,
 ): AlgaePhysiologyRates => {
   const definition = SPECIES[speciesId];
   const referenceNet = referenceNetLightRate(speciesId, light);
@@ -55,7 +56,12 @@ export const algaePhysiology = (
   );
   const grossPhotosynthesis = referenceGross * suitability;
   const temperatureStress = (1 - suitability) * 0.012;
-  const lightStressTurnover = referenceStress + temperatureStress;
+  // A predictable night stops photosynthesis but is not the same as a colony
+  // being stranded permanently in an unsuitable dark habitat. The world
+  // supplies darkAcclimation only for the natural day/night cycle; structural
+  // shade and a switched-off laboratory remain fully subject to light stress.
+  const lightStressTurnover = referenceStress * (1 - clamp01(darkAcclimation)) +
+    temperatureStress;
   return {
     grossPhotosynthesis,
     respiration,

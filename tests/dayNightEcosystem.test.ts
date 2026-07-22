@@ -58,6 +58,40 @@ describe('day/night producer metabolism', () => {
     }
   });
 
+  it('treats mission 6 daylight as a broad source rather than a hidden lamp cone', () => {
+    const scenario = SCENARIOS['mission-6'];
+    const snapshot = new SimulationWorld('mission-6').snapshot();
+    expect(scenario.lightOutput).toBe(0);
+    expect(scenario.naturalLightOutput).toBeGreaterThan(0);
+
+    const { columns, values } = snapshot.lightField;
+    const row = 4;
+    const left = values[row * columns + 2];
+    const middle = values[row * columns + Math.floor(columns / 2)];
+    const right = values[row * columns + columns - 3];
+    expect(Math.min(left, middle, right)).toBeGreaterThan(50);
+    expect(Math.max(left, middle, right) - Math.min(left, middle, right)).toBeLessThan(2);
+  });
+
+  it('combines laboratory daylight and lamp output while cycling daylight only', () => {
+    const world = new SimulationWorld('laboratory');
+    expect(world.snapshot().dayNight).toBeNull();
+    world.handle({ type: 'set-light-output', output: 60 });
+    world.handle({ type: 'set-natural-light-output', output: 80 });
+    world.handle({ type: 'set-day-night-enabled', enabled: true });
+    world.handle({ type: 'start' });
+
+    const day = advanceTo(world, 120);
+    const night = advanceTo(world, 300);
+    expect(day.dayNight?.phase).toBe('day');
+    expect(day.dayNight?.effectiveNaturalLightOutput).toBeCloseTo(80, 4);
+    expect(day.dayNight?.effectiveLightOutput).toBeCloseTo(140, 4);
+    expect(night.dayNight?.phase).toBe('night');
+    expect(night.dayNight?.effectiveNaturalLightOutput).toBeCloseTo(3.6, 4);
+    expect(night.dayNight?.effectiveLightOutput).toBeCloseTo(63.6, 4);
+    expect(night.lightOutput).toBe(60);
+  }, 20_000);
+
   it('changes the actual tank light and reverses producer oxygen flux at night', () => {
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
@@ -90,7 +124,9 @@ describe('day/night producer metabolism', () => {
       return cell;
     };
     const used = new Set<string>();
-    for (const x of [120, 250, 360, 470, 650, 760, 880, 1_030]) {
+    // A player-like solution uses a handful of broad daylight positions rather
+    // than exhausting every supplied inoculum or targeting hidden cell values.
+    for (const x of [180, 450, 750, 1_020]) {
       placeSeed(world, 'nitzschia', nearest(x, used));
       placeSeed(world, 'oedogonium', nearest(x + 28, used));
     }
@@ -99,11 +135,15 @@ describe('day/night producer metabolism', () => {
     world.handle({ type: 'start' });
     advanceTo(world, 90);
     world.handle({ type: 'pause' });
-    for (const cell of substrate.slice(0, 10)) placeFilm(world, 'decomposer', cell);
+    for (const cell of substrate.filter((_, index) => index % 8 === 1).slice(0, 3)) {
+      placeFilm(world, 'decomposer', cell);
+    }
     world.handle({ type: 'resume' });
     advanceTo(world, 190);
     world.handle({ type: 'pause' });
-    for (const cell of substrate.slice(4, 16)) placeFilm(world, 'nitrifier', cell);
+    for (const cell of substrate.filter((_, index) => index % 8 === 4).slice(0, 3)) {
+      placeFilm(world, 'nitrifier', cell);
+    }
     world.handle({ type: 'resume' });
 
     const samples = [180, 360, 540, 720, 900, 1_090]

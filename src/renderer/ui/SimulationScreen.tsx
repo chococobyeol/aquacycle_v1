@@ -1417,7 +1417,7 @@ export function SimulationScreen({
             {snapshot.dayNight && (
               <div
                 className={`day-night-readout phase-${snapshot.dayNight.phase}`}
-                title={`현재 광원 ${snapshot.dayNight.effectiveLightOutput.toFixed(0)} / ${snapshot.lightOutput.toFixed(0)}`}
+                title={`자연광 ${snapshot.dayNight.effectiveNaturalLightOutput.toFixed(0)} / ${snapshot.naturalLightOutput.toFixed(0)} · 전등 ${snapshot.lightOutput.toFixed(0)} · 합계 ${snapshot.dayNight.effectiveLightOutput.toFixed(0)}`}
               >
                 <span aria-hidden="true">{snapshot.dayNight.phase === 'night' ? '☾' : '☀'}</span>
                 <strong>{dayNightPhaseLabel[snapshot.dayNight.phase]}</strong>
@@ -2207,9 +2207,30 @@ export function SimulationScreen({
               {snapshot.mode === 'laboratory' && (
                 <section className="paper-panel lab-controls v2-lab-controls">
                   <div className="panel-label">실험실 광원</div>
-                  <label>
-                    <span>출력 <strong>{Math.round(snapshot.lightOutput)}</strong></span>
-                    <input type="range" min={30} max={120} value={snapshot.lightOutput} disabled={!editable} onChange={(event) => send({ type: 'set-light-output', output: Number(event.target.value) })} />
+                  <label className="lab-light-control">
+                    <span>전등 <strong>{Math.round(snapshot.lightOutput)}</strong></span>
+                    <input type="range" min={0} max={120} value={snapshot.lightOutput} disabled={!editable} onChange={(event) => send({ type: 'set-light-output', output: Number(event.target.value) })} />
+                  </label>
+                  <label className="lab-light-control">
+                    <span>자연광 <strong>{Math.round(snapshot.naturalLightOutput)}</strong></span>
+                    <input type="range" min={0} max={120} value={snapshot.naturalLightOutput} disabled={!editable} onChange={(event) => send({ type: 'set-natural-light-output', output: Number(event.target.value) })} />
+                  </label>
+                  <label className="lab-day-night-toggle">
+                    <input
+                      type="checkbox"
+                      checked={snapshot.dayNightEnabled}
+                      disabled={!editable || snapshot.naturalLightOutput <= 0}
+                      onChange={(event) => send({
+                        type: 'set-day-night-enabled',
+                        enabled: event.target.checked,
+                      })}
+                    />
+                    <span>
+                      <strong>자연광 낮·밤 주기</strong>
+                      <small>{snapshot.naturalLightOutput > 0
+                        ? snapshot.dayNightEnabled ? '새벽·낮·해질녘·밤 반복' : '현재 밝기로 고정'
+                        : '자연광 출력을 먼저 올리세요'}</small>
+                    </span>
                   </label>
                 </section>
               )}

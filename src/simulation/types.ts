@@ -368,8 +368,15 @@ export interface SimulationSnapshot {
   speed: SimulationSpeed;
   allSettled: boolean;
   hasStarted: boolean;
+  /** Artificial overhead fixture output. Zero means that no fixture is installed. */
   lightOutput: number;
-  dayNight: (DayNightState & { effectiveLightOutput: number }) | null;
+  /** Broad sky daylight at full daytime intensity. */
+  naturalLightOutput: number;
+  dayNightEnabled: boolean;
+  dayNight: (DayNightState & {
+    effectiveNaturalLightOutput: number;
+    effectiveLightOutput: number;
+  }) | null;
   waterTemperature: number;
   structures: StructureSnapshot[];
   cells: SurfaceCellSnapshot[];
@@ -506,6 +513,10 @@ export interface SimulationSaveData {
   animalCounter: number;
   measurementCounter: number;
   lightOutput: number;
+  /** Optional so frozen aquariums saved before natural daylight remain loadable. */
+  naturalLightOutput?: number;
+  /** Optional so older laboratory saves keep their former steady lighting. */
+  dayNightEnabled?: boolean;
   waterTemperature: number;
   structures: SavedStructureState[];
   substrateCells: SavedSurfaceCellBiology[];
@@ -561,7 +572,9 @@ export type SimulationCommand =
   | { type: 'retrieve-structure'; id: string }
   | { type: 'retrieve-animal'; id: string }
   | { type: 'remove-selected-algae'; speciesId: SpeciesId }
-  | { type: 'set-light-output'; output: number };
+  | { type: 'set-light-output'; output: number }
+  | { type: 'set-natural-light-output'; output: number }
+  | { type: 'set-day-night-enabled'; enabled: boolean };
 
 export interface WorkerSnapshotMessage {
   type: 'snapshot';

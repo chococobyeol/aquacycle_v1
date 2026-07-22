@@ -478,6 +478,26 @@
 .response-chart svg text { fill: #77807a; font-size: 7px; }
 .compact-observation dl > div { padding: 5px 0; }
 .v2-lab-controls label { margin-top: 6px; }
+.v2-lab-controls .lab-light-control > span {
+  display: flex;
+  justify-content: space-between;
+}
+.lab-day-night-toggle {
+  display: grid !important;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px !important;
+  padding: 8px;
+  border: 1px solid rgba(49, 65, 63, 0.24);
+  border-radius: 8px;
+  background: rgba(210, 229, 219, 0.36);
+  cursor: pointer;
+}
+.lab-day-night-toggle input { width: 17px; height: 17px; accent-color: #5b8982; }
+.lab-day-night-toggle > span { display: grid !important; gap: 2px; }
+.lab-day-night-toggle strong { font-size: 11px; }
+.lab-day-night-toggle small { color: #77817b; font-size: 8px; line-height: 1.25; }
 .v2-screen .control-dock { min-width: 0; }
 
 @media (max-width: 1220px) {

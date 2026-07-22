@@ -2543,58 +2543,84 @@ const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void 
   for (const cell of snapshot.cells) {
     const biomass = cell.biomass.vallisneria;
     if (cell.surfaceKind !== 'substrate' || biomass <= ALGAE_VISIBLE_BIOMASS) continue;
-    const height = 62 + Math.sqrt(Math.min(1, biomass)) * 190;
-    const spread = 10 + Math.sqrt(Math.min(1, biomass)) * 18;
-    const leafCount = Math.max(3, Math.round(4 + biomass * 6));
+    // Vallisneria is a basal rosette of long ribbon leaves. Biomass changes
+    // every ecology step (including nightly respiration), but an established
+    // leaf does not shorten every night. Keep geometry structural and use
+    // biomass only for health/opacity; the plant disappears only after death.
+    const plantHash = (cell.index * 0.61803398875) % 1;
+    const baseHeight = 170 + plantHash * 42;
+    const leafCount = 10;
+    const healthAlpha = 0.68 + Math.min(1, biomass / 0.28) * 0.26;
     for (let index = 0; index < leafCount; index += 1) {
       const ratio = leafCount <= 1 ? 0.5 : index / (leafCount - 1);
       const side = ratio * 2 - 1;
       const phase = cell.index * 0.73 + index * 1.37;
-      const leafHeight = height * (0.68 + 0.32 * (0.5 + 0.5 * Math.sin(phase)));
-      const rootX = cell.x + side * 3.5;
-      const tipX = cell.x + side * spread + Math.sin(phase * 1.7) * 8;
-      const controlX = cell.x - side * spread * 0.38 + Math.sin(phase) * 6;
-      const width = 2.2 + biomass * 2.4;
+      const leafHeight = baseHeight * (0.58 + 0.42 * (0.5 + 0.5 * Math.sin(phase)));
+      const rootX = cell.x + side * 10;
+      const lean = side * (30 + Math.abs(side) * 48) + Math.sin(phase * 1.7) * 22;
+      const tipX = rootX + lean;
+      const ribbonWidth = 11 + (index % 3) * 1.6;
+      const baseHalf = ribbonWidth * 0.28;
+      const midHalf = ribbonWidth / 2;
+      const swayA = Math.sin(phase * 1.11) * 25;
+      const swayB = Math.cos(phase * 0.83) * 32;
+      const controlAX = rootX + lean * 0.12 + swayA;
+      const controlBX = rootX + lean * 0.68 + swayB;
+      const tipY = cell.y - leafHeight;
+      const tipHalf = ribbonWidth * 0.22;
       layer
-        .moveTo(rootX, cell.y + 2)
+        .moveTo(rootX - baseHalf, cell.y + 8)
         .bezierCurveTo(
-          rootX + side * 4,
-          cell.y - leafHeight * 0.34,
-          controlX,
-          cell.y - leafHeight * 0.73,
-          tipX,
-          cell.y - leafHeight,
+          controlAX - midHalf * 0.78,
+          cell.y - leafHeight * 0.3,
+          controlBX - midHalf,
+          cell.y - leafHeight * 0.72,
+          tipX - tipHalf,
+          tipY + 2,
         )
-        .stroke({
-          color: index % 3 === 0 ? 0x486f43 : 0x6f9555,
-          width,
-          alpha: 0.72 + biomass * 0.22,
-          cap: 'round',
-        });
-      if (index % 2 === 0) {
-        layer
-          .moveTo(rootX + 1.2, cell.y)
-          .bezierCurveTo(
-            rootX + side * 4,
-            cell.y - leafHeight * 0.34,
-            controlX + 1,
-            cell.y - leafHeight * 0.72,
-            tipX + 1,
-            cell.y - leafHeight + 2,
-          )
-          .stroke({ color: 0xb8c77b, width: 0.9, alpha: 0.62, cap: 'round' });
-      }
+        .quadraticCurveTo(tipX, tipY - 2, tipX + tipHalf, tipY + 2)
+        .bezierCurveTo(
+          controlBX + midHalf,
+          cell.y - leafHeight * 0.72,
+          controlAX + midHalf * 0.78,
+          cell.y - leafHeight * 0.3,
+          rootX + baseHalf,
+          cell.y + 8,
+        )
+        .closePath()
+        .fill({
+          color: index % 3 === 0 ? 0x557f47 : index % 3 === 1 ? 0x6f9651 : 0x80a65d,
+          alpha: healthAlpha * (0.84 + (index % 4) * 0.045),
+        })
+        .stroke({ color: 0x354b3b, width: 1.55, alpha: 0.78, join: 'round' });
+      layer
+        .moveTo(rootX - baseHalf * 0.25, cell.y + 5)
+        .bezierCurveTo(
+          controlAX - midHalf * 0.2,
+          cell.y - leafHeight * 0.3,
+          controlBX - midHalf * 0.2,
+          cell.y - leafHeight * 0.72,
+          tipX - tipHalf * 0.3,
+          tipY + 2,
+        )
+        .stroke({ color: 0xd2d793, width: 1.15, alpha: 0.27, cap: 'round' });
     }
+    // The short crown is buried by the foreground substrate layer, so the
+    // leaves read as emerging from sediment rather than a cut spring-onion.
     layer
-      .ellipse(cell.x, cell.y + 2, 10 + biomass * 9, 4.5)
-      .fill({ color: 0x526b3b, alpha: 0.72 });
+      .roundRect(cell.x - 8, cell.y + 2, 16, 14, 5)
+      .fill({ color: 0x425f3e, alpha: 0.78 });
   }
 };
 
 const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   layer.clear();
-  const multiplier = snapshot.dayNight?.lightMultiplier ?? 1;
-  const darkness = Math.max(0, Math.min(1, 1 - multiplier));
+  if (!snapshot.dayNight) return;
+  const fullLight = snapshot.lightOutput + snapshot.naturalLightOutput;
+  const currentLight = snapshot.dayNight.effectiveLightOutput;
+  const darkness = fullLight > 0
+    ? Math.max(0, Math.min(1, 1 - currentLight / fullLight))
+    : 0;
   if (darkness <= 0.01) return;
   layer
     .rect(0, WATER_TOP, TANK_WIDTH, GROUND_Y - WATER_TOP)
@@ -3241,10 +3267,10 @@ export function AquariumCanvas({
         layers.base,
         layers.light,
         layers.substrateAlgae,
+        layers.plants,
         layers.foreground,
         layers.structures,
         layers.algae,
-        layers.plants,
         layers.analysis,
         layers.animals,
         layers.nightTint,
@@ -3270,7 +3296,8 @@ export function AquariumCanvas({
       // complete latest frame here; otherwise a paused setup screen can keep a
       // newly-created layer generation blank until another simulation update.
       const initialSnapshot = snapshotRef.current;
-      layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(initialSnapshot.dayNight?.lightMultiplier ?? 1);
+      layers.lamp.visible = initialSnapshot.lightOutput > 0.5;
+      layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(initialSnapshot.lightOutput / 120);
       const initialMotion = sampleMotion(performance.now());
       const initialRenderState = reconcileMotionWithSnapshot(initialSnapshot, initialMotion);
       const initialShowsLight = activeToolRef.current === 'light-probe';
@@ -3549,7 +3576,8 @@ export function AquariumCanvas({
     syncAnimalCarcasses(layers.animals, snapshot, animalCarcassDisplaysRef.current);
     drawAquaticPlants(layers.plants, snapshot);
     drawDayNightTint(layers.nightTint, snapshot);
-    layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(snapshot.dayNight?.lightMultiplier ?? 1);
+    layers.lamp.visible = snapshot.lightOutput > 0.5;
+    layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(snapshot.lightOutput / 120);
     const structureGeometryKey = structureAlgaeGeometryKey(snapshot);
     const algaeRevisionChanged = lastAlgaeRevisionRef.current !== snapshot.revision;
     const structureGeometryChanged =

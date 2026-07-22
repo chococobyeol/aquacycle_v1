@@ -225,7 +225,28 @@ const DIRECT_LIGHT_HALF_ANGLE = Math.PI * 0.49;
 // This calibrated scale preserves the existing mission light bands while the
 // source geometry now truthfully lives outside the glass.
 const DIRECT_LIGHT_SCALE = 2.85;
+// Daylight is sampled across the whole open water surface. Even a point below
+// an overhang receives some diffuse sky light, while a clear point receives
+// nearly the configured daylight output instead of inheriting the lamp cone.
+const NATURAL_LIGHT_SCALE = 0.9;
 const REFLECTED_LIGHT_LIMIT = 6;
+
+/**
+ * Every visible light source enters the same transport calculation. Sources
+ * differ only in geometry and emission properties; surfaces and organisms
+ * receive the summed local irradiance and never branch on source kind.
+ */
+interface LightEmitter {
+  id: 'ceiling-lamp' | 'daylight';
+  output: number;
+  samples: Vec2[];
+  emissionScale: number;
+  occludedTransmission: number;
+  halfAngle?: number;
+  angularExponent?: number;
+  distanceScale?: number;
+  distanceExponent?: number;
+}
 // Full ecology snapshots contain the complete surface and water grids. Motion
 // has its own 30 Hz shared channel, so publishing this large immutable graph
 // more than once per real second only churns V8 heap pages without making
@@ -416,6 +437,8 @@ export class SimulationWorld {
   private materialReference: { nitrogen: number; carbon: number } | null = null;
   private biogeochemistry = new BiogeochemistryLedger();
   private lightOutput = 90;
+  private naturalLightOutput = 0;
+  private dayNightEnabled = false;
   private appliedDayNightMultiplier = 1;
   private appliedDayNightPhase: DayNightPhase | null = null;
   private waterTemperature = 23.5;
@@ -428,6 +451,7 @@ export class SimulationWorld {
     values: Array.from({ length: LIGHT_COLUMNS * LIGHT_ROWS }, () => 0),
     revision: 0,
   };
+  private lightEmitters: LightEmitter[] = [];
   private lightReflectionSources: LightReflectionSource[] = [];
   private message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
@@ -479,13 +503,17 @@ export class SimulationWorld {
     this.biofilmSettlementCursor = 0;
     this.materialReference = null;
     this.lightOutput = this.scenario.lightOutput;
+    this.naturalLightOutput = this.scenario.naturalLightOutput;
+    this.dayNightEnabled = this.scenario.dayNightCycleInitiallyEnabled;
     const initialDayNight = this.currentDayNightState();
     this.appliedDayNightMultiplier = initialDayNight?.lightMultiplier ?? 1;
     this.appliedDayNightPhase = initialDayNight?.phase ?? null;
-    // A challenge tank is presented after its fixed lamp has already been on,
-    // so begin near the former well-mixed lamp equilibrium instead of making
+    // A tank is presented after its configured sources have already been on,
+    // so begin near their well-mixed thermal equilibrium instead of making
     // every mission spend its short time limit warming from room temperature.
-    this.waterTemperature = initialWaterTemperatureForLight(this.lightOutput);
+    this.waterTemperature = initialWaterTemperatureForLight(
+      this.lightOutput + this.naturalLightOutput * this.appliedDayNightMultiplier,
+    );
     this.biogeochemistry = new BiogeochemistryLedger({
       effectsEnabled: Boolean(this.scenario.waterCycle),
       initial: this.scenario.waterCycle?.initial,
@@ -622,7 +650,28 @@ export class SimulationWorld {
         break;
       case 'set-light-output':
         if (this.scenario.mode === 'laboratory' && this.canEdit()) {
-          this.lightOutput = clamp(command.output, 30, 120);
+          this.lightOutput = clamp(command.output, 0, 120);
+          this.lightDirty = true;
+          if (this.allSettled && !this.held) this.recomputeLight();
+        }
+        break;
+      case 'set-natural-light-output':
+        if (this.scenario.mode === 'laboratory' && this.canEdit()) {
+          this.naturalLightOutput = clamp(command.output, 0, 120);
+          this.lightDirty = true;
+          if (this.allSettled && !this.held) this.recomputeLight();
+        }
+        break;
+      case 'set-day-night-enabled':
+        if (
+          this.scenario.mode === 'laboratory' &&
+          this.scenario.dayNightCycle &&
+          this.canEdit()
+        ) {
+          this.dayNightEnabled = command.enabled;
+          const state = this.currentDayNightState();
+          this.appliedDayNightMultiplier = state?.lightMultiplier ?? 1;
+          this.appliedDayNightPhase = state?.phase ?? null;
           this.lightDirty = true;
           if (this.allSettled && !this.held) this.recomputeLight();
         }
@@ -802,6 +851,8 @@ export class SimulationWorld {
       allSettled: this.allSettled,
       hasStarted: this.hasStarted,
       lightOutput: this.lightOutput,
+      naturalLightOutput: this.naturalLightOutput,
+      dayNightEnabled: this.dayNightEnabled,
       dayNight: this.currentDayNightSnapshot(),
       waterTemperature: this.waterTemperature,
       structures: this.structureSnapshots(),
@@ -915,6 +966,8 @@ export class SimulationWorld {
       animalCounter: this.animalCounter,
       measurementCounter: this.measurementCounter,
       lightOutput: this.lightOutput,
+      naturalLightOutput: this.naturalLightOutput,
+      dayNightEnabled: this.dayNightEnabled,
       waterTemperature: this.waterTemperature,
       structures: this.structures.map((structure) => ({
         id: structure.id,
@@ -975,9 +1028,6 @@ export class SimulationWorld {
     this.outcome = data.outcome;
     this.outcomeAtSeconds = data.outcomeAtSeconds;
     this.elapsedSeconds = Math.max(0, data.elapsedSeconds);
-    const restoredDayNight = this.currentDayNightState();
-    this.appliedDayNightMultiplier = restoredDayNight?.lightMultiplier ?? 1;
-    this.appliedDayNightPhase = restoredDayNight?.phase ?? null;
     this.speed = normalizeSimulationSpeed(data.speed);
     this.hasStarted = data.hasStarted;
     // A thawed tank always opens paused so no ecology time passes while the
@@ -986,6 +1036,11 @@ export class SimulationWorld {
     this.allSettled = data.allSettled;
     this.successHoldAccumulator = Math.max(0, data.successHoldAccumulator);
     this.lightOutput = data.lightOutput;
+    this.naturalLightOutput = data.naturalLightOutput ?? this.scenario.naturalLightOutput;
+    this.dayNightEnabled = data.dayNightEnabled ?? this.scenario.dayNightCycleInitiallyEnabled;
+    const restoredDayNight = this.currentDayNightState();
+    this.appliedDayNightMultiplier = restoredDayNight?.lightMultiplier ?? 1;
+    this.appliedDayNightPhase = restoredDayNight?.phase ?? null;
     this.waterTemperature = data.waterTemperature;
 
     for (const saved of data.structures) {
@@ -2232,7 +2287,7 @@ export class SimulationWorld {
   }
 
   private currentDayNightState(): DayNightState | null {
-    return this.scenario.dayNightCycle
+    return this.scenario.dayNightCycle && this.dayNightEnabled
       ? dayNightStateAt(this.elapsedSeconds, this.scenario.dayNightCycle)
       : null;
   }
@@ -2241,7 +2296,9 @@ export class SimulationWorld {
     const state = this.currentDayNightState();
     return state ? {
       ...state,
-      effectiveLightOutput: this.lightOutput * state.lightMultiplier,
+      effectiveNaturalLightOutput: this.naturalLightOutput * state.lightMultiplier,
+      effectiveLightOutput:
+        this.lightOutput + this.naturalLightOutput * state.lightMultiplier,
     } : null;
   }
 
@@ -2265,11 +2322,12 @@ export class SimulationWorld {
     }
   }
 
-  private effectiveLightOutput(): number {
-    return this.lightOutput * this.appliedDayNightMultiplier;
+  private effectiveNaturalLightOutput(): number {
+    return this.naturalLightOutput * this.appliedDayNightMultiplier;
   }
 
   private recomputeLight(): void {
+    this.lightEmitters = this.buildLightEmitters();
     this.lightReflectionSources = this.buildLightReflectionSources();
     const values: number[] = [];
     for (let row = 0; row < LIGHT_ROWS; row += 1) {
@@ -2315,26 +2373,81 @@ export class SimulationWorld {
     this.snapshotDirty = true;
   }
 
-  private directLightAt(point: Vec2, occluders: MatterBody[]): number {
-    let direct = 0;
-    for (let index = 0; index < AREA_LIGHT_SAMPLES; index += 1) {
-      const ratio = index / (AREA_LIGHT_SAMPLES - 1);
-      const lampPoint = {
-        x: FIXED_LAMP_X - FIXED_LAMP_WIDTH / 2 + ratio * FIXED_LAMP_WIDTH,
-        y: FIXED_LAMP_Y,
-      };
-      const dx = point.x - lampPoint.x;
-      const dy = Math.max(1, point.y - lampPoint.y);
-      const distance = Math.hypot(dx, dy);
-      const angle = Math.abs(Math.atan2(dx, dy));
-      const cone = Math.pow(clamp(1 - angle / DIRECT_LIGHT_HALF_ANGLE, 0, 1), 1.48);
-      const distanceFalloff = 1 / (1 + Math.pow(distance / 470, 1.35));
-      const depth = Math.max(0, point.y - WATER_TOP);
-      const waterAttenuation = Math.exp(-depth * 0.00072);
-      const visible = Query.ray(occluders, lampPoint, point, 1.1).length === 0 ? 1 : 0;
-      direct += this.effectiveLightOutput() * DIRECT_LIGHT_SCALE * cone * distanceFalloff * waterAttenuation * visible;
+  private buildLightEmitters(): LightEmitter[] {
+    const emitters: LightEmitter[] = [];
+    if (this.lightOutput > 0) {
+      emitters.push({
+        id: 'ceiling-lamp',
+        output: this.lightOutput,
+        samples: Array.from({ length: AREA_LIGHT_SAMPLES }, (_, index) => ({
+          x: FIXED_LAMP_X - FIXED_LAMP_WIDTH / 2 +
+            (index / (AREA_LIGHT_SAMPLES - 1)) * FIXED_LAMP_WIDTH,
+          y: FIXED_LAMP_Y,
+        })),
+        emissionScale: DIRECT_LIGHT_SCALE,
+        occludedTransmission: 0,
+        halfAngle: DIRECT_LIGHT_HALF_ANGLE,
+        angularExponent: 1.48,
+        distanceScale: 470,
+        distanceExponent: 1.35,
+      });
     }
-    return direct / AREA_LIGHT_SAMPLES;
+    const daylightOutput = this.effectiveNaturalLightOutput();
+    if (daylightOutput > 0) {
+      emitters.push({
+        id: 'daylight',
+        output: daylightOutput,
+        samples: Array.from({ length: AMBIENT_SKY_SAMPLES }, (_, index) => ({
+          x: ((index + 0.5) / AMBIENT_SKY_SAMPLES) * TANK_WIDTH,
+          y: WATER_TOP - 12,
+        })),
+        emissionScale: NATURAL_LIGHT_SCALE,
+        // A broad sky source is not a set of laser rays. Blocked samples keep
+        // a small diffuse component representing water/air scattering.
+        occludedTransmission: 0.06,
+      });
+    }
+    return emitters;
+  }
+
+  private emitterLightAt(
+    emitter: LightEmitter,
+    point: Vec2,
+    occluders: MatterBody[],
+  ): number {
+    if (emitter.output <= 0 || emitter.samples.length === 0) return 0;
+    const depth = Math.max(0, point.y - WATER_TOP);
+    const waterAttenuation = Math.exp(-depth * 0.00072);
+    let irradiance = 0;
+    for (const sourcePoint of emitter.samples) {
+      const dx = point.x - sourcePoint.x;
+      const dy = Math.max(1, point.y - sourcePoint.y);
+      const distance = Math.hypot(dx, dy);
+      const angleFactor = emitter.halfAngle
+        ? Math.pow(
+          clamp(1 - Math.abs(Math.atan2(dx, dy)) / emitter.halfAngle, 0, 1),
+          emitter.angularExponent ?? 1,
+        )
+        : 1;
+      const distanceFactor = emitter.distanceScale
+        ? 1 / (1 + Math.pow(
+          distance / emitter.distanceScale,
+          emitter.distanceExponent ?? 2,
+        ))
+        : 1;
+      const clear = Query.ray(occluders, sourcePoint, point, 1.1).length === 0;
+      const transmission = clear ? 1 : emitter.occludedTransmission;
+      irradiance += emitter.output * emitter.emissionScale * angleFactor *
+        distanceFactor * waterAttenuation * transmission;
+    }
+    return irradiance / emitter.samples.length;
+  }
+
+  private emittedLightAt(point: Vec2, occluders: MatterBody[]): number {
+    return this.lightEmitters.reduce(
+      (sum, emitter) => sum + this.emitterLightAt(emitter, point, occluders),
+      0,
+    );
   }
 
   private buildLightReflectionSources(): LightReflectionSource[] {
@@ -2350,7 +2463,11 @@ export class SimulationWorld {
       return {
         bodyId: structure.body.id,
         point: reflectionPoint,
-        strength: clamp(this.directLightAt(reflectionPoint, blockers) * 0.065, 0, REFLECTED_LIGHT_LIMIT),
+        strength: clamp(
+          this.emittedLightAt(reflectionPoint, blockers) * 0.065,
+          0,
+          REFLECTED_LIGHT_LIMIT,
+        ),
       };
     }).filter((source) => source.strength >= 0.08);
   }
@@ -2381,7 +2498,7 @@ export class SimulationWorld {
     const occluders = this.structures
       .filter((structure) => structure.body.id !== excludedBodyId && !this.isHeldStructure(structure.id))
       .map((structure) => structure.body);
-    const direct = this.directLightAt(point, occluders);
+    const emitted = this.emittedLightAt(point, occluders);
     const depth = Math.max(0, point.y - WATER_TOP);
     let skyExposure = 0;
     for (let index = 0; index < AMBIENT_SKY_SAMPLES; index += 1) {
@@ -2393,11 +2510,11 @@ export class SimulationWorld {
     }
     skyExposure /= AMBIENT_SKY_SAMPLES;
     const ambient =
-      (1.1 * this.appliedDayNightMultiplier + this.effectiveLightOutput() * 0.03) *
+      (1.1 + this.lightOutput * 0.03) *
       (0.35 + skyExposure * 0.65) *
       Math.exp(-depth * 0.00062);
     const reflected = this.reflectedLightAt(point, excludedBodyId, occluders);
-    return clamp(ambient + direct + reflected, 0, 100);
+    return clamp(ambient + emitted + reflected, 0, 100);
   }
 
   private rebuildCrossConnections(): void {
@@ -3317,11 +3434,16 @@ export class SimulationWorld {
   private producerActivityPoint(
     cell: SurfaceCellState,
     speciesId: SpeciesId,
-    biomass: number,
   ): Vec2 {
     const anchor = this.cellWorldPoint(cell);
     if (speciesId !== 'vallisneria') return anchor;
-    const canopyHeight = 88 + clamp01(biomass) * 190;
+    // Supplied Vallisneria are rooted plants, not leaves rebuilt from reserve
+    // biomass every ecology tick. Their structural canopy therefore stays at
+    // a stable, per-plant height through nightly respiration. Biomass controls
+    // health and eventual death, while both rendering and physiology sample
+    // the same fixed ribbon-leaf canopy.
+    const plantHash = (cell.index * 0.61803398875) % 1;
+    const canopyHeight = (170 + plantHash * 42) * 0.8;
     return {
       x: anchor.x,
       y: Math.max(WATER_TOP + 16, anchor.y - canopyHeight),
@@ -3342,13 +3464,21 @@ export class SimulationWorld {
       const rates = emptyBiomass();
       const physiology = new Map<SpeciesId, ReturnType<typeof algaePhysiology>>();
       const resourceFactors = new Map<SpeciesId, number>();
+      const darkAcclimation = this.dayNightEnabled
+        ? clamp((0.35 - this.appliedDayNightMultiplier) / 0.305, 0, 1)
+        : 0;
       for (const speciesId of this.scenario.allowedSpecies) {
-        const activityPoint = this.producerActivityPoint(cell, speciesId, current[speciesId]);
+        const activityPoint = this.producerActivityPoint(cell, speciesId);
         const activityLight = speciesId === 'vallisneria'
           ? this.sampleLightField(activityPoint)
           : cell.light;
         const localTemperature = this.biogeochemistry.temperatureAt(activityPoint);
-        const response = algaePhysiology(speciesId, activityLight, localTemperature);
+        const response = algaePhysiology(
+          speciesId,
+          activityLight,
+          localTemperature,
+          darkAcclimation,
+        );
         const resourceFactor = this.biogeochemistry.algaeResourceFactor(activityPoint);
         physiology.set(speciesId, response);
         resourceFactors.set(speciesId, resourceFactor);
@@ -3370,7 +3500,7 @@ export class SimulationWorld {
         const amount = current[speciesId];
         if (amount <= 0) continue;
         const response = physiology.get(speciesId)!;
-        const activityPoint = this.producerActivityPoint(cell, speciesId, amount);
+        const activityPoint = this.producerActivityPoint(cell, speciesId);
         const resourceFactor = resourceFactors.get(speciesId) ?? 1;
         const rate = rates[speciesId];
         // Density-dependent limitation throttles only the photosynthesis left
@@ -3851,7 +3981,7 @@ export class SimulationWorld {
         cellSize: cell.cellSize,
         light: cell.light,
         plantCanopyLight: cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS
-          ? this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria', cell.biomass.vallisneria))
+          ? this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria'))
           : null,
         biomass: cloneBiomass(cell.biomass),
         biofilm: { ...cell.biofilm },
