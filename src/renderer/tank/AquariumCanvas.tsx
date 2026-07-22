@@ -3590,7 +3590,7 @@ export function AquariumCanvas({
     const to = clampTankInteractionPoint(toWorldPoint(event));
     const clientStart = dragStartClientRef.current ?? { x: event.clientX, y: event.clientY };
     if (isScreenDrag(clientStart, { x: event.clientX, y: event.clientY })) {
-      send({ type: 'select-region', from, to, filter: 'organism' });
+      send({ type: 'select-region', from, to, filter: selectionFilter });
     }
     else send({ type: 'select-at', point: to, filter: selectionFilter === 'all' ? 'all' : 'organism' });
     dragStartRef.current = null;

@@ -30,6 +30,6 @@ macOS 패키지는 `out/AquaCycle-darwin-*`에 생성됩니다. Windows에서는
 - Web Worker: 물리·광량·성장 시뮬레이션
 - 고해상도 두들 스프라이트 + 절차적 조류 표현
 
-장기 기획은 `docs/CORE_GAMEPLAY.md`, 기존 기술 구조는 `docs/MVP_TECHNICAL_ARCHITECTURE.md`, 현재 재구현 기준은 `docs/V2_REDESIGN.md`를 참고하세요.
+장기 기획은 `docs/CORE_GAMEPLAY.md`, 기존 기술 구조는 `docs/MVP_TECHNICAL_ARCHITECTURE.md`, 현재 재구현 기준은 `docs/V2_REDESIGN.md`를 참고하세요. 조류·체리새우·미생물·물질 순환의 과학적 근거와 차기 공간 수온·공통 물 수송 설계는 [`docs/SIMULATION_MODEL_AND_REFERENCES.md`](./docs/SIMULATION_MODEL_AND_REFERENCES.md)에 분리해 기록합니다.
 
 포함된 글꼴의 출처와 이용 안내는 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)를 참고하세요.

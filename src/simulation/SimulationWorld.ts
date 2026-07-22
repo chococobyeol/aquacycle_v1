@@ -64,6 +64,7 @@ import {
   type SelectionSnapshot,
   type SimulationCommand,
   type SimulationPhase,
+  type SimulationSaveData,
   type SimulationSnapshot,
   type SpeciesBiomass,
   type SpeciesId,
@@ -509,6 +510,11 @@ export class SimulationWorld {
       case 'reset':
         this.initialize(this.scenario.id);
         break;
+      case 'load-save':
+        this.loadSaveData(command.data);
+        break;
+      case 'export-save':
+        break;
       case 'set-speed': {
         const nextSpeed = normalizeSimulationSpeed(command.speed);
         if (nextSpeed !== this.speed) {
@@ -547,7 +553,7 @@ export class SimulationWorld {
         this.selectAt(command.point, command.filter);
         break;
       case 'select-region':
-        this.selectRegion(command.from, command.to);
+        this.selectRegion(command.from, command.to, command.filter);
         break;
       case 'select-measurement':
         this.selectMeasurement(command.id);
@@ -835,6 +841,175 @@ export class SimulationWorld {
     };
   }
 
+  public exportSaveData(): SimulationSaveData {
+    return {
+      version: 1,
+      scenarioId: this.scenario.id,
+      savedPhase: this.phase,
+      outcome: this.outcome,
+      outcomeAtSeconds: this.outcomeAtSeconds,
+      elapsedSeconds: this.elapsedSeconds,
+      speed: this.speed,
+      hasStarted: this.hasStarted,
+      allSettled: this.allSettled,
+      successHoldAccumulator: this.successHoldAccumulator,
+      structureCounter: this.structureCounter,
+      seedCounter: this.seedCounter,
+      animalCounter: this.animalCounter,
+      measurementCounter: this.measurementCounter,
+      lightOutput: this.lightOutput,
+      waterTemperature: this.waterTemperature,
+      structures: this.structures.map((structure) => ({
+        id: structure.id,
+        definitionId: structure.definitionId,
+        x: structure.body.position.x,
+        y: structure.body.position.y,
+        angle: structure.body.angle,
+        vx: structure.body.velocity.x,
+        vy: structure.body.velocity.y,
+        angularVelocity: structure.body.angularVelocity,
+        isSleeping: structure.body.isSleeping,
+        locked: structure.locked,
+        cells: structure.cells.map((cell) => ({
+          id: cell.id,
+          biomass: { ...cell.biomass },
+          biofilm: { ...cell.biofilm },
+        })),
+      })),
+      substrateCells: this.substrateCells.map((cell) => ({
+        id: cell.id,
+        biomass: { ...cell.biomass },
+        biofilm: { ...cell.biofilm },
+      })),
+      seedPlacements: this.seedPlacements.map((placement) => ({ ...placement })),
+      animals: this.animals.map((animal) => cloneAnimalState(animal)),
+      carcasses: this.carcasses.map((carcass) => ({
+        ...carcass,
+        position: { ...carcass.position },
+        waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
+      })),
+      measurements: this.measurements.map((measurement) => ({
+        ...measurement,
+        point: { ...measurement.point },
+      })),
+      animalPopulationEvents: this.animalPopulationEvents.map((event) => ({
+        ...event,
+        water: event.water ? { ...event.water } : null,
+      })),
+      animalPopulationEventTotals: {
+        ...this.animalPopulationEventTotals,
+        deathsByCause: { ...this.animalPopulationEventTotals.deathsByCause },
+      },
+      animalPopulationEventSequence: this.animalPopulationEventSequence,
+      totalAlgaeConsumed: this.totalAlgaeConsumed,
+      animalInventoryUsed: { ...this.animalInventoryUsed },
+      microbeInventoryUsed: { ...this.microbeInventoryUsed },
+      suspendedBiofilm: { ...this.suspendedBiofilm },
+      biofilmSettlementCursor: this.biofilmSettlementCursor,
+      materialReference: this.materialReference ? { ...this.materialReference } : null,
+      biogeochemistry: this.biogeochemistry.exportSaveState(),
+    };
+  }
+
+  public loadSaveData(data: SimulationSaveData): void {
+    if (data.version !== 1) throw new Error('지원하지 않는 냉동 수조 형식입니다.');
+    this.initialize(data.scenarioId);
+
+    this.outcome = data.outcome;
+    this.outcomeAtSeconds = data.outcomeAtSeconds;
+    this.elapsedSeconds = Math.max(0, data.elapsedSeconds);
+    this.speed = normalizeSimulationSpeed(data.speed);
+    this.hasStarted = data.hasStarted;
+    // A thawed tank always opens paused so no ecology time passes while the
+    // player is still orienting themselves after loading.
+    this.phase = data.hasStarted ? 'paused' : 'setup';
+    this.allSettled = data.allSettled;
+    this.successHoldAccumulator = Math.max(0, data.successHoldAccumulator);
+    this.lightOutput = data.lightOutput;
+    this.waterTemperature = data.waterTemperature;
+
+    for (const saved of data.structures) {
+      const structure = this.createStructure(
+        saved.definitionId,
+        saved.x,
+        saved.y,
+        saved.angle,
+        saved.locked,
+        saved.id,
+      );
+      Body.setPosition(structure.body, { x: saved.x, y: saved.y });
+      Body.setAngle(structure.body, saved.angle);
+      Body.setVelocity(structure.body, { x: saved.vx, y: saved.vy });
+      Body.setAngularVelocity(structure.body, saved.angularVelocity);
+      Sleeping.set(structure.body, saved.isSleeping);
+      const savedCells = new Map(saved.cells.map((cell) => [cell.id, cell]));
+      for (const cell of structure.cells) {
+        const restored = savedCells.get(cell.id);
+        if (!restored) continue;
+        cell.biomass = { ...restored.biomass };
+        cell.biofilm = { ...restored.biofilm };
+      }
+    }
+    const savedSubstrate = new Map(data.substrateCells.map((cell) => [cell.id, cell]));
+    for (const cell of this.substrateCells) {
+      const restored = savedSubstrate.get(cell.id);
+      if (!restored) continue;
+      cell.biomass = { ...restored.biomass };
+      cell.biofilm = { ...restored.biofilm };
+    }
+
+    this.structureCounter = Math.max(this.structureCounter, data.structureCounter);
+    this.seedCounter = data.seedCounter;
+    this.animalCounter = data.animalCounter;
+    this.measurementCounter = data.measurementCounter;
+    this.seedPlacements = data.seedPlacements.map((placement) => ({ ...placement }));
+    this.animals = data.animals.map((animal) => cloneAnimalState(animal));
+    this.carcasses = data.carcasses.map((carcass) => ({
+      ...carcass,
+      position: { ...carcass.position },
+      waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
+    }));
+    this.measurements = data.measurements.map((measurement) => ({
+      ...measurement,
+      point: { ...measurement.point },
+    }));
+    this.animalPopulationEvents = data.animalPopulationEvents.map((event) => ({
+      ...event,
+      water: event.water ? { ...event.water } : null,
+    }));
+    this.animalPopulationEventTotals = {
+      ...data.animalPopulationEventTotals,
+      deathsByCause: { ...data.animalPopulationEventTotals.deathsByCause },
+    };
+    this.animalPopulationEventSequence = data.animalPopulationEventSequence;
+    this.totalAlgaeConsumed = data.totalAlgaeConsumed;
+    this.animalInventoryUsed = { ...data.animalInventoryUsed };
+    this.microbeInventoryUsed = { ...data.microbeInventoryUsed };
+    this.suspendedBiofilm = { ...data.suspendedBiofilm };
+    this.biofilmSettlementCursor = data.biofilmSettlementCursor;
+    this.materialReference = data.materialReference ? { ...data.materialReference } : null;
+    this.biogeochemistry.restoreSaveState(data.biogeochemistry);
+
+    this.held = null;
+    this.probe = null;
+    this.selection = null;
+    this.pointer = { x: TANK_WIDTH / 2, y: WATER_TOP + 120 };
+    this.settleAccumulator = 0;
+    this.physicsAccumulator = 0;
+    this.growthAccumulator = 0;
+    this.animalMotionAccumulator = 0;
+    this.snapshotAccumulator = 0;
+    this.revision = 0;
+    this.crossConnectionsDirty = true;
+    this.lightDirty = true;
+    this.rebuildCrossConnections();
+    this.recomputeLight();
+    this.snapshotDirty = true;
+    this.message = data.hasStarted
+      ? '냉동 수조를 해동했습니다. 일시정지 상태에서 이어서 관찰할 수 있습니다.'
+      : '배치 중이던 냉동 수조를 해동했습니다.';
+  }
+
   public hasActiveMotion(): boolean {
     return Boolean(this.held) || (this.phase === 'running' && this.animals.length > 0) || this.structures.some(
       ({ body }) => !body.isStatic && !body.isSleeping,
@@ -885,6 +1060,7 @@ export class SimulationWorld {
     y: number,
     angle = 0,
     locked = false,
+    restoredId?: string,
   ): StructureState {
     const definition = STRUCTURES[definitionId];
     const options: Matter.IChamferableBodyDefinition = {
@@ -909,7 +1085,13 @@ export class SimulationWorld {
     Body.setDensity(body, definition.density);
     Body.setAngle(body, angle);
 
-    const id = `structure-${++this.structureCounter}`;
+    const id = restoredId ?? `structure-${++this.structureCounter}`;
+    if (restoredId) {
+      const restoredCounter = Number.parseInt(restoredId.replace(/^structure-/, ''), 10);
+      if (Number.isFinite(restoredCounter)) {
+        this.structureCounter = Math.max(this.structureCounter, restoredCounter);
+      }
+    }
     body.label = `structure:${id}`;
     const sampled = sampleEcologyFace(definition);
     const cellIds = sampled.map((_, index) => `${id}:cell-${index}`);
@@ -1036,6 +1218,19 @@ export class SimulationWorld {
   private pickExistingAt(point: Vec2): void {
     if (!this.canEdit() || this.held) return;
     this.pointer = this.clampPointer(point);
+
+    const nearestMeasurement = this.measurements.reduce<{
+      measurement: MeasurementState;
+      distance: number;
+    } | null>((nearest, measurement) => {
+      const distance = Math.sqrt(distanceSquared(this.pointer, measurement.point));
+      return !nearest || distance < nearest.distance ? { measurement, distance } : nearest;
+    }, null);
+    if (nearestMeasurement && nearestMeasurement.distance <= 30) {
+      this.selectMeasurement(nearestMeasurement.measurement.id);
+      this.message = '측정점을 선택했습니다. 아래 편집 도구에서 회수할 수 있습니다.';
+      return;
+    }
 
     if (!this.hasStarted) {
       const seed = this.nearestSeed(this.pointer);
@@ -1182,19 +1377,25 @@ export class SimulationWorld {
         const biomass = nearest.cell.biomass;
         const speciesIds = (Object.keys(biomass) as SpeciesId[])
           .filter((speciesId) => biomass[speciesId] > ALGAE_VISIBLE_BIOMASS);
-        if (speciesIds.length) {
-          const speciesId = [...speciesIds]
-            .sort((a, b) => biomass[b] - biomass[a])[0];
+        const microbeGuildIds = (['decomposer', 'nitrifier'] as const)
+          .filter((guildId) => nearest.cell.biofilm[guildId] >= 0.001);
+        if (speciesIds.length || microbeGuildIds.length) {
+          const speciesId = speciesIds.length
+            ? [...speciesIds].sort((a, b) => biomass[b] - biomass[a])[0]
+            : undefined;
           const location = this.cellWorldPoint(nearest.cell);
           this.selection = {
             kind: 'colony',
             ...location,
-            ownerLabel: nearest.cell.ownerLabel,
+            ownerLabel: `${nearest.cell.ownerLabel} 표면`,
             cellId: nearest.cell.id,
             speciesId,
             speciesIds,
+            microbeGuildIds,
           };
-          this.message = `${SPECIES[speciesId].shortName} 군락을 선택했습니다.`;
+          this.message = speciesId
+            ? `${SPECIES[speciesId].shortName} 군락과 같은 표면의 생태를 선택했습니다.`
+            : `${nearest.cell.ownerLabel}의 균 필름을 선택했습니다.`;
           return;
         }
       }
@@ -1229,7 +1430,7 @@ export class SimulationWorld {
     this.clearSelectionWithMessage('이 위치에는 선택할 수 있는 대상이 없습니다.');
   }
 
-  private selectRegion(from: Vec2, to: Vec2): void {
+  private selectRegion(from: Vec2, to: Vec2, filter: SelectionFilter): void {
     const start = this.clampPointer(from);
     const end = this.clampPointer(to);
     const bounds = {
@@ -1238,19 +1439,34 @@ export class SimulationWorld {
       maxX: Math.max(start.x, end.x),
       maxY: Math.max(start.y, end.y),
     };
-    const cells = this.allCells().filter((cell) => {
+    const cells = (filter === 'organism' || filter === 'all')
+      ? this.allCells().filter((cell) => {
       const point = this.cellWorldPoint(cell);
-      const biomass = cell.biomass.oedogonium + cell.biomass.nitzschia;
-      return biomass > ALGAE_VISIBLE_BIOMASS &&
+      const algae = cell.biomass.oedogonium + cell.biomass.nitzschia;
+      const microbes = cell.biofilm.decomposer + cell.biofilm.nitrifier;
+      return (algae > ALGAE_VISIBLE_BIOMASS || microbes >= 0.001) &&
         point.x >= bounds.minX && point.x <= bounds.maxX &&
         point.y >= bounds.minY && point.y <= bounds.maxY;
-    });
-    const animals = this.animals.filter((animal) =>
+      })
+      : [];
+    const animals = (filter === 'organism' || filter === 'all')
+      ? this.animals.filter((animal) =>
       animal.position.x >= bounds.minX && animal.position.x <= bounds.maxX &&
-      animal.position.y >= bounds.minY && animal.position.y <= bounds.maxY,
-    );
-    if (!cells.length && !animals.length) {
-      this.clearSelectionWithMessage('선택 영역 안에 보이는 생물이 없습니다.');
+      animal.position.y >= bounds.minY && animal.position.y <= bounds.maxY)
+      : [];
+    const structures = (filter === 'structure' || filter === 'all')
+      ? Query.region(this.structures.map((structure) => structure.body), {
+        min: { x: bounds.minX, y: bounds.minY },
+        max: { x: bounds.maxX, y: bounds.maxY },
+      }).flatMap((body) => this.structures.filter((structure) => structure.body.id === body.id))
+      : [];
+    const measurements = (filter === 'measurement' || filter === 'all')
+      ? this.measurements.filter(({ point }) =>
+        point.x >= bounds.minX && point.x <= bounds.maxX &&
+        point.y >= bounds.minY && point.y <= bounds.maxY)
+      : [];
+    if (!cells.length && !animals.length && !structures.length && !measurements.length) {
+      this.clearSelectionWithMessage('선택 영역 안에 관찰할 대상이 없습니다.');
       return;
     }
     const totals = cells.reduce<SpeciesBiomass>((sum, cell) => ({
@@ -1260,21 +1476,29 @@ export class SimulationWorld {
     const speciesIds = (Object.keys(totals) as SpeciesId[])
       .filter((speciesId) => totals[speciesId] > ALGAE_VISIBLE_BIOMASS);
     const speciesId = [...speciesIds].sort((a, b) => totals[b] - totals[a])[0];
+    const microbeGuildIds = (['decomposer', 'nitrifier'] as const).filter((guildId) =>
+      cells.some((cell) => cell.biofilm[guildId] >= 0.001));
+    const summaryParts = [
+      structures.length ? `구조물 ${structures.length}` : '',
+      measurements.length ? `측정점 ${measurements.length}` : '',
+      animals.length ? `새우 ${animals.length}` : '',
+      cells.length ? `표면 ${cells.length}` : '',
+    ].filter(Boolean);
     this.selection = {
       kind: 'region',
       x: (bounds.minX + bounds.maxX) / 2,
       y: (bounds.minY + bounds.maxY) / 2,
-      ownerLabel: animals.length
-        ? `선택 영역 · 새우 ${animals.length}마리${cells.length ? ` · 군락 ${cells.length}곳` : ''}`
-        : `선택 영역 · 군락 관찰점 ${cells.length}개`,
+      ownerLabel: `선택 영역 · ${summaryParts.join(' · ')}`,
       speciesId,
       speciesIds,
+      microbeGuildIds,
+      cellIds: cells.map((cell) => cell.id),
       animalIds: animals.map((animal) => animal.id),
+      structureIds: structures.map((structure) => structure.id),
+      measurementIds: measurements.map((measurement) => measurement.id),
       bounds,
     };
-    this.message = animals.length
-      ? `영역 안의 새우 ${animals.length}마리${cells.length ? `와 군락 ${cells.length}곳` : ''}을 선택했습니다.`
-      : `영역 안의 군락 관찰점 ${cells.length}개를 선택했습니다.`;
+    this.message = `영역 안에서 ${summaryParts.join(', ')}을 선택했습니다.`;
   }
 
   private selectMeasurement(id: string): void {

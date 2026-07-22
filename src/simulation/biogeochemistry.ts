@@ -3,6 +3,7 @@ import {
   TANK_WIDTH,
   WATER_TOP,
   type BiofilmBiomass,
+  type BiogeochemistrySaveState,
   type BiogeochemistrySnapshot,
   type MicrobeGuildId,
   type SpeciesBiomass,
@@ -317,6 +318,44 @@ export class BiogeochemistryLedger {
       headspaceCarbonDioxide: this.headspaceCarbonDioxide,
       headspaceOxygen: this.headspaceOxygen,
     };
+  }
+
+  public exportSaveState(): BiogeochemistrySaveState {
+    return {
+      detritus: Array.from(this.detritus),
+      organicMatter: Array.from(this.organicMatter),
+      toxicWaste: Array.from(this.toxicWaste),
+      nutrients: Array.from(this.nutrients),
+      oxygen: Array.from(this.oxygen),
+      dissolvedInorganicCarbon: this.dissolvedInorganicCarbon,
+      headspaceCarbonDioxide: this.headspaceCarbonDioxide,
+      headspaceOxygen: this.headspaceOxygen,
+      cumulativeOxygenProduction: this.cumulativeOxygenProduction,
+      cumulativeOxygenDemand: this.cumulativeOxygenDemand,
+      cumulativeDissolvedWaste: this.cumulativeDissolvedWaste,
+      fieldRevision: this.fieldRevision,
+    };
+  }
+
+  public restoreSaveState(state: BiogeochemistrySaveState): void {
+    const restoreField = (target: Float32Array | Float64Array, source: number[]): void => {
+      for (let index = 0; index < target.length; index += 1) {
+        const value = source[index];
+        target[index] = Number.isFinite(value) ? Math.max(0, value) : 0;
+      }
+    };
+    restoreField(this.detritus, state.detritus);
+    restoreField(this.organicMatter, state.organicMatter);
+    restoreField(this.toxicWaste, state.toxicWaste);
+    restoreField(this.nutrients, state.nutrients);
+    restoreField(this.oxygen, state.oxygen);
+    this.dissolvedInorganicCarbon = Math.max(0, state.dissolvedInorganicCarbon);
+    this.headspaceCarbonDioxide = Math.max(0, state.headspaceCarbonDioxide);
+    this.headspaceOxygen = Math.max(0, state.headspaceOxygen);
+    this.cumulativeOxygenProduction = Math.max(0, state.cumulativeOxygenProduction);
+    this.cumulativeOxygenDemand = Math.max(0, state.cumulativeOxygenDemand);
+    this.cumulativeDissolvedWaste = Math.max(0, state.cumulativeDissolvedWaste);
+    this.fieldRevision = Math.max(0, Math.floor(state.fieldRevision));
   }
 
   public snapshot(): BiogeochemistrySnapshot {

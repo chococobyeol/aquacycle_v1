@@ -5,6 +5,7 @@ import {
   useState,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from 'react';
 import {
   ALGAE_VISIBLE_BIOMASS,
@@ -34,13 +35,20 @@ import type {
   StructureDefinitionId,
   Vec2,
 } from '../../simulation/types';
-import { TANK_HEIGHT, TANK_WIDTH } from '../../simulation/types';
+import { GROUND_Y, TANK_HEIGHT, TANK_WIDTH, WATER_TOP } from '../../simulation/types';
 import { useSimulation } from '../hooks/useSimulation';
+import {
+  discardFrozenAquarium,
+  freezeAquarium,
+  readFrozenAquariums,
+  type FrozenAquariumRecord,
+} from '../storage/aquariumSaves';
 import { AquariumCanvas, type AquariumCameraTransform } from '../tank/AquariumCanvas';
 import {
   analysisLayerStatistics,
   type WaterQualityLayer,
 } from '../tank/waterQualityOverlay';
+import { CloseGlyph } from './CloseGlyph';
 
 interface SimulationScreenProps {
   scenarioId: ScenarioId;
@@ -80,6 +88,109 @@ interface EcologyHistoryPoint {
 }
 
 type HudPanelId = 'menu' | 'inventory' | 'quest' | 'observation';
+type ObservationView = 'selection' | 'overview';
+type ObservationSection = 'ecology' | 'water' | 'ledger' | 'history';
+
+interface ObservationSectionDefinition {
+  id: ObservationSection;
+  title: string;
+  summary: string;
+}
+
+interface DetachedPanelLayout {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface DetachedPanelInteractionState {
+  section: ObservationSection;
+  mode: 'move' | 'resize';
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startLayout: DetachedPanelLayout;
+  workspaceWidth: number;
+  workspaceHeight: number;
+}
+
+interface RightPanelResizeState {
+  pointerId: number;
+  startClientY: number;
+  startHeight: number;
+  maximumHeight: number;
+}
+
+const OBSERVATION_SECTION_ORDER: ObservationSection[] = ['ecology', 'water', 'ledger', 'history'];
+const DETACHED_PANEL_EDGE = 10;
+const DETACHED_PANEL_TOP = 74;
+const DETACHED_PANEL_BOTTOM = DETACHED_PANEL_EDGE;
+const DETACHED_PANEL_MIN_WIDTH = 300;
+const DETACHED_PANEL_MAX_WIDTH = 560;
+const DETACHED_PANEL_MIN_HEIGHT = 220;
+const RIGHT_PANEL_MIN_HEIGHT = 260;
+
+const clampDetachedPanelLayout = (
+  layout: DetachedPanelLayout,
+  workspaceWidth: number,
+  workspaceHeight: number,
+): DetachedPanelLayout => {
+  const maximumWidth = Math.max(1, workspaceWidth - DETACHED_PANEL_EDGE * 2);
+  const maximumHeight = Math.max(1, workspaceHeight - DETACHED_PANEL_TOP - DETACHED_PANEL_BOTTOM);
+  const minimumWidth = Math.min(DETACHED_PANEL_MIN_WIDTH, maximumWidth);
+  const minimumHeight = Math.min(DETACHED_PANEL_MIN_HEIGHT, maximumHeight);
+  const width = Math.max(minimumWidth, Math.min(Math.min(DETACHED_PANEL_MAX_WIDTH, maximumWidth), layout.width));
+  const height = Math.max(minimumHeight, Math.min(maximumHeight, layout.height));
+  return {
+    x: Math.max(DETACHED_PANEL_EDGE, Math.min(workspaceWidth - DETACHED_PANEL_EDGE - width, layout.x)),
+    y: Math.max(DETACHED_PANEL_TOP, Math.min(workspaceHeight - DETACHED_PANEL_BOTTOM - height, layout.y)),
+    width,
+    height,
+  };
+};
+
+const createDetachedPanelLayout = (
+  section: ObservationSection,
+  workspaceWidth: number,
+  workspaceHeight: number,
+): DetachedPanelLayout => {
+  const sectionIndex = OBSERVATION_SECTION_ORDER.indexOf(section);
+  const rightRailWidth = Math.min(372, Math.max(300, workspaceWidth * 0.27)) + 22;
+  const usableWidth = Math.max(DETACHED_PANEL_MIN_WIDTH, workspaceWidth - rightRailWidth - DETACHED_PANEL_EDGE * 2);
+  const initialTop = workspaceHeight >= 760 ? 214 : 114;
+  const usableHeight = Math.max(
+    DETACHED_PANEL_MIN_HEIGHT,
+    workspaceHeight - initialTop - DETACHED_PANEL_BOTTOM,
+  );
+  const gap = 12;
+  const twoColumns = usableWidth >= DETACHED_PANEL_MIN_WIDTH * 2 + gap;
+
+  if (twoColumns) {
+    const width = Math.min(380, (usableWidth - gap) / 2);
+    const height = Math.max(DETACHED_PANEL_MIN_HEIGHT, (usableHeight - gap) / 2);
+    return clampDetachedPanelLayout({
+      x: DETACHED_PANEL_EDGE + (sectionIndex % 2) * (width + gap),
+      y: initialTop + Math.floor(sectionIndex / 2) * (height + gap),
+      width,
+      height,
+    }, workspaceWidth, workspaceHeight);
+  }
+
+  const preferredHeight = section === 'history' ? 460 : section === 'water' ? 360 : 300;
+  return clampDetachedPanelLayout({
+    x: DETACHED_PANEL_EDGE + sectionIndex * 18,
+    y: initialTop + sectionIndex * 30,
+    width: Math.min(420, usableWidth),
+    height: preferredHeight,
+  }, workspaceWidth, workspaceHeight);
+};
+
+const detachedPanelLayoutsMatch = (
+  first: DetachedPanelLayout,
+  second: DetachedPanelLayout,
+): boolean => first.x === second.x && first.y === second.y &&
+  first.width === second.width && first.height === second.height;
 
 const closedHudPanels = (): Record<HudPanelId, boolean> => ({
   menu: false,
@@ -240,6 +351,20 @@ function HudIcon({ kind }: { kind: HudPanelId | 'back' }) {
   );
 }
 
+function ObservationDockGlyph({ direction }: { direction: 'detach' | 'attach' }) {
+  return (
+    <svg className="observation-dock-glyph" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="3" y="3.5" width="18" height="17" rx="2.5" />
+      <path d="M15.5 3.5v17" />
+      {direction === 'detach' ? (
+        <path d="M12.5 9H6m0 0 2.5-2.5M6 9l2.5 2.5" />
+      ) : (
+        <path d="M6 9h6.5m0 0L10 6.5M12.5 9 10 11.5" />
+      )}
+    </svg>
+  );
+}
+
 function RotateButton({
   direction,
   send,
@@ -285,17 +410,32 @@ export function SimulationScreen({
   onBack,
   onMissionComplete,
 }: SimulationScreenProps) {
-  const { snapshot, motionSource, send } = useSimulation(scenarioId);
+  const { snapshot, motionSource, send, requestSave, loadSave } = useSimulation(scenarioId);
   const scenario = SCENARIOS[scenarioId];
   const [activeTool, setActiveTool] = useState<InteractionTool>('select');
   const [inventoryCategory, setInventoryCategory] = useState<InventoryCategory>('structures');
   const [catalogSpecies, setCatalogSpecies] = useState<SpeciesId | null>(null);
   const [catalogAnimal, setCatalogAnimal] = useState<AnimalSpeciesId | null>(null);
   const [pendingInventory, setPendingInventory] = useState<PendingInventoryItem | null>(null);
-  const [waterQualityLayers, setWaterQualityLayers] = useState<WaterQualityLayer[]>([]);
+  const [waterQualityLayers, setWaterQualityLayers] = useState<WaterQualityLayer[]>(['organicMatter']);
+  const [waterQualityMapVisible, setWaterQualityMapVisible] = useState(false);
+  const [waterQualityLegendCollapsed, setWaterQualityLegendCollapsed] = useState(false);
   const waterQualityLayer = waterQualityLayers[0] ?? null;
   const [showMissionBriefing, setShowMissionBriefing] = useState(scenario.mode === 'challenge');
   const [openHudPanels, setOpenHudPanels] = useState<Record<HudPanelId, boolean>>(closedHudPanels);
+  const [observationView, setObservationView] = useState<ObservationView>('overview');
+  const [openObservationSections, setOpenObservationSections] = useState<ObservationSection[]>(['ecology']);
+  const [detachedObservationSections, setDetachedObservationSections] = useState<ObservationSection[]>([]);
+  const [detachedPanelLayouts, setDetachedPanelLayouts] = useState<Partial<Record<ObservationSection, DetachedPanelLayout>>>({});
+  const [activeDetachedSection, setActiveDetachedSection] = useState<ObservationSection | null>(null);
+  const [detachedPanelInteraction, setDetachedPanelInteraction] = useState<'move' | 'resize' | null>(null);
+  const [rightPanelHeight, setRightPanelHeight] = useState<number | null>(null);
+  const [rightPanelResizing, setRightPanelResizing] = useState(false);
+  const [saveVaultOpen, setSaveVaultOpen] = useState(false);
+  const [frozenAquariums, setFrozenAquariums] = useState<FrozenAquariumRecord[]>(readFrozenAquariums);
+  const [saveName, setSaveName] = useState('');
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [showGoalGuide, setShowGoalGuide] = useState(false);
   const [cameraTransform, setCameraTransform] = useState<AquariumCameraTransform | null>(null);
   const [cameraResetToken, setCameraResetToken] = useState(0);
@@ -305,14 +445,29 @@ export function SimulationScreen({
   const pendingInventoryRef = useRef<PendingInventoryItem | null>(null);
   const pendingInventoryRequestIdRef = useRef(0);
   const lastEcologySampleAt = useRef(Number.NEGATIVE_INFINITY);
+  const lastObservationSelectionKey = useRef<string | null>(null);
+  const tankWorkspaceRef = useRef<HTMLElement | null>(null);
+  const floatingInfoStackRef = useRef<HTMLElement | null>(null);
+  const detachedPanelInteractionRef = useRef<DetachedPanelInteractionState | null>(null);
+  const rightPanelResizeRef = useRef<RightPanelResizeState | null>(null);
   const [ecologyHistory, setEcologyHistory] = useState<EcologyHistoryPoint[]>([]);
   pendingInventoryRef.current = pendingInventory;
 
+  const observationSelectionKey = snapshot?.selection
+    ? JSON.stringify(snapshot.selection)
+    : catalogSpecies
+      ? `species:${catalogSpecies}`
+      : catalogAnimal
+        ? `animal:${catalogAnimal}`
+        : null;
+
   const enableWaterQualityLayer = useCallback((layer: WaterQualityLayer): void => {
+    setWaterQualityMapVisible(true);
     setWaterQualityLayers((current) => current.includes(layer) ? current : [...current, layer]);
   }, []);
 
   const toggleWaterQualityLayer = useCallback((layer: WaterQualityLayer): void => {
+    setWaterQualityMapVisible(true);
     setWaterQualityLayers((current) => current.includes(layer)
       ? current.filter((item) => item !== layer)
       : [...current, layer]);
@@ -325,8 +480,24 @@ export function SimulationScreen({
     setCatalogSpecies(null);
     setCatalogAnimal(null);
     setPendingInventory(null);
-    setWaterQualityLayers([]);
+    setWaterQualityLayers(['organicMatter']);
+    setWaterQualityMapVisible(false);
+    setWaterQualityLegendCollapsed(false);
     setOpenHudPanels(closedHudPanels());
+    setObservationView('overview');
+    setOpenObservationSections(['ecology']);
+    setDetachedObservationSections([]);
+    setDetachedPanelLayouts({});
+    setActiveDetachedSection(null);
+    setDetachedPanelInteraction(null);
+    setRightPanelHeight(null);
+    setRightPanelResizing(false);
+    rightPanelResizeRef.current = null;
+    setSaveVaultOpen(false);
+    setFrozenAquariums(readFrozenAquariums());
+    setSaveName('');
+    setSaveBusy(false);
+    setSaveNotice(null);
     setShowGoalGuide(false);
     setCameraTransform(null);
     setCameraResetToken((current) => current + 1);
@@ -335,6 +506,42 @@ export function SimulationScreen({
     lastEcologySampleAt.current = Number.NEGATIVE_INFINITY;
     setEcologyHistory([]);
   }, [scenarioId]);
+
+  useEffect(() => {
+    const workspace = tankWorkspaceRef.current;
+    if (!workspace) return undefined;
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setDetachedPanelLayouts((current) => {
+        let changed = false;
+        const next = { ...current };
+        for (const section of OBSERVATION_SECTION_ORDER) {
+          const layout = current[section];
+          if (!layout) continue;
+          const clamped = clampDetachedPanelLayout(layout, width, height);
+          if (!detachedPanelLayoutsMatch(layout, clamped)) {
+            next[section] = clamped;
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    });
+    resizeObserver.observe(workspace);
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!observationSelectionKey) {
+      lastObservationSelectionKey.current = null;
+      setObservationView('overview');
+      return;
+    }
+    if (lastObservationSelectionKey.current !== observationSelectionKey) {
+      lastObservationSelectionKey.current = observationSelectionKey;
+      setObservationView('selection');
+    }
+  }, [observationSelectionKey]);
 
   useEffect(() => {
     if (!snapshot) return;
@@ -480,7 +687,6 @@ export function SimulationScreen({
   const canvasEditable = editable || (biofilmEditable && (
     pendingInventory?.kind === 'biofilm' || snapshot.holding?.kind === 'biofilm'
   ));
-  const removalEditable = editable && !snapshot.holding && !pendingInventory;
   const progress = snapshot.missionProgress;
   const scoredZoneTarget = scenario.target?.type === 'habitat-coverage' ? scenario.target : null;
   const goalGuideCopy = scoredZoneTarget
@@ -488,12 +694,8 @@ export function SimulationScreen({
     : null;
   const selectedCells = snapshot.selection?.kind === 'colony' && snapshot.selection.cellId
     ? snapshot.cells.filter((cell) => cell.id === snapshot.selection?.cellId)
-    : snapshot.selection?.kind === 'region' && snapshot.selection.bounds
-      ? snapshot.cells.filter((cell) => {
-        const { minX, minY, maxX, maxY } = snapshot.selection!.bounds!;
-        return cell.x >= minX && cell.x <= maxX && cell.y >= minY && cell.y <= maxY &&
-          cell.biomass.oedogonium + cell.biomass.nitzschia > ALGAE_VISIBLE_BIOMASS;
-      })
+    : snapshot.selection?.kind === 'region' && snapshot.selection.cellIds
+      ? snapshot.cells.filter((cell) => snapshot.selection?.cellIds?.includes(cell.id))
       : [];
   const selectedBiomass = selectedCells.length
     ? selectedCells.reduce((total, cell) => ({
@@ -509,11 +711,7 @@ export function SimulationScreen({
       cell.biomass[speciesId] > ALGAE_VISIBLE_BIOMASS,
     ))
     : [];
-  const selectionFilter: SelectionFilter = inventoryCategory === 'structures'
-    ? 'structure'
-    : inventoryCategory === 'organisms'
-      ? 'organism'
-      : 'measurement';
+  const selectionFilter: SelectionFilter = 'all';
   const selectedAnimal = snapshot.selection?.kind === 'animal' && snapshot.selection.animalId
     ? snapshot.animals.find((animal) => animal.id === snapshot.selection?.animalId)
     : undefined;
@@ -522,6 +720,15 @@ export function SimulationScreen({
     : undefined;
   const selectedRegionAnimals = snapshot.selection?.kind === 'region' && snapshot.selection.animalIds
     ? snapshot.animals.filter((animal) => snapshot.selection?.animalIds?.includes(animal.id))
+    : [];
+  const selectedRegionStructures = snapshot.selection?.kind === 'region' && snapshot.selection.structureIds
+    ? snapshot.structures.filter((structure) => snapshot.selection?.structureIds?.includes(structure.id))
+    : [];
+  const selectedRegionMeasurements = snapshot.selection?.kind === 'region' && snapshot.selection.measurementIds
+    ? snapshot.measurements.filter((measurement) => snapshot.selection?.measurementIds?.includes(measurement.id))
+    : [];
+  const selectedMicrobeGuildIds = snapshot.selection?.kind === 'colony' || snapshot.selection?.kind === 'region'
+    ? MICROBE_IDS.filter((guildId) => selectedCells.some((cell) => cell.biofilm[guildId] >= 0.001))
     : [];
   const selectedStructure = snapshot.selection?.kind === 'structure' && snapshot.selection.structureId
     ? snapshot.structures.find((structure) => structure.id === snapshot.selection?.structureId)
@@ -536,6 +743,39 @@ export function SimulationScreen({
     : catalogSpecies;
   const inspectedAnimalSpecies = selectedAnimal?.speciesId ?? selectedCarcass?.speciesId ??
     (selectedRegionAnimals.length ? selectedRegionAnimals[0].speciesId : catalogAnimal);
+  const hasObservationSelection = Boolean(snapshot.selection || catalogSpecies || catalogAnimal);
+  const observationSelectionLabel = snapshot.selection?.ownerLabel ??
+    (catalogSpecies ? SPECIES[catalogSpecies].shortName : null) ??
+    (catalogAnimal ? ANIMALS[catalogAnimal].displayName : null) ??
+    '선택 대상';
+  const showProbePanel = Boolean(snapshot.probe) ||
+    activeTool === 'light-probe' ||
+    activeTool === 'temperature-probe' ||
+    activeTool === 'water-quality-probe';
+  const observationSections: ObservationSectionDefinition[] = [
+    {
+      id: 'ecology',
+      title: '생물·조류',
+      summary: `조류 ${(snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia).toFixed(1)} · 새우 ${snapshot.animalPopulation['cherry-shrimp'].total}마리`,
+    },
+    ...(scenario.waterCycle ? [
+      {
+        id: 'water' as const,
+        title: '수질·미생물',
+        summary: `산소 ${snapshot.biogeochemistry.average.oxygen.toFixed(1)} · 노폐물 ${snapshot.biogeochemistry.average.toxicWaste.toFixed(1)}`,
+      },
+      {
+        id: 'ledger' as const,
+        title: '기체·물질 장부',
+        summary: '질소·탄소 보존 확인',
+      },
+    ] : []),
+    {
+      id: 'history',
+      title: '변화 기록',
+      summary: '그래프·출생·사망 원인',
+    },
+  ];
   const selectedProbeTrend = inspectedSpecies
     ? (snapshot.probe ?? selectedMeasurement)?.trends[inspectedSpecies]
     : undefined;
@@ -545,7 +785,12 @@ export function SimulationScreen({
   const heldStructurePosition = snapshot.holding?.kind === 'structure'
     ? snapshot.holding
     : heldStructure;
-  const rightPanelVisible = (openHudPanels.quest || openHudPanels.observation) &&
+  const observationDockVisible = openHudPanels.observation && !(
+    observationView === 'overview' &&
+    observationSections.length > 0 &&
+    detachedObservationSections.length === observationSections.length
+  );
+  const rightPanelVisible = (openHudPanels.quest || observationDockVisible) &&
     !snapshot.holding && !pendingInventory;
   const cameraFitView = !cameraTransform || cameraTransform.zoom < 0.999;
   const inventoryPanelVisible = openHudPanels.inventory && !snapshot.holding && !pendingInventory;
@@ -664,11 +909,187 @@ export function SimulationScreen({
       ? '관찰 중에도 측정점을 설치할 수 있습니다'
       : '도구를 골라 수조 값을 측정하세요';
   })();
+  const scenarioFrozenAquariums = frozenAquariums.filter((record) => record.scenarioId === scenarioId);
+
+  const toggleObservationSection = (section: ObservationSection): void => {
+    setOpenObservationSections((current) => current.includes(section)
+      ? current.filter((item) => item !== section)
+      : [...current, section]);
+  };
+
+  const detachObservationSection = (section: ObservationSection): void => {
+    const workspace = tankWorkspaceRef.current;
+    if (workspace) {
+      const rect = workspace.getBoundingClientRect();
+      setDetachedPanelLayouts((current) => current[section]
+        ? current
+        : {
+          ...current,
+          [section]: createDetachedPanelLayout(section, rect.width, rect.height),
+        });
+    }
+    setDetachedObservationSections((current) => current.includes(section)
+      ? current
+      : [...current, section]);
+    setActiveDetachedSection(section);
+  };
+
+  const attachObservationSection = (section: ObservationSection): void => {
+    setDetachedObservationSections((current) => current.filter((item) => item !== section));
+    setOpenObservationSections((current) => current.includes(section)
+      ? current
+      : [...current, section]);
+    setActiveDetachedSection((current) => current === section ? null : current);
+  };
+
+  const beginDetachedPanelDrag = (
+    event: ReactPointerEvent<HTMLElement>,
+    section: ObservationSection,
+  ): void => {
+    if ((event.target as HTMLElement).closest('button')) return;
+    const workspace = tankWorkspaceRef.current;
+    if (!workspace) return;
+    const workspaceRect = workspace.getBoundingClientRect();
+    const startLayout = detachedPanelLayouts[section] ?? createDetachedPanelLayout(
+      section,
+      workspaceRect.width,
+      workspaceRect.height,
+    );
+    detachedPanelInteractionRef.current = {
+      section,
+      mode: 'move',
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startLayout,
+      workspaceWidth: workspaceRect.width,
+      workspaceHeight: workspaceRect.height,
+    };
+    setDetachedPanelLayouts((current) => current[section] ? current : { ...current, [section]: startLayout });
+    setActiveDetachedSection(section);
+    setDetachedPanelInteraction('move');
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  };
+
+  const beginDetachedPanelResize = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    section: ObservationSection,
+  ): void => {
+    const workspace = tankWorkspaceRef.current;
+    if (!workspace) return;
+    const workspaceRect = workspace.getBoundingClientRect();
+    const startLayout = detachedPanelLayouts[section] ?? createDetachedPanelLayout(
+      section,
+      workspaceRect.width,
+      workspaceRect.height,
+    );
+    detachedPanelInteractionRef.current = {
+      section,
+      mode: 'resize',
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startLayout,
+      workspaceWidth: workspaceRect.width,
+      workspaceHeight: workspaceRect.height,
+    };
+    setDetachedPanelLayouts((current) => current[section] ? current : { ...current, [section]: startLayout });
+    setActiveDetachedSection(section);
+    setDetachedPanelInteraction('resize');
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+    event.preventDefault();
+  };
+
+  const updateDetachedPanelInteraction = (event: ReactPointerEvent<HTMLElement>): void => {
+    const interaction = detachedPanelInteractionRef.current;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - interaction.startClientX;
+    const deltaY = event.clientY - interaction.startClientY;
+    const nextLayout = interaction.mode === 'move'
+      ? {
+        ...interaction.startLayout,
+        x: interaction.startLayout.x + deltaX,
+        y: interaction.startLayout.y + deltaY,
+      }
+      : {
+        ...interaction.startLayout,
+        width: interaction.startLayout.width + deltaX,
+        height: interaction.startLayout.height + deltaY,
+      };
+    setDetachedPanelLayouts((current) => ({
+      ...current,
+      [interaction.section]: clampDetachedPanelLayout(
+        nextLayout,
+        interaction.workspaceWidth,
+        interaction.workspaceHeight,
+      ),
+    }));
+  };
+
+  const endDetachedPanelInteraction = (event: ReactPointerEvent<HTMLElement>): void => {
+    const interaction = detachedPanelInteractionRef.current;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    detachedPanelInteractionRef.current = null;
+    setDetachedPanelInteraction(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const beginRightPanelResize = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    const panel = floatingInfoStackRef.current;
+    const workspace = tankWorkspaceRef.current;
+    if (!panel || !workspace) return;
+    const panelRect = panel.getBoundingClientRect();
+    const workspaceRect = workspace.getBoundingClientRect();
+    rightPanelResizeRef.current = {
+      pointerId: event.pointerId,
+      startClientY: event.clientY,
+      startHeight: panelRect.height,
+      maximumHeight: Math.max(RIGHT_PANEL_MIN_HEIGHT, workspaceRect.bottom - panelRect.top - DETACHED_PANEL_EDGE),
+    };
+    setRightPanelResizing(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+    event.preventDefault();
+  };
+
+  const updateRightPanelResize = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    const interaction = rightPanelResizeRef.current;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    setRightPanelHeight(Math.max(
+      RIGHT_PANEL_MIN_HEIGHT,
+      Math.min(interaction.maximumHeight, interaction.startHeight + event.clientY - interaction.startClientY),
+    ));
+  };
+
+  const endRightPanelResize = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    const interaction = rightPanelResizeRef.current;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    rightPanelResizeRef.current = null;
+    setRightPanelResizing(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const toggleWaterQualityMap = (): void => {
+    if (waterQualityMapVisible) {
+      setWaterQualityMapVisible(false);
+      setWaterQualityLegendCollapsed(false);
+      return;
+    }
+    setWaterQualityLegendCollapsed(false);
+    setWaterQualityMapVisible(true);
+  };
 
   const showCatalogSpecies = (speciesId: SpeciesId): void => {
     send({ type: 'clear-selection' });
     setCatalogAnimal(null);
     setCatalogSpecies(speciesId);
+    setObservationView('selection');
     setOpenHudPanels((current) => ({ ...current, observation: true }));
   };
 
@@ -676,6 +1097,7 @@ export function SimulationScreen({
     send({ type: 'clear-selection' });
     setCatalogSpecies(null);
     setCatalogAnimal(speciesId);
+    setObservationView('selection');
     setOpenHudPanels((current) => ({ ...current, observation: true }));
   };
 
@@ -701,7 +1123,7 @@ export function SimulationScreen({
     } else {
       setActiveTool(tool);
       if (tool === 'water-quality-probe') {
-        setWaterQualityLayers((current) => current.length ? current : ['organicMatter']);
+        setWaterQualityMapVisible(true);
       }
       send({ type: 'clear-selection' });
       if (tool === 'water-quality-probe') {
@@ -716,7 +1138,8 @@ export function SimulationScreen({
 
   const closeObservationMode = (): void => {
     setOpenHudPanels((current) => ({ ...current, observation: false }));
-    setWaterQualityLayers([]);
+    setWaterQualityMapVisible(false);
+    setWaterQualityLegendCollapsed(false);
     if (activeTool === 'water-quality-probe') {
       setActiveTool('select');
       send({ type: 'clear-probe' });
@@ -729,8 +1152,9 @@ export function SimulationScreen({
       return;
     }
     setOpenHudPanels((current) => ({ ...current, inventory: false, observation: true }));
+    setObservationView(observationSelectionKey ? 'selection' : 'overview');
     if (!scenario.waterCycle) return;
-    setWaterQualityLayers((current) => current.length ? current : ['organicMatter']);
+    setWaterQualityMapVisible(true);
     // The map is an observation overlay, not an installation tool. Opening it
     // must leave the pointer in ordinary selection mode.
     setActiveTool('select');
@@ -743,7 +1167,19 @@ export function SimulationScreen({
     setCatalogSpecies(null);
     setCatalogAnimal(null);
     setPendingInventory(null);
-    setWaterQualityLayers([]);
+    setWaterQualityLayers(['organicMatter']);
+    setWaterQualityMapVisible(false);
+    setWaterQualityLegendCollapsed(false);
+    setObservationView('overview');
+    setOpenObservationSections(['ecology']);
+    setDetachedObservationSections([]);
+    setDetachedPanelLayouts({});
+    setActiveDetachedSection(null);
+    setDetachedPanelInteraction(null);
+    setRightPanelHeight(null);
+    setRightPanelResizing(false);
+    detachedPanelInteractionRef.current = null;
+    rightPanelResizeRef.current = null;
     send({ type: 'clear-probe' });
     send({ type: 'clear-selection' });
   };
@@ -755,6 +1191,41 @@ export function SimulationScreen({
     setCameraResetToken((current) => current + 1);
     setOpenHudPanels(closedHudPanels());
     setShowMissionBriefing(snapshot.mode === 'challenge');
+  };
+
+  const freezeCurrentAquarium = async (): Promise<void> => {
+    if (saveBusy || snapshot.holding || pendingInventory) return;
+    setSaveBusy(true);
+    setSaveNotice(null);
+    try {
+      const data = await requestSave();
+      const defaultName = `${scenario.title} · 냉동 수조 ${scenarioFrozenAquariums.length + 1}`;
+      const next = freezeAquarium(saveName.trim() || defaultName, data);
+      setFrozenAquariums(next);
+      setSaveName('');
+      setSaveNotice('현재 순간을 냉동 수조로 보관했습니다.');
+    } catch (error) {
+      setSaveNotice(error instanceof Error ? error.message : '수조를 보관하지 못했습니다.');
+    } finally {
+      setSaveBusy(false);
+    }
+  };
+
+  const thawAquarium = (record: FrozenAquariumRecord): void => {
+    if (record.scenarioId !== scenarioId || snapshot.holding || pendingInventory) return;
+    resetUiState();
+    completionReported.current = false;
+    resumeAfterBriefing.current = false;
+    setEcologyHistory([]);
+    setShowMissionBriefing(false);
+    setCameraResetToken((current) => current + 1);
+    setOpenHudPanels(closedHudPanels());
+    loadSave(record.data);
+  };
+
+  const discardAquarium = (id: string): void => {
+    setFrozenAquariums(discardFrozenAquarium(id));
+    setSaveNotice('냉동 수조를 보관함에서 버렸습니다.');
   };
 
   const openMissionBriefing = (): void => {
@@ -821,7 +1292,7 @@ export function SimulationScreen({
         </div>
       )}
 
-      <main className={`simulation-screen v2-screen tank-first-screen ${rightPanelVisible ? 'has-right-panel' : ''} ${inventoryPanelVisible ? 'has-inventory-panel' : ''} ${snapshot.holding ? 'has-placement-toolbar' : ''} ${cameraFitView ? 'camera-fit-view' : ''}`}>
+      <main ref={tankWorkspaceRef} className={`simulation-screen v2-screen tank-first-screen ${rightPanelVisible ? 'has-right-panel' : ''} ${inventoryPanelVisible ? 'has-inventory-panel' : ''} ${snapshot.holding ? 'has-placement-toolbar' : ''} ${cameraFitView ? 'camera-fit-view' : ''}`}>
         <header className="game-header tank-hud" aria-label="수조 화면 메뉴">
           <div className="hud-tool-group hud-tool-group-left">
             <button
@@ -852,6 +1323,27 @@ export function SimulationScreen({
               title="보유 목록"
               onClick={() => toggleHudPanel('inventory')}
             ><HudIcon kind="inventory" /></button>
+            <div className="hud-mode-switcher" aria-label="수조 조작 모드">
+              <button
+                type="button"
+                className={activeTool === 'select' ? 'active' : ''}
+                disabled={Boolean(snapshot.holding) || Boolean(pendingInventory)}
+                onClick={() => {
+                  setPendingInventory(null);
+                  setActiveTool('select');
+                  send({ type: 'clear-probe' });
+                }}
+              >관찰</button>
+              <button
+                type="button"
+                className={activeTool === 'move' ? 'active' : ''}
+                disabled={!editable || Boolean(snapshot.holding) || Boolean(pendingInventory)}
+                onClick={() => {
+                  setActiveTool('move');
+                  send({ type: 'clear-probe' });
+                }}
+              >편집</button>
+            </div>
           </div>
 
           <div className="game-title tank-hud-title">
@@ -919,7 +1411,7 @@ export function SimulationScreen({
             </button>
             <button
               type="button"
-              className={`hud-tool-button ${openHudPanels.observation || waterQualityLayer ? 'active' : ''}`}
+              className={`hud-tool-button ${openHudPanels.observation ? 'active' : ''}`}
               aria-label={scenario.waterCycle ? '관찰 지도' : '관찰 기록'}
               aria-expanded={openHudPanels.observation}
               aria-controls="floating-observation-panel"
@@ -937,12 +1429,66 @@ export function SimulationScreen({
             <section id="floating-menu-panel" className="paper-panel floating-note floating-menu-panel" aria-label="메뉴">
               <div className="floating-note-heading">
                 <div><span className="panel-label">AQUACYCLE</span><h2>메뉴</h2></div>
-                <button type="button" className="floating-note-close" aria-label="메뉴 닫기" onClick={() => closeHudPanel('menu')}>×</button>
+                <button type="button" className="floating-note-close" aria-label="메뉴 닫기" onClick={() => closeHudPanel('menu')}><CloseGlyph /></button>
               </div>
               <div className="floating-menu-summary">
                 <strong>{scenario.title}</strong>
                 <span>{phaseName(snapshot)} · {formatTime(snapshot.elapsedSeconds)}</span>
               </div>
+              <button
+                type="button"
+                className={`save-vault-toggle ${saveVaultOpen ? 'active' : ''}`}
+                aria-expanded={saveVaultOpen}
+                onClick={() => {
+                  setSaveVaultOpen((current) => !current);
+                  setSaveNotice(null);
+                }}
+              >수조 보관함 <span>{scenarioFrozenAquariums.length}</span></button>
+              {saveVaultOpen && (
+                <section className="save-vault" aria-label="수조 보관함">
+                  <div className="save-vault-heading">
+                    <div><strong>냉동 수조</strong><small>현재 순간을 멈춘 채 보관하고 나중에 해동합니다.</small></div>
+                  </div>
+                  <div className="save-vault-create">
+                    <input
+                      type="text"
+                      value={saveName}
+                      maxLength={28}
+                      placeholder={`${scenario.title} · 냉동 수조 ${scenarioFrozenAquariums.length + 1}`}
+                      aria-label="냉동 수조 이름"
+                      onChange={(event) => setSaveName(event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      disabled={saveBusy || Boolean(snapshot.holding) || Boolean(pendingInventory)}
+                      onClick={() => void freezeCurrentAquarium()}
+                    >{saveBusy ? '냉동 중…' : '현재 수조 냉동'}</button>
+                  </div>
+                  {(snapshot.holding || pendingInventory) && <small className="save-vault-warning">들고 있는 항목을 놓거나 취소한 뒤 보관할 수 있습니다.</small>}
+                  {saveNotice && <p className="save-vault-notice" role="status">{saveNotice}</p>}
+                  <div className="save-vault-list">
+                    {scenarioFrozenAquariums.length === 0 ? (
+                      <p className="save-vault-empty">이 실험에서 보관한 수조가 없습니다.</p>
+                    ) : scenarioFrozenAquariums.map((record) => (
+                      <article className="frozen-aquarium-card" key={record.id}>
+                        <div>
+                          <strong>{record.name}</strong>
+                          <small>{formatTime(record.elapsedSeconds)} · {new Date(record.createdAt).toLocaleString('ko-KR', {
+                            month: 'numeric',
+                            day: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}</small>
+                        </div>
+                        <div className="frozen-aquarium-actions">
+                          <button type="button" onClick={() => thawAquarium(record)}>해동</button>
+                          <button type="button" className="discard" onClick={() => discardAquarium(record.id)}>버리기</button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
               <button type="button" onClick={() => {
                 closeHudPanel('menu');
                 openMissionBriefing();
@@ -959,29 +1505,7 @@ export function SimulationScreen({
                 <span className="panel-label">보유 목록</span>
                 <strong>{inventoryHint}</strong>
               </div>
-              <button type="button" className="floating-note-close" aria-label="보유 목록 닫기" onClick={() => closeHudPanel('inventory')}>×</button>
-            </div>
-
-            <div className="tool-switcher" aria-label="조작 모드">
-              <button
-                type="button"
-                className={activeTool === 'select' ? 'active' : ''}
-                disabled={Boolean(snapshot.holding) || Boolean(pendingInventory)}
-                onClick={() => {
-                  setPendingInventory(null);
-                  setActiveTool('select');
-                  send({ type: 'clear-probe' });
-                }}
-              >선택·관찰</button>
-              <button
-                type="button"
-                className={activeTool === 'move' ? 'active' : ''}
-                disabled={!editable || Boolean(snapshot.holding) || Boolean(pendingInventory)}
-                onClick={() => {
-                  setActiveTool('move');
-                  send({ type: 'clear-probe' });
-                }}
-              >이동·배치</button>
+              <button type="button" className="floating-note-close" aria-label="보유 목록 닫기" onClick={() => closeHudPanel('inventory')}><CloseGlyph /></button>
             </div>
 
             <div className="inventory-tabs" role="tablist" aria-label="목록 종류">
@@ -1201,11 +1725,7 @@ export function SimulationScreen({
                             send({ type: 'clear-probe' });
                             send({ type: 'select-measurement', id: measurement.id });
                             if (measurement.kind === 'water-quality') {
-                              setWaterQualityLayers((current) => current.length
-                                ? current
-                                : ['organicMatter']);
-                            } else {
-                              setWaterQualityLayers([]);
+                              setWaterQualityMapVisible(true);
                             }
                             setOpenHudPanels((current) => ({ ...current, observation: true }));
                           }}
@@ -1253,7 +1773,7 @@ export function SimulationScreen({
                     onCameraChange={setCameraTransform}
                     cameraResetToken={cameraResetToken}
                     showGoalGuide={showGoalGuide}
-                    waterQualityLayers={waterQualityLayers}
+                    waterQualityLayers={waterQualityMapVisible ? waterQualityLayers : []}
                   />
 
                   {biologicalPlacementMarker && (
@@ -1266,12 +1786,17 @@ export function SimulationScreen({
                     </span>
                   )}
 
-                  {scenario.waterCycle && openHudPanels.observation && (
+                  {scenario.waterCycle && openHudPanels.observation && waterQualityMapVisible && (
                     <AnalysisOverlayToolbar
                       snapshot={snapshot}
                       layers={waterQualityLayers}
+                      collapsed={waterQualityLegendCollapsed}
                       onLayerToggle={toggleWaterQualityLayer}
-                      onClose={closeObservationMode}
+                      onToggleCollapsed={() => setWaterQualityLegendCollapsed((current) => !current)}
+                      onClose={() => {
+                        setWaterQualityMapVisible(false);
+                        setWaterQualityLegendCollapsed(false);
+                      }}
                     />
                   )}
 
@@ -1309,11 +1834,19 @@ export function SimulationScreen({
           </section>
 
           {rightPanelVisible && (
-          <aside className="info-panel v2-info-panel floating-info-stack">
+          <aside
+            ref={floatingInfoStackRef}
+            className={`info-panel v2-info-panel floating-info-stack ${
+              observationDockVisible ? 'has-observation-dock' : ''
+            } ${rightPanelResizing ? 'is-resizing' : ''}`}
+            style={observationDockVisible && rightPanelHeight !== null
+              ? { height: `${rightPanelHeight}px` }
+              : undefined}
+          >
             {openHudPanels.quest && (
             <section id="floating-quest-panel" className="paper-panel mission-note floating-note floating-quest-panel">
               <div className="tape" aria-hidden="true" />
-              <button type="button" className="floating-note-close" aria-label="퀘스트 닫기" onClick={() => closeHudPanel('quest')}>×</button>
+              <button type="button" className="floating-note-close" aria-label="퀘스트 닫기" onClick={() => closeHudPanel('quest')}><CloseGlyph /></button>
               <p className="panel-kicker">오늘의 관찰</p>
               <div className="mission-note-heading">
                 <h2>{scenario.subtitle}</h2>
@@ -1367,14 +1900,52 @@ export function SimulationScreen({
             </section>
             )}
 
-            {openHudPanels.observation && (
+            {observationDockVisible && (
             <div id="floating-observation-panel" className="floating-observation-content">
               <section className="paper-panel floating-observation-heading">
-                <div><span className="panel-label">{scenario.waterCycle ? '관찰 지도' : '관찰 기록'}</span><strong>{snapshot.selection?.ownerLabel ?? '수조 전체'}</strong></div>
-                <button type="button" className="floating-note-close" aria-label="관찰 지도 닫기" onClick={closeObservationMode}>×</button>
+                <div>
+                  <span className="panel-label">{scenario.waterCycle ? '관찰 지도' : '관찰 기록'}</span>
+                  <strong>{observationView === 'selection' ? observationSelectionLabel : '수조 전체'}</strong>
+                </div>
+                <div className="observation-heading-actions">
+                  {scenario.waterCycle && (
+                    <button
+                      type="button"
+                      className={`observation-map-toggle ${waterQualityMapVisible ? 'active' : ''}`}
+                      aria-pressed={waterQualityMapVisible}
+                      onClick={toggleWaterQualityMap}
+                    >
+                      <i aria-hidden="true" />
+                      {waterQualityMapVisible ? '색 지도 끄기' : '색 지도 켜기'}
+                    </button>
+                  )}
+                  <button type="button" className="floating-note-close" aria-label="관찰 기록 닫기" onClick={closeObservationMode}><CloseGlyph /></button>
+                </div>
               </section>
 
-            {!selectedMeasurement && !inspectedAnimalSpecies && (
+              <div className="observation-scope-tabs" role="tablist" aria-label="관찰 범위">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={observationView === 'selection'}
+                  className={observationView === 'selection' ? 'active' : ''}
+                  disabled={!hasObservationSelection}
+                  onClick={() => setObservationView('selection')}
+                >선택 대상</button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={observationView === 'overview'}
+                  className={observationView === 'overview' ? 'active' : ''}
+                  onClick={() => setObservationView('overview')}
+                >수조 전체</button>
+              </div>
+
+              <div className="floating-observation-scroll">
+              {observationView === 'selection' && (
+              <>
+
+            {showProbePanel && !selectedMeasurement && !inspectedAnimalSpecies && (
               <section className="paper-panel environment-panel">
                 <div className="panel-row">
                   <span className="panel-label">
@@ -1431,33 +2002,41 @@ export function SimulationScreen({
               </section>
             )}
 
-            {selectedStructure ? (
+            {snapshot.selection?.kind === 'region' ? (
+              <RegionSelectionInspector
+                structures={selectedRegionStructures}
+                measurements={selectedRegionMeasurements}
+                animals={selectedRegionAnimals}
+                cells={selectedCells}
+                snapshot={snapshot}
+              />
+            ) : selectedStructure ? (
               <StructureInspector
                 structure={selectedStructure}
                 snapshot={snapshot}
                 isHeld={snapshot.holding?.kind === 'structure' && snapshot.holding.structureId === selectedStructure.id}
-                canRetrieve={removalEditable && !selectedStructure.locked}
-                onRetrieve={() => send({ type: 'retrieve-structure', id: selectedStructure.id })}
+                canRetrieve={false}
               />
             ) : selectedMeasurement ? (
               <MeasurementInspector
                 measurement={selectedMeasurement}
-                send={send}
                 waterQualityLayers={waterQualityLayers}
                 onWaterQualityLayerToggle={toggleWaterQualityLayer}
               />
             ) : selectedAnimal ? (
               <AnimalInspector
                 animal={selectedAnimal}
-                canRetrieve={removalEditable}
-                onRetrieve={() => send({ type: 'retrieve-animal', id: selectedAnimal.id })}
+                canRetrieve={false}
               />
             ) : selectedCarcass ? (
               <AnimalCarcassInspector carcass={selectedCarcass} />
-            ) : selectedRegionAnimals.length ? (
+            ) : selectedMicrobeGuildIds.length && selectedCells.length ? (
               <>
-                <AnimalGroupInspector animals={selectedRegionAnimals} />
-                {inspectedSpecies && selectedCells.length > 0 && (
+                <SurfaceCommunityInspector
+                  cells={selectedCells}
+                  snapshot={snapshot}
+                />
+                {inspectedSpecies && (
                   <SpeciesGuide
                     speciesId={inspectedSpecies}
                     probeLight={snapshot.probe?.light ?? selectedAverageLight}
@@ -1465,12 +2044,8 @@ export function SimulationScreen({
                     localBiomass={selectedBiomass}
                     onSelect={setCatalogSpecies}
                     availableSpecies={selectionSpeciesIds}
-                    headingLabel="선택 영역의 조류"
-                    scopeLabel={`선택 영역 관찰점 ${selectedCells.length}개`}
-                    onRemoveFromSelection={removalEditable
-                      ? () => send({ type: 'remove-selected-algae', speciesId: inspectedSpecies })
-                      : undefined}
-                    removalScopeLabel="선택 영역"
+                    headingLabel="같은 표면의 조류"
+                    scopeLabel={`선택 표면 ${selectedCells.length}곳`}
                   />
                 )}
               </>
@@ -1485,11 +2060,7 @@ export function SimulationScreen({
                 onSelect={selectionSpeciesIds.length ? setCatalogSpecies : showCatalogSpecies}
                 availableSpecies={selectionSpeciesIds.length ? selectionSpeciesIds : [inspectedSpecies]}
                 headingLabel={selectionSpeciesIds.length ? '선택한 생물' : '생물 정보'}
-                scopeLabel={snapshot.selection?.kind === 'region' ? `선택 영역 관찰점 ${selectedCells.length}개` : '선택한 위치'}
-                onRemoveFromSelection={removalEditable && selectedCells.length
-                  ? () => send({ type: 'remove-selected-algae', speciesId: inspectedSpecies })
-                  : undefined}
-                removalScopeLabel={snapshot.selection?.kind === 'region' ? '선택 영역' : '선택 지점'}
+                scopeLabel="선택한 위치"
               />
             ) : (
               <section className="paper-panel empty-inspector">
@@ -1497,77 +2068,170 @@ export function SimulationScreen({
                   <svg viewBox="0 0 32 32"><circle cx="13" cy="13" r="8" /><path d="m19 19 8 8" /><circle cx="13" cy="13" r="1.5" /></svg>
                 </span>
                 <h3>선택한 대상 없음</h3>
-                <p>
-                  {inventoryCategory === 'structures' && '수조의 구조물을 선택하면 해당 구조물 정보가 표시됩니다.'}
-                  {inventoryCategory === 'organisms' && '보이는 군락이나 동물을 클릭하고, 영역을 드래그해 그 안의 생물을 관찰할 수 있습니다.'}
-                  {inventoryCategory === 'instruments' && '측정점을 설치하거나 수조의 측정점을 선택하면 실시간 값이 표시됩니다.'}
-                </p>
+                <p>수조의 대상을 클릭하거나 영역을 드래그하면 구조물·생물·균 필름·측정점을 함께 관찰할 수 있습니다.</p>
               </section>
             )}
+            </>
+            )}
 
-            <section className="paper-panel observation-panel compact-observation">
-              <div className="panel-label">{scenario.allowedAnimals.length || snapshot.animals.length ? '생태 기록' : '군락 기록'}</div>
-              <dl>
-                {(scenario.allowedAnimals.length || snapshot.animals.length) && (
-                  <>
-                    <div><dt><i className="species-dot cherry-shrimp" />성체 암컷</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adultFemales}마리</dd></div>
-                    <div><dt>성체 수컷</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adultMales}마리</dd></div>
-                    <div><dt>어린 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].juveniles}마리</dd></div>
-                    <div><dt>전체 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].total}마리</dd></div>
-                    <div className="birth-total"><dt>누적 출생</dt><dd>{snapshot.animalPopulationEventTotals.births}마리</dd></div>
-                    <div className="carcass-total"><dt>누적 사망</dt><dd>{snapshot.animalPopulationEventTotals.deaths}마리</dd></div>
-                    {snapshot.carcasses.length > 0 && <div><dt>현재 남은 사체</dt><dd>{snapshot.carcasses.length}마리</dd></div>}
-                    <div className="consumption-total"><dt>새우가 먹은 조류</dt><dd>{snapshot.totalAlgaeConsumed.toFixed(1)}</dd></div>
-                  </>
+            {observationView === 'overview' && (
+            <>
+              <section className="paper-panel observation-panel compact-observation tank-observation-overview">
+                <div className="observation-overview-heading">
+                  <span className="panel-label">수조 기록</span>
+                  {detachedObservationSections.length > 0 && (
+                    <small>{detachedObservationSections.length}개 분리해서 보는 중</small>
+                  )}
+                </div>
+
+                {observationSections
+                  .filter((section) => !detachedObservationSections.includes(section.id))
+                  .map((section) => {
+                    const expanded = openObservationSections.includes(section.id);
+                    const panelId = `observation-section-${section.id}`;
+                    return (
+                      <section className="observation-section" key={section.id}>
+                        <div className="observation-section-heading">
+                          <button
+                            type="button"
+                            className="observation-section-toggle"
+                            aria-expanded={expanded}
+                            aria-controls={panelId}
+                            onClick={() => toggleObservationSection(section.id)}
+                          >
+                            <span>{section.title}</span>
+                            <small>{section.summary}</small>
+                            <i aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            className="observation-section-detach"
+                            aria-label={`${section.title} 따로 보기`}
+                            title="별도 기록창으로 열기"
+                            onClick={() => detachObservationSection(section.id)}
+                          ><ObservationDockGlyph direction="detach" /></button>
+                        </div>
+                        {expanded && (
+                          <div className="observation-section-body" id={panelId}>
+                            <ObservationSectionContent
+                              section={section.id}
+                              snapshot={snapshot}
+                              ecologyHistory={ecologyHistory}
+                            />
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+
+                {observationSections.length === detachedObservationSections.length && (
+                  <p className="observation-detached-empty">모든 항목을 별도 기록창으로 열었습니다.</p>
                 )}
-                {(scenario.allowedSpecies.includes('oedogonium') || snapshot.totalBiomass.oedogonium > 0) && (
-                  <div><dt><i className="species-dot oedogonium" />붓뚜껑말 총량</dt><dd>{snapshot.totalBiomass.oedogonium.toFixed(1)}</dd></div>
-                )}
-                {(scenario.allowedSpecies.includes('nitzschia') || snapshot.totalBiomass.nitzschia > 0) && (
-                  <div><dt><i className="species-dot nitzschia" />규조류 총량</dt><dd>{snapshot.totalBiomass.nitzschia.toFixed(1)}</dd></div>
-                )}
-                {scenario.waterCycle && (
-                  <>
-                    <div className="water-record-divider"><dt>평균 유기물</dt><dd>{snapshot.biogeochemistry.average.organicMatter.toFixed(2)}</dd></div>
-                    <div><dt>평균 암모니아성 노폐물</dt><dd>{snapshot.biogeochemistry.average.toxicWaste.toFixed(2)}</dd></div>
-                    <div><dt>평균 영양염</dt><dd>{snapshot.biogeochemistry.average.nutrients.toFixed(2)}</dd></div>
-                    <div><dt>평균 용존산소</dt><dd>{snapshot.biogeochemistry.average.oxygen.toFixed(2)}</dd></div>
-                    <div><dt>고형 유기 찌꺼기</dt><dd>{snapshot.biogeochemistry.detritusMass.toFixed(2)}</dd></div>
-                    <div><dt><i className="species-dot decomposer" />분해균 필름 총량</dt><dd>{snapshot.biogeochemistry.biofilmTotals.decomposer.toFixed(2)}</dd></div>
-                    <div><dt><i className="species-dot nitrifier" />질산화균 필름 총량</dt><dd>{snapshot.biogeochemistry.biofilmTotals.nitrifier.toFixed(2)}</dd></div>
-                    <div className="water-record-divider"><dt>물속 무기탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.dissolvedInorganicCarbon.toFixed(2)}</dd></div>
-                    <div><dt>공기층 이산화탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceCarbonDioxide.toFixed(2)}</dd></div>
-                    <div><dt>공기층 산소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceOxygen.toFixed(2)}</dd></div>
-                    <div className="material-ledger-row"><dt>질소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalNitrogen.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.nitrogenDriftRatio)}</small></dd></div>
-                    <div className="material-ledger-row"><dt>탄소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalCarbon.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.carbonDriftRatio)}</small></dd></div>
-                  </>
-                )}
-                {!scenario.allowedAnimals.length && !snapshot.animals.length && (
-                  <div><dt>{snapshot.mode === 'challenge' ? '판정 표면 점유' : '전체 표면 점유'}</dt><dd>{Math.round(snapshot.coverageRatio * 100)}%</dd></div>
-                )}
-              </dl>
-              {(scenario.allowedAnimals.length > 0 || snapshot.animals.length > 0) && (
-                <>
-                  <EcologyHistoryChart points={ecologyHistory} />
-                  <AnimalPopulationEventLog snapshot={snapshot} />
-                </>
+              </section>
+
+              {snapshot.mode === 'laboratory' && (
+                <section className="paper-panel lab-controls v2-lab-controls">
+                  <div className="panel-label">실험실 광원</div>
+                  <label>
+                    <span>출력 <strong>{Math.round(snapshot.lightOutput)}</strong></span>
+                    <input type="range" min={30} max={120} value={snapshot.lightOutput} disabled={!editable} onChange={(event) => send({ type: 'set-light-output', output: Number(event.target.value) })} />
+                  </label>
+                </section>
               )}
-              {scenario.waterCycle && <WaterCycleHistoryChart points={ecologyHistory} />}
-              {scenario.waterCycle && <ClosedCycleHistoryChart points={ecologyHistory} />}
-            </section>
-
-            {snapshot.mode === 'laboratory' && (
-              <section className="paper-panel lab-controls v2-lab-controls">
-                <div className="panel-label">실험실 광원</div>
-                <label>
-                  <span>출력 <strong>{Math.round(snapshot.lightOutput)}</strong></span>
-                  <input type="range" min={30} max={120} value={snapshot.lightOutput} disabled={!editable} onChange={(event) => send({ type: 'set-light-output', output: Number(event.target.value) })} />
-                </label>
-              </section>
+            </>
             )}
+              </div>
             </div>
             )}
+
+            {observationDockVisible && (
+              <button
+                type="button"
+                className="floating-info-resize-handle"
+                aria-label="관찰 패널 높이 조절"
+                title="드래그해 높이 조절 · 두 번 클릭해 전체 높이"
+                onDoubleClick={() => setRightPanelHeight(null)}
+                onPointerDown={beginRightPanelResize}
+                onPointerMove={updateRightPanelResize}
+                onPointerUp={endRightPanelResize}
+                onPointerCancel={endRightPanelResize}
+              ><span aria-hidden="true" /></button>
+            )}
           </aside>
+          )}
+
+          {openHudPanels.observation && !snapshot.holding && !pendingInventory && detachedObservationSections.length > 0 && (
+            <aside className="detached-observation-stack" aria-label="분리한 관찰 기록">
+              {detachedObservationSections.map((sectionId) => {
+                const section = observationSections.find((item) => item.id === sectionId);
+                if (!section) return null;
+                const workspaceRect = tankWorkspaceRef.current?.getBoundingClientRect();
+                const layout = detachedPanelLayouts[section.id] ?? createDetachedPanelLayout(
+                  section.id,
+                  workspaceRect?.width ?? window.innerWidth,
+                  workspaceRect?.height ?? window.innerHeight,
+                );
+                const isActive = activeDetachedSection === section.id;
+                return (
+                  <section
+                    className={`paper-panel detached-observation-panel compact-observation ${
+                      isActive && detachedPanelInteraction === 'move' ? 'is-dragging' : ''
+                    } ${
+                      isActive && detachedPanelInteraction === 'resize' ? 'is-resizing' : ''
+                    }`}
+                    key={section.id}
+                    style={{
+                      left: `${layout.x}px`,
+                      top: `${layout.y}px`,
+                      width: `${layout.width}px`,
+                      height: `${layout.height}px`,
+                      zIndex: isActive ? 5 : 1,
+                    }}
+                    onPointerDownCapture={() => setActiveDetachedSection(section.id)}
+                  >
+                    <header
+                      className="detached-observation-heading"
+                      title="제목줄을 드래그하여 이동"
+                      onPointerDown={(event) => beginDetachedPanelDrag(event, section.id)}
+                      onPointerMove={updateDetachedPanelInteraction}
+                      onPointerUp={endDetachedPanelInteraction}
+                      onPointerCancel={endDetachedPanelInteraction}
+                    >
+                      <span className="detached-observation-grip" aria-hidden="true" />
+                      <strong>{section.title}</strong>
+                      <button
+                        type="button"
+                        className="detached-observation-attach"
+                        onClick={() => attachObservationSection(section.id)}
+                        aria-label={`${section.title} 수조 기록에 넣기`}
+                        title="수조 기록에 다시 넣기"
+                      ><ObservationDockGlyph direction="attach" /></button>
+                    </header>
+                    <div className="detached-observation-body">
+                      <ObservationSectionContent
+                        section={section.id}
+                        snapshot={snapshot}
+                        ecologyHistory={ecologyHistory}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      className="detached-observation-resize-handle"
+                      aria-label={`${section.title} 기록창 크기 조절`}
+                      title="드래그하여 창 크기 조절"
+                      onPointerDown={(event) => beginDetachedPanelResize(event, section.id)}
+                      onPointerMove={updateDetachedPanelInteraction}
+                      onPointerUp={endDetachedPanelInteraction}
+                      onPointerCancel={endDetachedPanelInteraction}
+                    >
+                      <svg viewBox="0 0 18 18" aria-hidden="true">
+                        <path d="M8 16 16 8M12 16l4-4M4 16 16 4" />
+                      </svg>
+                    </button>
+                  </section>
+                );
+              })}
+            </aside>
           )}
         </section>
 
@@ -1614,10 +2278,271 @@ export function SimulationScreen({
                 )}
               </div>
             </section>
+          ) : activeTool === 'move' && selectedMeasurement && editable ? (
+            <section className="tank-edit-selection-toolbar" aria-label="선택한 측정점 편집">
+              <div><span>편집 대상</span><strong>{selectedMeasurement.kind === 'light' ? '광량 측정점' : selectedMeasurement.kind === 'temperature' ? '수온 측정점' : '수질 측정점'}</strong></div>
+              <small>관찰 정보와 편집 동작은 분리되어 있습니다.</small>
+              <button type="button" onClick={() => send({ type: 'remove-measurement', id: selectedMeasurement.id })}>측정점 회수</button>
+            </section>
           ) : null}
         </footer>
       </main>
     </>
+  );
+}
+
+function ObservationSectionContent({
+  section,
+  snapshot,
+  ecologyHistory,
+}: {
+  section: ObservationSection;
+  snapshot: SimulationSnapshot;
+  ecologyHistory: EcologyHistoryPoint[];
+}) {
+  const scenario = SCENARIOS[snapshot.scenarioId];
+  const hasShrimpRecord = snapshot.animalPopulation['cherry-shrimp'].total > 0 ||
+    snapshot.animalPopulationEventTotals.births > 0 ||
+    snapshot.animalPopulationEventTotals.deaths > 0 ||
+    snapshot.carcasses.length > 0;
+  const hasAlgaeRecord = snapshot.totalBiomass.oedogonium > ALGAE_VISIBLE_BIOMASS ||
+    snapshot.totalBiomass.nitzschia > ALGAE_VISIBLE_BIOMASS;
+
+  if (section === 'ecology') {
+    return (
+      <dl>
+        {hasShrimpRecord && (
+          <>
+            <div><dt><i className="species-dot cherry-shrimp" />성체 암컷</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adultFemales}마리</dd></div>
+            <div><dt>성체 수컷</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adultMales}마리</dd></div>
+            <div><dt>어린 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].juveniles}마리</dd></div>
+            <div><dt>전체 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].total}마리</dd></div>
+            <div className="birth-total"><dt>누적 출생</dt><dd>{snapshot.animalPopulationEventTotals.births}마리</dd></div>
+            <div className="carcass-total"><dt>누적 사망</dt><dd>{snapshot.animalPopulationEventTotals.deaths}마리</dd></div>
+            {snapshot.carcasses.length > 0 && <div><dt>현재 남은 사체</dt><dd>{snapshot.carcasses.length}마리</dd></div>}
+            <div className="consumption-total"><dt>새우가 먹은 조류</dt><dd>{snapshot.totalAlgaeConsumed.toFixed(1)}</dd></div>
+          </>
+        )}
+        {snapshot.totalBiomass.oedogonium > ALGAE_VISIBLE_BIOMASS && (
+          <div><dt><i className="species-dot oedogonium" />붓뚜껑말 총량</dt><dd>{snapshot.totalBiomass.oedogonium.toFixed(1)}</dd></div>
+        )}
+        {snapshot.totalBiomass.nitzschia > ALGAE_VISIBLE_BIOMASS && (
+          <div><dt><i className="species-dot nitzschia" />규조류 총량</dt><dd>{snapshot.totalBiomass.nitzschia.toFixed(1)}</dd></div>
+        )}
+        {!hasShrimpRecord && !hasAlgaeRecord && (
+          <div className="observation-empty-row"><dt>현재 관찰되는 생물</dt><dd>없음</dd></div>
+        )}
+        {!scenario.allowedAnimals.length && !snapshot.animals.length && (
+          <div><dt>{snapshot.mode === 'challenge' ? '판정 표면 점유' : '전체 표면 점유'}</dt><dd>{Math.round(snapshot.coverageRatio * 100)}%</dd></div>
+        )}
+      </dl>
+    );
+  }
+
+  if (section === 'water') {
+    return (
+      <dl>
+        <div><dt>평균 유기물</dt><dd>{snapshot.biogeochemistry.average.organicMatter.toFixed(2)}</dd></div>
+        <div><dt>평균 암모니아성 노폐물</dt><dd>{snapshot.biogeochemistry.average.toxicWaste.toFixed(2)}</dd></div>
+        <div><dt>평균 영양염</dt><dd>{snapshot.biogeochemistry.average.nutrients.toFixed(2)}</dd></div>
+        <div><dt>평균 용존산소</dt><dd>{snapshot.biogeochemistry.average.oxygen.toFixed(2)}</dd></div>
+        <div><dt>고형 유기 찌꺼기</dt><dd>{snapshot.biogeochemistry.detritusMass.toFixed(2)}</dd></div>
+        <div><dt><i className="species-dot decomposer" />분해균 필름 총량</dt><dd>{snapshot.biogeochemistry.biofilmTotals.decomposer.toFixed(2)}</dd></div>
+        <div><dt><i className="species-dot nitrifier" />질산화균 필름 총량</dt><dd>{snapshot.biogeochemistry.biofilmTotals.nitrifier.toFixed(2)}</dd></div>
+      </dl>
+    );
+  }
+
+  if (section === 'ledger') {
+    return (
+      <dl>
+        <div><dt>물속 무기탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.dissolvedInorganicCarbon.toFixed(2)}</dd></div>
+        <div><dt>공기층 이산화탄소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceCarbonDioxide.toFixed(2)}</dd></div>
+        <div><dt>공기층 산소</dt><dd>{snapshot.biogeochemistry.carbonCycle.headspaceOxygen.toFixed(2)}</dd></div>
+        <div className="material-ledger-row"><dt>질소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalNitrogen.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.nitrogenDriftRatio)}</small></dd></div>
+        <div className="material-ledger-row"><dt>탄소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalCarbon.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.carbonDriftRatio)}</small></dd></div>
+      </dl>
+    );
+  }
+
+  return (
+    <>
+      {(hasShrimpRecord || scenario.allowedAnimals.length > 0) && (
+        <>
+          <EcologyHistoryChart points={ecologyHistory} />
+          <AnimalPopulationEventLog snapshot={snapshot} />
+        </>
+      )}
+      {scenario.waterCycle && <WaterCycleHistoryChart points={ecologyHistory} />}
+      {scenario.waterCycle && <ClosedCycleHistoryChart points={ecologyHistory} />}
+      {!scenario.waterCycle && !hasShrimpRecord && (
+        <p className="observation-empty-copy">기록할 변화가 생기면 여기에 표시됩니다.</p>
+      )}
+    </>
+  );
+}
+
+const waterAtSurfaceCell = (
+  snapshot: SimulationSnapshot,
+  cell: SimulationSnapshot['cells'][number],
+) => {
+  const field = snapshot.biogeochemistry.water;
+  if (!field.columns || !field.rows) return snapshot.biogeochemistry.average;
+  const column = Math.max(0, Math.min(
+    field.columns - 1,
+    Math.floor((cell.x / TANK_WIDTH) * field.columns),
+  ));
+  const row = Math.max(0, Math.min(
+    field.rows - 1,
+    Math.floor(((cell.y - WATER_TOP) / (GROUND_Y - WATER_TOP)) * field.rows),
+  ));
+  const index = row * field.columns + column;
+  return {
+    organicMatter: field.organicMatter[index] ?? snapshot.biogeochemistry.average.organicMatter,
+    toxicWaste: field.toxicWaste[index] ?? snapshot.biogeochemistry.average.toxicWaste,
+    nutrients: field.nutrients[index] ?? snapshot.biogeochemistry.average.nutrients,
+    oxygen: field.oxygen[index] ?? snapshot.biogeochemistry.average.oxygen,
+  };
+};
+
+function SurfaceCommunityInspector({
+  cells,
+  snapshot,
+}: {
+  cells: SimulationSnapshot['cells'];
+  snapshot: SimulationSnapshot;
+}) {
+  const count = Math.max(1, cells.length);
+  const averageLight = cells.reduce((sum, cell) => sum + cell.light, 0) / count;
+  const decomposer = cells.reduce((sum, cell) => sum + cell.biofilm.decomposer, 0);
+  const nitrifier = cells.reduce((sum, cell) => sum + cell.biofilm.nitrifier, 0);
+  const water = cells.reduce((sum, cell) => {
+    const local = waterAtSurfaceCell(snapshot, cell);
+    return {
+      organicMatter: sum.organicMatter + local.organicMatter,
+      toxicWaste: sum.toxicWaste + local.toxicWaste,
+      nutrients: sum.nutrients + local.nutrients,
+      oxygen: sum.oxygen + local.oxygen,
+    };
+  }, { organicMatter: 0, toxicWaste: 0, nutrients: 0, oxygen: 0 });
+  const owners = [...new Set(cells.map((cell) => cell.ownerLabel))];
+
+  return (
+    <section className="paper-panel surface-community-inspector">
+      <div className="surface-community-heading">
+        <span className="surface-community-icon" aria-hidden="true"><i /><i /><i /></span>
+        <div>
+          <span className="panel-label">선택한 표면</span>
+          <h3>균 필름과 표면 환경</h3>
+          <small>{owners.join(' · ')} · {cells.length}개 관찰점</small>
+        </div>
+      </div>
+      <dl className="species-facts">
+        <div><dt><i className="species-dot decomposer" />분해균 필름</dt><dd>평균 {(decomposer / count * 100).toFixed(1)}%</dd></div>
+        <div><dt><i className="species-dot nitrifier" />질산화균 필름</dt><dd>평균 {(nitrifier / count * 100).toFixed(1)}%</dd></div>
+        <div><dt>광량</dt><dd>평균 {averageLight.toFixed(1)} / 100</dd></div>
+        <div><dt>수온</dt><dd>{snapshot.waterTemperature.toFixed(1)}°C</dd></div>
+        <div><dt>유기물</dt><dd>{(water.organicMatter / count).toFixed(2)}</dd></div>
+        <div><dt>암모니아성 노폐물</dt><dd>{(water.toxicWaste / count).toFixed(2)}</dd></div>
+        <div><dt>영양염</dt><dd>{(water.nutrients / count).toFixed(2)}</dd></div>
+        <div><dt>용존산소</dt><dd>{(water.oxygen / count).toFixed(2)}</dd></div>
+      </dl>
+    </section>
+  );
+}
+
+function RegionSelectionInspector({
+  structures,
+  measurements,
+  animals,
+  cells,
+  snapshot,
+}: {
+  structures: SimulationSnapshot['structures'];
+  measurements: SimulationSnapshot['measurements'];
+  animals: SimulationSnapshot['animals'];
+  cells: SimulationSnapshot['cells'];
+  snapshot: SimulationSnapshot;
+}) {
+  const algaeTotal = cells.reduce(
+    (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia,
+    0,
+  );
+  const decomposer = cells.reduce((sum, cell) => sum + cell.biofilm.decomposer, 0);
+  const nitrifier = cells.reduce((sum, cell) => sum + cell.biofilm.nitrifier, 0);
+
+  return (
+    <section className="paper-panel region-selection-inspector">
+      <div className="region-selection-heading">
+        <div><span className="panel-label">영역 관찰</span><h3>선택 영역 안의 대상</h3></div>
+        <strong>{structures.length + measurements.length + animals.length + cells.length}개</strong>
+      </div>
+      <div className="region-selection-counts">
+        <span>구조물 <b>{structures.length}</b></span>
+        <span>측정점 <b>{measurements.length}</b></span>
+        <span>새우 <b>{animals.length}</b></span>
+        <span>표면 <b>{cells.length}</b></span>
+      </div>
+
+      {structures.length > 0 && (
+        <section className="region-selection-group">
+          <h4>구조물 환경 비교</h4>
+          {structures.map((structure) => {
+            const definition = STRUCTURES[structure.definitionId];
+            const surfaceCells = snapshot.cells.filter((cell) => cell.ownerId === structure.id);
+            const lights = surfaceCells.map((cell) => cell.light);
+            const minimum = lights.length ? Math.min(...lights) : 0;
+            const maximum = lights.length ? Math.max(...lights) : 0;
+            const average = lights.length
+              ? lights.reduce((sum, value) => sum + value, 0) / lights.length
+              : 0;
+            const surfaceAlgae = surfaceCells.reduce(
+              (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia,
+              0,
+            );
+            const surfaceBiofilm = surfaceCells.reduce(
+              (sum, cell) => sum + cell.biofilm.decomposer + cell.biofilm.nitrifier,
+              0,
+            );
+            return (
+              <div className="region-structure-row" key={structure.id}>
+                <img src={definition.assetPath} alt="" />
+                <div><strong>{definition.label}</strong><small>수온 {snapshot.waterTemperature.toFixed(1)}°C · 조류 {surfaceAlgae.toFixed(1)} · 균 {surfaceBiofilm.toFixed(1)}</small></div>
+                <span>빛 {minimum.toFixed(0)}–{maximum.toFixed(0)}<b>평균 {average.toFixed(0)}</b></span>
+              </div>
+            );
+          })}
+        </section>
+      )}
+
+      {measurements.length > 0 && (
+        <section className="region-selection-group">
+          <h4>측정점 비교</h4>
+          {measurements.map((measurement, index) => (
+            <div className="region-measurement-row" key={measurement.id}>
+              <span><MeasurementIcon kind={measurement.kind} compact />측정점 {index + 1}</span>
+              <strong>{measurement.kind === 'light'
+                ? `광량 ${Math.round(measurement.light)}`
+                : measurement.kind === 'temperature'
+                  ? `${measurement.temperature.toFixed(1)}°C`
+                  : `산소 ${measurement.water.oxygen.toFixed(1)} · 암모니아 ${measurement.water.toxicWaste.toFixed(1)}`}</strong>
+            </div>
+          ))}
+        </section>
+      )}
+
+      {(animals.length > 0 || cells.length > 0) && (
+        <section className="region-selection-group region-ecology-summary">
+          <h4>생물과 표면</h4>
+          <dl className="species-facts">
+            <div><dt>체리새우</dt><dd>{animals.length}마리</dd></div>
+            <div><dt>조류 총량</dt><dd>{algaeTotal.toFixed(1)}</dd></div>
+            <div><dt>분해균 필름</dt><dd>{decomposer.toFixed(2)}</dd></div>
+            <div><dt>질산화균 필름</dt><dd>{nitrifier.toFixed(2)}</dd></div>
+          </dl>
+        </section>
+      )}
+    </section>
   );
 }
 
@@ -1664,12 +2589,16 @@ function StructureInspector({
 function AnalysisOverlayToolbar({
   snapshot,
   layers,
+  collapsed,
   onLayerToggle,
+  onToggleCollapsed,
   onClose,
 }: {
   snapshot: SimulationSnapshot;
   layers: readonly WaterQualityLayer[];
+  collapsed: boolean;
   onLayerToggle: (layer: WaterQualityLayer) => void;
+  onToggleCollapsed: () => void;
   onClose: () => void;
 }) {
   const dissolvedLayerCount = layers.filter((layer) =>
@@ -1677,56 +2606,76 @@ function AnalysisOverlayToolbar({
 
   return (
     <section
-      className="tank-analysis-toolbar analysis-multiple"
-      aria-label="겹쳐 보는 관찰 지도"
+      className={`tank-analysis-toolbar analysis-multiple ${collapsed ? 'is-collapsed' : ''}`}
+      aria-label="겹쳐 보는 색 지도"
       onPointerDown={(event) => event.stopPropagation()}
     >
       <div className="tank-analysis-heading">
-        <span>관찰 지도</span>
+        <span>색 지도</span>
         <strong>{layers.length ? `${layers.length}개 겹쳐 보기` : '표시 없음'}</strong>
-        <button type="button" onClick={onClose} aria-label="관찰 지도 닫기">×</button>
-      </div>
-      <div className="tank-analysis-selected-layers">
-        {layers.map((layer) => {
-          const channel = waterQualityChannel(layer)!;
-          const statistics = analysisLayerStatistics(snapshot, layer);
-          const isBiofilm = layer === 'decomposer' || layer === 'nitrifier';
-          const formatValue = (value: number): string => isBiofilm
-            ? `${value.toFixed(1)}%`
-            : value.toFixed(1);
-          const displayMode = isBiofilm
-            ? '표면 얼룩'
-            : dissolvedLayerCount === 1
-              ? '색 지도'
-              : '등치선';
-          return (
-            <div className={`tank-analysis-selected-row channel-${layer}`} key={layer}>
-              <i aria-hidden="true" />
-              <strong>{channel.shortLabel}</strong>
-              <span>{displayMode}</span>
-              <small>평균 {formatValue(statistics.average)} · 최고 {formatValue(statistics.maximum)}</small>
-            </div>
-          );
-        })}
-      </div>
-      <small className="tank-analysis-method">
-        {layers.length
-          ? '수질 한 항목은 색 지도로, 여러 항목은 같은 기준의 등치선으로 겹칩니다. 균 필름은 표면 얼룩입니다.'
-          : '아래에서 보고 싶은 수질이나 균 필름을 고르세요. 지도 창은 그대로 유지됩니다.'}
-      </small>
-      <div className="tank-analysis-channel-strip" role="group" aria-label="색 지도 채널">
-        {WATER_QUALITY_CHANNELS.map((item) => (
+        <div className="tank-analysis-actions">
           <button
             type="button"
-            key={item.id}
-            className={`channel-${item.id} ${layers.includes(item.id) ? 'active' : ''}`}
-            aria-pressed={layers.includes(item.id)}
-            onClick={() => onLayerToggle(item.id)}
+            className="tank-analysis-collapse"
+            onClick={onToggleCollapsed}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? '색 지도 범례 펼치기' : '색 지도 범례 접기'}
+            title={collapsed ? '범례 펼치기' : '범례 작게 접기'}
           >
-            <i aria-hidden="true" />{layers.includes(item.id) ? '✓ ' : ''}{item.shortLabel}
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              {collapsed
+                ? <path d="m4 10 4-4 4 4" />
+                : <path d="m4 6 4 4 4-4" />}
+            </svg>
           </button>
-        ))}
+          <button type="button" className="tank-analysis-close" onClick={onClose} aria-label="색 지도 닫기" title="색 표시 끄기"><CloseGlyph /></button>
+        </div>
       </div>
+      {!collapsed && (
+        <>
+          <div className="tank-analysis-selected-layers">
+            {layers.map((layer) => {
+              const channel = waterQualityChannel(layer)!;
+              const statistics = analysisLayerStatistics(snapshot, layer);
+              const isBiofilm = layer === 'decomposer' || layer === 'nitrifier';
+              const formatValue = (value: number): string => isBiofilm
+                ? `${value.toFixed(1)}%`
+                : value.toFixed(1);
+              const displayMode = isBiofilm
+                ? '표면 얼룩'
+                : dissolvedLayerCount === 1
+                  ? '색 지도'
+                  : '등치선';
+              return (
+                <div className={`tank-analysis-selected-row channel-${layer}`} key={layer}>
+                  <i aria-hidden="true" />
+                  <strong>{channel.shortLabel}</strong>
+                  <span>{displayMode}</span>
+                  <small>평균 {formatValue(statistics.average)} · 최고 {formatValue(statistics.maximum)}</small>
+                </div>
+              );
+            })}
+          </div>
+          <small className="tank-analysis-method">
+            {layers.length
+              ? '수질 한 항목은 색 지도로, 여러 항목은 같은 기준의 등치선으로 겹칩니다. 균 필름은 표면 얼룩입니다.'
+              : '아래에서 보고 싶은 수질이나 균 필름을 고르세요. 지도 창은 그대로 유지됩니다.'}
+          </small>
+          <div className="tank-analysis-channel-strip" role="group" aria-label="색 지도 채널">
+            {WATER_QUALITY_CHANNELS.map((item) => (
+              <button
+                type="button"
+                key={item.id}
+                className={`channel-${item.id} ${layers.includes(item.id) ? 'active' : ''}`}
+                aria-pressed={layers.includes(item.id)}
+                onClick={() => onLayerToggle(item.id)}
+              >
+                <i aria-hidden="true" />{layers.includes(item.id) ? '✓ ' : ''}{item.shortLabel}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -1789,12 +2738,10 @@ function WaterQualityReadout({
 
 function MeasurementInspector({
   measurement,
-  send,
   waterQualityLayers,
   onWaterQualityLayerToggle,
 }: {
   measurement: SimulationSnapshot['measurements'][number];
-  send: (command: SimulationCommand) => void;
   waterQualityLayers: readonly WaterQualityLayer[];
   onWaterQualityLayerToggle: (layer: WaterQualityLayer) => void;
 }) {
@@ -1839,7 +2786,6 @@ function MeasurementInspector({
             : <div><dt>관찰 범위</dt><dd>네 수질 · 두 균 필름</dd></div>}
         <div><dt>기록 방식</dt><dd>시뮬레이션 중 실시간 갱신</dd></div>
       </dl>
-      <button type="button" className="remove-measurement" onClick={() => send({ type: 'remove-measurement', id: measurement.id })}>측정점 회수</button>
     </section>
   );
 }

@@ -155,16 +155,32 @@ input:focus-visible {
   display: grid;
   width: 32px;
   height: 32px;
-  padding: 0 0 3px;
+  padding: 0;
   place-items: center;
   border: 2px solid #53615d;
   border-radius: 50%;
   background: rgba(247, 240, 217, 0.86);
   color: #53615d;
-  font-family: "Apple SD Gothic Neo", sans-serif;
-  font-size: 22px;
-  line-height: 1;
   cursor: pointer;
+}
+
+.close-glyph {
+  display: block;
+  width: 15px;
+  height: 15px;
+  overflow: visible;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.menu-settings-close:hover,
+.menu-settings-close:focus-visible {
+  background: #f3d486;
+  color: #344743;
 }
 
 .settings-progress-row {

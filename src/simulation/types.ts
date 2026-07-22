@@ -285,6 +285,10 @@ export interface SelectionSnapshot {
   animalId?: string;
   carcassId?: string;
   animalIds?: string[];
+  structureIds?: string[];
+  measurementIds?: string[];
+  cellIds?: string[];
+  microbeGuildIds?: MicrobeGuildId[];
   bounds?: {
     minX: number;
     minY: number;
@@ -343,12 +347,135 @@ export interface SimulationSnapshot {
   revision: number;
 }
 
+export interface BiogeochemistrySaveState {
+  detritus: number[];
+  organicMatter: number[];
+  toxicWaste: number[];
+  nutrients: number[];
+  oxygen: number[];
+  dissolvedInorganicCarbon: number;
+  headspaceCarbonDioxide: number;
+  headspaceOxygen: number;
+  cumulativeOxygenProduction: number;
+  cumulativeOxygenDemand: number;
+  cumulativeDissolvedWaste: number;
+  fieldRevision: number;
+}
+
+export interface SavedSurfaceCellBiology {
+  id: string;
+  biomass: SpeciesBiomass;
+  biofilm: BiofilmBiomass;
+}
+
+export interface SavedStructureState {
+  id: string;
+  definitionId: StructureDefinitionId;
+  x: number;
+  y: number;
+  angle: number;
+  vx: number;
+  vy: number;
+  angularVelocity: number;
+  isSleeping: boolean;
+  locked: boolean;
+  cells: SavedSurfaceCellBiology[];
+}
+
+export interface SavedAnimalState {
+  id: string;
+  speciesId: AnimalSpeciesId;
+  origin: 'supplied' | 'born';
+  position: Vec2;
+  velocity: Vec2;
+  facing: -1 | 1;
+  poseAngle: number;
+  bodyLength: number;
+  lifeStage: AnimalLifeStage;
+  sex: AnimalSex;
+  ageSeconds: number;
+  lifespanSeconds: number;
+  energy: number;
+  structuralBiomass: number;
+  storedBiomass: number;
+  health: number;
+  behavior: AnimalBehavior;
+  behaviorTimer: number;
+  targetCellId: string | null;
+  nextTargetEvaluation: number;
+  recentIntake: number;
+  consumedBiomass: number;
+  grazingSessionIntake: number;
+  secondsSinceFood: number;
+  growthProgress: number;
+  reproductionCooldown: number;
+  gestationRemaining: number | null;
+  matingAccumulator: number;
+  randomSeed: number;
+}
+
+export interface SavedAnimalCarcassState {
+  id: string;
+  sourceAnimalId: string;
+  speciesId: AnimalSpeciesId;
+  position: Vec2;
+  facing: -1 | 1;
+  poseAngle: number;
+  bodyLength: number;
+  lifeStage: AnimalLifeStage;
+  cause: AnimalDeathCause;
+  waterAtDeath: WaterQualityValues | null;
+  ageSeconds: number;
+}
+
+export interface SimulationSaveData {
+  version: 1;
+  scenarioId: ScenarioId;
+  savedPhase: SimulationPhase;
+  outcome: MissionOutcome;
+  outcomeAtSeconds: number | null;
+  elapsedSeconds: number;
+  speed: SimulationSpeed;
+  hasStarted: boolean;
+  allSettled: boolean;
+  successHoldAccumulator: number;
+  structureCounter: number;
+  seedCounter: number;
+  animalCounter: number;
+  measurementCounter: number;
+  lightOutput: number;
+  waterTemperature: number;
+  structures: SavedStructureState[];
+  substrateCells: SavedSurfaceCellBiology[];
+  seedPlacements: Array<{
+    id: string;
+    speciesId: SpeciesId;
+    cellId: string;
+    locked: boolean;
+  }>;
+  animals: SavedAnimalState[];
+  carcasses: SavedAnimalCarcassState[];
+  measurements: Array<{ id: string; kind: MeasurementKind; point: Vec2 }>;
+  animalPopulationEvents: AnimalPopulationEventSnapshot[];
+  animalPopulationEventTotals: AnimalPopulationEventTotals;
+  animalPopulationEventSequence: number;
+  totalAlgaeConsumed: number;
+  animalInventoryUsed: Record<AnimalSpeciesId, number>;
+  microbeInventoryUsed: Record<MicrobeGuildId, number>;
+  suspendedBiofilm: BiofilmBiomass;
+  biofilmSettlementCursor: number;
+  materialReference: { nitrogen: number; carbon: number } | null;
+  biogeochemistry: BiogeochemistrySaveState;
+}
+
 export type SimulationCommand =
   | { type: 'initialize'; scenarioId: ScenarioId }
   | { type: 'start' }
   | { type: 'pause' }
   | { type: 'resume' }
   | { type: 'reset' }
+  | { type: 'export-save'; requestId: number }
+  | { type: 'load-save'; data: SimulationSaveData }
   | { type: 'set-speed'; speed: SimulationSpeed }
   | { type: 'pointer-move'; point: Vec2 }
   | { type: 'pick-structure'; definitionId: StructureDefinitionId; point?: Vec2 }
@@ -357,7 +484,7 @@ export type SimulationCommand =
   | { type: 'pick-biofilm'; guildId: MicrobeGuildId; point?: Vec2 }
   | { type: 'pick-at'; point: Vec2 }
   | { type: 'select-at'; point: Vec2; filter: SelectionFilter }
-  | { type: 'select-region'; from: Vec2; to: Vec2; filter: 'organism' }
+  | { type: 'select-region'; from: Vec2; to: Vec2; filter: SelectionFilter }
   | { type: 'select-measurement'; id: string }
   | { type: 'clear-selection' }
   | { type: 'drop-held'; point: Vec2 }
@@ -379,6 +506,12 @@ export interface WorkerSnapshotMessage {
   snapshot: SimulationSnapshot;
 }
 
+export interface WorkerSaveMessage {
+  type: 'save-data';
+  requestId: number;
+  data: SimulationSaveData;
+}
+
 export interface WorkerMotionMessage {
   type: 'motion';
   /** Monotonically increases for the lifetime of a simulation worker. */
@@ -391,4 +524,4 @@ export interface WorkerMotionMessage {
   probe: ProbeSnapshot | null;
 }
 
-export type WorkerMessage = WorkerSnapshotMessage | WorkerMotionMessage;
+export type WorkerMessage = WorkerSnapshotMessage | WorkerMotionMessage | WorkerSaveMessage;

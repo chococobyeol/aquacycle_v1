@@ -4,6 +4,7 @@ import type {
   ProbeSnapshot,
   ScenarioId,
   SimulationCommand,
+  SimulationSaveData,
   SimulationSnapshot,
   StructureSnapshot,
   AnimalSnapshot,
@@ -91,6 +92,8 @@ export interface SimulationController {
   snapshot: SimulationSnapshot | null;
   motionSource: SimulationMotionSource;
   send: (command: SimulationCommand) => void;
+  requestSave: () => Promise<SimulationSaveData>;
+  loadSave: (data: SimulationSaveData) => void;
 }
 
 export const commandRebasesMotion = (command: SimulationCommand): boolean => {
@@ -101,6 +104,7 @@ export const commandRebasesMotion = (command: SimulationCommand): boolean => {
     case 'pause':
     case 'resume':
     case 'set-speed':
+    case 'load-save':
     case 'pick-structure':
     case 'pick-seed':
     case 'pick-animal':
@@ -131,6 +135,11 @@ const sameHoldingIdentity = (
 
 export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
   const workerRef = useRef<Worker | null>(null);
+  const saveRequestSequence = useRef(0);
+  const saveRequests = useRef(new Map<number, {
+    resolve: (data: SimulationSaveData) => void;
+    reject: (reason: Error) => void;
+  }>());
   const [motionStore] = useState(createSimulationMotionStore);
   const [snapshot, setSnapshot] = useState<SimulationSnapshot | null>(null);
 
@@ -153,6 +162,11 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
           motionStore.clear();
         }
         setSnapshot(event.data.snapshot);
+      } else if (event.data.type === 'save-data') {
+        const pending = saveRequests.current.get(event.data.requestId);
+        if (!pending) return;
+        saveRequests.current.delete(event.data.requestId);
+        pending.resolve(event.data.data);
       } else {
         const motion = event.data;
         motionStore.accept(motion, performance.now());
@@ -177,6 +191,10 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
       worker.removeEventListener('message', receiveSnapshot);
       worker.terminate();
       workerRef.current = null;
+      for (const pending of saveRequests.current.values()) {
+        pending.reject(new Error('시뮬레이션이 닫혀 저장을 완료하지 못했습니다.'));
+      }
+      saveRequests.current.clear();
       motionStore.reset();
     };
   }, [motionStore, scenarioId]);
@@ -189,5 +207,20 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
     workerRef.current?.postMessage(command);
   }, [motionStore]);
 
-  return { snapshot, motionSource: motionStore, send };
+  const requestSave = useCallback((): Promise<SimulationSaveData> => {
+    const worker = workerRef.current;
+    if (!worker) return Promise.reject(new Error('아직 수조가 준비되지 않았습니다.'));
+    const requestId = saveRequestSequence.current += 1;
+    return new Promise<SimulationSaveData>((resolve, reject) => {
+      saveRequests.current.set(requestId, { resolve, reject });
+      worker.postMessage({ type: 'export-save', requestId } satisfies SimulationCommand);
+    });
+  }, []);
+
+  const loadSave = useCallback((data: SimulationSaveData): void => {
+    motionStore.clear();
+    workerRef.current?.postMessage({ type: 'load-save', data } satisfies SimulationCommand);
+  }, [motionStore]);
+
+  return { snapshot, motionSource: motionStore, send, requestSave, loadSave };
 };

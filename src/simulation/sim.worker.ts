@@ -4,6 +4,7 @@ import { SimulationWorld } from './SimulationWorld';
 import type {
   SimulationCommand,
   WorkerMotionMessage,
+  WorkerSaveMessage,
   WorkerSnapshotMessage,
 } from './types';
 import { MOTION_SAMPLE_INTERVAL_MS } from './types';
@@ -35,6 +36,15 @@ const publishMotion = (): void => {
 };
 
 scope.addEventListener('message', (event: MessageEvent<SimulationCommand>) => {
+  if (event.data.type === 'export-save') {
+    const message: WorkerSaveMessage = {
+      type: 'save-data',
+      requestId: event.data.requestId,
+      data: world.exportSaveData(),
+    };
+    scope.postMessage(message);
+    return;
+  }
   world.handle(event.data);
   if (event.data.type === 'pointer-move' || event.data.type === 'probe') {
     interactiveMotionDirty = true;

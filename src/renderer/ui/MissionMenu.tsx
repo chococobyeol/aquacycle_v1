@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 import type { ScenarioId } from '../../simulation/types';
+import { CloseGlyph } from './CloseGlyph';
 
 type MissionId = Exclude<ScenarioId, 'laboratory'>;
 
@@ -301,7 +302,7 @@ export function MissionMenu({
           if (event.target === event.currentTarget) closeSettings();
         }}>
           <section id="menu-settings-dialog" className="menu-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="menu-settings-title">
-            <button type="button" className="menu-settings-close" aria-label="설정 닫기" onClick={closeSettings}>×</button>
+            <button type="button" className="menu-settings-close" aria-label="설정 닫기" onClick={closeSettings}><CloseGlyph /></button>
             <p className="panel-kicker">AQUACYCLE</p>
             <h2 id="menu-settings-title">설정</h2>
 
