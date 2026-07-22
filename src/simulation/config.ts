@@ -304,8 +304,8 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     colonyAppearance: '육안으로는 밝은 녹색의 얇은 솜털이나 부드러운 막처럼 보입니다.',
     niche: '밝은 돌 앞면에서 빠르게 성장하지만 깊은 그늘에서는 서서히 감소합니다.',
     lightCurve: [
-      { light: 0, netRate: -0.032 },
-      { light: 15, netRate: -0.016 },
+      { light: 0, netRate: -0.004 },
+      { light: 15, netRate: -0.002 },
       { light: 28, netRate: 0 },
       { light: 45, netRate: 0.042 },
       { light: 68, netRate: 0.068 },
@@ -341,8 +341,8 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     colonyAppearance: '육안으로는 황갈색 먼지나 아주 얇은 얼룩막처럼 보입니다.',
     niche: '그늘에서 붓뚜껑말보다 유리하며 밝은 곳에서 즉시 죽지는 않지만 경쟁 우위가 줄어듭니다.',
     lightCurve: [
-      { light: 0, netRate: -0.024 },
-      { light: 6, netRate: -0.012 },
+      { light: 0, netRate: -0.0035 },
+      { light: 6, netRate: -0.001 },
       { light: 12, netRate: 0.006 },
       { light: 25, netRate: 0.055 },
       { light: 38, netRate: 0.062 },
@@ -378,8 +378,8 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     colonyAppearance: '바닥의 생장점에서 가늘고 긴 녹색 잎이 물결치며 위로 뻗습니다.',
     niche: '바닥에만 심을 수 있지만 잎이 위쪽의 밝은 물층까지 닿아 낮 동안 안정적인 생산자 역할을 합니다.',
     lightCurve: [
-      { light: 0, netRate: -0.012 },
-      { light: 10, netRate: -0.005 },
+      { light: 0, netRate: -0.002 },
+      { light: 10, netRate: -0.001 },
       { light: 18, netRate: 0 },
       { light: 35, netRate: 0.018 },
       { light: 58, netRate: 0.032 },

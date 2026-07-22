@@ -278,7 +278,15 @@ describe('consumer-resource emergence', () => {
     expect(productiveSnapshot.animalPopulation[SHRIMP].total).toBeGreaterThan(
       lowSnapshot.animalPopulation[SHRIMP].total,
     );
-    expect(totalAlgae(productiveSnapshot)).toBeGreaterThan(totalAlgae(lowSnapshot));
+    // Standing crop alone can be lower in the productive tank because its
+    // larger shrimp population has already converted more algae into consumer
+    // biomass. Remaining algae plus cumulative grazing is the relevant
+    // primary-production throughput comparison.
+    expect(
+      totalAlgae(productiveSnapshot) + productiveSnapshot.totalAlgaeConsumed,
+    ).toBeGreaterThan(
+      totalAlgae(lowSnapshot) + lowSnapshot.totalAlgaeConsumed,
+    );
     expect(productiveSnapshot.totalAlgaeConsumed).toBeGreaterThan(
       lowSnapshot.totalAlgaeConsumed * 1.25,
     );

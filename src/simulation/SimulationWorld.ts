@@ -3464,21 +3464,13 @@ export class SimulationWorld {
       const rates = emptyBiomass();
       const physiology = new Map<SpeciesId, ReturnType<typeof algaePhysiology>>();
       const resourceFactors = new Map<SpeciesId, number>();
-      const darkAcclimation = this.dayNightEnabled
-        ? clamp((0.35 - this.appliedDayNightMultiplier) / 0.305, 0, 1)
-        : 0;
       for (const speciesId of this.scenario.allowedSpecies) {
         const activityPoint = this.producerActivityPoint(cell, speciesId);
         const activityLight = speciesId === 'vallisneria'
           ? this.sampleLightField(activityPoint)
           : cell.light;
         const localTemperature = this.biogeochemistry.temperatureAt(activityPoint);
-        const response = algaePhysiology(
-          speciesId,
-          activityLight,
-          localTemperature,
-          darkAcclimation,
-        );
+        const response = algaePhysiology(speciesId, activityLight, localTemperature);
         const resourceFactor = this.biogeochemistry.algaeResourceFactor(activityPoint);
         physiology.set(speciesId, response);
         resourceFactors.set(speciesId, resourceFactor);

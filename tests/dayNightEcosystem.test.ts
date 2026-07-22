@@ -46,13 +46,16 @@ describe('day/night producer metabolism', () => {
     expect(dayNightStateAt(300, cycle).lightMultiplier).toBeCloseTo(0.045, 6);
   });
 
-  it('keeps respiration running when gross photosynthesis reaches zero', () => {
+  it('uses the same local-darkness response for night and structural shade', () => {
     for (const speciesId of ['oedogonium', 'nitzschia', 'vallisneria'] as const) {
       const dark = algaePhysiology(speciesId, 0, 24);
       const lit = algaePhysiology(speciesId, 70, 24);
       expect(dark.grossPhotosynthesis).toBe(0);
       expect(dark.respiration).toBeGreaterThan(0);
-      expect(dark.netGrowth).toBeLessThan(0);
+      expect(dark.netGrowth).toBeCloseTo(
+        -dark.respiration - dark.lightStressTurnover,
+        8,
+      );
       expect(lit.grossPhotosynthesis).toBeGreaterThan(lit.respiration);
       expect(lit.netGrowth).toBeGreaterThan(0);
     }
@@ -108,7 +111,8 @@ describe('day/night producer metabolism', () => {
     );
     expect(day.biogeochemistry.algaeFluxes.grossProductionBiomassPerSecond)
       .toBeGreaterThan(day.biogeochemistry.algaeFluxes.respirationBiomassPerSecond);
-    expect(night.biogeochemistry.algaeFluxes.grossProductionBiomassPerSecond).toBe(0);
+    expect(night.biogeochemistry.algaeFluxes.grossProductionBiomassPerSecond)
+      .toBeLessThan(night.biogeochemistry.algaeFluxes.respirationBiomassPerSecond);
     expect(night.biogeochemistry.algaeFluxes.respirationBiomassPerSecond).toBeGreaterThan(0);
   }, 20_000);
 
