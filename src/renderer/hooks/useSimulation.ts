@@ -122,6 +122,8 @@ export const commandRebasesMotion = (command: SimulationCommand): boolean => {
     case 'pick-animal':
     case 'pick-biofilm':
     case 'pick-at':
+    case 'hold-structure':
+    case 'rotate-structure':
     case 'rotate-held':
     case 'retrieve-structure':
     case 'retrieve-animal':

@@ -13,6 +13,42 @@ const seed = (world: SimulationWorld, speciesId: SpeciesId, point: Vec2): void =
 };
 
 describe('editable removal tools', () => {
+  it('selects a structure before moving it and exposes separate move and rotation commands', () => {
+    const world = new SimulationWorld('laboratory');
+    const placement = { x: 510, y: 280 };
+    world.handle({ type: 'pick-structure', definitionId: 'flat-stone', point: placement });
+    world.handle({ type: 'drop-held', point: placement });
+    settle(world);
+
+    const structure = world.snapshot().structures[0];
+    world.handle({ type: 'pick-at', point: structure });
+    const selected = world.snapshot();
+    expect(selected.holding).toBeNull();
+    expect(selected.selection).toMatchObject({
+      kind: 'structure',
+      structureId: structure.id,
+    });
+
+    world.handle({ type: 'rotate-structure', id: structure.id, radians: Math.PI / 18 });
+    const rotated = world.snapshot();
+    expect(rotated.holding).toBeNull();
+    expect(rotated.structures[0].angle).not.toBeCloseTo(structure.angle, 6);
+    expect(rotated.allSettled).toBe(false);
+
+    const cursor = { x: 640, y: 330 };
+    world.handle({ type: 'hold-structure', id: structure.id, point: cursor });
+    const moving = world.snapshot();
+    expect(moving.holding).toMatchObject({
+      kind: 'structure',
+      source: 'existing',
+      structureId: structure.id,
+      x: cursor.x,
+      y: cursor.y,
+    });
+    expect(moving.structures[0].x).toBeCloseTo(cursor.x, 6);
+    expect(moving.structures[0].y).toBeCloseTo(cursor.y, 6);
+  });
+
   it('returns a selected structure to inventory and removes its attached colony', () => {
     const world = new SimulationWorld('laboratory');
     const placement = { x: 510, y: 280 };

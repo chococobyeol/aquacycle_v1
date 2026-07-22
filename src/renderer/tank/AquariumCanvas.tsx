@@ -2876,6 +2876,7 @@ export function AquariumCanvas({
   const lastMotionSequenceRef = useRef<number | null>(null);
   const rebasedMotionSequenceRef = useRef<number | null>(null);
   const activeToolRef = useRef(activeTool);
+  const editableRef = useRef(editable);
   const layersRef = useRef<AquariumLayers | null>(null);
   const texturesRef = useRef(new Map<string, Texture>());
   const structureDisplaysRef = useRef(new Map<string, StructureDisplay>());
@@ -2925,6 +2926,7 @@ export function AquariumCanvas({
   snapshotRef.current = snapshot;
   motionSourceRef.current = motionSource;
   activeToolRef.current = activeTool;
+  editableRef.current = editable;
   onCameraChangeRef.current = onCameraChange;
   hasPendingInventoryRef.current = hasPendingInventory;
   onPendingInventoryReadyRef.current = onPendingInventoryReady;
@@ -3485,6 +3487,13 @@ export function AquariumCanvas({
     }
 
     const handleKeyDown = (event: KeyboardEvent): void => {
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      ) return;
       if (event.key === 'Escape') {
         pendingConsumedRef.current = false;
         send({ type: 'cancel-held' });
@@ -3500,6 +3509,22 @@ export function AquariumCanvas({
       }
       if (snapshotRef.current.holding?.kind === 'structure' && (event.key === 'e' || event.key === 'E')) {
         send({ type: 'rotate-held', radians: Math.PI / 36 });
+      }
+      if (
+        editableRef.current &&
+        activeToolRef.current === 'move' &&
+        (event.key === 'Delete' || event.key === 'Backspace')
+      ) {
+        const current = snapshotRef.current;
+        if (current.holding?.kind === 'structure' && current.holding.source === 'existing') {
+          event.preventDefault();
+          send({ type: 'remove-held-structure' });
+          return;
+        }
+        if (current.selection?.kind === 'structure' && current.selection.structureId) {
+          event.preventDefault();
+          send({ type: 'retrieve-structure', id: current.selection.structureId });
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);

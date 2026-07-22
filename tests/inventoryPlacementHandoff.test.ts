@@ -156,4 +156,17 @@ describe('inventory preview rendering contract', () => {
     expect(screenSource).toContain('onToolComplete={completeCanvasInteraction}');
     expect(canvasSource).toContain("onToolComplete('move');");
   });
+
+  it('selects structures before showing separate move, rotate, and delete actions', () => {
+    expect(screenSource).toContain('className="tank-structure-edit-orbit"');
+    expect(screenSource).toContain("type: 'hold-structure'");
+    expect(screenSource).toContain("type: 'rotate-structure'");
+    expect(screenSource).toContain("type: 'retrieve-structure'");
+    expect(screenSource).toContain('wheel-rotate-hint');
+    expect(screenSource).toContain('motionSource.getFrames()');
+    expect(screenSource).toContain('animationFrame = requestAnimationFrame(updatePosition);');
+    expect(canvasStyles).toContain('.tank-structure-edit-orbit .structure-action-move { top: 0; left: 0; }');
+    expect(canvasSource).toContain("event.key === 'Delete' || event.key === 'Backspace'");
+    expect(canvasStyles).not.toContain('.tank-rotation-orbit');
+  });
 });

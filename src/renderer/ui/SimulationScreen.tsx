@@ -36,10 +36,11 @@ import type {
   SimulationSnapshot,
   SpeciesId,
   StructureDefinitionId,
+  StructureSnapshot,
   Vec2,
 } from '../../simulation/types';
 import { GROUND_Y, TANK_HEIGHT, TANK_WIDTH, WATER_TOP } from '../../simulation/types';
-import { useSimulation } from '../hooks/useSimulation';
+import { useSimulation, type SimulationMotionSource } from '../hooks/useSimulation';
 import {
   discardFrozenAquarium,
   freezeAquarium,
@@ -47,8 +48,14 @@ import {
   type FrozenAquariumRecord,
 } from '../storage/aquariumSaves';
 import { AquariumCanvas, type AquariumCameraTransform } from '../tank/AquariumCanvas';
+import { createReusableMotionInterpolator } from '../tank/motionInterpolation';
+import {
+  structureEditOverlayLayout,
+  structureEditOverlaySnapshot,
+} from '../tank/structureEditOverlay';
 import {
   analysisLayerStatistics,
+  biofilmPlacementLayers,
   type WaterQualityLayer,
 } from '../tank/waterQualityOverlay';
 import { CloseGlyph } from './CloseGlyph';
@@ -76,6 +83,12 @@ interface PendingInventoryItem {
   speciesId?: SpeciesId;
   animalSpeciesId?: AnimalSpeciesId;
   microbeGuildId?: MicrobeGuildId;
+}
+
+interface WaterQualityViewState {
+  layers: WaterQualityLayer[];
+  visible: boolean;
+  legendCollapsed: boolean;
 }
 
 interface EcologyHistoryPoint {
@@ -400,15 +413,21 @@ function ObservationDockGlyph({ direction }: { direction: 'detach' | 'attach' })
 function RotateButton({
   direction,
   send,
+  structureId,
+  className,
 }: {
   direction: -1 | 1;
   send: (command: SimulationCommand) => void;
+  structureId?: string;
+  className?: string;
 }) {
   const timerRef = useRef<number | null>(null);
-  const rotate = (): void => send({
-    type: 'rotate-held',
-    radians: direction * (Math.PI / 18),
-  });
+  const rotate = (): void => {
+    const radians = direction * (Math.PI / 18);
+    send(structureId
+      ? { type: 'rotate-structure', id: structureId, radians }
+      : { type: 'rotate-held', radians });
+  };
   const stop = (): void => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
     timerRef.current = null;
@@ -416,6 +435,7 @@ function RotateButton({
   return (
     <button
       type="button"
+      className={className}
       aria-label={direction < 0 ? '반시계 방향 회전' : '시계 방향 회전'}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId);
@@ -434,6 +454,90 @@ function RotateButton({
         <path d={direction < 0 ? 'M3 3v5h5' : 'M21 3v5h-5'} />
       </svg>
     </button>
+  );
+}
+
+function StructureEditControls({
+  structure,
+  cameraTransform,
+  motionSource,
+  send,
+}: {
+  structure: StructureSnapshot;
+  cameraTransform: AquariumCameraTransform;
+  motionSource: SimulationMotionSource;
+  send: (command: SimulationCommand) => void;
+}) {
+  const orbitRef = useRef<HTMLDivElement | null>(null);
+  const structureRef = useRef(structure);
+  const cameraRef = useRef(cameraTransform);
+  structureRef.current = structure;
+  cameraRef.current = cameraTransform;
+
+  useEffect(() => {
+    const interpolator = createReusableMotionInterpolator();
+    let animationFrame = 0;
+    let lastLayoutKey = '';
+    const updatePosition = (): void => {
+      const base = structureRef.current;
+      const motion = interpolator.sample(motionSource.getFrames(), performance.now());
+      const moving = motion?.structures.find((candidate) => candidate.id === base.id);
+      const rendered = structureEditOverlaySnapshot(base, moving);
+      const layout = structureEditOverlayLayout(rendered, cameraRef.current);
+      const layoutKey = [
+        layout.left,
+        layout.top,
+        layout.rotateLeftX,
+        layout.rotateRightX,
+        layout.deleteY,
+      ].map((value) => value.toFixed(2)).join(':');
+      const orbit = orbitRef.current;
+      if (orbit && layoutKey !== lastLayoutKey) {
+        lastLayoutKey = layoutKey;
+        orbit.style.left = `${layout.left}px`;
+        orbit.style.top = `${layout.top}px`;
+        orbit.style.setProperty('--rotate-left-x', `${layout.rotateLeftX}px`);
+        orbit.style.setProperty('--rotate-right-x', `${layout.rotateRightX}px`);
+        orbit.style.setProperty('--delete-y', `${layout.deleteY}px`);
+      }
+      animationFrame = requestAnimationFrame(updatePosition);
+    };
+    updatePosition();
+    return () => cancelAnimationFrame(animationFrame);
+  }, [motionSource]);
+
+  return (
+    <div
+      ref={orbitRef}
+      className="tank-structure-edit-orbit"
+      aria-label="선택한 구조물 편집"
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      <button
+        type="button"
+        className="structure-action-move"
+        aria-label="구조물 이동"
+        title="이동"
+        onClick={() => send({ type: 'hold-structure', id: structure.id })}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 3v18M3 12h18M12 3 9 6m3-3 3 3M12 21l-3-3m3 3 3-3M3 12l3-3m-3 3 3 3M21 12l-3-3m3 3-3 3" />
+        </svg>
+      </button>
+      <RotateButton className="structure-action-rotate-left" direction={-1} send={send} structureId={structure.id} />
+      <RotateButton className="structure-action-rotate-right" direction={1} send={send} structureId={structure.id} />
+      <button
+        type="button"
+        className="structure-action-delete"
+        aria-label="구조물 삭제"
+        title="보유 목록으로 회수 · Delete"
+        onClick={() => send({ type: 'retrieve-structure', id: structure.id })}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6" />
+        </svg>
+      </button>
+    </div>
   );
 }
 
@@ -476,6 +580,8 @@ export function SimulationScreen({
   const resumeAfterBriefing = useRef(false);
   const pendingInventoryRef = useRef<PendingInventoryItem | null>(null);
   const pendingInventoryRequestIdRef = useRef(0);
+  const biofilmOverlayRestoreRef = useRef<WaterQualityViewState | null>(null);
+  const biofilmPlacementWasActiveRef = useRef(false);
   const lastEcologySampleAt = useRef(Number.NEGATIVE_INFINITY);
   const lastObservationSelectionKey = useRef<string | null>(null);
   const tankWorkspaceRef = useRef<HTMLElement | null>(null);
@@ -496,9 +602,26 @@ export function SimulationScreen({
         ? `animal:${catalogAnimal}`
         : null;
 
-  const enableWaterQualityLayer = useCallback((layer: WaterQualityLayer): void => {
+  const beginBiofilmOverlay = useCallback((guildId: MicrobeGuildId): void => {
+    if (!biofilmOverlayRestoreRef.current) {
+      biofilmOverlayRestoreRef.current = {
+        layers: [...waterQualityLayers],
+        visible: waterQualityMapVisible,
+        legendCollapsed: waterQualityLegendCollapsed,
+      };
+    }
+    setWaterQualityLayers(biofilmPlacementLayers(guildId));
     setWaterQualityMapVisible(true);
-    setWaterQualityLayers((current) => current.includes(layer) ? current : [...current, layer]);
+    setWaterQualityLegendCollapsed(false);
+  }, [waterQualityLayers, waterQualityMapVisible, waterQualityLegendCollapsed]);
+
+  const restoreBiofilmOverlay = useCallback((): void => {
+    const previous = biofilmOverlayRestoreRef.current;
+    if (!previous) return;
+    biofilmOverlayRestoreRef.current = null;
+    setWaterQualityLayers(previous.layers);
+    setWaterQualityMapVisible(previous.visible);
+    setWaterQualityLegendCollapsed(previous.legendCollapsed);
   }, []);
 
   const toggleWaterQualityLayer = useCallback((layer: WaterQualityLayer): void => {
@@ -510,6 +633,8 @@ export function SimulationScreen({
 
   useEffect(() => {
     completionReported.current = false;
+    biofilmOverlayRestoreRef.current = null;
+    biofilmPlacementWasActiveRef.current = false;
     setActiveTool('select');
     setInventoryCategory('structures');
     setCatalogSpecies(null);
@@ -667,6 +792,18 @@ export function SimulationScreen({
     window.addEventListener('keydown', cancel);
     return () => window.removeEventListener('keydown', cancel);
   }, [pendingInventory]);
+
+  const biofilmPlacementActive = pendingInventory?.kind === 'biofilm' ||
+    snapshot?.holding?.kind === 'biofilm';
+  useEffect(() => {
+    if (biofilmPlacementActive) {
+      biofilmPlacementWasActiveRef.current = true;
+      return;
+    }
+    if (!biofilmPlacementWasActiveRef.current) return;
+    biofilmPlacementWasActiveRef.current = false;
+    restoreBiofilmOverlay();
+  }, [biofilmPlacementActive, restoreBiofilmOverlay]);
 
   const returnToSelection = useCallback((): void => {
     setActiveTool('select');
@@ -828,9 +965,9 @@ export function SimulationScreen({
   const heldStructure = snapshot.holding?.kind === 'structure'
     ? snapshot.structures.find((structure) => structure.id === snapshot.holding?.structureId)
     : undefined;
-  const heldStructurePosition = snapshot.holding?.kind === 'structure'
-    ? snapshot.holding
-    : heldStructure;
+  const editableSelectedStructure = activeTool === 'move' && editable && !snapshot.holding
+    ? selectedStructure
+    : undefined;
   const observationDockVisible = openHudPanels.observation && !(
     observationView === 'overview' &&
     observationSections.length > 0 &&
@@ -840,32 +977,6 @@ export function SimulationScreen({
     !snapshot.holding && !pendingInventory;
   const cameraFitView = !cameraTransform || cameraTransform.zoom < 0.999;
   const inventoryPanelVisible = openHudPanels.inventory && !snapshot.holding && !pendingInventory;
-  const heldStructureScreenWidth = heldStructure
-    ? Math.abs(heldStructure.width * Math.cos(heldStructure.angle)) +
-      Math.abs(heldStructure.height * Math.sin(heldStructure.angle))
-    : 0;
-  const rotationOrbitStyle = (() => {
-    if (!heldStructure) return undefined;
-    if (cameraTransform) {
-      const span = Math.min(
-        Math.max(80, cameraTransform.viewportWidth - 12),
-        Math.max(130, heldStructureScreenWidth * cameraTransform.scale + 96),
-      );
-      const x = cameraTransform.offsetX + heldStructurePosition!.x * cameraTransform.scale;
-      const y = cameraTransform.offsetY + heldStructurePosition!.y * cameraTransform.scale;
-      return {
-        left: `${Math.max(span / 2 + 6, Math.min(cameraTransform.viewportWidth - span / 2 - 6, x))}px`,
-        top: `${Math.max(84, Math.min(cameraTransform.viewportHeight - 84, y))}px`,
-        '--orbit-span': `${span}px`,
-      } as CSSProperties;
-    }
-    const span = Math.max(26, (heldStructureScreenWidth / TANK_WIDTH) * 100 + 18);
-    return {
-      left: `${Math.max(span / 2 + 1, Math.min(99 - span / 2, (heldStructurePosition!.x / TANK_WIDTH) * 100))}%`,
-      top: `${(heldStructurePosition!.y / TANK_HEIGHT) * 100}%`,
-      '--orbit-span': `${span}%`,
-    } as CSSProperties;
-  })();
   const biologicalPlacementMarker = snapshot.holding &&
     (snapshot.holding.kind === 'seed' || snapshot.holding.kind === 'biofilm') &&
     cameraTransform
@@ -1224,6 +1335,8 @@ export function SimulationScreen({
   };
 
   const resetUiState = (): void => {
+    biofilmOverlayRestoreRef.current = null;
+    biofilmPlacementWasActiveRef.current = false;
     setActiveTool('select');
     setInventoryCategory('structures');
     setCatalogSpecies(null);
@@ -1717,7 +1830,7 @@ export function SimulationScreen({
                             label: microbe.displayName,
                             microbeGuildId: guildId,
                           });
-                          enableWaterQualityLayer(guildId);
+                          beginBiofilmOverlay(guildId);
                           setActiveTool('move');
                         }}
                       >
@@ -1890,15 +2003,13 @@ export function SimulationScreen({
                     </div>
                   )}
 
-                  {!pendingInventory && snapshot.holding?.kind === 'structure' && heldStructure && (
-                    <div
-                      className="tank-rotation-orbit"
-                      style={rotationOrbitStyle}
-                      aria-label="구조물 회전"
-                    >
-                      <RotateButton direction={-1} send={send} />
-                      <RotateButton direction={1} send={send} />
-                    </div>
+                  {!pendingInventory && editableSelectedStructure && cameraTransform && (
+                    <StructureEditControls
+                      structure={editableSelectedStructure}
+                      cameraTransform={cameraTransform}
+                      motionSource={motionSource}
+                      send={send}
+                    />
                   )}
                 </div>
               </div>
@@ -2351,9 +2462,9 @@ export function SimulationScreen({
                         : SPECIES[snapshot.holding.speciesId!].shortName}
                 </strong>
               </div>
-              <small>
+              <small className={snapshot.holding.kind === 'structure' ? 'wheel-rotate-hint' : undefined}>
                 {snapshot.holding.kind === 'structure'
-                  ? 'Q/E 또는 휠로 회전 · 수조를 클릭해 놓기'
+                  ? <><i aria-hidden="true" />휠 또는 Q/E로 회전 · 수조를 클릭해 놓기</>
                   : snapshot.holding.kind === 'animal'
                     ? '수면 아래 원하는 위치를 클릭해 방류'
                     : snapshot.holding.kind === 'biofilm'

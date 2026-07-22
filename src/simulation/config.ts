@@ -215,6 +215,11 @@ export const SHRIMP_ECOLOGY_RULES = {
   matingRecentFeedingSeconds: 12,
   gestationRecentFeedingSeconds: 24,
   maturationSeconds: 180,
+  // Supplied adults are not a synchronized laboratory cohort. Spreading their
+  // first reproductive opportunity prevents every female from brooding at
+  // once while leaving later reproduction governed by food and life history.
+  suppliedAdultReproductionCooldownMin: 100,
+  suppliedAdultReproductionCooldownMax: 400,
   // The visual population represents a compressed colony. Every completed
   // brood therefore contains at least one individual of each sex (IDs are
   // assigned alternately), avoiding a one-offspring demographic dead end.
@@ -604,13 +609,13 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     id: 'mission-2',
     mode: 'challenge',
     title: '두 번째 실험 · 빛의 틈새',
-    subtitle: '규조류 서식 면적',
+    subtitle: '규조류 군락량',
     instruction:
-      '강한 고정 조명 아래에서 규조류가 안정적으로 자라는 앞면을 전체 구조물 면적의 18%까지 늘리세요.',
+      '강한 고정 조명 아래에서 규조류가 자란 양을 220까지 늘리세요.',
     briefing: {
       question: '밝은 수조에서 저광량을 선호하는 규조류의 서식처를 어떻게 만들 수 있을까요?',
-      goal: '배치한 구조물 전체 앞면 중 규조류가 안정적으로 자란 면적을 18% 이상 만들고 4초간 유지하세요.',
-      success: '너무 밝거나 너무 어두운 곳은 제외하고, 적합한 빛에서 일정 밀도 이상 자란 앞면만 집계합니다.',
+      goal: '수조 전체에서 규조류가 자란 양을 220 이상으로 늘리고 4초간 유지하세요.',
+      success: '위치나 구조물 개수와 관계없이 수조 안의 규조류를 모두 합산합니다.',
       supplied: '규조류 접종 4회 · 넓적한 사암 3개 · 둥근 강돌 4개 · 세로 판석 3개 · 광량 탐침 · 수온계',
     },
     timeLimitSeconds: 260,
@@ -628,16 +633,13 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     dayNightCycle: null,
     dayNightCycleInitiallyEnabled: false,
     target: {
-      type: 'habitat-coverage',
+      type: 'biomass',
       speciesId: 'nitzschia',
-      ratio: 0.18,
-      minBiomass: 0.045,
-      minLight: 12,
-      maxLight: 58,
+      amount: 220,
       holdSeconds: 4,
-      label: '안정된 규조류 면적',
+      label: '규조류가 자란 양',
     },
-    targetIncludesSubstrate: false,
+    targetIncludesSubstrate: true,
   },
   'mission-3': {
     id: 'mission-3',
@@ -653,7 +655,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       supplied: '붓뚜껑말 접종 2회 · 세 종류의 구조물 무제한 · 광량 탐침 · 수온계',
     },
     timeLimitSeconds: 300,
-    lightOutput: 60,
+    lightOutput: 52,
     naturalLightOutput: 0,
     seedBudget: { oedogonium: 2, nitzschia: 0, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0 },
@@ -688,7 +690,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       supplied: '체리새우 성체 4마리 · 두 조류 접종 각 4회 · 세 종류의 구조물 무제한 · 광량 탐침 · 수온계',
     },
     timeLimitSeconds: 300,
-    lightOutput: 88,
+    lightOutput: 68,
     naturalLightOutput: 0,
     seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 4 },

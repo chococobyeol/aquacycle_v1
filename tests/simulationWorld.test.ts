@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { SCENARIOS } from '../src/simulation/config';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
-import type { SpeciesId, StructureDefinitionId, Vec2 } from '../src/simulation/types';
+import type {
+  SpeciesId,
+  StructureDefinitionId,
+  SurfaceCellSnapshot,
+  Vec2,
+} from '../src/simulation/types';
 
 const settle = (world: SimulationWorld, ticks = 600): void => {
   for (let index = 0; index < ticks; index += 1) world.tick(1 / 60);
@@ -136,8 +141,12 @@ describe('V2 mission simulation world', () => {
     expect(continued.elapsedSeconds).toBeGreaterThan(elapsedAtSuccess);
   }, 30_000);
 
-  it('makes mission 2 a diatom-only challenge scored only in the suitable shade band', () => {
+  it('scores mission 2 by total diatom biomass without penalizing extra habitat', () => {
     const world = new SimulationWorld('mission-2');
+    const target = SCENARIOS['mission-2'].target;
+    expect(target?.type).toBe('biomass');
+    if (target?.type !== 'biomass') throw new Error('unexpected mission target');
+    expect(target.amount).toBe(220);
     expect(world.snapshot().remainingSeeds.oedogonium).toBe(0);
     world.handle({ type: 'pick-seed', speciesId: 'oedogonium', point: { x: 400, y: 300 } });
     expect(world.snapshot().holding).toBeNull();
@@ -147,13 +156,16 @@ describe('V2 mission simulation world', () => {
     placeStructure(world, 'round-stone', { x: 875, y: 270 });
     settle(world, 900);
     const snapshot = world.snapshot();
-    const suitableShade = snapshot.cells
-      .filter((cell) => cell.targetEligible && cell.light >= 12 && cell.light <= 58)
-      .sort((a, b) => a.x - b.x);
-    expect(suitableShade.length).toBeGreaterThan(80);
-    for (const ratio of [0.05, 0.35, 0.65, 0.95]) {
-      placeSeed(world, 'nitzschia', suitableShade[Math.floor(suitableShade.length * ratio)]);
-    }
+    const closestToOptimum = (cells: typeof snapshot.cells) => [...cells]
+      .sort((a, b) => Math.abs(a.light - 38) - Math.abs(b.light - 38))[0];
+    const inoculationCells = [
+      ...snapshot.structures.map((structure) => closestToOptimum(
+        snapshot.cells.filter((cell) => cell.ownerId === structure.id),
+      )),
+      closestToOptimum(snapshot.cells.filter((cell) => cell.surfaceKind === 'substrate')),
+    ];
+    expect(inoculationCells).toHaveLength(4);
+    for (const cell of inoculationCells) placeSeed(world, 'nitzschia', cell);
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 8 });
     for (let index = 0; index < 2200 && world.snapshot().outcome === 'pending'; index += 1) {
@@ -161,39 +173,73 @@ describe('V2 mission simulation world', () => {
     }
     const finalSnapshot = world.snapshot();
     expect(finalSnapshot.outcome).toBe('success');
-    expect(finalSnapshot.missionProgress?.unit).toBe('habitat-coverage');
+    expect(finalSnapshot.missionProgress?.unit).toBe('biomass');
+    expect(finalSnapshot.missionProgress?.current).toBeCloseTo(
+      finalSnapshot.totalBiomass.nitzschia,
+      8,
+    );
+    expect(finalSnapshot.totalBiomass.nitzschia).toBeGreaterThanOrEqual(target.amount);
     expect(finalSnapshot.totalBiomass.oedogonium).toBe(0);
   }, 30_000);
 
-  it('starts mission 2 without requiring every supplied structure type', () => {
-    const world = new SimulationWorld('mission-2');
-    placeStructure(world, 'flat-stone', { x: 390, y: 250 });
-    settle(world);
-    const cell = world.snapshot().cells.find((candidate) => candidate.targetEligible);
-    expect(cell).toBeDefined();
-    placeSeed(world, 'nitzschia', cell!);
-    world.handle({ type: 'start' });
-    expect(world.snapshot().phase).toBe('running');
-  });
-
-  it('does not start a surface-scored mission from a substrate-only inoculation', () => {
+  it('starts mission 2 from a substrate inoculation without requiring a structure', () => {
     const world = new SimulationWorld('mission-2');
     const substrate = world.snapshot().cells.find((cell) => cell.surfaceKind === 'substrate')!;
     placeSeed(world, 'nitzschia', substrate);
     world.handle({ type: 'start' });
+    expect(world.snapshot().phase).toBe('running');
+  });
+
+  it('keeps four well-lit substrate inoculations below the mission 2 target', () => {
+    const world = new SimulationWorld('mission-2');
+    const target = SCENARIOS['mission-2'].target;
+    if (target?.type !== 'biomass') throw new Error('unexpected mission target');
+    const selected: SurfaceCellSnapshot[] = [];
+    const substrate = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((a, b) => Math.abs(a.light - 38) - Math.abs(b.light - 38));
+    for (const candidate of substrate) {
+      if (selected.some((cell) => Math.hypot(cell.x - candidate.x, cell.y - candidate.y) < 70)) continue;
+      selected.push(candidate);
+      if (selected.length === 4) break;
+    }
+    expect(selected).toHaveLength(4);
+    for (const cell of selected) placeSeed(world, 'nitzschia', cell);
+
+    world.handle({ type: 'start' });
+    world.handle({ type: 'set-speed', speed: 8 });
+    for (let index = 0; index < 2050; index += 1) world.tick(1 / 60);
+
+    const final = world.snapshot();
+    expect(final.outcome).toBe('failure');
+    expect(final.totalBiomass.nitzschia).toBeLessThan(target.amount);
+  }, 30_000);
+
+  it('requires a diatom inoculation but no particular mission 2 surface', () => {
+    const world = new SimulationWorld('mission-2');
+    world.handle({ type: 'start' });
     expect(world.snapshot().phase).toBe('setup');
-    expect(world.snapshot().message).toContain('구조물 표면');
+    expect(world.snapshot().message).toContain('필수 조류');
+
+    const substrate = world.snapshot().cells.find((cell) => cell.surfaceKind === 'substrate')!;
+    placeSeed(world, 'nitzschia', substrate);
+    world.handle({ type: 'start' });
+    expect(world.snapshot().phase).toBe('running');
+  });
+
+  it('does not reduce mission 2 progress when an unused structure is added', () => {
+    const world = new SimulationWorld('mission-2');
+    const substrate = world.snapshot().cells.find((cell) => cell.surfaceKind === 'substrate')!;
+    placeSeed(world, 'nitzschia', substrate);
+    const before = world.snapshot().missionProgress;
 
     placeStructure(world, 'flat-stone', { x: 390, y: 250 });
     settle(world);
-    world.handle({ type: 'start' });
-    expect(world.snapshot().phase).toBe('setup');
-    expect(world.snapshot().message).toContain('구조물 앞면');
+    const after = world.snapshot().missionProgress;
 
-    const structureCell = world.snapshot().cells.find((cell) => cell.targetEligible)!;
-    placeSeed(world, 'nitzschia', structureCell);
-    world.handle({ type: 'start' });
-    expect(world.snapshot().phase).toBe('running');
+    expect(before?.unit).toBe('biomass');
+    expect(after?.unit).toBe('biomass');
+    expect(after?.current).toBeCloseTo(before!.current, 8);
   });
 
   it('rejects duplicate inoculation without consuming another seed', () => {

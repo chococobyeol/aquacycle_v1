@@ -43,6 +43,12 @@ describe('scalable observation panel layout', () => {
     expect(screenSource).not.toContain("setWaterQualityLayers((current) => current.length ? current : ['organicMatter'])");
   });
 
+  it('restores the previous color-map view after microbial placement', () => {
+    expect(screenSource).toContain('const biofilmOverlayRestoreRef = useRef<WaterQualityViewState | null>(null)');
+    expect(screenSource).toContain('setWaterQualityLayers(biofilmPlacementLayers(guildId))');
+    expect(screenSource).toContain('restoreBiofilmOverlay();');
+  });
+
   it('gives every detached panel stable independent geometry', () => {
     expect(screenSource).toContain('interface DetachedPanelLayout');
     expect(screenSource).toContain('const [detachedPanelLayouts, setDetachedPanelLayouts]');

@@ -6,6 +6,13 @@ import type {
 
 export type WaterQualityLayer = WaterQualityVariable | MicrobeGuildId | 'temperature' | 'flow';
 
+/** Temporary analysis pair shown while choosing a microbial inoculation site. */
+export const biofilmPlacementLayers = (
+  guildId: MicrobeGuildId,
+): WaterQualityLayer[] => guildId === 'decomposer'
+  ? ['organicMatter', 'decomposer']
+  : ['toxicWaste', 'nitrifier'];
+
 /**
  * Dissolved channels do not share one useful ecological scale. In particular,
  * organic matter and toxic waste already matter well below 100.

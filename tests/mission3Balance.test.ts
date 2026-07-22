@@ -51,6 +51,25 @@ const separatedBrightest = (
   return selected;
 };
 
+const separatedClosest = (
+  cells: SurfaceCellSnapshot[],
+  light: number,
+  count: number,
+): SurfaceCellSnapshot[] => {
+  const selected: SurfaceCellSnapshot[] = [];
+  for (const candidate of [...cells].sort((a, b) =>
+    Math.abs(a.light - light) - Math.abs(b.light - light),
+  )) {
+    const separated = selected.every((cell) =>
+      Math.hypot(cell.x - candidate.x, cell.y - candidate.y) > 70,
+    );
+    if (!separated) continue;
+    selected.push(candidate);
+    if (selected.length === count) break;
+  }
+  return selected;
+};
+
 const runPastTimeLimit = (world: SimulationWorld): void => {
   world.handle({ type: 'start' });
   world.handle({ type: 'set-speed', speed: 8 });
@@ -61,7 +80,7 @@ describe('mission 3 balance', () => {
   it('scores all Oedogonium biomass directly, without a position or light-band bonus', () => {
     const scenario = SCENARIOS['mission-3'];
     expect(scenario.requiredStructures).toEqual({});
-    expect(scenario.lightOutput).toBe(60);
+    expect(scenario.lightOutput).toBe(52);
     expect(scenario.targetIncludesSubstrate).toBe(true);
     expect(scenario.target?.type).toBe('biomass');
     const target = scenario.target;
@@ -95,7 +114,7 @@ describe('mission 3 balance', () => {
     );
   }, 30_000);
 
-  it('keeps two-seed substrate waiting below target while allowing a structure-assisted solution', () => {
+  it('rejects substrate and single-low-stone shortcuts while allowing a raised solution', () => {
     const target = SCENARIOS['mission-3'].target;
     if (target?.type !== 'biomass') throw new Error('unexpected mission target');
 
@@ -112,16 +131,32 @@ describe('mission 3 balance', () => {
     expect(waiting.totalBiomass.oedogonium).toBeLessThan(target.amount);
     expect(waiting.missionProgress?.current).toBeCloseTo(waiting.totalBiomass.oedogonium, 8);
 
-    // A centered flat stone is deliberately only one valid example. Mission
-    // scoring remains the same total-biomass sum for every other arrangement.
-    const assistedWorld = new SimulationWorld('mission-3');
-    placeStructure(assistedWorld, 'flat-stone', { x: 408, y: 250 });
-    const structureSeeds = separatedBrightest(
-      assistedWorld.snapshot().cells.filter((cell) => cell.surfaceKind === 'structure-face'),
+    const lowStoneWorld = new SimulationWorld('mission-3');
+    placeStructure(lowStoneWorld, 'flat-stone', { x: 408, y: 250 });
+    const lowStoneSeeds = separatedClosest(
+      lowStoneWorld.snapshot().cells.filter((cell) => cell.surfaceKind === 'structure-face'),
+      68,
       2,
     );
-    expect(structureSeeds).toHaveLength(2);
-    for (const cell of structureSeeds) placeSeed(assistedWorld, 'oedogonium', cell);
+    expect(lowStoneSeeds).toHaveLength(2);
+    for (const cell of lowStoneSeeds) placeSeed(lowStoneWorld, 'oedogonium', cell);
+    runPastTimeLimit(lowStoneWorld);
+    const lowStone = lowStoneWorld.snapshot();
+    expect(lowStone.outcome).toBe('failure');
+    expect(lowStone.totalBiomass.oedogonium).toBeLessThan(target.amount);
+
+    // This stack is one convenient regression fixture, not a hidden scoring
+    // rule. Every arrangement is still judged by the same whole-tank biomass.
+    const assistedWorld = new SimulationWorld('mission-3');
+    placeStructure(assistedWorld, 'tall-stone', { x: 408, y: 250 });
+    placeStructure(assistedWorld, 'flat-stone', { x: 408, y: 300 });
+    const structureSeed = separatedClosest(
+      assistedWorld.snapshot().cells.filter((cell) => cell.surfaceKind === 'structure-face'),
+      68,
+      1,
+    );
+    expect(structureSeed).toHaveLength(1);
+    placeSeed(assistedWorld, 'oedogonium', structureSeed[0]);
     runPastTimeLimit(assistedWorld);
     const assisted = assistedWorld.snapshot();
     expect(assisted.outcome).toBe('success');

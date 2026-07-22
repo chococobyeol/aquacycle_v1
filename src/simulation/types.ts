@@ -556,6 +556,8 @@ export type SimulationCommand =
   | { type: 'pick-animal'; speciesId: AnimalSpeciesId; point?: Vec2 }
   | { type: 'pick-biofilm'; guildId: MicrobeGuildId; point?: Vec2 }
   | { type: 'pick-at'; point: Vec2 }
+  | { type: 'hold-structure'; id: string; point?: Vec2 }
+  | { type: 'rotate-structure'; id: string; radians: number }
   | { type: 'select-at'; point: Vec2; filter: SelectionFilter }
   | { type: 'select-region'; from: Vec2; to: Vec2; filter: SelectionFilter }
   | { type: 'select-measurement'; id: string }

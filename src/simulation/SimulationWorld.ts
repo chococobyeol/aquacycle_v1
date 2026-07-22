@@ -327,7 +327,6 @@ const SHRIMP_POST_GRAZE_ROAM_VARIANCE_SECONDS = 1.5;
 // gated by current reserve and recent access to food rather than a hidden
 // population-capacity formula.
 const SHRIMP_REPRODUCTION_ENERGY = SHRIMP_ECOLOGY_RULES.reproductionEnergy;
-const SHRIMP_INITIAL_REPRODUCTION_COOLDOWN = 80;
 const SHRIMP_NEW_ADULT_REPRODUCTION_COOLDOWN = 120;
 const SHRIMP_MATING_SECONDS = 3;
 const SHRIMP_GESTATION_SECONDS = 75;
@@ -599,6 +598,12 @@ export class SimulationWorld {
         break;
       case 'pick-at':
         this.pickExistingAt(command.point);
+        break;
+      case 'hold-structure':
+        this.holdExistingStructure(command.id, command.point);
+        break;
+      case 'rotate-structure':
+        this.rotateStructure(command.id, command.radians);
         break;
       case 'select-at':
         this.selectAt(command.point, command.filter);
@@ -1412,18 +1417,34 @@ export class SimulationWorld {
       this.message = '고정 접종 기반은 이 도전에서 옮길 수 없습니다.';
       return;
     }
+    this.selection = {
+      kind: 'structure',
+      x: structure.body.position.x,
+      y: structure.body.position.y,
+      ownerLabel: STRUCTURES[structure.definitionId].label,
+      structureId: structure.id,
+    };
+    this.message = `${STRUCTURES[structure.definitionId].label}을 선택했습니다. 이동·회전·삭제 동작을 고르세요.`;
+    this.snapshotDirty = true;
+  }
+
+  private holdExistingStructure(id: string, point?: Vec2): void {
+    if (!this.canEdit() || this.held) return;
+    const structure = this.structureById(id);
+    if (!structure || structure.locked) return;
     const originPosition = { ...structure.body.position };
     const originAngle = structure.body.angle;
     const originSleeping = structure.body.isSleeping;
+    this.pointer = this.clampPointer(point ?? originPosition);
     Body.setStatic(structure.body, true);
+    Body.setPosition(structure.body, this.pointer);
     this.held = {
       kind: 'structure',
       source: 'existing',
       structureId: structure.id,
-      offset: {
-        x: structure.body.position.x - this.pointer.x,
-        y: structure.body.position.y - this.pointer.y,
-      },
+      // Moving starts from the visual center, so the object does not jump to
+      // an arbitrary edge based on where its selection click landed.
+      offset: { x: 0, y: 0 },
       valid: true,
       originPosition,
       originAngle,
@@ -1436,8 +1457,11 @@ export class SimulationWorld {
       ownerLabel: STRUCTURES[structure.definitionId].label,
       structureId: structure.id,
     };
+    this.constrainHeldStructure(structure);
+    this.updateHeldStructureValidity(structure);
     this.allSettled = false;
-    this.message = `${STRUCTURES[structure.definitionId].label}을 옮기는 중입니다. 다시 클릭하면 놓습니다.`;
+    this.message = `${STRUCTURES[structure.definitionId].label}을 옮기는 중입니다. 휠이나 Q/E로 돌리고 클릭해 놓으세요.`;
+    this.snapshotDirty = true;
   }
 
   private selectAt(point: Vec2, filter: SelectionFilter): void {
@@ -1951,6 +1975,29 @@ export class SimulationWorld {
     this.updateHeldStructureValidity(structure);
   }
 
+  private rotateStructure(id: string, radians: number): void {
+    if (!this.canEdit() || this.held) return;
+    const structure = this.structureById(id);
+    if (!structure || structure.locked) return;
+    if (structure.body.isStatic) Body.setStatic(structure.body, false);
+    Body.setAngle(structure.body, structure.body.angle + radians);
+    Body.setVelocity(structure.body, { x: 0, y: 0 });
+    Body.setAngularVelocity(structure.body, 0);
+    Sleeping.set(structure.body, false);
+    this.selection = {
+      kind: 'structure',
+      x: structure.body.position.x,
+      y: structure.body.position.y,
+      ownerLabel: STRUCTURES[structure.definitionId].label,
+      structureId: structure.id,
+    };
+    this.wakeStructuresAfterTopologyChange();
+    this.lightDirty = true;
+    this.crossConnectionsDirty = true;
+    this.message = `${STRUCTURES[structure.definitionId].label}을 회전했습니다. 접점에 따라 다시 안착합니다.`;
+    this.snapshotDirty = true;
+  }
+
   private constrainHeldStructure(structure: StructureState): void {
     const padding = 5;
     const bounds = structure.body.bounds;
@@ -2047,7 +2094,7 @@ export class SimulationWorld {
     }
     if (!this.requiredSeedsPlaced()) {
       this.message = this.scenario.targetIncludesSubstrate
-        ? '붓뚜껑말을 원하는 표면에 접종해 주세요.'
+        ? '필수 조류를 원하는 표면에 접종해 주세요.'
         : '필수 조류를 점수에 포함되는 구조물 앞면에 접종해 주세요.';
       return;
     }
@@ -4082,7 +4129,12 @@ export class SimulationWorld {
       grazingSessionIntake: 0,
       secondsSinceFood: Number.POSITIVE_INFINITY,
       growthProgress: 1,
-      reproductionCooldown: SHRIMP_INITIAL_REPRODUCTION_COOLDOWN,
+      reproductionCooldown:
+        SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMin +
+        deterministicNoise(numericId * 11.3) * (
+          SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMax -
+          SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMin
+        ),
       gestationRemaining: null,
       matingAccumulator: 0,
       randomSeed: numericId * 17.17,

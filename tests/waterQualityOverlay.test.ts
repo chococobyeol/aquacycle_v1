@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { SimulationSnapshot } from '../src/simulation/types';
 import {
   analysisLayerStatistics,
+  biofilmPlacementLayers,
   normalizeWaterQualityForDisplay,
   normalizeWaterQualityValue,
   waterQualityOverlayAlpha,
@@ -29,6 +30,10 @@ const overlaySnapshot = {
 } as SimulationSnapshot;
 
 describe('water-quality analysis overlay', () => {
+  it('pairs each inoculum with its food field and its own film', () => {
+    expect(biofilmPlacementLayers('decomposer')).toEqual(['organicMatter', 'decomposer']);
+    expect(biofilmPlacementLayers('nitrifier')).toEqual(['toxicWaste', 'nitrifier']);
+  });
   it('uses the lower ecological scale for organic matter and toxic waste', () => {
     expect(normalizeWaterQualityValue('organicMatter', 12)).toBeCloseTo(0.5);
     expect(normalizeWaterQualityValue('toxicWaste', 24)).toBe(1);

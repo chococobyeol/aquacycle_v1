@@ -312,6 +312,10 @@ describe("mission 4 consumer balance", () => {
       at300.animalPopulation[SHRIMP].adults,
     );
     expect(at300.animalPopulation[SHRIMP].total).toBeGreaterThan(4);
+    // Supplied adults are deliberately out of reproductive synchrony. A
+    // healthy setup grows, but it must not erupt into a double-digit colony
+    // during the five-minute challenge window.
+    expect(at300.animalPopulation[SHRIMP].total).toBeLessThanOrEqual(8);
     expect(at300.missionProgress?.current).toBe(
       at300.animalPopulation[SHRIMP].adults,
     );
@@ -323,6 +327,7 @@ describe("mission 4 consumer balance", () => {
     const consumedAt300 = at300.totalAlgaeConsumed;
     const at600 = advanceTo(world, 600);
     expect(at600.animalPopulation[SHRIMP].total).toBeGreaterThan(8);
+    expect(at600.animalPopulation[SHRIMP].total).toBeLessThanOrEqual(13);
     expect(at600.animalPopulation[SHRIMP].total).toBeLessThan(
       SHRIMP_TECHNICAL_POPULATION_LIMIT,
     );
