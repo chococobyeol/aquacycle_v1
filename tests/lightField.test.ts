@@ -82,6 +82,38 @@ describe('aquarium light field', () => {
     ray.mockRestore();
   });
 
+  it('reuses an unchanged Vallisneria canopy throughout accelerated dawn and dusk', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === 'substrate');
+    const plantCell = substrate.find((cell) => cell.x > 560) ?? substrate[0];
+    world.handle({ type: 'pick-seed', speciesId: 'vallisneria', point: plantCell });
+    world.handle({ type: 'drop-held', point: plantCell });
+
+    const internals = world as unknown as {
+      rebuildVallisneriaCanopyOptics(): void;
+      computeCanopyTransmissionAt(point: Vec2, excludedPlantId?: string): number;
+      stepVallisneriaLifecycle(deltaSeconds: number): void;
+    };
+    // Isolate a pure source-intensity transition. Structural growth has its own
+    // quantized invalidation path and is allowed to rebuild the canopy.
+    internals.stepVallisneriaLifecycle = () => undefined;
+    const rebuild = vi.spyOn(internals, 'rebuildVallisneriaCanopyOptics');
+    const transmission = vi.spyOn(internals, 'computeCanopyTransmissionAt');
+    const initialRevision = world.snapshot().lightField.revision;
+
+    world.handle({ type: 'start' });
+    world.handle({ type: 'set-speed', speed: 64 });
+    for (let index = 0; index < 90; index += 1) world.tick(0.1);
+
+    const snapshot = world.snapshot();
+    expect(snapshot.lightField.revision - initialRevision).toBeGreaterThan(25);
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(transmission).not.toHaveBeenCalled();
+    rebuild.mockRestore();
+    transmission.mockRestore();
+  });
+
   it('changes source intensity without rebuilding a settled laboratory light path', () => {
     const world = new SimulationWorld('laboratory');
     placeStructure(world, 'tall-stone', { x: 408, y: 280 });

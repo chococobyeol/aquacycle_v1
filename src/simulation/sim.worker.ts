@@ -16,10 +16,16 @@ import type {
   WorkerSnapshotMessage,
 } from './types';
 import { MOTION_SAMPLE_INTERVAL_MS } from './types';
+import {
+  addPendingWorkerTime,
+  takeWorkerSimulationQuantum,
+  WORKER_SIMULATION_QUANTUM_SECONDS,
+} from './workerCadence';
 
 const scope = self as DedicatedWorkerGlobalScope;
 const world = new SimulationWorld('mission-1');
-let lastTick = performance.now();
+let lastSchedulerAtMs = performance.now();
+let pendingRealSeconds = 0;
 let motionSequence = 0;
 let interactiveMotionDirty = false;
 let snapshotTelemetry: SharedTelemetryWriter | null = null;
@@ -89,14 +95,47 @@ scope.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
   }
 });
 
-setInterval(() => {
+/**
+ * Run at most one small, fixed simulation quantum per worker task.
+ *
+ * The old repeating 60 Hz timer passed the whole wall-clock delay back into
+ * `world.tick()`. At 64x, one expensive ecology pass could therefore turn the
+ * next pass into several seconds of catch-up work, which delayed the separate
+ * motion timer by hundreds of milliseconds. A zero-delay continuation still
+ * catches up when the machine has spare capacity, but returns to the worker
+ * event loop between quanta so the 30 Hz motion publisher can run.
+ */
+const scheduleSimulation = (): void => {
   const now = performance.now();
-  const deltaSeconds = Math.min(0.1, (now - lastTick) / 1000);
-  lastTick = now;
-  if (world.tick(deltaSeconds)) {
+  const elapsedSeconds = (now - lastSchedulerAtMs) / 1000;
+  lastSchedulerAtMs = now;
+  pendingRealSeconds = addPendingWorkerTime(pendingRealSeconds, elapsedSeconds);
+
+  const quantum = takeWorkerSimulationQuantum(pendingRealSeconds);
+  if (quantum) {
+    pendingRealSeconds = quantum.remainingSeconds;
+    if (world.tick(quantum.deltaSeconds)) {
+      publish();
+    }
+    setTimeout(scheduleSimulation, 0);
+    return;
+  }
+
+  const waitMs = Math.max(
+    1,
+    (WORKER_SIMULATION_QUANTUM_SECONDS - pendingRealSeconds) * 1000,
+  );
+  setTimeout(scheduleSimulation, waitMs);
+};
+
+setTimeout(() => {
+  lastSchedulerAtMs = performance.now();
+  pendingRealSeconds = WORKER_SIMULATION_QUANTUM_SECONDS;
+  if (world.tick(WORKER_SIMULATION_QUANTUM_SECONDS)) {
     publish();
   }
-}, 1000 / 60);
+  setTimeout(scheduleSimulation, 0);
+}, WORKER_SIMULATION_QUANTUM_SECONDS * 1000);
 
 // Motion has one real-time transport cadence. It deliberately runs separately
 // from full snapshots: a full ecology publication must not create a missing or

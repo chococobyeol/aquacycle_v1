@@ -9,6 +9,11 @@ import {
   type WorkerMessage,
   type WorkerMotionMessage,
 } from '../src/simulation/types';
+import {
+  addPendingWorkerTime,
+  takeWorkerSimulationQuantum,
+  WORKER_SIMULATION_QUANTUM_SECONDS,
+} from '../src/simulation/workerCadence';
 
 const motionMessage = (sequence: number): WorkerMotionMessage => ({
   type: 'motion',
@@ -103,5 +108,22 @@ describe('simulation worker motion cadence', () => {
       expect(Math.abs(interval - MOTION_SAMPLE_INTERVAL_MS)).toBeLessThan(1);
     }
     expect(messages.some((message) => message.type === 'snapshot')).toBe(true);
+  });
+
+  it('slices worker catch-up into fixed 120 Hz tasks instead of one delayed burst', () => {
+    let pendingSeconds = addPendingWorkerTime(0, 0.1);
+    const deltas: number[] = [];
+    while (true) {
+      const quantum = takeWorkerSimulationQuantum(pendingSeconds);
+      if (!quantum) break;
+      deltas.push(quantum.deltaSeconds);
+      pendingSeconds = quantum.remainingSeconds;
+    }
+
+    expect(deltas).toHaveLength(12);
+    for (const deltaSeconds of deltas) {
+      expect(deltaSeconds).toBeCloseTo(WORKER_SIMULATION_QUANTUM_SECONDS, 10);
+    }
+    expect(pendingSeconds).toBeCloseTo(0, 10);
   });
 });

@@ -535,6 +535,7 @@ export class SimulationWorld {
   private lightReflectionSources: LightReflectionSource[] = [];
   private lightTransportCache = new Map<string, LightTransportPath>();
   private vallisneriaCanopyOptics: VallisneriaCanopyOptics[] = [];
+  private canopyTransmissionCache = new Map<string, number>();
   private message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
   public constructor(scenarioId: ScenarioId = 'mission-1') {
@@ -607,6 +608,7 @@ export class SimulationWorld {
     this.lightReflectionSources = [];
     this.lightTransportCache.clear();
     this.vallisneriaCanopyOptics = [];
+    this.canopyTransmissionCache.clear();
     this.crossConnectionsDirty = true;
     this.message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
@@ -2613,7 +2615,6 @@ export class SimulationWorld {
       this.appliedDayNightMultiplier = multiplier;
       this.appliedDayNightPhase = state?.phase ?? null;
       this.lightDirty = true;
-      this.recomputeLight();
     }
   }
 
@@ -2628,7 +2629,11 @@ export class SimulationWorld {
       this.lightReflectionSources = this.buildLightReflectionSources();
       this.lightTransportCache.clear();
     }
-    this.rebuildVallisneriaCanopyOptics();
+    const nextCanopySignature = this.currentCanopyLightSignature();
+    if (nextCanopySignature !== this.canopyLightSignature) {
+      this.rebuildVallisneriaCanopyOptics();
+      this.canopyTransmissionCache.clear();
+    }
     const values: number[] = [];
     for (let row = 0; row < LIGHT_ROWS; row += 1) {
       for (let column = 0; column < LIGHT_COLUMNS; column += 1) {
@@ -2675,7 +2680,7 @@ export class SimulationWorld {
     if (this.probe) this.setProbe(this.probe);
     this.lightDirty = false;
     this.lightTransportDirty = false;
-    this.canopyLightSignature = this.currentCanopyLightSignature();
+    this.canopyLightSignature = nextCanopySignature;
     this.snapshotDirty = true;
   }
 
@@ -2873,7 +2878,7 @@ export class SimulationWorld {
    * stone/light transport, so living plants can cast soft shade without
    * rebuilding Matter ray paths or behaving like opaque rocks.
    */
-  private canopyTransmissionAt(point: Vec2, excludedPlantId?: string): number {
+  private computeCanopyTransmissionAt(point: Vec2, excludedPlantId?: string): number {
     let opticalDepth = 0;
     for (const canopy of this.vallisneriaCanopyOptics) {
       if (canopy.plantId === excludedPlantId) continue;
@@ -2903,6 +2908,22 @@ export class SimulationWorld {
     return Math.exp(-Math.min(1.45, opticalDepth));
   }
 
+  private canopyTransmissionAt(
+    point: Vec2,
+    excludedPlantId?: string,
+    cache = false,
+  ): number {
+    if (this.vallisneriaCanopyOptics.length === 0) return 1;
+    const key = `${point.x}:${point.y}:${excludedPlantId ?? 'all'}`;
+    if (cache) {
+      const cached = this.canopyTransmissionCache.get(key);
+      if (cached !== undefined) return cached;
+    }
+    const transmission = this.computeCanopyTransmissionAt(point, excludedPlantId);
+    if (cache) this.canopyTransmissionCache.set(key, transmission);
+    return transmission;
+  }
+
   private lightAtWithCanopy(
     point: Vec2,
     excludedBodyId?: number,
@@ -2910,7 +2931,7 @@ export class SimulationWorld {
     excludedPlantId?: string,
   ): number {
     return this.lightAt(point, excludedBodyId, cache) *
-      this.canopyTransmissionAt(point, excludedPlantId);
+      this.canopyTransmissionAt(point, excludedPlantId, cache);
   }
 
   private rebuildVallisneriaCanopyOptics(): void {

@@ -2640,6 +2640,24 @@ const drawAquaticPlants = (
 
 };
 
+const vallisneriaVisualKey = (snapshot: SimulationSnapshot): string => {
+  const plants = snapshot.plants.map((plant) => [
+    plant.id,
+    plant.cellId,
+    plant.x.toFixed(2),
+    plant.y.toFixed(2),
+    Math.round(plant.structuralScale / 0.015),
+    Math.round(plant.health / 0.04),
+    plant.lifeStage,
+  ].join(':'));
+  const occupiedCells = snapshot.cells.flatMap((cell) =>
+    cell.surfaceKind === 'substrate' && cell.biomass.vallisneria > 0.004
+      ? [`${cell.id}:${Math.round(cell.biomass.vallisneria / 0.025)}`]
+      : []
+  );
+  return `${plants.join('|')}#${occupiedCells.join('|')}`;
+};
+
 const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   layer.clear();
   if (!snapshot.dayNight) return;
@@ -2923,6 +2941,7 @@ export function AquariumCanvas({
   const lastAnalysisDrawRef = useRef('');
   const lastAlgaeRevisionRef = useRef(-1);
   const lastAlgaeStructureGeometryRef = useRef('');
+  const lastPlantsDrawRef = useRef('');
   const lastSeedsDrawRef = useRef('');
   const lastGoalGuideDrawRef = useRef('');
   const lastInteractionDrawRef = useRef('');
@@ -3358,6 +3377,7 @@ export function AquariumCanvas({
       syncAnimalCarcasses(layers.animals, initialSnapshot, ownedAnimalCarcassDisplays);
       drawAquaticPlants(layers.plantsBack, initialSnapshot, 'back');
       drawAquaticPlants(layers.plantsFront, initialSnapshot, 'front');
+      lastPlantsDrawRef.current = vallisneriaVisualKey(initialSnapshot);
       drawDayNightTint(layers.nightTint, initialSnapshot);
       drawGoalGuide(layers.goalGuide, initialSnapshot, showGoalGuideRef.current);
       drawSeeds(layers.seeds, initialSnapshot);
@@ -3620,8 +3640,12 @@ export function AquariumCanvas({
       isPendingInventoryHandoff(),
     );
     syncAnimalCarcasses(layers.animals, snapshot, animalCarcassDisplaysRef.current);
-    drawAquaticPlants(layers.plantsBack, snapshot, 'back');
-    drawAquaticPlants(layers.plantsFront, snapshot, 'front');
+    const plantsKey = vallisneriaVisualKey(snapshot);
+    if (lastPlantsDrawRef.current !== plantsKey) {
+      drawAquaticPlants(layers.plantsBack, snapshot, 'back');
+      drawAquaticPlants(layers.plantsFront, snapshot, 'front');
+      lastPlantsDrawRef.current = plantsKey;
+    }
     drawDayNightTint(layers.nightTint, snapshot);
     layers.lamp.visible = snapshot.lightOutput > 0.5;
     layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(snapshot.lightOutput / 120);

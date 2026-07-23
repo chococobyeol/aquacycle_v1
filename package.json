@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify:long-cycle": "vite-node scripts/verifyLongCycle.ts"
+    "verify:long-cycle": "vite-node scripts/verifyLongCycle.ts",
+    "verify:day-night-performance": "vite-node scripts/verifyDayNightLightingPerformance.ts",
+    "verify:worker-cadence": "vite-node scripts/verifyWorkerCadence.ts"
   },
   "dependencies": {
     "matter-js": "^0.20.0",

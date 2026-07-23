@@ -130,7 +130,11 @@ describe('spatial water temperature', () => {
     const world = new SimulationWorld('laboratory');
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 64 });
-    while (world.snapshot().elapsedSeconds < 1_800) world.tick(0.1);
+    // The target duration is deterministic at 64x. Building the complete
+    // surface/water snapshot on every integration step only benchmarks JSON-
+    // ready diagnostics and made this transport assertion hardware-sensitive.
+    const steps = Math.ceil(1_800 / (64 * 0.1));
+    for (let step = 0; step < steps; step += 1) world.tick(0.1);
 
     const transport = world.snapshot().biogeochemistry.transport;
     expect(transport.temperature).toHaveLength(TRANSPORT_CELL_COUNT);
