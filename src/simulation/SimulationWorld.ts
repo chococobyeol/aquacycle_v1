@@ -123,6 +123,8 @@ interface SeedPlacementState {
   cellId: string;
   locked: boolean;
   origin: 'supplied' | 'runner';
+  /** Exact root point for macrophytes; ecology still belongs to cellId. */
+  rootPosition?: Vec2;
   plant?: VallisneriaLifeState;
 }
 
@@ -187,6 +189,7 @@ interface HeldSeedState {
   speciesId: SpeciesId;
   seedId: string;
   candidateCellId: string | null;
+  candidateRootPosition?: Vec2;
   valid: boolean;
   originCellId?: string;
   originBiomass?: number;
@@ -1080,6 +1083,7 @@ export class SimulationWorld {
       })),
       seedPlacements: this.seedPlacements.map((placement) => ({
         ...placement,
+        rootPosition: placement.rootPosition ? { ...placement.rootPosition } : undefined,
         plant: placement.plant ? { ...placement.plant } : undefined,
       })),
       animals: this.animals.map((animal) => cloneAnimalState(animal)),
@@ -1172,6 +1176,7 @@ export class SimulationWorld {
       return {
         ...placement,
         origin,
+        rootPosition: placement.rootPosition ? { ...placement.rootPosition } : undefined,
         plant: placement.speciesId === 'vallisneria'
           ? placement.plant
             ? {
@@ -1394,6 +1399,7 @@ export class SimulationWorld {
       speciesId,
       seedId: `seed-${++this.seedCounter}`,
       candidateCellId: null,
+      candidateRootPosition: undefined,
       valid: false,
     };
     this.updateHeldSeedCandidate(this.pointer);
@@ -1481,11 +1487,17 @@ export class SimulationWorld {
           speciesId: placement.speciesId,
           seedId: placement.id,
           candidateCellId: placement.cellId,
+          candidateRootPosition: placement.rootPosition
+            ? { ...placement.rootPosition }
+            : originCell
+              ? this.vallisneriaRootPosition(placement, originCell)
+              : undefined,
           valid: true,
           originCellId: placement.cellId,
           originBiomass,
           originPlacement: {
             ...placement,
+            rootPosition: placement.rootPosition ? { ...placement.rootPosition } : undefined,
             plant: placement.plant ? { ...placement.plant } : undefined,
           },
         };
@@ -1936,11 +1948,23 @@ export class SimulationWorld {
       ? {
         ...heldSeed.originPlacement,
         cellId,
+        rootPosition: heldSeed.speciesId === 'vallisneria'
+          ? heldSeed.candidateRootPosition
+            ? { ...heldSeed.candidateRootPosition }
+            : undefined
+          : heldSeed.originPlacement.rootPosition,
         plant: heldSeed.originPlacement.plant
           ? { ...heldSeed.originPlacement.plant }
           : undefined,
       }
-      : this.createSeedPlacement(heldSeed.seedId, heldSeed.speciesId, cellId));
+      : this.createSeedPlacement(
+        heldSeed.seedId,
+        heldSeed.speciesId,
+        cellId,
+        'supplied',
+        null,
+        heldSeed.candidateRootPosition,
+      ));
     this.held = null;
     if (heldSeed.speciesId === 'vallisneria') {
       this.lightDirty = true;
@@ -2198,7 +2222,16 @@ export class SimulationWorld {
   private updateHeldSeedCandidate(point: Vec2): void {
     if (!this.held || this.held.kind !== 'seed') return;
     const held = this.held;
-    const nearest = this.nearestCell(point);
+    // A rooted plant may occupy the foreground depth in front of a rock. If
+    // structure-face cells participate here, the visually overlapping rock
+    // always wins nearest-cell selection and makes foreground planting
+    // impossible even though the substrate is directly beneath the pointer.
+    const nearest = this.nearestCell(
+      point,
+      held.speciesId === 'vallisneria'
+        ? (cell) => cell.surfaceKind === 'substrate'
+        : undefined,
+    );
     const validDistance = nearest
       ? Math.max(8, nearest.cell.cellSize * 0.9)
       : 0;
@@ -2211,6 +2244,16 @@ export class SimulationWorld {
       )
       : false;
     held.candidateCellId = candidateCellId;
+    held.candidateRootPosition = held.speciesId === 'vallisneria' && nearest && candidateCellId && rootedOnSubstrate
+      ? {
+        x: clamp(point.x, 2, TANK_WIDTH - 2),
+        y: clamp(
+          point.y,
+          GROUND_Y - nearest.cell.cellSize * 3 + 1,
+          GROUND_Y - 1,
+        ),
+      }
+      : undefined;
     held.valid = Boolean(candidateCellId) && rootedOnSubstrate && !duplicate;
   }
 
@@ -2842,7 +2885,7 @@ export class SimulationWorld {
       if (placement.speciesId !== 'vallisneria' || !placement.plant) return [];
       const cell = this.cellById(placement.cellId);
       if (!cell || cell.biomass.vallisneria <= 0.004) return [];
-      const anchor = this.cellWorldPoint(cell);
+      const anchor = this.vallisneriaRootPosition(placement, cell);
       const scale = placement.plant.structuralScale;
       return [{
         plantId: placement.id,
@@ -2866,7 +2909,8 @@ export class SimulationWorld {
         const scale = alive
           ? Math.round(placement.plant!.structuralScale / VALLISNERIA_CANOPY_LIGHT_QUANTIZATION)
           : 0;
-        return `${placement.id}:${placement.cellId}:${scale}`;
+        const root = cell ? this.vallisneriaRootPosition(placement, cell) : null;
+        return `${placement.id}:${placement.cellId}:${root?.x.toFixed(2)}:${root?.y.toFixed(2)}:${scale}`;
       })
       .sort()
       .join('|');
@@ -3790,13 +3834,14 @@ export class SimulationWorld {
     cell: SurfaceCellState,
     speciesId: SpeciesId,
   ): Vec2 {
-    const anchor = this.cellWorldPoint(cell);
-    if (speciesId !== 'vallisneria') return anchor;
+    const surfacePoint = this.cellWorldPoint(cell);
+    if (speciesId !== 'vallisneria') return surfacePoint;
     // Structural leaf size follows the much slower ramet life cycle, not the
     // reserve biomass lost and regained within one night/day cycle.
     const ramet = this.seedPlacements.find((placement) =>
       placement.speciesId === 'vallisneria' && placement.cellId === cell.id
     );
+    const anchor = ramet ? this.vallisneriaRootPosition(ramet, cell) : surfacePoint;
     const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
     const canopy = vallisneriaCanopyBounds(cell.index, anchor, structuralScale);
     return {
@@ -3811,17 +3856,55 @@ export class SimulationWorld {
     cellId: string,
     origin: 'supplied' | 'runner' = 'supplied',
     parentId: string | null = null,
+    rootPosition?: Vec2,
   ): SeedPlacementState {
+    const cell = this.cellById(cellId);
     return {
       id,
       speciesId,
       cellId,
       locked: false,
       origin,
+      rootPosition: speciesId === 'vallisneria' && cell
+        ? rootPosition
+          ? { ...rootPosition }
+          : this.defaultVallisneriaRootPosition(id, cell)
+        : undefined,
       plant: speciesId === 'vallisneria'
         ? this.createVallisneriaLifeState(id, origin, parentId)
         : undefined,
     };
+  }
+
+  /**
+   * The biology grid stays discrete, but a ramet roots at a stable continuous
+   * point inside its cell. This prevents rows and columns from becoming a
+   * visible planting grid while keeping deterministic replays.
+   */
+  private defaultVallisneriaRootPosition(id: string, cell: SurfaceCellState): Vec2 {
+    const seed = deterministicStringSeed(id);
+    const radius = Math.max(1, cell.cellSize * 0.43);
+    return {
+      x: clamp(
+        cell.x + (deterministicNoise(seed * 0.0371) * 2 - 1) * radius,
+        2,
+        TANK_WIDTH - 2,
+      ),
+      y: clamp(
+        cell.y + (deterministicNoise(seed * 0.0713 + 17) * 2 - 1) * radius,
+        GROUND_Y - cell.cellSize * 3 + 1,
+        GROUND_Y - 1,
+      ),
+    };
+  }
+
+  private vallisneriaRootPosition(
+    placement: SeedPlacementState,
+    cell: SurfaceCellState,
+  ): Vec2 {
+    return placement.rootPosition
+      ? placement.rootPosition
+      : this.defaultVallisneriaRootPosition(placement.id, cell);
   }
 
   private createVallisneriaLifeState(
@@ -3872,7 +3955,7 @@ export class SimulationWorld {
   private runnerDestination(parent: SeedPlacementState): SurfaceCellState | null {
     const source = this.cellById(parent.cellId);
     if (!source || source.surfaceKind !== 'substrate') return null;
-    const sourcePoint = this.cellWorldPoint(source);
+    const sourcePoint = this.vallisneriaRootPosition(parent, source);
     const occupiedCells = new Set(this.seedPlacements
       .filter((placement) => placement.speciesId === 'vallisneria')
       .map((placement) => placement.cellId));
@@ -3999,7 +4082,10 @@ export class SimulationWorld {
           biomass * (0.0008 + senescenceProgress * 0.0024) * deltaSeconds,
         );
         cell.biomass.vallisneria -= senescenceLoss;
-        this.biogeochemistry.recordAlgaeTurnover(this.cellWorldPoint(cell), senescenceLoss);
+        this.biogeochemistry.recordAlgaeTurnover(
+          this.vallisneriaRootPosition(placement, cell),
+          senescenceLoss,
+        );
       }
 
       const expired = life.ageSeconds >= life.lifespanSeconds;
@@ -4007,7 +4093,10 @@ export class SimulationWorld {
       if (expired || reserveCollapsed || cell.biomass.vallisneria <= 0.004) {
         const remaining = Math.max(0, cell.biomass.vallisneria);
         if (remaining > 0) {
-          this.biogeochemistry.recordAlgaeTurnover(this.cellWorldPoint(cell), remaining);
+          this.biogeochemistry.recordAlgaeTurnover(
+            this.vallisneriaRootPosition(placement, cell),
+            remaining,
+          );
           cell.biomass.vallisneria = 0;
         }
         deaths.add(placement.id);
@@ -4595,7 +4684,9 @@ export class SimulationWorld {
     return this.seedPlacements.flatMap((placement) => {
       const cell = this.cellById(placement.cellId);
       if (!cell) return [];
-      const point = this.cellWorldPoint(cell);
+      const point = placement.speciesId === 'vallisneria' && placement.plant
+        ? this.vallisneriaRootPosition(placement, cell)
+        : this.cellWorldPoint(cell);
       return [{
         id: placement.id,
         speciesId: placement.speciesId,
@@ -4612,7 +4703,7 @@ export class SimulationWorld {
       if (placement.speciesId !== 'vallisneria' || !placement.plant) return [];
       const cell = this.cellById(placement.cellId);
       if (!cell || cell.biomass.vallisneria <= 0.004) return [];
-      const point = this.cellWorldPoint(cell);
+      const point = this.vallisneriaRootPosition(placement, cell);
       return [{
         id: placement.id,
         speciesId: 'vallisneria' as const,
@@ -4674,7 +4765,11 @@ export class SimulationWorld {
       };
     }
     const candidate = this.held.candidateCellId ? this.cellById(this.held.candidateCellId) : undefined;
-    const point = candidate ? this.cellWorldPoint(candidate) : this.pointer;
+    const point = this.held.speciesId === 'vallisneria' && this.held.candidateRootPosition
+      ? this.held.candidateRootPosition
+      : candidate
+        ? this.cellWorldPoint(candidate)
+        : this.pointer;
     return {
       kind: 'seed',
       source: this.held.source,
@@ -4837,9 +4932,13 @@ export class SimulationWorld {
     );
   }
 
-  private nearestCell(point: Vec2): { cell: SurfaceCellState; distance: number } | null {
+  private nearestCell(
+    point: Vec2,
+    predicate?: (cell: SurfaceCellState) => boolean,
+  ): { cell: SurfaceCellState; distance: number } | null {
     let nearest: { cell: SurfaceCellState; distance: number } | null = null;
     for (const cell of this.allCells()) {
+      if (predicate && !predicate(cell)) continue;
       const distance = Math.sqrt(distanceSquared(point, this.cellWorldPoint(cell)));
       if (!nearest || distance < nearest.distance) nearest = { cell, distance };
     }
@@ -4852,7 +4951,9 @@ export class SimulationWorld {
       if (placement.locked) continue;
       const cell = this.cellById(placement.cellId);
       if (!cell) continue;
-      const anchor = this.cellWorldPoint(cell);
+      const anchor = placement.speciesId === 'vallisneria' && placement.plant
+        ? this.vallisneriaRootPosition(placement, cell)
+        : this.cellWorldPoint(cell);
       const distance = placement.speciesId === 'vallisneria' && placement.plant
         ? vallisneriaHitDistance(
           point,
@@ -4874,7 +4975,7 @@ export class SimulationWorld {
       if (placement.speciesId !== 'vallisneria' || !placement.plant) continue;
       const cell = this.cellById(placement.cellId);
       if (!cell || cell.biomass.vallisneria <= 0.004) continue;
-      const anchor = this.cellWorldPoint(cell);
+      const anchor = this.vallisneriaRootPosition(placement, cell);
       const leafDistance = vallisneriaHitDistance(
         point,
         cell.index,

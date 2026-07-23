@@ -3572,6 +3572,12 @@ const ClosedCycleHistoryChart = memo(function ClosedCycleHistoryChart({
   };
   const latest = points.at(-1);
   const rows = [
+    {
+      key: 'mineral-nitrogen',
+      label: '무기질소',
+      value: (latest?.toxicWaste ?? 0) + (latest?.nutrients ?? 0),
+      values: points.map((point) => point.toxicWaste + point.nutrients),
+    },
     { key: 'nutrient', label: '영양염', value: latest?.nutrients ?? 0, values: points.map((point) => point.nutrients) },
     { key: 'dic', label: '무기탄소', value: latest?.dissolvedInorganicCarbon ?? 0, values: points.map((point) => point.dissolvedInorganicCarbon) },
     { key: 'oxygen', label: '용존산소', value: latest?.oxygen ?? 0, values: points.map((point) => point.oxygen) },
@@ -3582,7 +3588,7 @@ const ClosedCycleHistoryChart = memo(function ClosedCycleHistoryChart({
         <strong>닫힌 물질·기체 순환</strong>
         <small>최근 {formatTime(windowSeconds)}</small>
       </div>
-      <svg viewBox="0 0 240 72" role="img" aria-label="영양염과 물속 무기탄소, 용존산소의 시간 변화">
+      <svg viewBox="0 0 240 94" role="img" aria-label="무기질소 합계와 영양염, 물속 무기탄소, 용존산소의 시간 변화">
         {rows.map((row, index) => {
           const top = 2 + index * 23;
           const pointsText = line(row.values, top);
@@ -3596,7 +3602,7 @@ const ClosedCycleHistoryChart = memo(function ClosedCycleHistoryChart({
           );
         })}
       </svg>
-      <small className="ecology-history-note">광합성은 유한한 무기탄소를 쓰고, 호흡·분해가 다시 돌려놓습니다.</small>
+      <small className="ecology-history-note">무기질소는 암모니아와 영양염의 합계입니다. 생산자는 무기질소와 무기탄소를 흡수합니다.</small>
     </div>
   );
 });
@@ -3754,7 +3760,7 @@ function SpeciesGuide({
           <div><dt>무기탄소</dt><dd>유한한 물속 무기탄소 C에 <b>C ÷ ({WATER_CYCLE_RULES.carbonHalfSaturation} + C)</b>을 곱합니다. 새 군락 1.0에 탄소 <b>{WATER_CYCLE_RULES.biomassCarbon}</b>가 실제로 들어갑니다.</dd></div>
           <div><dt>산소 생산</dt><dd>고정한 탄소 1.0당 산소 <b>{WATER_CYCLE_RULES.oxygenPerFixedCarbon}</b>를 만들며, 넘친 산소는 닫힌 공기층으로 이동합니다.</dd></div>
           <div><dt>낮·밤 호흡</dt><dd>빛이 없어 총광합성이 멈춰도 호흡은 계속됩니다. 24°C 기준 군락량 1.0당 <b>{(species.respirationRateAtReference * 100).toFixed(1)}%/초</b>를 호흡하며, 수온이 높을수록 빨라집니다.</dd></div>
-          <div><dt>질소 소비</dt><dd>새 군락 1.0당 무기질소 <b>{WATER_CYCLE_RULES.biomassNitrogen}</b>를 흡수합니다. 죽거나 먹힌 군락은 찌꺼기와 생물 몸을 거쳐 다시 순환합니다.</dd></div>
+          <div><dt>무기질소 흡수</dt><dd>새 생체량 1.0당 무기질소 <b>{WATER_CYCLE_RULES.biomassNitrogen}</b>를 흡수합니다. 죽거나 먹힌 생체량은 찌꺼기와 생물 몸을 거쳐 다시 순환합니다.</dd></div>
           <div><dt>자연 소실</dt><dd>그래프의 환경 성장률 계산 뒤에 군락량의 <b>0.18%/초</b>가 추가로 줄며, 다른 종의 경쟁과 새우 섭식도 별도로 적용됩니다.</dd></div>
         </dl>
       </section>

@@ -21,9 +21,24 @@ export interface VallisneriaDepthAnchor extends Vec2 {
 
 export type VallisneriaRenderDepth = 'back' | 'front';
 
-/** Substrate below the structure support plane is the foreground depth row. */
-export const vallisneriaRenderDepth = (anchor: Vec2): VallisneriaRenderDepth =>
-  anchor.y > STRUCTURE_SUPPORT_Y ? 'front' : 'back';
+const VALLISNERIA_YOUNG_HEIGHT_SCALE = 0.58;
+const VALLISNERIA_MATURE_HEIGHT_SCALE = 2.55;
+
+/**
+ * Young rosettes keep the compact placement size. Once a healthy plant passes
+ * that stage, leaf length accelerates non-linearly so a well supplied adult
+ * can occupy most of the water column. The slowly changing structural scale
+ * still controls the transition, so poor reserves, stress and senescence
+ * shorten the plant instead of merely fading a full-sized drawing.
+ */
+export const vallisneriaLeafHeightScale = (structuralScale: number): number => {
+  const scale = Math.max(0.12, Math.min(1, structuralScale));
+  if (scale <= VALLISNERIA_YOUNG_HEIGHT_SCALE) return scale;
+  const progress = (scale - VALLISNERIA_YOUNG_HEIGHT_SCALE) /
+    (1 - VALLISNERIA_YOUNG_HEIGHT_SCALE);
+  const eased = progress * progress * (3 - progress * 2);
+  return scale + eased * (VALLISNERIA_MATURE_HEIGHT_SCALE - scale);
+};
 
 /** Draw smaller screen-y first so roots closer to the viewer overlap them. */
 export const compareVallisneriaDepth = (
@@ -59,7 +74,7 @@ export const vallisneriaLeaves = (
   structuralScale: number,
 ): VallisneriaLeafGeometry[] => {
   const plantHash = (cellIndex * 0.61803398875) % 1;
-  const baseHeight = (184 + plantHash * 34) * structuralScale;
+  const baseHeight = (184 + plantHash * 34) * vallisneriaLeafHeightScale(structuralScale);
   const leafCount = Math.max(3, Math.round(2 + structuralScale * 6));
   return Array.from({ length: leafCount }, (_, index) => {
     const ratio = leafCount <= 1 ? 0.5 : index / (leafCount - 1);
@@ -76,7 +91,10 @@ export const vallisneriaLeaves = (
     const swayA = Math.sin(phase * 1.11) * (3 + structuralScale * 6);
     const swayB = Math.cos(phase * 0.83) * (4 + structuralScale * 8);
     return {
-      root: { x: rootX, y: anchor.y + 8 },
+      // The stored placement point is the painted bottom of the plant. Keeping
+      // these coordinates identical makes depth ordering and the visible root
+      // agree without an extra rendering offset.
+      root: { x: rootX, y: anchor.y },
       controlA: {
         x: rootX + lean * 0.18 + swayA,
         y: anchor.y - leafHeight * 0.3,
@@ -90,6 +108,13 @@ export const vallisneriaLeaves = (
     };
   });
 };
+
+/**
+ * Matter settles every stone's lowest collision point on this support line.
+ * The plant anchor is also its painted bottom, so no visual offset is needed.
+ */
+export const vallisneriaRenderDepth = (anchor: Vec2): VallisneriaRenderDepth =>
+  anchor.y > STRUCTURE_SUPPORT_Y ? 'front' : 'back';
 
 export const vallisneriaLeafPoint = (
   leaf: VallisneriaLeafGeometry,
@@ -105,7 +130,7 @@ export const vallisneriaCanopyBounds = (
   let minX = anchor.x;
   let minY = anchor.y;
   let maxX = anchor.x;
-  let maxY = anchor.y + 8;
+  let maxY = anchor.y;
   for (const leaf of leaves) {
     for (let sample = 0; sample <= 12; sample += 1) {
       const point = vallisneriaLeafPoint(leaf, sample / 12);

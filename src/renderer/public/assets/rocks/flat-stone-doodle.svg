@@ -10,5 +10,5 @@
     <path d="M30 34c31-13 64-17 101-14M165 17c29 0 52 4 77 12M47 57c34 8 70 10 108 6M187 59c23-2 44-7 64-16" fill="none" stroke="#6a7067" stroke-width="2" stroke-linecap="round" opacity=".67"/>
     <path d="m35 29 10-4m9 1 13-4m31-8 15-2m94 16 12 3m-157 35 16 3m17-1 10 2m113-4 12-4" fill="none" stroke="#f0e4bf" stroke-width="2.2" stroke-linecap="round" opacity=".72"/>
   </g>
-  <use href="#stone" fill="none" stroke="#303c3a" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
+  <use href="#stone" fill="none" stroke="#303c3a" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>
 </svg>

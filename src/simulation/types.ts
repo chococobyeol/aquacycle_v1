@@ -555,6 +555,8 @@ export interface SimulationSaveData {
     speciesId: SpeciesId;
     cellId: string;
     locked: boolean;
+    /** Exact visual/ecological root point; older saves fall back to a stable in-cell offset. */
+    rootPosition?: Vec2;
     /** Optional fields keep older version-1 frozen aquariums loadable. */
     origin?: 'supplied' | 'runner';
     plant?: {

@@ -1073,16 +1073,19 @@ const createStructureDisplay = (
   const texture = usableStructureTexture(textures, structure.assetPath);
   const visualOffset = structureVisualOffset(definition.collisionPolygon);
 
-  // Keep a complete vector stone underneath the texture at all times. Even if a
-  // graphics driver loses or rejects the texture, the object can never collapse
-  // into a selection outline with an invisible body.
+  // Keep a filled vector stone underneath the texture at all times. The vector
+  // outline is needed only when no usable texture was loaded; drawing it below
+  // a healthy SVG doubles the visible outside half of the normal stone edge.
   const fallback = new Graphics()
     .poly(polygonPoints(definition.collisionPolygon))
     .fill({ color: 0xb7aa8c, alpha: 1 })
     .poly(polygonPoints(definition.ecologyPolygon))
-    .fill({ color: 0xd8cca9, alpha: 0.34 })
-    .poly(polygonPoints(definition.collisionPolygon))
-    .stroke({ color: 0x303c3a, width: 4, join: 'round' });
+    .fill({ color: 0xd8cca9, alpha: 0.34 });
+  if (!texture) {
+    fallback
+      .poly(polygonPoints(definition.collisionPolygon))
+      .stroke({ color: 0x303c3a, width: 2.6, join: 'round' });
+  }
   fallback.position.set(visualOffset.x, visualOffset.y);
   container.addChild(fallback);
 
@@ -2529,6 +2532,64 @@ const drawSeeds = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   }
 };
 
+const drawVallisneriaPlant = (
+  layer: Graphics,
+  cellIndex: number,
+  root: Vec2,
+  structuralScale: number,
+  health: number,
+  senescent: boolean,
+  opacity = 1,
+): void => {
+  const healthAlpha = (0.48 + health * 0.46) * opacity;
+  const healthyPalette = [0x557f47, 0x6f9651, 0x80a65d];
+  const oldPalette = [0x7f7441, 0x9a8750, 0xa89159];
+  const leaves = vallisneriaLeaves(cellIndex, root, structuralScale);
+  for (let index = 0; index < leaves.length; index += 1) {
+    const leaf = leaves[index];
+    const ribbonWidth = leaf.ribbonWidth;
+    const baseHalf = ribbonWidth * 0.36;
+    const midHalf = ribbonWidth / 2;
+    const tipHalf = ribbonWidth * 0.16;
+    layer
+      .moveTo(leaf.root.x - baseHalf, leaf.root.y)
+      .bezierCurveTo(
+        leaf.controlA.x - midHalf * 0.78,
+        leaf.controlA.y,
+        leaf.controlB.x - midHalf,
+        leaf.controlB.y,
+        leaf.tip.x - tipHalf,
+        leaf.tip.y + 2,
+      )
+      .quadraticCurveTo(leaf.tip.x, leaf.tip.y - 2, leaf.tip.x + tipHalf, leaf.tip.y + 2)
+      .bezierCurveTo(
+        leaf.controlB.x + midHalf,
+        leaf.controlB.y,
+        leaf.controlA.x + midHalf * 0.78,
+        leaf.controlA.y,
+        leaf.root.x + baseHalf,
+        leaf.root.y,
+      )
+      .closePath()
+      .fill({
+        color: (senescent ? oldPalette : healthyPalette)[index % 3],
+        alpha: healthAlpha * (0.84 + (index % 4) * 0.045),
+      })
+      .stroke({ color: 0x354b3b, width: 1.05, alpha: 0.72 * opacity, join: 'round' });
+    layer
+      .moveTo(leaf.root.x - baseHalf * 0.25, leaf.root.y - 3)
+      .bezierCurveTo(
+        leaf.controlA.x - midHalf * 0.2,
+        leaf.controlA.y,
+        leaf.controlB.x - midHalf * 0.2,
+        leaf.controlB.y,
+        leaf.tip.x - tipHalf * 0.3,
+        leaf.tip.y + 2,
+      )
+      .stroke({ color: 0xd2d793, width: 0.75, alpha: 0.24 * opacity, cap: 'round' });
+  }
+};
+
 const drawAquaticPlants = (
   layer: Graphics,
   snapshot: SimulationSnapshot,
@@ -2539,13 +2600,21 @@ const drawAquaticPlants = (
   const visiblePlants = snapshot.cells.flatMap((cell) => {
     const plant = plantsByCell.get(cell.id);
     const visibleThreshold = plant ? 0.004 : ALGAE_VISIBLE_BIOMASS;
+    const root = plant ?? cell;
     if (
       cell.surfaceKind !== 'substrate' ||
       cell.biomass.vallisneria <= visibleThreshold ||
-      vallisneriaRenderDepth(cell) !== depth
+      vallisneriaRenderDepth(root) !== depth
     ) return [];
     return [{ cell, plant }];
-  }).sort((a, b) => compareVallisneriaDepth(a.cell, b.cell));
+  }).sort((a, b) => {
+    const left = a.plant ?? a.cell;
+    const right = b.plant ?? b.cell;
+    return compareVallisneriaDepth(
+      { index: a.cell.index, x: left.x, y: left.y },
+      { index: b.cell.index, x: right.x, y: right.y },
+    );
+  });
 
   for (const { cell, plant } of visiblePlants) {
     const biomass = cell.biomass.vallisneria;
@@ -2553,69 +2622,22 @@ const drawAquaticPlants = (
     // over a life stage. This keeps leaves stable through a single night but
     // makes runner daughters small and old plants visibly thin and yellow.
     const structuralScale = plant?.structuralScale ?? 0.72;
+    const root = plant ?? cell;
     // A juvenile rosette should read as a few narrow strap leaves, not a
     // radial tentacle cluster. Maturity adds leaves and height while keeping
     // every blade anchored to the same compact crown.
     const health = plant?.health ?? Math.min(1, biomass / 0.28);
     const senescent = plant?.lifeStage === 'senescent';
-    const healthAlpha = 0.48 + health * 0.46;
-    const healthyPalette = [0x557f47, 0x6f9651, 0x80a65d];
-    const oldPalette = [0x7f7441, 0x9a8750, 0xa89159];
-    const leaves = vallisneriaLeaves(cell.index, cell, structuralScale);
-    for (let index = 0; index < leaves.length; index += 1) {
-      const leaf = leaves[index];
-      const ribbonWidth = leaf.ribbonWidth;
-      const baseHalf = ribbonWidth * 0.36;
-      const midHalf = ribbonWidth / 2;
-      const tipHalf = ribbonWidth * 0.16;
-      layer
-        .moveTo(leaf.root.x - baseHalf, leaf.root.y)
-        .bezierCurveTo(
-          leaf.controlA.x - midHalf * 0.78,
-          leaf.controlA.y,
-          leaf.controlB.x - midHalf,
-          leaf.controlB.y,
-          leaf.tip.x - tipHalf,
-          leaf.tip.y + 2,
-        )
-        .quadraticCurveTo(leaf.tip.x, leaf.tip.y - 2, leaf.tip.x + tipHalf, leaf.tip.y + 2)
-        .bezierCurveTo(
-          leaf.controlB.x + midHalf,
-          leaf.controlB.y,
-          leaf.controlA.x + midHalf * 0.78,
-          leaf.controlA.y,
-          leaf.root.x + baseHalf,
-          leaf.root.y,
-        )
-        .closePath()
-        .fill({
-          color: (senescent ? oldPalette : healthyPalette)[index % 3],
-          alpha: healthAlpha * (0.84 + (index % 4) * 0.045),
-        })
-        .stroke({ color: 0x354b3b, width: 1.05, alpha: 0.72, join: 'round' });
-      layer
-        .moveTo(leaf.root.x - baseHalf * 0.25, leaf.root.y - 3)
-        .bezierCurveTo(
-          leaf.controlA.x - midHalf * 0.2,
-          leaf.controlA.y,
-          leaf.controlB.x - midHalf * 0.2,
-          leaf.controlB.y,
-          leaf.tip.x - tipHalf * 0.3,
-          leaf.tip.y + 2,
-        )
-        .stroke({ color: 0xd2d793, width: 0.75, alpha: 0.24, cap: 'round' });
-    }
+    drawVallisneriaPlant(
+      layer,
+      cell.index,
+      root,
+      structuralScale,
+      health,
+      senescent,
+    );
   }
 
-  // A small local cap buries only the crown. The broad substrate ridge is
-  // behind the plants, so it no longer cuts horizontally across every leaf.
-  for (const { cell, plant } of visiblePlants) {
-    const structuralScale = plant?.structuralScale ?? 0.72;
-    layer
-      .ellipse(cell.x, cell.y + 8, 5.5 + structuralScale * 3.2, 2.2 + structuralScale)
-      .fill({ color: 0x95785a, alpha: 0.9 })
-      .stroke({ color: 0xc4a675, width: 0.7, alpha: 0.45 });
-  }
 };
 
 const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void => {
@@ -2642,6 +2664,17 @@ const drawInteraction = (
   if (!held || (suppressInventoryHolding && held.source === 'inventory')) return;
   if (held.kind === 'seed' && held.speciesId) {
     const color = held.valid ? SPECIES[held.speciesId].color : 0xcf5f5a;
+    if (held.speciesId === 'vallisneria') {
+      drawVallisneriaPlant(
+        layer,
+        997,
+        { x: held.x, y: held.y },
+        0.62,
+        1,
+        false,
+        held.valid ? 0.82 : 0.58,
+      );
+    }
     layer
       .circle(held.x, held.y, 11)
       .fill({ color: 0xf9f2d9, alpha: 0.7 })

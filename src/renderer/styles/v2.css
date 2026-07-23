@@ -2695,10 +2695,12 @@
 .water-cycle-history-value.decomposer { fill: #a96535; }
 .water-cycle-history-value.toxic { fill: #9e4e4e; }
 .water-cycle-history-value.nitrifier { fill: #347d77; }
-.water-cycle-history.closed-cycle-history svg { height: 86px; }
+.water-cycle-history.closed-cycle-history svg { height: 112px; }
+.water-cycle-history-line.mineral-nitrogen { stroke: #8a7348; }
 .water-cycle-history-line.nutrient { stroke: #718d4d; }
 .water-cycle-history-line.dic { stroke: #607f98; }
 .water-cycle-history-line.oxygen { stroke: #4aa3b0; }
+.water-cycle-history-value.mineral-nitrogen { fill: #79623c; }
 .water-cycle-history-value.nutrient { fill: #5f7840; }
 .water-cycle-history-value.dic { fill: #506f89; }
 .water-cycle-history-value.oxygen { fill: #348b98; }
