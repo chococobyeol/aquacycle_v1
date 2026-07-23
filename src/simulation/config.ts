@@ -85,6 +85,10 @@ export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
  * and the numbers printed in the guide in one module prevents the handbook
  * from silently drifting away from the actual model.
  */
+const OXYGEN_PER_ORGANIC_CARBON = 1.12;
+const OXYGEN_PER_NITRIFIED_NITROGEN =
+  OXYGEN_PER_ORGANIC_CARBON * (64 / 14) / (32 / 12);
+
 export const WATER_CYCLE_RULES = {
   // All living and dead biomass uses one gameplay matter unit with a fixed
   // carbon:nitrogen composition.  This is deliberately simpler than a full
@@ -99,11 +103,15 @@ export const WATER_CYCLE_RULES = {
   mineralNutrientHalfSaturation: 3.5,
   detritusSolubilizationRate: 0.009,
   closedGasExchangeRate: 0.018,
-  // Includes the oxygen margin needed to close the compressed decomposition,
-  // animal respiration and nitrification loop. At 0.92 each complete matter
-  // cycle lost oxygen; 1.12 balances multi-generation four-hour runs while a
-  // consumer-heavy or poorly lit tank can still become hypoxic.
-  oxygenPerFixedCarbon: 1.12,
+  // One shared oxygen-equivalent conversion is used in both directions:
+  // fixing organic carbon produces it and mineralising that same carbon
+  // consumes it. The absolute value sets the game's display-unit scale; it is
+  // no longer an empirical margin that differs by process.
+  oxygenPerOrganicCarbon: OXYGEN_PER_ORGANIC_CARBON,
+  // NH4-N -> NO3-N requires 64/14 g O2 per g N, while CH2O carbon oxidation
+  // requires 32/12 g O2 per g C. Deriving this value from the carbon scale
+  // keeps carbon and nitrogen redox paths on one auditable unit system.
+  oxygenPerNitrifiedNitrogen: OXYGEN_PER_NITRIFIED_NITROGEN,
   algae: {
     // Ammonium is used first, with nitrate/other mineral nutrients filling the
     // remainder.  Uptake is charged only for newly fixed biomass.
@@ -115,7 +123,6 @@ export const WATER_CYCLE_RULES = {
     respirationFraction: 0.28,
     adultMaintenanceBiomassPerSecond: 0.000055,
     juvenileMaintenanceBiomassPerSecond: 0.000032,
-    oxygenPerRespiredCarbon: 0.86,
     adultStructuralBiomass: 1,
     juvenileBirthBiomass: 0.16,
     suppliedReserveBiomass: 0.08,
@@ -157,7 +164,6 @@ export const MICROBE_ECOLOGY_RULES = {
     biomassYield: 0.42,
     maintenanceDecayRate: 0.0022,
     starvationDecayRate: 0.013,
-    oxygenPerSubstrate: 0.21,
     surfaceSpreadRate: 0.025,
     waterborneExportRate: 0.0007,
     suspendedDecayRate: 0.025,
@@ -174,7 +180,6 @@ export const MICROBE_ECOLOGY_RULES = {
     biomassYield: 0.11,
     maintenanceDecayRate: 0.0012,
     starvationDecayRate: 0.0035,
-    oxygenPerSubstrate: 0.72,
     surfaceSpreadRate: 0.012,
     waterborneExportRate: 0.00035,
     suspendedDecayRate: 0.008,

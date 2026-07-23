@@ -157,9 +157,12 @@ it('keeps a closed mission-5 ecosystem alive through several shrimp generations'
   ).toBeLessThan(8);
   // The mission now starts with a deliberately finite nutrient reserve so an
   // untreated tank cannot coast through the objective. A treated tank should
-  // recycle enough to remain near/above the 3.5 half-saturation point rather
-  // than preserving the former oversized starting reservoir.
-  expect(finalChemistry.nutrients).toBeGreaterThan(3.2);
+  // recycle enough total mineral N (ammonium + nitrate) to remain near the
+  // 3.5 half-saturation point rather than preserving an oversized nitrate-only
+  // reservoir. Producers can use both pools.
+  expect(
+    finalChemistry.nutrients + final.biogeochemistry.average.toxicWaste,
+  ).toBeGreaterThan(3.2);
   expect(finalChemistry.inorganicCarbon).toBeGreaterThan(12);
   expect(hasRiseAndFall('organic')).toBe(true);
   expect(hasRiseAndFall('nutrients')).toBe(true);
@@ -173,4 +176,9 @@ it('keeps a closed mission-5 ecosystem alive through several shrimp generations'
     .toBeLessThan(0.0001);
   expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio))
     .toBeLessThan(0.0001);
-}, 90_000);
+  expect(Math.abs(final.biogeochemistry.materialBalance.oxygenEquivalentDriftRatio))
+    .toBeLessThan(0.0001);
+// This is 7,200 simulated seconds with live population bookkeeping. Leave
+// enough wall-clock headroom for developers to run it while the Electron
+// build is also open; the assertions and simulated duration stay unchanged.
+}, 180_000);

@@ -159,5 +159,7 @@ describe('day/night producer metabolism', () => {
       .toBeGreaterThan(30);
     expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio)).toBeLessThan(0.0001);
     expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio)).toBeLessThan(0.0001);
+    expect(Math.abs(final.biogeochemistry.materialBalance.oxygenEquivalentDriftRatio))
+      .toBeLessThan(0.0001);
   }, 40_000);
 });

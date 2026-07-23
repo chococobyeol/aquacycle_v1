@@ -16,6 +16,7 @@ import {
   BiogeochemistryLedger,
   emptyBiofilm,
 } from './biogeochemistry';
+import { oxygenEquivalentInventory } from './stoichiometry';
 import { FIXED_LAMP_WIDTH, FIXED_LAMP_X, FIXED_LAMP_Y } from './lightGeometry';
 import { dayNightStateAt, type DayNightPhase, type DayNightState } from './dayNight';
 import {
@@ -507,7 +508,11 @@ export class SimulationWorld {
   };
   private suspendedBiofilm: BiofilmBiomass = emptyBiofilm();
   private biofilmSettlementCursor = 0;
-  private materialReference: { nitrogen: number; carbon: number } | null = null;
+  private materialReference: {
+    nitrogen: number;
+    carbon: number;
+    oxygenEquivalent: number;
+  } | null = null;
   private biogeochemistry = new BiogeochemistryLedger();
   private lightOutput = 90;
   private naturalLightOutput = 0;
@@ -915,13 +920,20 @@ export class SimulationWorld {
     biogeochemistry.materialBalance = {
       totalNitrogen: materialTotals.nitrogen,
       totalCarbon: materialTotals.carbon,
+      oxygenEquivalent: materialTotals.oxygenEquivalent,
       referenceNitrogen: reference?.nitrogen ?? null,
       referenceCarbon: reference?.carbon ?? null,
+      referenceOxygenEquivalent: reference?.oxygenEquivalent ?? null,
       nitrogenDriftRatio: reference && reference.nitrogen > 0
         ? (materialTotals.nitrogen - reference.nitrogen) / reference.nitrogen
         : 0,
       carbonDriftRatio: reference && reference.carbon > 0
         ? (materialTotals.carbon - reference.carbon) / reference.carbon
+        : 0,
+      oxygenEquivalentDriftRatio: reference &&
+        Math.abs(reference.oxygenEquivalent) > 1e-9
+        ? (materialTotals.oxygenEquivalent - reference.oxygenEquivalent) /
+          Math.abs(reference.oxygenEquivalent)
         : 0,
     };
 
@@ -1219,8 +1231,16 @@ export class SimulationWorld {
     this.microbeInventoryUsed = { ...data.microbeInventoryUsed };
     this.suspendedBiofilm = { ...data.suspendedBiofilm };
     this.biofilmSettlementCursor = data.biofilmSettlementCursor;
-    this.materialReference = data.materialReference ? { ...data.materialReference } : null;
     this.biogeochemistry.restoreSaveState(data.biogeochemistry, data.waterTemperature);
+    const restoredTotals = this.computeMaterialTotals();
+    this.materialReference = data.materialReference
+      ? {
+        nitrogen: data.materialReference.nitrogen,
+        carbon: data.materialReference.carbon,
+        oxygenEquivalent:
+          data.materialReference.oxygenEquivalent ?? restoredTotals.oxygenEquivalent,
+      }
+      : null;
     this.waterTemperature = this.biogeochemistry.averageTemperature();
 
     this.held = null;
@@ -1251,7 +1271,11 @@ export class SimulationWorld {
     );
   }
 
-  private computeMaterialTotals(): { nitrogen: number; carbon: number } {
+  private computeMaterialTotals(): {
+    nitrogen: number;
+    carbon: number;
+    oxygenEquivalent: number;
+  } {
     const water = this.biogeochemistry.materialState();
     const surfaceBiomass = this.allCells().reduce((sum, cell) => sum +
       cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria +
@@ -1263,11 +1287,17 @@ export class SimulationWorld {
     const suspended = this.suspendedBiofilm.decomposer + this.suspendedBiofilm.nitrifier;
     const biologicalMatter = water.organicMatter + water.detritus +
       surfaceBiomass + animalBiomass + suspended;
+    const organicCarbon = biologicalMatter * WATER_CYCLE_RULES.biomassCarbon;
     return {
       nitrogen: water.toxicWaste + water.nutrients +
         biologicalMatter * WATER_CYCLE_RULES.biomassNitrogen,
       carbon: water.dissolvedInorganicCarbon + water.headspaceCarbonDioxide +
-        biologicalMatter * WATER_CYCLE_RULES.biomassCarbon,
+        organicCarbon,
+      oxygenEquivalent: oxygenEquivalentInventory({
+        totalOxygen: water.dissolvedOxygen + water.headspaceOxygen,
+        organicCarbon,
+        nitrateNitrogen: water.nutrients,
+      }),
     };
   }
 
@@ -1931,6 +1961,9 @@ export class SimulationWorld {
       ) {
         this.materialReference.nitrogen += inoculum * WATER_CYCLE_RULES.biomassNitrogen;
         this.materialReference.carbon += inoculum * WATER_CYCLE_RULES.biomassCarbon;
+        this.materialReference.oxygenEquivalent -=
+          inoculum * WATER_CYCLE_RULES.biomassCarbon *
+          WATER_CYCLE_RULES.oxygenPerOrganicCarbon;
       }
       this.microbeInventoryUsed[heldBiofilm.guildId] += 1;
       this.held = null;
@@ -3554,25 +3587,22 @@ export class SimulationWorld {
         temperature,
       );
       const maintenanceRequest = maintenanceRate * metabolicTemperatureFactor * deltaSeconds;
-      const reserveLoss = this.biogeochemistry.effectsEnabled
-        ? Math.min(animal.storedBiomass, maintenanceRequest)
+      const availableForRespiration = this.biogeochemistry.effectsEnabled
+        ? animal.storedBiomass + animal.structuralBiomass
         : maintenanceRequest;
+      const actualRespiration = this.biogeochemistry.recordAnimalRespiration(
+        animal.position,
+        Math.min(maintenanceRequest, availableForRespiration),
+      );
       if (this.biogeochemistry.effectsEnabled) {
+        const reserveLoss = Math.min(animal.storedBiomass, actualRespiration);
         animal.storedBiomass -= reserveLoss;
-      }
-      const structuralLoss = this.biogeochemistry.effectsEnabled
-        ? Math.min(
+        const structuralLoss = Math.min(
           animal.structuralBiomass,
-          Math.max(0, maintenanceRequest - reserveLoss),
-        )
-        : 0;
-      if (this.biogeochemistry.effectsEnabled) {
+          Math.max(0, actualRespiration - reserveLoss),
+        );
         animal.structuralBiomass -= structuralLoss;
       }
-      this.biogeochemistry.recordAnimalRespiration(
-        animal.position,
-        reserveLoss + structuralLoss,
-      );
 
       const environmentalDeathCause = environmentalDeathCauses.get(animal.id);
       if (environmentalDeathCause) {
@@ -4221,7 +4251,7 @@ export class SimulationWorld {
         const naturalTurnover = amount * 0.0018 * deltaSeconds;
         result[speciesId] = Math.max(
           0,
-          amount + production - requestedRespiration - stressTurnover + replacement - naturalTurnover,
+          amount + production - respiration - stressTurnover + replacement - naturalTurnover,
         );
       }
 

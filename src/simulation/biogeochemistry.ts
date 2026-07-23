@@ -25,6 +25,11 @@ import {
   relativeOxygenSolubility,
 } from './gasExchange';
 import { thetaTemperatureFactor } from './temperatureResponse';
+import {
+  nitrifierStoichiometry,
+  organicCarbonOxygenDemand,
+  producerOxygenProduction,
+} from './stoichiometry';
 
 export const WATER_COLUMNS = 36;
 export const WATER_ROWS = 20;
@@ -76,11 +81,14 @@ export class BiogeochemistryLedger {
   public readonly effectsEnabled: boolean;
 
   private readonly detritus = new Float64Array(CELL_COUNT);
-  private readonly organicMatter = new Float32Array(CELL_COUNT);
-  private readonly toxicWaste = new Float32Array(CELL_COUNT);
-  private readonly nutrients = new Float32Array(CELL_COUNT);
-  private readonly oxygen = new Float32Array(CELL_COUNT);
-  private readonly dissolvedInorganicCarbon = new Float32Array(CELL_COUNT);
+  // Chemistry uses Float64 because these are conserved ledgers, not render
+  // buffers. Float32 rounding was small per step but accumulated measurably
+  // across tens of thousands of closed day/night reaction steps.
+  private readonly organicMatter = new Float64Array(CELL_COUNT);
+  private readonly toxicWaste = new Float64Array(CELL_COUNT);
+  private readonly nutrients = new Float64Array(CELL_COUNT);
+  private readonly oxygen = new Float64Array(CELL_COUNT);
+  private readonly dissolvedInorganicCarbon = new Float64Array(CELL_COUNT);
   private readonly transport: WaterTransportGrid;
 
   private headspaceCarbonDioxide: number = WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide;
@@ -213,7 +221,7 @@ export class BiogeochemistryLedger {
     const paidBiomass = Math.min(actual, paidNitrogen / nitrogenPerBiomass);
     const fixedCarbon = paidBiomass * carbonPerBiomass;
     this.removeMassAround(this.dissolvedInorganicCarbon, index, fixedCarbon);
-    const oxygenProduced = fixedCarbon * WATER_CYCLE_RULES.oxygenPerFixedCarbon;
+    const oxygenProduced = producerOxygenProduction(fixedCarbon, removedNutrients);
     const dissolved = this.addMassAround(this.oxygen, index, oxygenProduced);
     this.headspaceOxygen += oxygenProduced - dissolved;
     this.cumulativeOxygenProduction += oxygenProduced;
@@ -235,16 +243,34 @@ export class BiogeochemistryLedger {
       return requested;
     }
     const index = this.indexAt(point);
-    const oxygenPerBiomass = WATER_CYCLE_RULES.biomassCarbon *
-      WATER_CYCLE_RULES.oxygenPerFixedCarbon;
+    const oxygenPerBiomass = organicCarbonOxygenDemand(
+      WATER_CYCLE_RULES.biomassCarbon,
+    );
+    const availableOxygen = this.massAround(this.oxygen, index);
+    const carbonCapacity = this.capacityAroundOrTank(
+      this.dissolvedInorganicCarbon,
+      index,
+      requested * WATER_CYCLE_RULES.biomassCarbon,
+    );
+    const nitrogenCapacity = this.capacityAroundOrTank(
+      this.toxicWaste,
+      index,
+      requested * WATER_CYCLE_RULES.biomassNitrogen,
+    );
+    const supported = Math.min(
+      requested,
+      availableOxygen / Math.max(1e-9, oxygenPerBiomass),
+      carbonCapacity / WATER_CYCLE_RULES.biomassCarbon,
+      nitrogenCapacity / WATER_CYCLE_RULES.biomassNitrogen,
+    );
     const removedOxygen = this.removeMassAround(
       this.oxygen,
       index,
-      requested * oxygenPerBiomass,
+      supported * oxygenPerBiomass,
     );
     const actual = oxygenPerBiomass > 0
-      ? Math.min(requested, removedOxygen / oxygenPerBiomass)
-      : requested;
+      ? Math.min(supported, removedOxygen / oxygenPerBiomass)
+      : supported;
     if (actual <= 0) return 0;
     const carbon = actual * WATER_CYCLE_RULES.biomassCarbon;
     const nitrogen = actual * WATER_CYCLE_RULES.biomassNitrogen;
@@ -283,8 +309,9 @@ export class BiogeochemistryLedger {
       const feces = consumed * WATER_CYCLE_RULES.shrimp.fecesFraction;
       const respired = consumed * WATER_CYCLE_RULES.shrimp.respirationFraction;
       this.detritus[this.indexAt(point)] += feces;
-      this.cumulativeOxygenDemand += respired * WATER_CYCLE_RULES.biomassCarbon *
-        WATER_CYCLE_RULES.shrimp.oxygenPerRespiredCarbon;
+      this.cumulativeOxygenDemand += organicCarbonOxygenDemand(
+        respired * WATER_CYCLE_RULES.biomassCarbon,
+      );
       this.cumulativeDissolvedWaste += respired * WATER_CYCLE_RULES.biomassNitrogen;
       // Earlier missions deliberately do not enforce the closed material
       // ledger. Preserve their established food/energy balance while still
@@ -296,7 +323,10 @@ export class BiogeochemistryLedger {
     const feces = consumed * WATER_CYCLE_RULES.shrimp.fecesFraction;
     const respired = consumed - assimilated - feces;
     this.detritus[index] += feces;
-    this.releaseRespiredBiomass(index, respired);
+    const actuallyRespired = this.releaseRespiredBiomass(index, respired);
+    // Under oxygen limitation this share was not mineralised. Keeping it as
+    // detritus closes the material and redox ledgers instead of deleting it.
+    this.detritus[index] += Math.max(0, respired - actuallyRespired);
     return assimilated;
   }
 
@@ -311,15 +341,16 @@ export class BiogeochemistryLedger {
   }
 
   /** Converts a real loss from animal reserve/body into CO2 and ammonium. */
-  public recordAnimalRespiration(point: Vec2, metabolizedBiomass: number): void {
-    if (metabolizedBiomass <= 0) return;
+  public recordAnimalRespiration(point: Vec2, metabolizedBiomass: number): number {
+    if (metabolizedBiomass <= 0) return 0;
     if (!this.effectsEnabled) {
-      this.cumulativeOxygenDemand += metabolizedBiomass * WATER_CYCLE_RULES.biomassCarbon *
-        WATER_CYCLE_RULES.shrimp.oxygenPerRespiredCarbon;
+      this.cumulativeOxygenDemand += organicCarbonOxygenDemand(
+        metabolizedBiomass * WATER_CYCLE_RULES.biomassCarbon,
+      );
       this.cumulativeDissolvedWaste += metabolizedBiomass * WATER_CYCLE_RULES.biomassNitrogen;
-      return;
+      return metabolizedBiomass;
     }
-    this.releaseRespiredBiomass(this.indexAt(point), metabolizedBiomass);
+    return this.releaseRespiredBiomass(this.indexAt(point), metabolizedBiomass);
   }
 
   /**
@@ -562,16 +593,45 @@ export class BiogeochemistryLedger {
       materialBalance: {
         totalNitrogen,
         totalCarbon,
+        oxygenEquivalent: 0,
         referenceNitrogen: null,
         referenceCarbon: null,
+        referenceOxygenEquivalent: null,
         nitrogenDriftRatio: 0,
         carbonDriftRatio: 0,
+        oxygenEquivalentDriftRatio: 0,
       },
     };
   }
 
   private applyBiofilmReactions(deltaSeconds: number, sites: BiofilmReactionSite[]): void {
-    for (const site of sites) {
+    // Explicit two-stage reaction step:
+    // 1. every guild reads the same pre-reaction concentrations;
+    // 2. withdrawals and product capacities are allocated from separate
+    //    budgets, so a product made earlier in this loop cannot be eaten in
+    //    the same Euler step.
+    //
+    // Stable spatial ordering makes competition deterministic without making
+    // results depend on the caller's surface-cell array order.
+    const initialOrganicMatter = new Float64Array(this.organicMatter);
+    const initialToxicWaste = new Float64Array(this.toxicWaste);
+    const initialNutrients = new Float64Array(this.nutrients);
+    const initialOxygen = new Float64Array(this.oxygen);
+    const initialCarbon = new Float64Array(this.dissolvedInorganicCarbon);
+    const organicWithdrawal = new Float64Array(initialOrganicMatter);
+    const toxicWasteWithdrawal = new Float64Array(initialToxicWaste);
+    const oxygenWithdrawal = new Float64Array(initialOxygen);
+    const carbonWithdrawal = new Float64Array(initialCarbon);
+    const toxicWasteProducts = new Float64Array(initialToxicWaste);
+    const nutrientProducts = new Float64Array(initialNutrients);
+    const carbonProducts = new Float64Array(initialCarbon);
+    const orderedSites = [...sites].sort((left, right) =>
+      left.point.y - right.point.y ||
+      left.point.x - right.point.x ||
+      left.biofilm.decomposer - right.biofilm.decomposer ||
+      left.biofilm.nitrifier - right.biofilm.nitrifier);
+
+    for (const site of orderedSites) {
       site.biofilm.decomposer = clamp(site.biofilm.decomposer, 0, 1);
       site.biofilm.nitrifier = clamp(site.biofilm.nitrifier, 0, 1);
       const index = this.indexAt(site.point);
@@ -580,7 +640,12 @@ export class BiogeochemistryLedger {
         const biomass = site.biofilm[guildId];
         if (biomass <= 0) continue;
         const kinetics = MICROBE_ECOLOGY_RULES[guildId];
-        const quality = this.sampleAt(site.point);
+        const quality: WaterQualityValues = {
+          organicMatter: initialOrganicMatter[index],
+          toxicWaste: initialToxicWaste[index],
+          nutrients: initialNutrients[index],
+          oxygen: initialOxygen[index],
+        };
         const activity = saturation(quality[kinetics.substrate], kinetics.halfSaturation) *
           saturation(quality.oxygen, kinetics.oxygenHalfSaturation);
         const temperatureFactor = thetaTemperatureFactor(
@@ -593,49 +658,99 @@ export class BiogeochemistryLedger {
         const requested = biomass * kinetics.maximumUptake * activity *
           temperatureFactor * deltaSeconds;
         const foodField = guildId === 'decomposer' ? this.organicMatter : this.toxicWaste;
-        const foodAvailable = this.massAround(foodField, index);
-        const oxygenAvailable = this.massAround(this.oxygen, index);
-        let actual = Math.min(
-          requested,
-          foodAvailable,
-          oxygenAvailable / Math.max(1e-9, kinetics.oxygenPerSubstrate),
-        );
+        const foodWithdrawal = guildId === 'decomposer'
+          ? organicWithdrawal
+          : toxicWasteWithdrawal;
+        const foodAvailable = this.massAround(foodWithdrawal, index);
+        const oxygenAvailable = this.massAround(oxygenWithdrawal, index);
+        let actual = Math.min(requested, foodAvailable);
 
         if (guildId === 'decomposer') {
           const retainedFraction = kinetics.biomassYield * freeSurface;
+          const mineralizedFraction = Math.max(0, 1 - retainedFraction);
+          const oxygenPerSubstrate = organicCarbonOxygenDemand(
+            mineralizedFraction * WATER_CYCLE_RULES.biomassCarbon,
+          );
           const productPerSubstrate = (1 - retainedFraction) *
             WATER_CYCLE_RULES.biomassNitrogen;
-          const productCapacity = this.capacityAround(this.toxicWaste, index);
-          actual = Math.min(actual, productCapacity / Math.max(1e-9, productPerSubstrate));
-        } else {
-          const retainedNitrogenFraction = kinetics.biomassYield * freeSurface;
-          const productCapacity = this.capacityAround(this.nutrients, index);
+          const productCapacity = this.capacityAround(toxicWasteProducts, index);
+          const carbonProductCapacity = this.capacityAround(
+            carbonProducts,
+            index,
+          );
+          const carbonPerSubstrate = mineralizedFraction *
+            WATER_CYCLE_RULES.biomassCarbon;
           actual = Math.min(
             actual,
-            productCapacity / Math.max(1e-9, 1 - retainedNitrogenFraction),
+            oxygenAvailable / Math.max(1e-9, oxygenPerSubstrate),
+            productCapacity / Math.max(1e-9, productPerSubstrate),
+            carbonProductCapacity / Math.max(1e-9, carbonPerSubstrate),
           );
+        } else {
+          const retainedNitrogenFraction = kinetics.biomassYield * freeSurface;
+          const productCapacity = this.capacityAround(nutrientProducts, index);
+          const availableCarbon = this.massAround(carbonWithdrawal, index);
+          const reactionAt = (processedNitrogen: number) => {
+            const potentialGrowth =
+              processedNitrogen * retainedNitrogenFraction /
+              WATER_CYCLE_RULES.biomassNitrogen;
+            const carbonLimitedGrowth = Math.min(
+              potentialGrowth,
+              availableCarbon / WATER_CYCLE_RULES.biomassCarbon,
+            );
+            return nitrifierStoichiometry(processedNitrogen, carbonLimitedGrowth);
+          };
+          const feasible = (processedNitrogen: number): boolean => {
+            const reaction = reactionAt(processedNitrogen);
+            return reaction.oxygenDemand <= oxygenAvailable + 1e-12 &&
+              reaction.nitrateProduced <= productCapacity + 1e-12;
+          };
+          if (!feasible(actual)) {
+            let low = 0;
+            let high = actual;
+            for (let iteration = 0; iteration < 32; iteration += 1) {
+              const middle = (low + high) / 2;
+              if (feasible(middle)) low = middle;
+              else high = middle;
+            }
+            actual = low;
+          }
         }
 
-        const consumed = this.removeMassAround(foodField, index, actual);
-        const oxygenDemand = consumed * kinetics.oxygenPerSubstrate;
-        this.removeMassAround(this.oxygen, index, oxygenDemand);
-        this.cumulativeOxygenDemand += oxygenDemand;
+        const consumed = this.removeMassAround(foodWithdrawal, index, actual);
+        this.removeMassAround(foodField, index, consumed);
 
         let growth = 0;
+        let oxygenDemand = 0;
         if (guildId === 'decomposer') {
           growth = consumed * kinetics.biomassYield * freeSurface;
           const mineralized = Math.max(0, consumed - growth);
+          oxygenDemand = organicCarbonOxygenDemand(
+            mineralized * WATER_CYCLE_RULES.biomassCarbon,
+          );
+          const releasedNitrogen = mineralized * WATER_CYCLE_RULES.biomassNitrogen;
+          const releasedCarbon = mineralized * WATER_CYCLE_RULES.biomassCarbon;
+          this.addMassAround(
+            toxicWasteProducts,
+            index,
+            releasedNitrogen,
+          );
           this.addMassAround(
             this.toxicWaste,
             index,
-            mineralized * WATER_CYCLE_RULES.biomassNitrogen,
+            releasedNitrogen,
+          );
+          this.addMassAround(
+            carbonProducts,
+            index,
+            releasedCarbon,
           );
           this.addMassAround(
             this.dissolvedInorganicCarbon,
             index,
-            mineralized * WATER_CYCLE_RULES.biomassCarbon,
+            releasedCarbon,
           );
-          this.cumulativeDissolvedWaste += mineralized * WATER_CYCLE_RULES.biomassNitrogen;
+          this.cumulativeDissolvedWaste += releasedNitrogen;
         } else {
           const retainedNitrogen = consumed * kinetics.biomassYield * freeSurface;
           const potentialGrowth = retainedNitrogen / WATER_CYCLE_RULES.biomassNitrogen;
@@ -644,19 +759,33 @@ export class BiogeochemistryLedger {
             potentialGrowth,
             availableCarbon / WATER_CYCLE_RULES.biomassCarbon,
           );
-          growth = carbonLimitedGrowth;
-          const actualRetainedNitrogen = growth * WATER_CYCLE_RULES.biomassNitrogen;
+          const reaction = nitrifierStoichiometry(consumed, carbonLimitedGrowth);
+          growth = reaction.growthBiomass;
+          oxygenDemand = reaction.oxygenDemand;
+          this.removeMassAround(
+            carbonWithdrawal,
+            index,
+            reaction.fixedCarbon,
+          );
           this.removeMassAround(
             this.dissolvedInorganicCarbon,
             index,
-            growth * WATER_CYCLE_RULES.biomassCarbon,
+            reaction.fixedCarbon,
+          );
+          this.addMassAround(
+            nutrientProducts,
+            index,
+            reaction.nitrateProduced,
           );
           this.addMassAround(
             this.nutrients,
             index,
-            Math.max(0, consumed - actualRetainedNitrogen),
+            reaction.nitrateProduced,
           );
         }
+        this.removeMassAround(oxygenWithdrawal, index, oxygenDemand);
+        const removedOxygen = this.removeMassAround(this.oxygen, index, oxygenDemand);
+        this.cumulativeOxygenDemand += removedOxygen;
 
         const realizedActivity = requested > 0
           ? activity * clamp(consumed / requested, 0, 1)
@@ -683,16 +812,38 @@ export class BiogeochemistryLedger {
     }
   }
 
-  private releaseRespiredBiomass(index: number, biomass: number): void {
-    if (biomass <= 0) return;
-    const carbon = biomass * WATER_CYCLE_RULES.biomassCarbon;
-    const nitrogen = biomass * WATER_CYCLE_RULES.biomassNitrogen;
-    const oxygenDemand = carbon * WATER_CYCLE_RULES.shrimp.oxygenPerRespiredCarbon;
+  private releaseRespiredBiomass(index: number, biomass: number): number {
+    if (biomass <= 0) return 0;
+    const oxygenPerBiomass = organicCarbonOxygenDemand(
+      WATER_CYCLE_RULES.biomassCarbon,
+    );
+    const oxygenAvailable = this.massAround(this.oxygen, index);
+    const carbonCapacity = this.capacityAroundOrTank(
+      this.dissolvedInorganicCarbon,
+      index,
+      biomass * WATER_CYCLE_RULES.biomassCarbon,
+    );
+    const nitrogenCapacity = this.capacityAroundOrTank(
+      this.toxicWaste,
+      index,
+      biomass * WATER_CYCLE_RULES.biomassNitrogen,
+    );
+    const actual = Math.min(
+      biomass,
+      oxygenPerBiomass > 0 ? oxygenAvailable / oxygenPerBiomass : biomass,
+      carbonCapacity / WATER_CYCLE_RULES.biomassCarbon,
+      nitrogenCapacity / WATER_CYCLE_RULES.biomassNitrogen,
+    );
+    if (actual <= 0) return 0;
+    const carbon = actual * WATER_CYCLE_RULES.biomassCarbon;
+    const nitrogen = actual * WATER_CYCLE_RULES.biomassNitrogen;
+    const oxygenDemand = organicCarbonOxygenDemand(carbon);
     this.addMassAround(this.dissolvedInorganicCarbon, index, carbon);
     this.addMassAround(this.toxicWaste, index, nitrogen);
-    this.removeMassAround(this.oxygen, index, oxygenDemand);
-    this.cumulativeOxygenDemand += oxygenDemand;
+    const removedOxygen = this.removeMassAround(this.oxygen, index, oxygenDemand);
+    this.cumulativeOxygenDemand += removedOxygen;
     this.cumulativeDissolvedWaste += nitrogen;
+    return actual;
   }
 
   private exchangeClosedHeadspace(deltaSeconds: number): void {
@@ -752,7 +903,7 @@ export class BiogeochemistryLedger {
     };
   }
 
-  private fieldMass(field: Float32Array): number {
+  private fieldMass(field: Float32Array | Float64Array): number {
     let total = 0;
     for (const value of field) total += value;
     return total / CELL_COUNT;
@@ -774,23 +925,54 @@ export class BiogeochemistryLedger {
     return Array.from({ length: WATER_COLUMNS }, (_, column) => column);
   }
 
-  private massAround(field: Float32Array, index: number): number {
+  private massAround(field: Float32Array | Float64Array, index: number): number {
     return this.indicesAround(index).reduce((sum, candidate) => sum + field[candidate], 0) /
       CELL_COUNT;
   }
 
-  private capacityAround(field: Float32Array, index: number): number {
+  private capacityAround(field: Float32Array | Float64Array, index: number): number {
     return this.indicesAround(index).reduce(
       (sum, candidate) => sum + Math.max(0, MAX_CONCENTRATION - field[candidate]),
       0,
     ) / CELL_COUNT;
   }
 
-  private removeMassAround(field: Float32Array, index: number, requested: number): number {
+  private fieldCapacity(field: Float32Array | Float64Array): number {
+    let capacity = 0;
+    for (const value of field) capacity += Math.max(0, MAX_CONCENTRATION - value);
+    return capacity / CELL_COUNT;
+  }
+
+  /**
+   * Reaction products normally fit in the local stencil. Only scan the whole
+   * tank when that stencil is genuinely saturated and addMassAround would
+   * need its tank-wide overflow path. This keeps exact product accounting
+   * without turning every organism's respiration into a full-grid reduction.
+   */
+  private capacityAroundOrTank(
+    field: Float32Array | Float64Array,
+    index: number,
+    required: number,
+  ): number {
+    const localCapacity = this.capacityAround(field, index);
+    return localCapacity >= required
+      ? localCapacity
+      : this.fieldCapacity(field);
+  }
+
+  private removeMassAround(
+    field: Float32Array | Float64Array,
+    index: number,
+    requested: number,
+  ): number {
     return this.removeMassFromIndices(field, this.indicesAround(index), requested);
   }
 
-  private addMassAround(field: Float32Array, index: number, requested: number): number {
+  private addMassAround(
+    field: Float32Array | Float64Array,
+    index: number,
+    requested: number,
+  ): number {
     const local = this.indicesAround(index);
     const locallyAdded = this.addMassToIndices(field, local, requested);
     if (locallyAdded >= requested - 1e-12) return locallyAdded;
@@ -798,7 +980,11 @@ export class BiogeochemistryLedger {
     return locallyAdded + this.addMassToIndices(field, all, requested - locallyAdded);
   }
 
-  private removeMassFromIndices(field: Float32Array, indices: number[], requested: number): number {
+  private removeMassFromIndices(
+    field: Float32Array | Float64Array,
+    indices: number[],
+    requested: number,
+  ): number {
     if (requested <= 0 || !indices.length) return 0;
     const available = indices.reduce((sum, index) => sum + field[index], 0) / CELL_COUNT;
     const actual = Math.min(requested, available);
@@ -808,7 +994,11 @@ export class BiogeochemistryLedger {
     return actual;
   }
 
-  private addMassToIndices(field: Float32Array, indices: number[], requested: number): number {
+  private addMassToIndices(
+    field: Float32Array | Float64Array,
+    indices: number[],
+    requested: number,
+  ): number {
     if (requested <= 0 || !indices.length) return 0;
     const capacity = indices.reduce(
       (sum, index) => sum + Math.max(0, MAX_CONCENTRATION - field[index]),

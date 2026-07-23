@@ -301,10 +301,13 @@ export interface BiogeochemistrySnapshot {
   materialBalance: {
     totalNitrogen: number;
     totalCarbon: number;
+    oxygenEquivalent: number;
     referenceNitrogen: number | null;
     referenceCarbon: number | null;
+    referenceOxygenEquivalent: number | null;
     nitrogenDriftRatio: number;
     carbonDriftRatio: number;
+    oxygenEquivalentDriftRatio: number;
   };
 }
 
@@ -582,7 +585,12 @@ export interface SimulationSaveData {
   microbeInventoryUsed: Record<MicrobeGuildId, number>;
   suspendedBiofilm: BiofilmBiomass;
   biofilmSettlementCursor: number;
-  materialReference: { nitrogen: number; carbon: number } | null;
+  materialReference: {
+    nitrogen: number;
+    carbon: number;
+    /** Optional so frozen aquariums from before redox auditing still load. */
+    oxygenEquivalent?: number;
+  } | null;
   biogeochemistry: BiogeochemistrySaveState;
 }
 

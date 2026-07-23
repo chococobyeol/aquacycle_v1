@@ -4,22 +4,29 @@ import {
   type BiofilmReactionSite,
 } from '../src/simulation/biogeochemistry';
 import { WATER_CYCLE_RULES } from '../src/simulation/config';
+import { oxygenEquivalentInventory } from '../src/simulation/stoichiometry';
 
 const totals = (
   ledger: BiogeochemistryLedger,
   sites: BiofilmReactionSite[],
-): { nitrogen: number; carbon: number } => {
+): { nitrogen: number; carbon: number; oxygenEquivalent: number } => {
   const state = ledger.materialState();
   const film = sites.reduce(
     (sum, site) => sum + site.biofilm.decomposer + site.biofilm.nitrifier,
     0,
   );
   const organicBiomass = state.organicMatter + state.detritus + film;
+  const organicCarbon = organicBiomass * WATER_CYCLE_RULES.biomassCarbon;
   return {
     nitrogen: state.toxicWaste + state.nutrients +
       organicBiomass * WATER_CYCLE_RULES.biomassNitrogen,
     carbon: state.dissolvedInorganicCarbon + state.headspaceCarbonDioxide +
-      organicBiomass * WATER_CYCLE_RULES.biomassCarbon,
+      organicCarbon,
+    oxygenEquivalent: oxygenEquivalentInventory({
+      totalOxygen: state.dissolvedOxygen + state.headspaceOxygen,
+      organicCarbon,
+      nitrateNitrogen: state.nutrients,
+    }),
   };
 };
 
@@ -47,6 +54,10 @@ describe('closed material ledger', () => {
       .toBeLessThan(0.00002);
     expect(Math.abs((final.carbon - initial.carbon) / initial.carbon))
       .toBeLessThan(0.00002);
+    expect(Math.abs(
+      (final.oxygenEquivalent - initial.oxygenEquivalent) /
+      initial.oxygenEquivalent,
+    )).toBeLessThan(0.00002);
     expect(ledger.materialState().dissolvedInorganicCarbon).toBeGreaterThanOrEqual(0);
     expect(ledger.materialState().headspaceCarbonDioxide).toBeGreaterThanOrEqual(0);
     expect(ledger.materialState().headspaceOxygen).toBeGreaterThanOrEqual(0);

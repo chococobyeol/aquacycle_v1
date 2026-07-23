@@ -229,7 +229,7 @@ export class WaterTransportGrid {
    * field that can silently lose material.
    */
   public advectConservativeField(
-    field: Float32Array,
+    field: Float32Array | Float64Array,
     deltaSeconds: number,
     maximum: number | ArrayLike<number> = 100,
   ): void {
@@ -353,7 +353,7 @@ export class WaterTransportGrid {
    * coarse cell is not zero unresolved water motion in a real aquarium.
    */
   public disperseConservativeField(
-    field: Float32Array,
+    field: Float32Array | Float64Array,
     deltaSeconds: number,
     fieldMixingPerSecond: number,
   ): void {
@@ -715,7 +715,7 @@ export class WaterTransportGrid {
   }
 
   private dispersePair(
-    field: Float32Array,
+    field: Float32Array | Float64Array,
     first: number,
     second: number,
     fieldRetention: number,

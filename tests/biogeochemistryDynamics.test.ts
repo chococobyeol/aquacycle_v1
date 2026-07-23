@@ -50,6 +50,26 @@ describe('active biogeochemistry', () => {
     expect(ledger.snapshot().water.organicMatter).toHaveLength(36 * 20);
   });
 
+  it('does not delete animal biomass when oxygen cannot support respiration', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 0, nutrients: 20, oxygen: 0 },
+    });
+    const before = ledger.materialState();
+
+    expect(ledger.recordAnimalRespiration(point, 0.5)).toBe(0);
+    const assimilated = ledger.recordAnimalFeeding(point, 1);
+    const after = ledger.materialState();
+
+    expect(assimilated).toBeCloseTo(0.3, 12);
+    expect(after.detritus).toBeCloseTo(0.7, 12);
+    expect(after.dissolvedInorganicCarbon).toBeCloseTo(
+      before.dissolvedInorganicCarbon,
+      12,
+    );
+    expect(after.toxicWaste).toBeCloseTo(before.toxicWaste, 12);
+  });
+
   it('makes an early inoculation shrink when both microbial foods are scarce', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,
@@ -209,5 +229,33 @@ describe('active biogeochemistry', () => {
       expect(film.biofilm.nitrifier).toBeGreaterThanOrEqual(0);
       expect(film.biofilm.decomposer + film.biofilm.nitrifier).toBeLessThanOrEqual(1.000001);
     }
+  });
+
+  it('evaluates one biofilm step from a shared pre-reaction state regardless of site order', () => {
+    const makeLedger = () => new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 18, toxicWaste: 9, nutrients: 12, oxygen: 72 },
+    });
+    const definitions: BiofilmReactionSite[] = [
+      { point: { x: 520, y: 600 }, biofilm: { decomposer: 0.42, nitrifier: 0.08 } },
+      { point: { x: 600, y: 600 }, biofilm: { decomposer: 0.24, nitrifier: 0.31 } },
+      { point: { x: 680, y: 600 }, biofilm: { decomposer: 0.12, nitrifier: 0.46 } },
+    ];
+    const cloneSites = (items: BiofilmReactionSite[]) => items.map((item) => ({
+      point: { ...item.point },
+      biofilm: { ...item.biofilm },
+    }));
+    const forwardLedger = makeLedger();
+    const reverseLedger = makeLedger();
+    const forwardSites = cloneSites(definitions);
+    const reverseSites = cloneSites([...definitions].reverse());
+
+    forwardLedger.advance(4, forwardSites);
+    reverseLedger.advance(4, reverseSites);
+
+    expect(reverseLedger.materialState()).toEqual(forwardLedger.materialState());
+    const byX = (items: BiofilmReactionSite[]) =>
+      [...items].sort((left, right) => left.point.x - right.point.x);
+    expect(byX(reverseSites)).toEqual(byX(forwardSites));
   });
 });

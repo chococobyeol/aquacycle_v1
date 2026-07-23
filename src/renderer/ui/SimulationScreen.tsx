@@ -2598,6 +2598,7 @@ function ObservationSectionContent({
         <div><dt>현재 수온의 물쪽 산소 목표</dt><dd>{gas.oxygenWaterEquilibrium.toFixed(2)}</dd></div>
         <div className="material-ledger-row"><dt>질소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalNitrogen.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.nitrogenDriftRatio)}</small></dd></div>
         <div className="material-ledger-row"><dt>탄소 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.totalCarbon.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.carbonDriftRatio)}</small></dd></div>
+        <div className="material-ledger-row"><dt>산소 등가 장부</dt><dd>{snapshot.biogeochemistry.materialBalance.oxygenEquivalent.toFixed(2)} <small>{formatSignedPercent(snapshot.biogeochemistry.materialBalance.oxygenEquivalentDriftRatio)}</small></dd></div>
       </dl>
     );
   }
@@ -3612,7 +3613,7 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
   const adultMaintenance = WATER_CYCLE_RULES.shrimp.adultMaintenanceBiomassPerSecond;
   const juvenileMaintenance = WATER_CYCLE_RULES.shrimp.juvenileMaintenanceBiomassPerSecond;
   const oxygenPerAdultSecond = adultMaintenance * WATER_CYCLE_RULES.biomassCarbon *
-    WATER_CYCLE_RULES.shrimp.oxygenPerRespiredCarbon;
+    WATER_CYCLE_RULES.oxygenPerOrganicCarbon;
   return (
     <section className="paper-panel animal-inspector animal-guide">
       <div className="animal-inspector-heading">
@@ -3758,7 +3759,7 @@ function SpeciesGuide({
           <div><dt>직접 생존 조건</dt><dd>현재 모델에서 용존산소·유기물·암모니아성 노폐물은 조류를 직접 죽이지 않습니다. 빛·수온·영양염·경쟁·섭식이 양을 결정합니다.</dd></div>
           <div><dt>무기질소</dt><dd>암모니아성 노폐물과 영양염 합계 N에 <b>N ÷ ({WATER_CYCLE_RULES.mineralNutrientHalfSaturation} + N)</b>을 곱합니다. 새 군락은 필요한 질소 중 암모니아를 최대 <b>{Math.round(WATER_CYCLE_RULES.algae.ammoniumPreference * 100)}%</b> 우선 흡수하고, 부족분은 영양염에서 가져옵니다.</dd></div>
           <div><dt>무기탄소</dt><dd>유한한 물속 무기탄소 C에 <b>C ÷ ({WATER_CYCLE_RULES.carbonHalfSaturation} + C)</b>을 곱합니다. 새 군락 1.0에 탄소 <b>{WATER_CYCLE_RULES.biomassCarbon}</b>가 실제로 들어갑니다.</dd></div>
-          <div><dt>산소 생산</dt><dd>고정한 탄소 1.0당 산소 <b>{WATER_CYCLE_RULES.oxygenPerFixedCarbon}</b>를 만들며, 넘친 산소는 닫힌 공기층으로 이동합니다.</dd></div>
+          <div><dt>산소 생산</dt><dd>고정한 탄소 1.0당 산소 <b>{WATER_CYCLE_RULES.oxygenPerOrganicCarbon}</b>를 만들고, 질산염을 흡수하면 질소 환원에 해당하는 산소 등가량이 더해집니다. 넘친 산소는 닫힌 공기층으로 이동합니다.</dd></div>
           <div><dt>낮·밤 호흡</dt><dd>빛이 없어 총광합성이 멈춰도 호흡은 계속됩니다. 24°C 기준 군락량 1.0당 <b>{(species.respirationRateAtReference * 100).toFixed(1)}%/초</b>를 호흡하며, 수온이 높을수록 빨라집니다.</dd></div>
           <div><dt>무기질소 흡수</dt><dd>새 생체량 1.0당 무기질소 <b>{WATER_CYCLE_RULES.biomassNitrogen}</b>를 흡수합니다. 죽거나 먹힌 생체량은 찌꺼기와 생물 몸을 거쳐 다시 순환합니다.</dd></div>
           <div><dt>자연 소실</dt><dd>그래프의 환경 성장률 계산 뒤에 군락량의 <b>0.18%/초</b>가 추가로 줄며, 다른 종의 경쟁과 새우 섭식도 별도로 적용됩니다.</dd></div>

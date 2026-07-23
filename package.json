@@ -11,7 +11,8 @@
     "make": "electron-forge make",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "verify:long-cycle": "vite-node scripts/verifyLongCycle.ts"
   },
   "dependencies": {
     "matter-js": "^0.20.0",
