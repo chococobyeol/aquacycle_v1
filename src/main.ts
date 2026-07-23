@@ -27,6 +27,11 @@ const createMainWindow = (): BrowserWindow => {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // AquaCycle is a continuously running simulation, not a document tab.
+      // Electron otherwise throttles renderer and worker timers when the
+      // window is minimized or covered, changing both the simulated result
+      // and the graph samples collected during the same wall-clock period.
+      backgroundThrottling: false,
     },
   });
 

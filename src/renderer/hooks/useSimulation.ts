@@ -53,6 +53,56 @@ export interface SimulationMotionStore extends SimulationMotionSource {
   reset: () => void;
 }
 
+export const BACKGROUND_TELEMETRY_POLL_INTERVAL_MS = 16;
+
+export interface TelemetryPollingClock {
+  requestAnimationFrame: (callback: FrameRequestCallback) => number;
+  cancelAnimationFrame: (handle: number) => void;
+  setInterval: (callback: () => void, intervalMs: number) => number;
+  clearInterval: (handle: number) => void;
+}
+
+const browserTelemetryPollingClock: TelemetryPollingClock = {
+  requestAnimationFrame: (callback) => window.requestAnimationFrame(callback),
+  cancelAnimationFrame: (handle) => window.cancelAnimationFrame(handle),
+  setInterval: (callback, intervalMs) => window.setInterval(callback, intervalMs),
+  clearInterval: (handle) => window.clearInterval(handle),
+};
+
+/**
+ * Full ecology snapshots drive mission progress and graph history, so their
+ * transport must not depend solely on visible-frame painting. The timer is a
+ * background-safe fallback; while frames are active the shared reader rejects
+ * the duplicate generation and this adds no React updates.
+ *
+ * Motion remains frame-driven because a hidden window does not need animal
+ * pose interpolation. The newest bounded motion sample is picked up as soon as
+ * rendering resumes.
+ */
+export const startTelemetryPolling = (
+  pollSnapshot: () => void,
+  pollMotion: () => void,
+  clock: TelemetryPollingClock = browserTelemetryPollingClock,
+): (() => void) => {
+  let animationFrame: number | null = null;
+  const pollFrame = (): void => {
+    pollSnapshot();
+    pollMotion();
+    animationFrame = clock.requestAnimationFrame(pollFrame);
+  };
+
+  animationFrame = clock.requestAnimationFrame(pollFrame);
+  const backgroundTimer = clock.setInterval(
+    pollSnapshot,
+    BACKGROUND_TELEMETRY_POLL_INTERVAL_MS,
+  );
+
+  return () => {
+    if (animationFrame !== null) clock.cancelAnimationFrame(animationFrame);
+    clock.clearInterval(backgroundTimer);
+  };
+};
+
 const EMPTY_MOTION_FRAMES: SimulationMotionFrames = {
   previous: null,
   current: null,
@@ -165,7 +215,7 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
     const worker = new SimulationWorker();
     workerRef.current = worker;
     motionStore.clear();
-    let telemetryAnimationFrame: number | null = null;
+    let stopTelemetryPolling: (() => void) | null = null;
 
     const receiveWorkerMessage = (message: WorkerMessage): void => {
       if (message.type === 'snapshot') {
@@ -221,20 +271,21 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
           binaryMotion: binaryMotionChannel,
         });
 
-        const pollTelemetry = (): void => {
-          // Apply topology first, then the newest motion for that topology. Both
-          // channels coalesce naturally when a busy frame cannot keep up.
+        const pollSnapshot = (): void => {
           const snapshotMessage = snapshotReader.readLatest();
           if (snapshotMessage) receiveWorkerMessage(snapshotMessage);
+        };
+        const pollMotion = (): void => {
+          // Apply topology first, then the newest motion for that topology. Both
+          // channels coalesce naturally when a busy frame cannot keep up.
           // Interactive packets contain the pointer-held item or probe and
           // intentionally win when both channels carry the same sequence.
           const interactiveMotionMessage = interactiveMotionReader.readLatest();
           if (interactiveMotionMessage) receiveWorkerMessage(interactiveMotionMessage);
           const binaryMotionMessage = binaryMotionReader.readLatest();
           if (binaryMotionMessage) receiveWorkerMessage(binaryMotionMessage);
-          telemetryAnimationFrame = requestAnimationFrame(pollTelemetry);
         };
-        telemetryAnimationFrame = requestAnimationFrame(pollTelemetry);
+        stopTelemetryPolling = startTelemetryPolling(pollSnapshot, pollMotion);
       } catch (error) {
         // Development servers without cross-origin isolation hide or reject
         // SharedArrayBuffer. The ordinary worker channel remains a functional
@@ -246,7 +297,7 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
 
     return () => {
       worker.removeEventListener('message', receivePostedMessage);
-      if (telemetryAnimationFrame !== null) cancelAnimationFrame(telemetryAnimationFrame);
+      stopTelemetryPolling?.();
       worker.terminate();
       workerRef.current = null;
       for (const pending of saveRequests.current.values()) {
