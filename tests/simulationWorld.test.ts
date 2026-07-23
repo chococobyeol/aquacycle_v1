@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { SCENARIOS } from '../src/simulation/config';
+import { SCENARIOS, STRUCTURES } from '../src/simulation/config';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import { structureAuthoredPolygonToWorld } from '../src/simulation/structureGeometry';
 import type {
   SpeciesId,
   StructureDefinitionId,
   SurfaceCellSnapshot,
   Vec2,
 } from '../src/simulation/types';
+import { STRUCTURE_SUPPORT_Y } from '../src/simulation/types';
 
 const settle = (world: SimulationWorld, ticks = 600): void => {
   for (let index = 0; index < ticks; index += 1) world.tick(1 / 60);
@@ -58,6 +60,16 @@ describe('V2 mission simulation world', () => {
     expect(settled.allSettled).toBe(true);
     expect(settled.structures).toHaveLength(1);
     expect(settled.cells.filter((cell) => cell.ownerId === settled.structures[0].id).length).toBeGreaterThan(150);
+    const settledStructure = settled.structures[0];
+    const settledDefinition = STRUCTURES[settledStructure.definitionId];
+    const bottom = Math.max(...structureAuthoredPolygonToWorld(
+      settledDefinition.collisionPolygon,
+      settledDefinition.collisionPolygon,
+      settledStructure,
+      settledStructure.angle,
+    ).map((point) => point.y));
+    expect(bottom).toBeLessThanOrEqual(STRUCTURE_SUPPORT_Y + 0.5);
+    expect(bottom).toBeGreaterThan(STRUCTURE_SUPPORT_Y - 2);
 
     const brightest = settled.cells
       .filter((cell) => cell.ownerId === settled.structures[0].id)

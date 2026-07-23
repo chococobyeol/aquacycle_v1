@@ -53,6 +53,7 @@ import {
 } from './temperatureResponse';
 import {
   GROUND_Y,
+  STRUCTURE_SUPPORT_Y,
   TANK_HEIGHT,
   TANK_WIDTH,
   WATER_TOP,
@@ -602,7 +603,7 @@ export class SimulationWorld {
     this.message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
     this.boundaries = [
-      Bodies.rectangle(TANK_WIDTH / 2, GROUND_Y + 58, TANK_WIDTH + 120, 116, {
+      Bodies.rectangle(TANK_WIDTH / 2, STRUCTURE_SUPPORT_Y + 58, TANK_WIDTH + 120, 116, {
         isStatic: true,
         label: 'boundary:ground',
         friction: 1,
@@ -2173,7 +2174,9 @@ export class SimulationWorld {
     if (bounds.min.x < padding) dx = padding - bounds.min.x;
     if (bounds.max.x > TANK_WIDTH - padding) dx = TANK_WIDTH - padding - bounds.max.x;
     if (bounds.min.y < WATER_TOP + padding) dy = WATER_TOP + padding - bounds.min.y;
-    if (bounds.max.y > GROUND_Y - padding) dy = GROUND_Y - padding - bounds.max.y;
+    if (bounds.max.y > STRUCTURE_SUPPORT_Y - padding) {
+      dy = STRUCTURE_SUPPORT_Y - padding - bounds.max.y;
+    }
     if (dx || dy) Body.translate(structure.body, { x: dx, y: dy });
   }
 
@@ -2184,7 +2187,7 @@ export class SimulationWorld {
       bounds.min.x >= 2 &&
       bounds.max.x <= TANK_WIDTH - 2 &&
       bounds.min.y >= WATER_TOP + 2 &&
-      bounds.max.y <= GROUND_Y - 2;
+      bounds.max.y <= STRUCTURE_SUPPORT_Y - 2;
     const collisions = Query.collides(
       structure.body,
       this.structures.filter((item) => item.id !== structure.id).map((item) => item.body),

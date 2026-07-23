@@ -42,6 +42,8 @@ import {
 import {
   compareVallisneriaDepth,
   vallisneriaLeaves,
+  vallisneriaRenderDepth,
+  type VallisneriaRenderDepth,
 } from '../../simulation/vallisneriaGeometry';
 import {
   canPanTankCamera,
@@ -303,7 +305,8 @@ interface AquariumLayers {
   algae: Container;
   analysis: Sprite;
   animals: Container;
-  plants: Graphics;
+  plantsBack: Graphics;
+  plantsFront: Graphics;
   nightTint: Graphics;
   goalGuide: Graphics;
   seeds: Graphics;
@@ -2526,7 +2529,11 @@ const drawSeeds = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   }
 };
 
-const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void => {
+const drawAquaticPlants = (
+  layer: Graphics,
+  snapshot: SimulationSnapshot,
+  depth: VallisneriaRenderDepth,
+): void => {
   layer.clear();
   const plantsByCell = new Map(snapshot.plants.map((plant) => [plant.cellId, plant]));
   const visiblePlants = snapshot.cells.flatMap((cell) => {
@@ -2534,7 +2541,8 @@ const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void 
     const visibleThreshold = plant ? 0.004 : ALGAE_VISIBLE_BIOMASS;
     if (
       cell.surfaceKind !== 'substrate' ||
-      cell.biomass.vallisneria <= visibleThreshold
+      cell.biomass.vallisneria <= visibleThreshold ||
+      vallisneriaRenderDepth(cell) !== depth
     ) return [];
     return [{ cell, plant }];
   }).sort((a, b) => compareVallisneriaDepth(a.cell, b.cell));
@@ -2597,6 +2605,16 @@ const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void 
         )
         .stroke({ color: 0xd2d793, width: 0.75, alpha: 0.24, cap: 'round' });
     }
+  }
+
+  // A small local cap buries only the crown. The broad substrate ridge is
+  // behind the plants, so it no longer cuts horizontally across every leaf.
+  for (const { cell, plant } of visiblePlants) {
+    const structuralScale = plant?.structuralScale ?? 0.72;
+    layer
+      .ellipse(cell.x, cell.y + 8, 5.5 + structuralScale * 3.2, 2.2 + structuralScale)
+      .fill({ color: 0x95785a, alpha: 0.9 })
+      .stroke({ color: 0xc4a675, width: 0.7, alpha: 0.45 });
   }
 };
 
@@ -3208,7 +3226,8 @@ export function AquariumCanvas({
         algae: createAlgaeParticleLayer('structure-face'),
         analysis: new Sprite(Texture.EMPTY),
         animals: new Container(),
-        plants: new Graphics(),
+        plantsBack: new Graphics(),
+        plantsFront: new Graphics(),
         nightTint: new Graphics(),
         goalGuide: new Graphics(),
         seeds: new Graphics(),
@@ -3236,10 +3255,11 @@ export function AquariumCanvas({
         layers.base,
         layers.light,
         layers.substrateAlgae,
-        layers.plants,
         layers.foreground,
+        layers.plantsBack,
         layers.structures,
         layers.algae,
+        layers.plantsFront,
         layers.analysis,
         layers.animals,
         layers.nightTint,
@@ -3303,7 +3323,8 @@ export function AquariumCanvas({
         isPendingInventoryHandoff(),
       );
       syncAnimalCarcasses(layers.animals, initialSnapshot, ownedAnimalCarcassDisplays);
-      drawAquaticPlants(layers.plants, initialSnapshot);
+      drawAquaticPlants(layers.plantsBack, initialSnapshot, 'back');
+      drawAquaticPlants(layers.plantsFront, initialSnapshot, 'front');
       drawDayNightTint(layers.nightTint, initialSnapshot);
       drawGoalGuide(layers.goalGuide, initialSnapshot, showGoalGuideRef.current);
       drawSeeds(layers.seeds, initialSnapshot);
@@ -3566,7 +3587,8 @@ export function AquariumCanvas({
       isPendingInventoryHandoff(),
     );
     syncAnimalCarcasses(layers.animals, snapshot, animalCarcassDisplaysRef.current);
-    drawAquaticPlants(layers.plants, snapshot);
+    drawAquaticPlants(layers.plantsBack, snapshot, 'back');
+    drawAquaticPlants(layers.plantsFront, snapshot, 'front');
     drawDayNightTint(layers.nightTint, snapshot);
     layers.lamp.visible = snapshot.lightOutput > 0.5;
     layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(snapshot.lightOutput / 120);

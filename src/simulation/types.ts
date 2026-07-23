@@ -5,6 +5,12 @@ export const TANK_WIDTH = 1200;
 export const TANK_HEIGHT = 720;
 export const WATER_TOP = 56;
 export const GROUND_Y = 646;
+/**
+ * Structures settle on the middle of the shallow substrate depth band. The
+ * lower substrate row remains visually in front of them while the upper rows
+ * read as background habitat.
+ */
+export const STRUCTURE_SUPPORT_Y = GROUND_Y - 12;
 
 /**
  * Visual motion is sampled on a real-time clock, independently of simulation

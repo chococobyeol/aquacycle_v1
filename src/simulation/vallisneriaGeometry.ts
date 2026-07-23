@@ -1,4 +1,4 @@
-import type { Vec2 } from './types';
+import { STRUCTURE_SUPPORT_Y, type Vec2 } from './types';
 
 export interface VallisneriaLeafGeometry {
   root: Vec2;
@@ -18,6 +18,12 @@ export interface VallisneriaCanopyBounds {
 export interface VallisneriaDepthAnchor extends Vec2 {
   index: number;
 }
+
+export type VallisneriaRenderDepth = 'back' | 'front';
+
+/** Substrate below the structure support plane is the foreground depth row. */
+export const vallisneriaRenderDepth = (anchor: Vec2): VallisneriaRenderDepth =>
+  anchor.y > STRUCTURE_SUPPORT_Y ? 'front' : 'back';
 
 /** Draw smaller screen-y first so roots closer to the viewer overlap them. */
 export const compareVallisneriaDepth = (
