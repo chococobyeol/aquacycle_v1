@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import type { SpeciesId, Vec2 } from '../src/simulation/types';
-import { vallisneriaLeafPoint, vallisneriaLeaves } from '../src/simulation/vallisneriaGeometry';
+import {
+  compareVallisneriaDepth,
+  vallisneriaLeafPoint,
+  vallisneriaLeaves,
+} from '../src/simulation/vallisneriaGeometry';
 
 const placeSeed = (
   world: SimulationWorld,
@@ -23,6 +27,16 @@ const advanceTo = (world: SimulationWorld, targetSeconds: number): void => {
 };
 
 describe('Vallisneria ramet life cycle', () => {
+  it('renders lower roots after upper roots so foreground plants overlap the background', () => {
+    const anchors = [
+      { index: 3, x: 600, y: 615 },
+      { index: 1, x: 400, y: 590 },
+      { index: 2, x: 500, y: 604 },
+    ].sort(compareVallisneriaDepth);
+
+    expect(anchors.map((anchor) => anchor.y)).toEqual([590, 604, 615]);
+  });
+
   it('casts translucent canopy shade without acting like an opaque rock', () => {
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');

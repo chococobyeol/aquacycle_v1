@@ -15,6 +15,16 @@ export interface VallisneriaCanopyBounds {
   maxY: number;
 }
 
+export interface VallisneriaDepthAnchor extends Vec2 {
+  index: number;
+}
+
+/** Draw smaller screen-y first so roots closer to the viewer overlap them. */
+export const compareVallisneriaDepth = (
+  a: VallisneriaDepthAnchor,
+  b: VallisneriaDepthAnchor,
+): number => a.y - b.y || a.x - b.x || a.index - b.index;
+
 const cubicPoint = (
   start: Vec2,
   controlA: Vec2,
@@ -135,4 +145,3 @@ export const vallisneriaHitDistance = (
   }
   return nearest;
 };
-

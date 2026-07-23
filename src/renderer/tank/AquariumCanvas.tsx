@@ -39,7 +39,10 @@ import {
   structureAuthoredPolygonToWorld,
   structureVisualOffset,
 } from '../../simulation/structureGeometry';
-import { vallisneriaLeaves } from '../../simulation/vallisneriaGeometry';
+import {
+  compareVallisneriaDepth,
+  vallisneriaLeaves,
+} from '../../simulation/vallisneriaGeometry';
 import {
   canPanTankCamera,
   clampTankInteractionPoint,
@@ -2526,13 +2529,18 @@ const drawSeeds = (layer: Graphics, snapshot: SimulationSnapshot): void => {
 const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   layer.clear();
   const plantsByCell = new Map(snapshot.plants.map((plant) => [plant.cellId, plant]));
-  for (const cell of snapshot.cells) {
-    const biomass = cell.biomass.vallisneria;
+  const visiblePlants = snapshot.cells.flatMap((cell) => {
     const plant = plantsByCell.get(cell.id);
+    const visibleThreshold = plant ? 0.004 : ALGAE_VISIBLE_BIOMASS;
     if (
       cell.surfaceKind !== 'substrate' ||
-      (plant ? biomass <= 0.004 : biomass <= ALGAE_VISIBLE_BIOMASS)
-    ) continue;
+      cell.biomass.vallisneria <= visibleThreshold
+    ) return [];
+    return [{ cell, plant }];
+  }).sort((a, b) => compareVallisneriaDepth(a.cell, b.cell));
+
+  for (const { cell, plant } of visiblePlants) {
+    const biomass = cell.biomass.vallisneria;
     // Reserve biomass drives metabolism, while structuralScale changes slowly
     // over a life stage. This keeps leaves stable through a single night but
     // makes runner daughters small and old plants visibly thin and yellow.
