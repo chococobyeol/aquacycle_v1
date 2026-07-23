@@ -899,6 +899,7 @@ export class SimulationWorld {
   }
 
   public snapshot(): SimulationSnapshot {
+    this.refreshColonySelection();
     const cells = this.surfaceSnapshots();
     const eligibleCells = cells.filter((cell) => cell.targetEligible);
     const totalBiomass = cells.reduce<SpeciesBiomass>(
@@ -1746,6 +1747,54 @@ export class SimulationWorld {
       }
     }
     this.clearSelectionWithMessage('이 위치에는 선택할 수 있는 대상이 없습니다.');
+  }
+
+  /**
+   * A colony selection follows a surface cell, not a historical species label.
+   * The selected Vallisneria ramet can die while diatoms later occupy the same
+   * cell; retaining its old plant/species metadata made the inspector describe
+   * an organism that no longer existed.
+   */
+  private refreshColonySelection(): void {
+    const selection = this.selection;
+    if (selection?.kind !== 'colony' || !selection.cellId) return;
+
+    const cell = this.cellById(selection.cellId);
+    if (!cell) {
+      this.selection = null;
+      return;
+    }
+
+    const speciesIds = (Object.keys(cell.biomass) as SpeciesId[])
+      .filter((speciesId) => cell.biomass[speciesId] > ALGAE_VISIBLE_BIOMASS);
+    const microbeGuildIds = (['decomposer', 'nitrifier'] as const)
+      .filter((guildId) => cell.biofilm[guildId] >= 0.001);
+    const activePlant = selection.plantId
+      ? this.seedPlacements.find((placement) =>
+        placement.id === selection.plantId &&
+        placement.speciesId === 'vallisneria' &&
+        Boolean(placement.plant) &&
+        cell.biomass.vallisneria > 0.004)
+      : undefined;
+    const speciesId = activePlant
+      ? 'vallisneria'
+      : selection.speciesId && speciesIds.includes(selection.speciesId)
+        ? selection.speciesId
+        : [...speciesIds].sort((first, second) =>
+          cell.biomass[second] - cell.biomass[first])[0];
+    const point = activePlant
+      ? this.vallisneriaRootPosition(activePlant, cell)
+      : this.cellWorldPoint(cell);
+
+    this.selection = {
+      ...selection,
+      ...point,
+      ownerLabel: activePlant ? '나사말 포기' : `${cell.ownerLabel} 표면`,
+      plantId: activePlant?.id,
+      speciesId,
+      speciesIds,
+      microbeGuildIds,
+    };
   }
 
   private selectRegion(from: Vec2, to: Vec2, filter: SelectionFilter): void {

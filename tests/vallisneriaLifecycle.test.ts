@@ -175,6 +175,44 @@ describe('Vallisneria ramet life cycle', () => {
     expect(selection?.cellId).toBe(planted.cellId);
   });
 
+  it('updates a selected plant surface to the diatom colony that replaces a dead ramet', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
+    const target = substrate[Math.floor(substrate.length / 2)];
+    placeSeed(world, 'vallisneria', target);
+    const planted = world.snapshot().plants[0];
+    const cell = world.snapshot().cells.find((candidate) => candidate.id === planted.cellId)!;
+    const leaves = vallisneriaLeaves(cell.index, planted, planted.structuralScale);
+    const leafPoint = vallisneriaLeafPoint(leaves[Math.floor(leaves.length / 2)], 0.55);
+    world.handle({ type: 'select-at', point: leafPoint, filter: 'organism' });
+
+    const internals = world as unknown as {
+      substrateCells: Array<{
+        id: string;
+        biomass: { oedogonium: number; nitzschia: number; vallisneria: number };
+      }>;
+      seedPlacements: Array<{
+        id: string;
+        plant?: { ageSeconds: number; lifespanSeconds: number };
+      }>;
+    };
+    const selectedCell = internals.substrateCells.find((candidate) => candidate.id === planted.cellId)!;
+    selectedCell.biomass.nitzschia = 0.28;
+    const plant = internals.seedPlacements.find((placement) => placement.id === planted.id)!.plant!;
+    plant.ageSeconds = plant.lifespanSeconds - 0.1;
+
+    world.handle({ type: 'start' });
+    for (let index = 0; index < 3; index += 1) world.tick(0.1);
+    const selection = world.snapshot().selection;
+
+    expect(world.snapshot().plants).toHaveLength(0);
+    expect(selection?.kind).toBe('colony');
+    expect(selection?.plantId).toBeUndefined();
+    expect(selection?.speciesId).toBe('nitzschia');
+    expect(selection?.speciesIds).toEqual(['nitzschia']);
+    expect(selection?.ownerLabel).toBe(`${target.ownerLabel} 표면`);
+  });
+
   it('includes a ramet when a dragged observation region intersects its leaves', () => {
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');

@@ -915,9 +915,6 @@ export function SimulationScreen({
   const selectedRegionMeasurements = snapshot.selection?.kind === 'region' && snapshot.selection.measurementIds
     ? snapshot.measurements.filter((measurement) => snapshot.selection?.measurementIds?.includes(measurement.id))
     : [];
-  const selectedMicrobeGuildIds = snapshot.selection?.kind === 'colony' || snapshot.selection?.kind === 'region'
-    ? MICROBE_IDS.filter((guildId) => selectedCells.some((cell) => cell.biofilm[guildId] >= 0.001))
-    : [];
   const selectedStructure = snapshot.selection?.kind === 'structure' && snapshot.selection.structureId
     ? snapshot.structures.find((structure) => structure.id === snapshot.selection?.structureId)
     : undefined;
@@ -927,7 +924,10 @@ export function SimulationScreen({
   const inspectedSpecies = selectionSpeciesIds.length
     ? catalogSpecies && selectionSpeciesIds.includes(catalogSpecies)
       ? catalogSpecies
-      : snapshot.selection?.speciesId ?? selectionSpeciesIds[0]
+      : snapshot.selection?.speciesId &&
+          selectionSpeciesIds.includes(snapshot.selection.speciesId)
+        ? snapshot.selection.speciesId
+        : selectionSpeciesIds[0]
     : catalogSpecies;
   const inspectedAnimalSpecies = selectedAnimal?.speciesId ?? selectedCarcass?.speciesId ??
     (selectedRegionAnimals.length ? selectedRegionAnimals[0].speciesId : catalogAnimal);
@@ -2217,7 +2217,7 @@ export function SimulationScreen({
               />
             ) : selectedCarcass ? (
               <AnimalCarcassInspector carcass={selectedCarcass} />
-            ) : selectedMicrobeGuildIds.length && selectedCells.length ? (
+            ) : selectedCells.length ? (
               <>
                 <SurfaceCommunityInspector
                   cells={selectedCells}
