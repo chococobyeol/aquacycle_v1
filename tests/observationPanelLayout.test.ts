@@ -31,6 +31,10 @@ describe('scalable observation panel layout', () => {
   });
 
   it('keeps the color map independent from the observation record panel', () => {
+    const observationToggleSource = screenSource.slice(
+      screenSource.indexOf('const toggleObservationMode'),
+      screenSource.indexOf('const resetUiState'),
+    );
     expect(screenSource).toContain('const [waterQualityMapVisible, setWaterQualityMapVisible]');
     expect(screenSource).toContain('const [waterQualityLegendCollapsed, setWaterQualityLegendCollapsed]');
     expect(screenSource).toContain('waterQualityLayers={waterQualityMapVisible ? waterQualityLayers : []}');
@@ -41,6 +45,7 @@ describe('scalable observation panel layout', () => {
     expect(styles).toContain('.tank-first-screen .tank-analysis-toolbar.is-collapsed');
     expect(screenSource).toContain("useState<WaterQualityLayer[]>(['organicMatter'])");
     expect(screenSource).not.toContain("setWaterQualityLayers((current) => current.length ? current : ['organicMatter'])");
+    expect(observationToggleSource).not.toContain('setWaterQualityMapVisible(true)');
   });
 
   it('restores the previous color-map view after microbial placement', () => {

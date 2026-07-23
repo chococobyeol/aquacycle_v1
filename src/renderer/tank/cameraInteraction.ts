@@ -1,6 +1,10 @@
 import { GROUND_Y, type Vec2 } from '../../simulation/types';
 import {
+  CAMERA_SCENE_BOTTOM,
   CAMERA_SCENE_HEIGHT,
+  CAMERA_SCENE_LEFT,
+  CAMERA_SCENE_RIGHT,
+  CAMERA_SCENE_TOP,
   CAMERA_SCENE_WIDTH,
   TANK_FRAME_STROKE_WIDTH,
   TANK_GLASS_LEFT,
@@ -29,15 +33,65 @@ export const fitTankZoom = (viewportWidth: number, viewportHeight: number): numb
   return Math.min(1, containScale / coverScale);
 };
 
+export interface TankCameraCenterBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+/**
+ * HUD panels float over the aquarium rather than resizing it. A controlled
+ * overscroll therefore lets the player pull a covered tank edge into the
+ * remaining clear viewport. At least roughly two thirds of the viewport stays
+ * on the scene, so the aquarium cannot be lost entirely off-screen.
+ */
+export const tankCameraCenterBounds = (
+  viewportWidth: number,
+  viewportHeight: number,
+  zoom: number,
+): TankCameraCenterBounds => {
+  const scale = coverTankScale(viewportWidth, viewportHeight) * zoom;
+  if (!Number.isFinite(scale) || scale <= 0) {
+    const centerX = (CAMERA_SCENE_LEFT + CAMERA_SCENE_RIGHT) / 2;
+    const centerY = (CAMERA_SCENE_TOP + CAMERA_SCENE_BOTTOM) / 2;
+    return { minX: centerX, maxX: centerX, minY: centerY, maxY: centerY };
+  }
+  const visibleWidth = viewportWidth / scale;
+  const visibleHeight = viewportHeight / scale;
+  const halfWidth = visibleWidth / 2;
+  const halfHeight = visibleHeight / 2;
+  const sceneCenterX = (CAMERA_SCENE_LEFT + CAMERA_SCENE_RIGHT) / 2;
+  const sceneCenterY = (CAMERA_SCENE_TOP + CAMERA_SCENE_BOTTOM) / 2;
+  const baseMinX = halfWidth >= CAMERA_SCENE_WIDTH / 2
+    ? sceneCenterX
+    : CAMERA_SCENE_LEFT + halfWidth;
+  const baseMaxX = halfWidth >= CAMERA_SCENE_WIDTH / 2
+    ? sceneCenterX
+    : CAMERA_SCENE_RIGHT - halfWidth;
+  const baseMinY = halfHeight >= CAMERA_SCENE_HEIGHT / 2
+    ? sceneCenterY
+    : CAMERA_SCENE_TOP + halfHeight;
+  const baseMaxY = halfHeight >= CAMERA_SCENE_HEIGHT / 2
+    ? sceneCenterY
+    : CAMERA_SCENE_BOTTOM - halfHeight;
+  const overscrollX = Math.min(CAMERA_SCENE_WIDTH * 0.36, visibleWidth * 0.36);
+  const overscrollY = Math.min(CAMERA_SCENE_HEIGHT * 0.32, visibleHeight * 0.32);
+  return {
+    minX: baseMinX - overscrollX,
+    maxX: baseMaxX + overscrollX,
+    minY: baseMinY - overscrollY,
+    maxY: baseMaxY + overscrollY,
+  };
+};
+
 export const canPanTankCamera = (
   viewportWidth: number,
   viewportHeight: number,
   zoom: number,
 ): boolean => {
-  const scale = coverTankScale(viewportWidth, viewportHeight) * zoom;
-  if (!Number.isFinite(scale) || scale <= 0) return false;
-  return viewportWidth / scale < CAMERA_SCENE_WIDTH - 0.5 ||
-    viewportHeight / scale < CAMERA_SCENE_HEIGHT - 0.5;
+  const bounds = tankCameraCenterBounds(viewportWidth, viewportHeight, zoom);
+  return bounds.maxX - bounds.minX > 0.5 || bounds.maxY - bounds.minY > 0.5;
 };
 
 export const shouldStartCameraPan = (

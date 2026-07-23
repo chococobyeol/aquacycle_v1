@@ -15,8 +15,9 @@ const MAX_SUPPLIED_ADULT_AGE_SECONDS = 300;
 const MAX_TEST_TIME_SECONDS = 1_450;
 // The lifecycle simulation intentionally advances more than a thousand
 // in-world seconds. On slower Macs or while other long-run suites execute in
-// parallel it can exceed 15 seconds without indicating a simulation failure.
-const LIFECYCLE_TEST_TIMEOUT_MS = 30_000;
+// parallel it can take roughly a minute without indicating a simulation failure.
+// Runtime performance has its own bounded long-run contract tests.
+const LIFECYCLE_TEST_TIMEOUT_MS = 90_000;
 
 type WorldSnapshot = ReturnType<SimulationWorld["snapshot"]>;
 

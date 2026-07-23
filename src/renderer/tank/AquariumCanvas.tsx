@@ -39,6 +39,7 @@ import {
   structureAuthoredPolygonToWorld,
   structureVisualOffset,
 } from '../../simulation/structureGeometry';
+import { vallisneriaLeaves } from '../../simulation/vallisneriaGeometry';
 import {
   canPanTankCamera,
   clampTankInteractionPoint,
@@ -47,16 +48,11 @@ import {
   isScreenDrag,
   isTankInteractionPoint,
   shouldStartCameraPan,
+  tankCameraCenterBounds,
 } from './cameraInteraction';
 import {
-  CAMERA_SCENE_BOTTOM,
   CAMERA_SCENE_CENTER_X,
   CAMERA_SCENE_CENTER_Y,
-  CAMERA_SCENE_HEIGHT,
-  CAMERA_SCENE_LEFT,
-  CAMERA_SCENE_RIGHT,
-  CAMERA_SCENE_TOP,
-  CAMERA_SCENE_WIDTH,
   LAMP_CABLE_TOP,
   LAMP_FIXTURE_HEIGHT,
   LAMP_FIXTURE_LEFT,
@@ -215,20 +211,9 @@ const clampCamera = (camera: CameraState, width: number, height: number): Camera
   const zoom = Math.max(fitTankZoom(width, height), Math.min(CAMERA_MAX_ZOOM, camera.zoom));
   const scale = coverTankScale(width, height) * zoom;
   if (!Number.isFinite(scale) || scale <= 0) return { ...defaultCamera(), zoom };
-  const halfWidth = width / scale / 2;
-  const halfHeight = height / scale / 2;
-  const centerX = halfWidth >= CAMERA_SCENE_WIDTH / 2
-    ? CAMERA_SCENE_CENTER_X
-    : Math.max(
-      CAMERA_SCENE_LEFT + halfWidth,
-      Math.min(CAMERA_SCENE_RIGHT - halfWidth, camera.centerX),
-    );
-  const centerY = halfHeight >= CAMERA_SCENE_HEIGHT / 2
-    ? CAMERA_SCENE_CENTER_Y
-    : Math.max(
-      CAMERA_SCENE_TOP + halfHeight,
-      Math.min(CAMERA_SCENE_BOTTOM - halfHeight, camera.centerY),
-    );
+  const bounds = tankCameraCenterBounds(width, height, zoom);
+  const centerX = Math.max(bounds.minX, Math.min(bounds.maxX, camera.centerX));
+  const centerY = Math.max(bounds.minY, Math.min(bounds.maxY, camera.centerY));
   return { zoom, centerX, centerY };
 };
 
@@ -2551,56 +2536,40 @@ const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void 
     // Reserve biomass drives metabolism, while structuralScale changes slowly
     // over a life stage. This keeps leaves stable through a single night but
     // makes runner daughters small and old plants visibly thin and yellow.
-    const plantHash = (cell.index * 0.61803398875) % 1;
     const structuralScale = plant?.structuralScale ?? 0.72;
-    const baseHeight = (184 + plantHash * 34) * structuralScale;
     // A juvenile rosette should read as a few narrow strap leaves, not a
     // radial tentacle cluster. Maturity adds leaves and height while keeping
     // every blade anchored to the same compact crown.
-    const leafCount = Math.max(3, Math.round(2 + structuralScale * 6));
     const health = plant?.health ?? Math.min(1, biomass / 0.28);
     const senescent = plant?.lifeStage === 'senescent';
     const healthAlpha = 0.48 + health * 0.46;
     const healthyPalette = [0x557f47, 0x6f9651, 0x80a65d];
     const oldPalette = [0x7f7441, 0x9a8750, 0xa89159];
-    for (let index = 0; index < leafCount; index += 1) {
-      const ratio = leafCount <= 1 ? 0.5 : index / (leafCount - 1);
-      const side = ratio * 2 - 1;
-      const phase = cell.index * 0.73 + index * 1.37;
-      const leafHeight = baseHeight *
-        (0.78 + (1 - Math.abs(side)) * 0.18) *
-        (0.94 + Math.sin(phase) * 0.06);
-      const rootX = cell.x + side * (3 + structuralScale * 4);
-      const lean = side * (10 + structuralScale * 24 + Math.abs(side) * 9) +
-        Math.sin(phase * 1.7) * (3 + structuralScale * 5);
-      const tipX = rootX + lean;
-      const ribbonWidth = 4.6 + structuralScale * 2.5 + (index % 3) * 0.35;
+    const leaves = vallisneriaLeaves(cell.index, cell, structuralScale);
+    for (let index = 0; index < leaves.length; index += 1) {
+      const leaf = leaves[index];
+      const ribbonWidth = leaf.ribbonWidth;
       const baseHalf = ribbonWidth * 0.36;
       const midHalf = ribbonWidth / 2;
-      const swayA = Math.sin(phase * 1.11) * (3 + structuralScale * 6);
-      const swayB = Math.cos(phase * 0.83) * (4 + structuralScale * 8);
-      const controlAX = rootX + lean * 0.18 + swayA;
-      const controlBX = rootX + lean * 0.7 + swayB;
-      const tipY = cell.y - leafHeight;
       const tipHalf = ribbonWidth * 0.16;
       layer
-        .moveTo(rootX - baseHalf, cell.y + 8)
+        .moveTo(leaf.root.x - baseHalf, leaf.root.y)
         .bezierCurveTo(
-          controlAX - midHalf * 0.78,
-          cell.y - leafHeight * 0.3,
-          controlBX - midHalf,
-          cell.y - leafHeight * 0.72,
-          tipX - tipHalf,
-          tipY + 2,
+          leaf.controlA.x - midHalf * 0.78,
+          leaf.controlA.y,
+          leaf.controlB.x - midHalf,
+          leaf.controlB.y,
+          leaf.tip.x - tipHalf,
+          leaf.tip.y + 2,
         )
-        .quadraticCurveTo(tipX, tipY - 2, tipX + tipHalf, tipY + 2)
+        .quadraticCurveTo(leaf.tip.x, leaf.tip.y - 2, leaf.tip.x + tipHalf, leaf.tip.y + 2)
         .bezierCurveTo(
-          controlBX + midHalf,
-          cell.y - leafHeight * 0.72,
-          controlAX + midHalf * 0.78,
-          cell.y - leafHeight * 0.3,
-          rootX + baseHalf,
-          cell.y + 8,
+          leaf.controlB.x + midHalf,
+          leaf.controlB.y,
+          leaf.controlA.x + midHalf * 0.78,
+          leaf.controlA.y,
+          leaf.root.x + baseHalf,
+          leaf.root.y,
         )
         .closePath()
         .fill({
@@ -2609,14 +2578,14 @@ const drawAquaticPlants = (layer: Graphics, snapshot: SimulationSnapshot): void 
         })
         .stroke({ color: 0x354b3b, width: 1.05, alpha: 0.72, join: 'round' });
       layer
-        .moveTo(rootX - baseHalf * 0.25, cell.y + 5)
+        .moveTo(leaf.root.x - baseHalf * 0.25, leaf.root.y - 3)
         .bezierCurveTo(
-          controlAX - midHalf * 0.2,
-          cell.y - leafHeight * 0.3,
-          controlBX - midHalf * 0.2,
-          cell.y - leafHeight * 0.72,
-          tipX - tipHalf * 0.3,
-          tipY + 2,
+          leaf.controlA.x - midHalf * 0.2,
+          leaf.controlA.y,
+          leaf.controlB.x - midHalf * 0.2,
+          leaf.controlB.y,
+          leaf.tip.x - tipHalf * 0.3,
+          leaf.tip.y + 2,
         )
         .stroke({ color: 0xd2d793, width: 0.75, alpha: 0.24, cap: 'round' });
     }
@@ -2883,8 +2852,6 @@ export function AquariumCanvas({
   const motionSourceRef = useRef(motionSource);
   const motionInterpolatorRef = useRef<ReturnType<typeof createReusableMotionInterpolator> | null>(null);
   motionInterpolatorRef.current ??= createReusableMotionInterpolator();
-  const lastMotionSequenceRef = useRef<number | null>(null);
-  const rebasedMotionSequenceRef = useRef<number | null>(null);
   const activeToolRef = useRef(activeTool);
   const editableRef = useRef(editable);
   const layersRef = useRef<AquariumLayers | null>(null);
@@ -2956,25 +2923,7 @@ export function AquariumCanvas({
 
   const sampleMotion = (nowMs: number) => {
     const frames = motionSourceRef.current.getFrames();
-    const sequence = frames.current?.sequence ?? null;
-    if (sequence === null) {
-      lastMotionSequenceRef.current = null;
-      rebasedMotionSequenceRef.current = null;
-      return null;
-    }
-    if (sequence !== lastMotionSequenceRef.current) {
-      const lastSequence = lastMotionSequenceRef.current;
-      rebasedMotionSequenceRef.current = lastSequence !== null && sequence !== lastSequence + 1
-        ? sequence
-        : null;
-      lastMotionSequenceRef.current = sequence;
-    }
-    return motionInterpolatorRef.current!.sample(
-      rebasedMotionSequenceRef.current === sequence
-        ? { previous: null, current: frames.current }
-        : frames,
-      nowMs,
-    );
+    return motionInterpolatorRef.current!.sample(frames, nowMs);
   };
 
   const isPendingInventoryHandoff = (): boolean =>

@@ -8,7 +8,8 @@ import type {
 import type { SimulationMotionFrames } from '../hooks/useSimulation';
 
 const MIN_SAMPLE_DURATION_MS = 16;
-const MAX_SAMPLE_DURATION_MS = 67;
+const MAX_SAMPLE_DURATION_MS = 120;
+const MAX_INTERPOLATABLE_SAMPLE_GAP_MS = 250;
 
 export interface InterpolatedMotionState {
   sequence: number;
@@ -132,6 +133,42 @@ const matchingHolding = (
   }
 };
 
+const sameMotionTopology = (
+  previous: NonNullable<SimulationMotionFrames['previous']>,
+  current: NonNullable<SimulationMotionFrames['current']>,
+): boolean => {
+  if (
+    previous.structures.length !== current.structures.length ||
+    previous.animals.length !== current.animals.length ||
+    Boolean(previous.probe) !== Boolean(current.probe)
+  ) return false;
+  if (
+    previous.holding || current.holding
+      ? !matchingHolding(previous.holding, current.holding)
+      : false
+  ) return false;
+  for (const structure of current.structures) {
+    const before = previous.structures.find((candidate) => candidate.id === structure.id);
+    if (!before || before.isHeld !== structure.isHeld) return false;
+  }
+  for (const animal of current.animals) {
+    if (!previous.animals.some((candidate) => candidate.id === animal.id)) return false;
+  }
+  return true;
+};
+
+const canInterpolateSamples = (
+  previous: NonNullable<SimulationMotionFrames['previous']>,
+  current: NonNullable<SimulationMotionFrames['current']>,
+): boolean => {
+  if (current.sequence <= previous.sequence) return false;
+  const sampledDuration = current.sampledAtMs - previous.sampledAtMs;
+  return Number.isFinite(sampledDuration) &&
+    sampledDuration > 0 &&
+    sampledDuration <= MAX_INTERPOLATABLE_SAMPLE_GAP_MS &&
+    sameMotionTopology(previous, current);
+};
+
 const interpolateAnimal = (
   previous: AnimalSnapshot,
   current: AnimalSnapshot,
@@ -164,8 +201,10 @@ const interpolateStructure = (
 
 /**
  * Renders one worker sample behind and fills that 30 Hz interval at display
- * refresh rate. A missing sample or sequence gap deliberately rebases to the
- * authoritative current frame instead of replaying stale fast-forward motion.
+ * refresh rate. Shared telemetry may coalesce samples while the worker is
+ * busy. Sequence gaps therefore remain interpolatable when timestamps are
+ * close and entity/holding topology is unchanged; genuine topology changes
+ * still rebase to the authoritative frame.
  */
 export const interpolateMotionFrames = (
   frames: SimulationMotionFrames,
@@ -174,7 +213,7 @@ export const interpolateMotionFrames = (
   const current = frames.current;
   if (!current) return null;
   const previous = frames.previous;
-  if (!previous || current.sequence !== previous.sequence + 1) {
+  if (!previous || !canInterpolateSamples(previous, current)) {
     return {
       sequence: current.sequence,
       interpolated: false,
@@ -272,7 +311,7 @@ export const createReusableMotionInterpolator = (): ReusableMotionInterpolator =
       const current = frames.current;
       if (!current) return null;
       const previous = frames.previous;
-      if (!previous || current.sequence !== previous.sequence + 1) {
+      if (!previous || !canInterpolateSamples(previous, current)) {
         return {
           sequence: current.sequence,
           interpolated: false,

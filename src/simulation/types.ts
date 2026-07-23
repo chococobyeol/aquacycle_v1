@@ -135,6 +135,8 @@ export interface PlantRametSnapshot {
   y: number;
   origin: 'supplied' | 'runner';
   parentId: string | null;
+  /** Runner-born daughters remain physiologically connected while juvenile. */
+  connectedToParent: boolean;
   ageSeconds: number;
   lifespanSeconds: number;
   lifeStage: PlantLifeStage;
@@ -348,6 +350,7 @@ export interface SelectionSnapshot {
   ownerLabel: string;
   structureId?: string;
   cellId?: string;
+  plantId?: string;
   speciesId?: SpeciesId;
   speciesIds?: SpeciesId[];
   measurementId?: string;
@@ -550,6 +553,8 @@ export interface SimulationSaveData {
     origin?: 'supplied' | 'runner';
     plant?: {
       parentId: string | null;
+      /** Optional so older frozen aquariums restore juvenile connections safely. */
+      connectedToParent?: boolean;
       ageSeconds: number;
       lifespanSeconds: number;
       structuralScale: number;

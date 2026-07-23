@@ -121,6 +121,10 @@ export class BiogeochemistryLedger {
     this.transport.setEnvironment(light, obstacles);
   }
 
+  public setTransportLight(light: ArrayLike<number>): void {
+    this.transport.setLightField(light);
+  }
+
   public advanceTemperature(deltaSeconds: number, ambientTemperature = 22): void {
     this.transport.advanceHeat(deltaSeconds, ambientTemperature);
   }

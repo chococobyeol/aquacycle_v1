@@ -890,7 +890,9 @@ export function SimulationScreen({
     ? selectedCells.reduce((total, cell) => total + cell.light, 0) / selectedCells.length
     : undefined;
   const selectedPlants = selectedCells.length
-    ? snapshot.plants.filter((plant) => selectedCells.some((cell) => cell.id === plant.cellId))
+    ? snapshot.plants.filter((plant) => snapshot.selection?.plantId
+      ? plant.id === snapshot.selection.plantId
+      : selectedCells.some((cell) => cell.id === plant.cellId))
     : [];
   const selectionSpeciesIds = snapshot.selection?.kind === 'colony' || snapshot.selection?.kind === 'region'
     ? SPECIES_IDS.filter((speciesId) => selectedCells.some((cell) =>
@@ -1330,9 +1332,8 @@ export function SimulationScreen({
     setOpenHudPanels((current) => ({ ...current, inventory: false, observation: true }));
     setObservationView(observationSelectionKey ? 'selection' : 'overview');
     if (!scenario.waterCycle) return;
-    setWaterQualityMapVisible(true);
-    // The map is an observation overlay, not an installation tool. Opening it
-    // must leave the pointer in ordinary selection mode.
+    // Opening the observation record must not override the player's explicit
+    // colour-map choice. It only leaves the pointer in ordinary selection mode.
     setActiveTool('select');
     send({ type: 'clear-probe' });
   };
@@ -2790,7 +2791,11 @@ function RegionSelectionInspector({
   snapshot: SimulationSnapshot;
 }) {
   const algaeTotal = cells.reduce(
-    (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria,
+    (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia,
+    0,
+  );
+  const aquaticPlantTotal = cells.reduce(
+    (sum, cell) => sum + cell.biomass.vallisneria,
     0,
   );
   const decomposer = cells.reduce((sum, cell) => sum + cell.biofilm.decomposer, 0);
@@ -2822,7 +2827,11 @@ function RegionSelectionInspector({
               ? lights.reduce((sum, value) => sum + value, 0) / lights.length
               : 0;
             const surfaceAlgae = surfaceCells.reduce(
-              (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria,
+              (sum, cell) => sum + cell.biomass.oedogonium + cell.biomass.nitzschia,
+              0,
+            );
+            const surfacePlants = surfaceCells.reduce(
+              (sum, cell) => sum + cell.biomass.vallisneria,
               0,
             );
             const surfaceBiofilm = surfaceCells.reduce(
@@ -2838,7 +2847,7 @@ function RegionSelectionInspector({
             return (
               <div className="region-structure-row" key={structure.id}>
                 <img src={definition.assetPath} alt="" />
-                <div><strong>{definition.label}</strong><small>수온 {localTemperature.toFixed(1)}°C · 조류 {surfaceAlgae.toFixed(1)} · 균 {surfaceBiofilm.toFixed(1)}</small></div>
+                <div><strong>{definition.label}</strong><small>수온 {localTemperature.toFixed(1)}°C · 조류 {surfaceAlgae.toFixed(1)} · 수초 {surfacePlants.toFixed(1)} · 균 {surfaceBiofilm.toFixed(1)}</small></div>
                 <span>빛 {minimum.toFixed(0)}–{maximum.toFixed(0)}<b>평균 {average.toFixed(0)}</b></span>
               </div>
             );
@@ -2867,7 +2876,12 @@ function RegionSelectionInspector({
           <h4>생물과 표면</h4>
           <dl className="species-facts">
             <div><dt>체리새우</dt><dd>{animals.length}마리</dd></div>
-            <div><dt>조류 총량</dt><dd>{algaeTotal.toFixed(1)}</dd></div>
+            {algaeTotal > ALGAE_VISIBLE_BIOMASS && (
+              <div><dt>조류 총량</dt><dd>{algaeTotal.toFixed(1)}</dd></div>
+            )}
+            {aquaticPlantTotal > ALGAE_VISIBLE_BIOMASS && (
+              <div><dt>나사말 총량</dt><dd>{aquaticPlantTotal.toFixed(1)}</dd></div>
+            )}
             <div><dt>분해균 필름</dt><dd>{decomposer.toFixed(2)}</dd></div>
             <div><dt>질산화균 필름</dt><dd>{nitrifier.toFixed(2)}</dd></div>
           </dl>
@@ -3462,7 +3476,7 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
         <strong>시간에 따른 변화</strong>
         <small>{points.length > 1 ? `${formatTime(timeBounds.start)}–${formatTime(timeBounds.end)}` : '관찰 대기 중'}</small>
       </div>
-      <svg viewBox="0 0 240 72" role="img" aria-label="조류 총량과 새우 개체 수의 시간 변화">
+      <svg viewBox="0 0 240 72" role="img" aria-label="생산자 총량과 새우 개체 수의 시간 변화">
         <path className="ecology-history-guide" d="M43 32H189M43 68H189" />
         <text x="5" y="12">생산자</text>
         <text x="5" y="48">새우</text>
@@ -3726,6 +3740,7 @@ function SpeciesGuide({
                 <div><dt>생장 상태</dt><dd>{plantRamets[0].lifeStage === 'juvenile' ? '어린 포기 · 잎을 키우는 중' : plantRamets[0].lifeStage === 'mature' ? '성체 · 러너 번식 가능' : '노쇠 · 잎과 저장량 감소'}</dd></div>
                 <div><dt>건강</dt><dd>{Math.round(plantRamets[0].health * 100)} / 100</dd></div>
                 <div><dt>러너 준비</dt><dd>{Math.round(plantRamets[0].runnerProgress * 100)}% · 자손 {plantRamets[0].reproductionCount}포기</dd></div>
+                <div><dt>부모 연결</dt><dd>{plantRamets[0].connectedToParent ? '러너로 연결됨 · 저장량 지원 중' : '독립한 포기'}</dd></div>
               </dl>
             </>
           ) : <p>수조에서 나사말 포기나 나사말이 있는 영역을 선택하면 나이·건강·러너 번식을 볼 수 있습니다.</p>}

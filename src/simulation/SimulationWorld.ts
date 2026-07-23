@@ -37,6 +37,12 @@ import {
   structureAuthoredPolygonToWorld,
 } from './structureGeometry';
 import {
+  vallisneriaCanopyBounds,
+  vallisneriaHitDistance,
+  vallisneriaLeafPoint,
+  vallisneriaLeaves,
+} from './vallisneriaGeometry';
+import {
   DEFAULT_SIMULATION_SPEED,
   normalizeSimulationSpeed,
   type SimulationSpeed,
@@ -121,6 +127,7 @@ interface SeedPlacementState {
 
 interface VallisneriaLifeState {
   parentId: string | null;
+  connectedToParent: boolean;
   ageSeconds: number;
   lifespanSeconds: number;
   structuralScale: number;
@@ -138,7 +145,28 @@ interface MeasurementState {
 interface LightReflectionSource {
   bodyId: number;
   point: Vec2;
-  strength: number;
+  lampCoefficient: number;
+  daylightCoefficient: number;
+}
+
+interface LightReflectionPath {
+  source: LightReflectionSource;
+  transportFactor: number;
+}
+
+interface LightTransportPath {
+  ambientBase: number;
+  ambientLampCoefficient: number;
+  lampCoefficient: number;
+  daylightCoefficient: number;
+  reflections: LightReflectionPath[];
+}
+
+interface VallisneriaCanopyOptics {
+  plantId: string;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number };
+  leafOpticalDepth: number;
+  leafSamples: Vec2[][];
 }
 
 interface HeldStructureState {
@@ -253,7 +281,6 @@ const REFLECTED_LIGHT_LIMIT = 6;
  */
 interface LightEmitter {
   id: 'ceiling-lamp' | 'daylight';
-  output: number;
   samples: Vec2[];
   emissionScale: number;
   occludedTransmission: number;
@@ -301,6 +328,15 @@ const VALLISNERIA_RUNNER_MIN_DISTANCE = 42;
 const VALLISNERIA_RUNNER_MAX_DISTANCE = 170;
 const VALLISNERIA_LOW_RESERVE = 0.055;
 const VALLISNERIA_LOW_RESERVE_GRACE_SECONDS = 150;
+// A stolon stays connected through the daughter's juvenile establishment.
+// Transfer is deliberately bounded and mass-conserving: it buffers a shaded
+// daughter but cannot create biomass or drain the parent below its own reserve.
+const VALLISNERIA_CLONAL_SUPPORT_PER_SECOND = 0.00055;
+const VALLISNERIA_CLONAL_SUPPORT_TARGET = 0.22;
+// Five-percent structural steps are visually/ecologically smooth at the
+// 36×20 light-field resolution and avoid rebuilding the field for imperceptible
+// sub-pixel leaf growth during fast-forward.
+const VALLISNERIA_CANOPY_LIGHT_QUANTIZATION = 0.05;
 const BIOFILM_INOCULUM_BIOMASS = 0.18;
 const PICK_SEED_DISTANCE = 18;
 const PICK_ANIMAL_DISTANCE = 28;
@@ -476,6 +512,8 @@ export class SimulationWorld {
   private appliedDayNightPhase: DayNightPhase | null = null;
   private waterTemperature = 23.5;
   private lightDirty = true;
+  private lightTransportDirty = true;
+  private canopyLightSignature = '';
   private crossConnectionsDirty = true;
   private lightRevision = 0;
   private lightField: LightFieldSnapshot = {
@@ -486,6 +524,8 @@ export class SimulationWorld {
   };
   private lightEmitters: LightEmitter[] = [];
   private lightReflectionSources: LightReflectionSource[] = [];
+  private lightTransportCache = new Map<string, LightTransportPath>();
+  private vallisneriaCanopyOptics: VallisneriaCanopyOptics[] = [];
   private message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
   public constructor(scenarioId: ScenarioId = 'mission-1') {
@@ -553,7 +593,11 @@ export class SimulationWorld {
       initialTemperature: this.waterTemperature,
     });
     this.lightDirty = true;
+    this.lightTransportDirty = true;
+    this.canopyLightSignature = '';
     this.lightReflectionSources = [];
+    this.lightTransportCache.clear();
+    this.vallisneriaCanopyOptics = [];
     this.crossConnectionsDirty = true;
     this.message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
@@ -803,6 +847,7 @@ export class SimulationWorld {
           if (Math.abs(this.growthAccumulator) < 1e-10) this.growthAccumulator = 0;
           this.elapsedSeconds += growthStepSeconds;
           this.updateDayNightLighting();
+          if (this.lightDirty) this.recomputeLight();
           this.biogeochemistry.beginStep(growthStepSeconds);
           this.stepTemperature(growthStepSeconds);
           this.stepGrowth(growthStepSeconds);
@@ -1128,7 +1173,13 @@ export class SimulationWorld {
         origin,
         plant: placement.speciesId === 'vallisneria'
           ? placement.plant
-            ? { ...placement.plant }
+            ? {
+              ...placement.plant,
+              connectedToParent: placement.plant.connectedToParent ?? (
+                placement.plant.parentId !== null &&
+                placement.plant.ageSeconds < VALLISNERIA_JUVENILE_SECONDS
+              ),
+            }
             : this.createVallisneriaLifeState(placement.id, origin, null)
           : undefined,
       };
@@ -1178,6 +1229,8 @@ export class SimulationWorld {
     this.revision = 0;
     this.crossConnectionsDirty = true;
     this.lightDirty = true;
+    this.lightTransportDirty = true;
+    this.canopyLightSignature = '';
     this.rebuildCrossConnections();
     this.recomputeLight();
     this.snapshotDirty = true;
@@ -1294,6 +1347,7 @@ export class SimulationWorld {
     Composite.add(this.engine.world, body);
     this.crossConnectionsDirty = true;
     this.lightDirty = true;
+    this.lightTransportDirty = true;
     return structure;
   }
 
@@ -1571,6 +1625,26 @@ export class SimulationWorld {
         this.message = `${ANIMALS[carcass.speciesId].displayName}의 사체를 선택했습니다.`;
         return;
       }
+      const plantHit = this.nearestVallisneria(exact);
+      // Strap leaves are visually thin; a generous water-space tolerance
+      // makes the whole rosette easy to inspect without demanding pixel-perfect clicks.
+      if (plantHit && plantHit.distance <= 22) {
+        const cell = this.cellById(plantHit.placement.cellId);
+        if (cell) {
+          this.selection = {
+            kind: 'colony',
+            ...exact,
+            ownerLabel: '나사말 포기',
+            cellId: cell.id,
+            plantId: plantHit.placement.id,
+            speciesId: 'vallisneria',
+            speciesIds: ['vallisneria'],
+            microbeGuildIds: [],
+          };
+          this.message = '나사말 포기를 선택했습니다. 잎·저장량·러너 상태를 관찰할 수 있습니다.';
+          return;
+        }
+      }
       const nearest = this.nearestCell(exact);
       if (nearest && nearest.distance <= Math.max(13, nearest.cell.cellSize * 1.55)) {
         const biomass = nearest.cell.biomass;
@@ -1638,7 +1712,7 @@ export class SimulationWorld {
       maxX: Math.max(start.x, end.x),
       maxY: Math.max(start.y, end.y),
     };
-    const cells = (filter === 'organism' || filter === 'all')
+    const cellsInBounds = (filter === 'organism' || filter === 'all')
       ? this.allCells().filter((cell) => {
       const point = this.cellWorldPoint(cell);
       const algae = cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria;
@@ -1648,6 +1722,24 @@ export class SimulationWorld {
         point.y >= bounds.minY && point.y <= bounds.maxY;
       })
       : [];
+    const plantCells = (filter === 'organism' || filter === 'all')
+      ? this.seedPlacements.flatMap((placement) => {
+        if (placement.speciesId !== 'vallisneria' || !placement.plant) return [];
+        const cell = this.cellById(placement.cellId);
+        if (!cell || cell.biomass.vallisneria <= 0.004) return [];
+        const canopy = vallisneriaCanopyBounds(
+          cell.index,
+          this.cellWorldPoint(cell),
+          placement.plant.structuralScale,
+        );
+        const intersects = canopy.maxX >= bounds.minX && canopy.minX <= bounds.maxX &&
+          canopy.maxY >= bounds.minY && canopy.minY <= bounds.maxY;
+        return intersects ? [cell] : [];
+      })
+      : [];
+    const cells = Array.from(new Map(
+      [...cellsInBounds, ...plantCells].map((cell) => [cell.id, cell]),
+    ).values());
     const animals = (filter === 'organism' || filter === 'all')
       ? this.animals.filter((animal) =>
       animal.position.x >= bounds.minX && animal.position.x <= bounds.maxX &&
@@ -1776,6 +1868,7 @@ export class SimulationWorld {
       this.held = null;
       this.wakeStructuresAfterTopologyChange();
       this.lightDirty = true;
+      this.lightTransportDirty = true;
       this.crossConnectionsDirty = true;
       this.message = '돌을 놓았습니다. 중력과 접점에 따라 자연스럽게 안착하는 중입니다.';
       return;
@@ -1848,6 +1941,10 @@ export class SimulationWorld {
       }
       : this.createSeedPlacement(heldSeed.seedId, heldSeed.speciesId, cellId));
     this.held = null;
+    if (heldSeed.speciesId === 'vallisneria') {
+      this.lightDirty = true;
+      if (this.allSettled) this.recomputeLight();
+    }
     this.message = `${SPECIES[heldSeed.speciesId].shortName} 접종 위치를 정했습니다.`;
   }
 
@@ -1999,6 +2096,10 @@ export class SimulationWorld {
     this.seedPlacements = this.seedPlacements.filter((placement) =>
       placement.speciesId !== speciesId || !affectedCellIds.has(placement.cellId),
     );
+    if (speciesId === 'vallisneria') {
+      this.lightDirty = true;
+      if (this.allSettled) this.recomputeLight();
+    }
     this.selection = null;
     this.message = `${scopeLabel}에서 ${SPECIES[speciesId].shortName}을 걷어냈습니다.`;
     this.snapshotDirty = true;
@@ -2014,6 +2115,7 @@ export class SimulationWorld {
       this.selection = null;
     }
     this.lightDirty = true;
+    this.lightTransportDirty = true;
     this.crossConnectionsDirty = true;
   }
 
@@ -2057,6 +2159,7 @@ export class SimulationWorld {
     };
     this.wakeStructuresAfterTopologyChange();
     this.lightDirty = true;
+    this.lightTransportDirty = true;
     this.crossConnectionsDirty = true;
     this.message = `${STRUCTURES[structure.definitionId].label}을 회전했습니다. 접점에 따라 다시 안착합니다.`;
     this.snapshotDirty = true;
@@ -2329,7 +2432,7 @@ export class SimulationWorld {
     const nearest = this.nearestCell(exact);
     const snapDistance = nearest ? Math.max(7, nearest.cell.cellSize * 0.72) : 0;
     const onSurface = nearest && nearest.distance <= snapDistance ? nearest : null;
-    const light = onSurface ? onSurface.cell.light : this.lightAt(exact);
+    const light = onSurface ? onSurface.cell.light : this.lightAtWithCanopy(exact);
     const measuredPoint = onSurface ? this.cellWorldPoint(onSurface.cell) : exact;
     const biofilm = onSurface ? { ...onSurface.cell.biofilm } : emptyBiofilm();
     const localTemperature = this.biogeochemistry.temperatureAt(measuredPoint);
@@ -2440,15 +2543,20 @@ export class SimulationWorld {
   }
 
   private recomputeLight(): void {
-    this.lightEmitters = this.buildLightEmitters();
-    this.lightReflectionSources = this.buildLightReflectionSources();
+    const transportChanged = this.lightTransportDirty;
+    if (transportChanged) {
+      this.lightEmitters = this.buildLightEmitters();
+      this.lightReflectionSources = this.buildLightReflectionSources();
+      this.lightTransportCache.clear();
+    }
+    this.rebuildVallisneriaCanopyOptics();
     const values: number[] = [];
     for (let row = 0; row < LIGHT_ROWS; row += 1) {
       for (let column = 0; column < LIGHT_COLUMNS; column += 1) {
-        values.push(this.lightAt({
+        values.push(this.lightAtWithCanopy({
           x: ((column + 0.5) / LIGHT_COLUMNS) * TANK_WIDTH,
           y: WATER_TOP + ((row + 0.5) / LIGHT_ROWS) * (GROUND_Y - WATER_TOP),
-        }));
+        }, undefined, true));
       }
     }
     this.lightRevision += 1;
@@ -2458,40 +2566,44 @@ export class SimulationWorld {
       values,
       revision: this.lightRevision,
     };
-    this.biogeochemistry.setTransportEnvironment(
-      values,
-      this.structures
-        .filter((structure) => !this.isHeldStructure(structure.id))
-        .map((structure) => {
-          const definition = STRUCTURES[structure.definitionId];
-          return {
-            polygon: structureAuthoredPolygonToWorld(
-              definition.collisionPolygon,
-              definition.collisionPolygon,
-              structure.body.position,
-              structure.body.angle,
-            ),
-          };
-        }),
-    );
+    if (transportChanged) {
+      this.biogeochemistry.setTransportEnvironment(
+        values,
+        this.structures
+          .filter((structure) => !this.isHeldStructure(structure.id))
+          .map((structure) => {
+            const definition = STRUCTURES[structure.definitionId];
+            return {
+              polygon: structureAuthoredPolygonToWorld(
+                definition.collisionPolygon,
+                definition.collisionPolygon,
+                structure.body.position,
+                structure.body.angle,
+              ),
+            };
+          }),
+      );
+    } else {
+      this.biogeochemistry.setTransportLight(values);
+    }
 
     for (const cell of this.allCells()) {
       const ownerBodyId = cell.surfaceKind === 'structure-face'
         ? this.structureById(cell.ownerId)?.body.id
         : undefined;
-      cell.light = this.lightAt(this.cellWorldPoint(cell), ownerBodyId);
+      cell.light = this.lightAtWithCanopy(this.cellWorldPoint(cell), ownerBodyId, true);
     }
     if (this.probe) this.setProbe(this.probe);
     this.lightDirty = false;
+    this.lightTransportDirty = false;
+    this.canopyLightSignature = this.currentCanopyLightSignature();
     this.snapshotDirty = true;
   }
 
   private buildLightEmitters(): LightEmitter[] {
-    const emitters: LightEmitter[] = [];
-    if (this.lightOutput > 0) {
-      emitters.push({
+    return [
+      {
         id: 'ceiling-lamp',
-        output: this.lightOutput,
         samples: Array.from({ length: AREA_LIGHT_SAMPLES }, (_, index) => ({
           x: FIXED_LAMP_X - FIXED_LAMP_WIDTH / 2 +
             (index / (AREA_LIGHT_SAMPLES - 1)) * FIXED_LAMP_WIDTH,
@@ -2503,13 +2615,9 @@ export class SimulationWorld {
         angularExponent: 1.48,
         distanceScale: 470,
         distanceExponent: 1.35,
-      });
-    }
-    const daylightOutput = this.effectiveNaturalLightOutput();
-    if (daylightOutput > 0) {
-      emitters.push({
+      },
+      {
         id: 'daylight',
-        output: daylightOutput,
         samples: Array.from({ length: AMBIENT_SKY_SAMPLES }, (_, index) => ({
           x: ((index + 0.5) / AMBIENT_SKY_SAMPLES) * TANK_WIDTH,
           y: WATER_TOP - 12,
@@ -2518,17 +2626,16 @@ export class SimulationWorld {
         // A broad sky source is not a set of laser rays. Blocked samples keep
         // a small diffuse component representing water/air scattering.
         occludedTransmission: 0.06,
-      });
-    }
-    return emitters;
+      },
+    ];
   }
 
-  private emitterLightAt(
+  private emitterLightCoefficientAt(
     emitter: LightEmitter,
     point: Vec2,
     occluders: MatterBody[],
   ): number {
-    if (emitter.output <= 0 || emitter.samples.length === 0) return 0;
+    if (emitter.samples.length === 0) return 0;
     const depth = Math.max(0, point.y - WATER_TOP);
     const waterAttenuation = Math.exp(-depth * 0.00072);
     let irradiance = 0;
@@ -2550,17 +2657,24 @@ export class SimulationWorld {
         : 1;
       const clear = Query.ray(occluders, sourcePoint, point, 1.1).length === 0;
       const transmission = clear ? 1 : emitter.occludedTransmission;
-      irradiance += emitter.output * emitter.emissionScale * angleFactor *
+      irradiance += emitter.emissionScale * angleFactor *
         distanceFactor * waterAttenuation * transmission;
     }
     return irradiance / emitter.samples.length;
   }
 
-  private emittedLightAt(point: Vec2, occluders: MatterBody[]): number {
-    return this.lightEmitters.reduce(
-      (sum, emitter) => sum + this.emitterLightAt(emitter, point, occluders),
-      0,
-    );
+  private emittedLightCoefficientsAt(
+    point: Vec2,
+    occluders: MatterBody[],
+  ): { lamp: number; daylight: number } {
+    let lamp = 0;
+    let daylight = 0;
+    for (const emitter of this.lightEmitters) {
+      const coefficient = this.emitterLightCoefficientAt(emitter, point, occluders);
+      if (emitter.id === 'ceiling-lamp') lamp += coefficient;
+      else daylight += coefficient;
+    }
+    return { lamp, daylight };
   }
 
   private buildLightReflectionSources(): LightReflectionSource[] {
@@ -2573,45 +2687,32 @@ export class SimulationWorld {
       const blockers = activeStructures
         .filter((candidate) => candidate.body.id !== structure.body.id)
         .map((candidate) => candidate.body);
+      const incident = this.emittedLightCoefficientsAt(reflectionPoint, blockers);
       return {
         bodyId: structure.body.id,
         point: reflectionPoint,
-        strength: clamp(
-          this.emittedLightAt(reflectionPoint, blockers) * 0.065,
-          0,
-          REFLECTED_LIGHT_LIMIT,
-        ),
+        lampCoefficient: incident.lamp,
+        daylightCoefficient: incident.daylight,
       };
-    }).filter((source) => source.strength >= 0.08);
+    });
   }
 
-  private reflectedLightAt(point: Vec2, excludedBodyId: number | undefined, occluders: MatterBody[]): number {
-    let reflected = 0;
-    for (const source of this.lightReflectionSources) {
-      if (source.bodyId === excludedBodyId) continue;
-      const dx = point.x - source.point.x;
-      const dy = point.y - source.point.y;
-      const distance = Math.max(1, Math.hypot(dx, dy));
-      if (distance >= 400) continue;
-      const upwardDirection = clamp(-dy / distance, -1, 1);
-      const facing = clamp(0.35 + upwardDirection * 0.65, 0.08, 1);
-      const distanceFalloff = 1 / (1 + Math.pow(distance / 230, 2));
-      const localFade = clamp((400 - distance) / 120, 0, 1);
-      const contribution = source.strength * facing * distanceFalloff * localFade;
-      if (contribution < 0.04) continue;
-      const blockers = occluders.filter((body) => body.id !== source.bodyId);
-      const visible = Query.ray(blockers, source.point, point, 1).length === 0 ? 1 : 0;
-      reflected += contribution * visible;
-      if (reflected >= REFLECTED_LIGHT_LIMIT) return REFLECTED_LIGHT_LIMIT;
+  private lightTransportPathAt(
+    point: Vec2,
+    excludedBodyId?: number,
+    cache = false,
+  ): LightTransportPath {
+    const key = `${point.x}:${point.y}:${excludedBodyId ?? 'water'}`;
+    if (cache) {
+      const cached = this.lightTransportCache.get(key);
+      if (cached) return cached;
     }
-    return reflected;
-  }
 
-  private lightAt(point: Vec2, excludedBodyId?: number): number {
     const occluders = this.structures
-      .filter((structure) => structure.body.id !== excludedBodyId && !this.isHeldStructure(structure.id))
+      .filter((structure) =>
+        structure.body.id !== excludedBodyId && !this.isHeldStructure(structure.id))
       .map((structure) => structure.body);
-    const emitted = this.emittedLightAt(point, occluders);
+    const emitted = this.emittedLightCoefficientsAt(point, occluders);
     const depth = Math.max(0, point.y - WATER_TOP);
     let skyExposure = 0;
     for (let index = 0; index < AMBIENT_SKY_SAMPLES; index += 1) {
@@ -2622,12 +2723,150 @@ export class SimulationWorld {
       if (Query.ray(occluders, skyPoint, point, 1).length === 0) skyExposure += 1;
     }
     skyExposure /= AMBIENT_SKY_SAMPLES;
-    const ambient =
-      (1.1 + this.lightOutput * 0.03) *
-      (0.35 + skyExposure * 0.65) *
-      Math.exp(-depth * 0.00062);
-    const reflected = this.reflectedLightAt(point, excludedBodyId, occluders);
-    return clamp(ambient + emitted + reflected, 0, 100);
+    const ambientTransport =
+      (0.35 + skyExposure * 0.65) * Math.exp(-depth * 0.00062);
+    const reflections: LightReflectionPath[] = [];
+    for (const source of this.lightReflectionSources) {
+      if (source.bodyId === excludedBodyId) continue;
+      const dx = point.x - source.point.x;
+      const dy = point.y - source.point.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      if (distance >= 400) continue;
+      const upwardDirection = clamp(-dy / distance, -1, 1);
+      const facing = clamp(0.35 + upwardDirection * 0.65, 0.08, 1);
+      const distanceFalloff = 1 / (1 + Math.pow(distance / 230, 2));
+      const localFade = clamp((400 - distance) / 120, 0, 1);
+      const transportFactor = facing * distanceFalloff * localFade;
+      if (transportFactor * REFLECTED_LIGHT_LIMIT < 0.04) continue;
+      const blockers = occluders.filter((body) => body.id !== source.bodyId);
+      if (Query.ray(blockers, source.point, point, 1).length === 0) {
+        reflections.push({ source, transportFactor });
+      }
+    }
+    const path = {
+      ambientBase: 1.1 * ambientTransport,
+      ambientLampCoefficient: 0.03 * ambientTransport,
+      lampCoefficient: emitted.lamp,
+      daylightCoefficient: emitted.daylight,
+      reflections,
+    };
+    if (cache) this.lightTransportCache.set(key, path);
+    return path;
+  }
+
+  private evaluateLightTransport(path: LightTransportPath): number {
+    const daylightOutput = this.effectiveNaturalLightOutput();
+    let reflected = 0;
+    for (const reflection of path.reflections) {
+      const incident =
+        reflection.source.lampCoefficient * this.lightOutput +
+        reflection.source.daylightCoefficient * daylightOutput;
+      const strength = clamp(incident * 0.065, 0, REFLECTED_LIGHT_LIMIT);
+      if (strength < 0.08) continue;
+      const contribution = strength * reflection.transportFactor;
+      if (contribution < 0.04) continue;
+      reflected += contribution;
+      if (reflected >= REFLECTED_LIGHT_LIMIT) {
+        reflected = REFLECTED_LIGHT_LIMIT;
+        break;
+      }
+    }
+    return clamp(
+      path.ambientBase +
+      path.ambientLampCoefficient * this.lightOutput +
+      path.lampCoefficient * this.lightOutput +
+      path.daylightCoefficient * daylightOutput +
+      reflected,
+      0,
+      100,
+    );
+  }
+
+  private lightAt(point: Vec2, excludedBodyId?: number, cache = false): number {
+    return this.evaluateLightTransport(
+      this.lightTransportPathAt(point, excludedBodyId, cache),
+    );
+  }
+
+  /**
+   * Vallisneria blades transmit most light but overlapping leaves accumulate
+   * optical depth. This is a cheap Beer-Lambert canopy layer over the cached
+   * stone/light transport, so living plants can cast soft shade without
+   * rebuilding Matter ray paths or behaving like opaque rocks.
+   */
+  private canopyTransmissionAt(point: Vec2, excludedPlantId?: string): number {
+    let opticalDepth = 0;
+    for (const canopy of this.vallisneriaCanopyOptics) {
+      if (canopy.plantId === excludedPlantId) continue;
+      const { bounds } = canopy;
+      if (
+        point.y <= bounds.minY ||
+        point.x < bounds.minX - 18 ||
+        point.x > bounds.maxX + 18
+      ) continue;
+
+      for (const samples of canopy.leafSamples) {
+        let leafDensity = 0;
+        for (const blade of samples) {
+          const verticalGap = point.y - blade.y;
+          if (verticalGap <= 3) continue;
+          // Water scatter widens the penumbra below a translucent blade.
+          const sigma = 4.5 + Math.min(12, verticalGap * 0.024);
+          const dx = point.x - blade.x;
+          leafDensity = Math.max(
+            leafDensity,
+            Math.exp(-(dx * dx) / (2 * sigma * sigma)),
+          );
+        }
+        opticalDepth += leafDensity * canopy.leafOpticalDepth;
+      }
+    }
+    return Math.exp(-Math.min(1.45, opticalDepth));
+  }
+
+  private lightAtWithCanopy(
+    point: Vec2,
+    excludedBodyId?: number,
+    cache = false,
+    excludedPlantId?: string,
+  ): number {
+    return this.lightAt(point, excludedBodyId, cache) *
+      this.canopyTransmissionAt(point, excludedPlantId);
+  }
+
+  private rebuildVallisneriaCanopyOptics(): void {
+    this.vallisneriaCanopyOptics = this.seedPlacements.flatMap((placement) => {
+      if (placement.speciesId !== 'vallisneria' || !placement.plant) return [];
+      const cell = this.cellById(placement.cellId);
+      if (!cell || cell.biomass.vallisneria <= 0.004) return [];
+      const anchor = this.cellWorldPoint(cell);
+      const scale = placement.plant.structuralScale;
+      return [{
+        plantId: placement.id,
+        bounds: vallisneriaCanopyBounds(cell.index, anchor, scale),
+        leafOpticalDepth: 0.035 + scale * 0.028,
+        leafSamples: vallisneriaLeaves(cell.index, anchor, scale).map((leaf) =>
+          Array.from({ length: 7 }, (_, index) =>
+            vallisneriaLeafPoint(leaf, (index + 1) / 8)
+          )
+        ),
+      }];
+    });
+  }
+
+  private currentCanopyLightSignature(): string {
+    return this.seedPlacements
+      .filter((placement) => placement.speciesId === 'vallisneria' && placement.plant)
+      .map((placement) => {
+        const cell = this.cellById(placement.cellId);
+        const alive = cell && cell.biomass.vallisneria > 0.004;
+        const scale = alive
+          ? Math.round(placement.plant!.structuralScale / VALLISNERIA_CANOPY_LIGHT_QUANTIZATION)
+          : 0;
+        return `${placement.id}:${placement.cellId}:${scale}`;
+      })
+      .sort()
+      .join('|');
   }
 
   private rebuildCrossConnections(): void {
@@ -3555,12 +3794,11 @@ export class SimulationWorld {
     const ramet = this.seedPlacements.find((placement) =>
       placement.speciesId === 'vallisneria' && placement.cellId === cell.id
     );
-    const plantHash = (cell.index * 0.61803398875) % 1;
     const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
-    const canopyHeight = (170 + plantHash * 42) * 0.8 * structuralScale;
+    const canopy = vallisneriaCanopyBounds(cell.index, anchor, structuralScale);
     return {
       x: anchor.x,
-      y: Math.max(WATER_TOP + 16, anchor.y - canopyHeight),
+      y: Math.max(WATER_TOP + 16, canopy.minY + 5),
     };
   }
 
@@ -3594,6 +3832,7 @@ export class SimulationWorld {
       (VALLISNERIA_MAX_LIFESPAN_SECONDS - VALLISNERIA_MIN_LIFESPAN_SECONDS);
     return {
       parentId,
+      connectedToParent: origin === 'runner' && parentId !== null,
       // Inventory plants are established young rosettes, while a runner-born
       // daughter visibly starts small and must mature before making a runner.
       ageSeconds: origin === 'supplied'
@@ -3635,6 +3874,21 @@ export class SimulationWorld {
       .filter((placement) => placement.speciesId === 'vallisneria')
       .map((placement) => placement.cellId));
     const parentSeed = deterministicStringSeed(parent.id) + (parent.plant?.reproductionCount ?? 0) * 97;
+    const sourceTotal = source.biomass.oedogonium +
+      source.biomass.nitzschia + source.biomass.vallisneria;
+    const sourceLight = this.sampleLightField(this.producerActivityPoint(source, 'vallisneria'));
+    const sourceTemperature = this.biogeochemistry.temperatureAt(
+      this.producerActivityPoint(source, 'vallisneria'),
+    );
+    const sourceSuitability = habitatSuitability(
+      'vallisneria',
+      sourceLight,
+      sourceTemperature,
+    );
+    // Ramets in a poor or crowded patch tend to explore farther before
+    // rooting; productive patches keep a shorter, denser clone network.
+    const preferredDistance = 82 + (1 - sourceSuitability) * 34 +
+      clamp01((sourceTotal - 0.62) / 0.38) * 24;
     const candidates = this.substrateCells.flatMap((cell) => {
       if (occupiedCells.has(cell.id) || cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS) return [];
       const total = cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria;
@@ -3644,19 +3898,66 @@ export class SimulationWorld {
         distance < VALLISNERIA_RUNNER_MIN_DISTANCE ||
         distance > VALLISNERIA_RUNNER_MAX_DISTANCE
       ) return [];
-      // Prefer a natural runner length, with a deterministic left/right choice
-      // preventing every daughter from filling cells in array order.
-      const score = Math.abs(distance - 92) +
-        deterministicNoise(parentSeed + cell.index * 1.71) * 26;
+      const targetPoint = this.producerActivityPoint(cell, 'vallisneria');
+      const targetSuitability = habitatSuitability(
+        'vallisneria',
+        this.sampleLightField(targetPoint),
+        this.biogeochemistry.temperatureAt(targetPoint),
+      );
+      // Clonal foraging is a bias, not omniscience: habitat and competition
+      // matter, while deterministic noise still produces varied directions.
+      const competition = clamp01(total);
+      const score = Math.abs(distance - preferredDistance) +
+        (1 - targetSuitability) * 68 +
+        competition * 54 +
+        deterministicNoise(parentSeed + cell.index * 1.71) * 24;
       return [{ cell, score }];
     });
     candidates.sort((left, right) => left.score - right.score);
     return candidates[0]?.cell ?? null;
   }
 
+  private stepVallisneriaClonalIntegration(deltaSeconds: number): void {
+    const byId = new Map(this.seedPlacements.map((placement) => [placement.id, placement]));
+    for (const daughter of this.seedPlacements) {
+      const life = daughter.plant;
+      if (
+        daughter.speciesId !== 'vallisneria' ||
+        !life ||
+        !life.connectedToParent
+      ) continue;
+      const parent = life.parentId ? byId.get(life.parentId) : undefined;
+      const parentCell = parent ? this.cellById(parent.cellId) : undefined;
+      const daughterCell = this.cellById(daughter.cellId);
+      if (
+        !parent?.plant ||
+        !parentCell ||
+        !daughterCell ||
+        life.ageSeconds >= VALLISNERIA_JUVENILE_SECONDS
+      ) {
+        life.connectedToParent = false;
+        continue;
+      }
+      const parentSurplus = Math.max(0, parentCell.biomass.vallisneria - 0.24);
+      const daughterDeficit = Math.max(
+        0,
+        VALLISNERIA_CLONAL_SUPPORT_TARGET - daughterCell.biomass.vallisneria,
+      );
+      const transfer = Math.min(
+        parentSurplus,
+        daughterDeficit,
+        VALLISNERIA_CLONAL_SUPPORT_PER_SECOND * deltaSeconds,
+      );
+      if (transfer <= 0) continue;
+      parentCell.biomass.vallisneria -= transfer;
+      daughterCell.biomass.vallisneria += transfer;
+    }
+  }
+
   private stepVallisneriaLifecycle(deltaSeconds: number): void {
     const deaths = new Set<string>();
     const daughters: SeedPlacementState[] = [];
+    this.stepVallisneriaClonalIntegration(deltaSeconds);
 
     for (const placement of this.seedPlacements) {
       if (placement.speciesId !== 'vallisneria' || !placement.plant) continue;
@@ -3747,6 +4048,9 @@ export class SimulationWorld {
       this.seedPlacements = this.seedPlacements.filter((placement) => !deaths.has(placement.id));
     }
     if (daughters.length) this.seedPlacements.push(...daughters);
+    if (this.currentCanopyLightSignature() !== this.canopyLightSignature) {
+      this.lightDirty = true;
+    }
     if (deaths.size || daughters.length) this.snapshotDirty = true;
   }
 
@@ -4314,6 +4618,7 @@ export class SimulationWorld {
         y: point.y,
         origin: placement.origin,
         parentId: placement.plant.parentId,
+        connectedToParent: placement.plant.connectedToParent,
         ageSeconds: placement.plant.ageSeconds,
         lifespanSeconds: placement.plant.lifespanSeconds,
         lifeStage: this.vallisneriaLifeStage(placement.plant),
@@ -4544,7 +4849,46 @@ export class SimulationWorld {
       if (placement.locked) continue;
       const cell = this.cellById(placement.cellId);
       if (!cell) continue;
-      const distance = Math.sqrt(distanceSquared(point, this.cellWorldPoint(cell)));
+      const anchor = this.cellWorldPoint(cell);
+      const distance = placement.speciesId === 'vallisneria' && placement.plant
+        ? vallisneriaHitDistance(
+          point,
+          cell.index,
+          anchor,
+          placement.plant.structuralScale,
+        )
+        : Math.sqrt(distanceSquared(point, anchor));
+      if (!nearest || distance < nearest.distance) nearest = { placement, distance };
+    }
+    return nearest;
+  }
+
+  private nearestVallisneria(
+    point: Vec2,
+  ): { placement: SeedPlacementState; distance: number } | null {
+    let nearest: { placement: SeedPlacementState; distance: number } | null = null;
+    for (const placement of this.seedPlacements) {
+      if (placement.speciesId !== 'vallisneria' || !placement.plant) continue;
+      const cell = this.cellById(placement.cellId);
+      if (!cell || cell.biomass.vallisneria <= 0.004) continue;
+      const anchor = this.cellWorldPoint(cell);
+      const leafDistance = vallisneriaHitDistance(
+        point,
+        cell.index,
+        anchor,
+        placement.plant.structuralScale,
+      );
+      const canopy = vallisneriaCanopyBounds(
+        cell.index,
+        anchor,
+        placement.plant.structuralScale,
+      );
+      const boundsDx = Math.max(canopy.minX - point.x, 0, point.x - canopy.maxX);
+      const boundsDy = Math.max(canopy.minY - point.y, 0, point.y - canopy.maxY);
+      // The whole rosette silhouette is one inspectable organism. The leaf
+      // centreline remains the precise path, while the canopy envelope fills
+      // narrow gaps between overlapping ribbons for comfortable selection.
+      const distance = Math.min(leafDistance, Math.hypot(boundsDx, boundsDy));
       if (!nearest || distance < nearest.distance) nearest = { placement, distance };
     }
     return nearest;

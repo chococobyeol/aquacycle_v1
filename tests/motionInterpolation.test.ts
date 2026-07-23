@@ -97,14 +97,27 @@ describe('Pixi motion interpolation', () => {
     expect(complete?.structures[0].x).toBe(230);
   });
 
-  it('rebases instead of replaying stale motion after a sequence gap', () => {
+  it('uses timestamps to smooth a coalesced sequence gap when topology is unchanged', () => {
     const previous = frame(20, 5_000, 8_000, [animal('shrimp-1', 40, 50)]);
     const current = frame(22, 5_033, 8_034, [animal('shrimp-1', 440, 350)]);
     const sampled = interpolateMotionFrames({ previous, current }, 8_034);
 
+    expect(sampled?.interpolated).toBe(true);
+    expect(sampled?.animals[0].x).toBe(40);
+    expect(sampled?.animals[0].y).toBe(50);
+  });
+
+  it('rebases across a sequence gap when animal topology changed', () => {
+    const previous = frame(20, 5_000, 8_000, [animal('shrimp-1', 40, 50)]);
+    const current = frame(22, 5_066, 8_067, [
+      animal('shrimp-1', 80, 90),
+      animal('new-shrimp', 100, 110),
+    ]);
+    const sampled = interpolateMotionFrames({ previous, current }, 8_067);
+
     expect(sampled?.interpolated).toBe(false);
-    expect(sampled?.animals[0].x).toBe(440);
-    expect(sampled?.animals[0].y).toBe(350);
+    expect(sampled?.animals).toHaveLength(2);
+    expect(sampled?.animals[0].x).toBe(80);
   });
 
   it('starts a newly born animal at its authoritative current pose', () => {

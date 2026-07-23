@@ -120,8 +120,8 @@ export class WaterTransportGrid {
   }
 
   public setEnvironment(light: ArrayLike<number>, obstacles: WaterTransportObstacle[]): void {
+    this.copyLightField(light);
     for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
-      this.light[index] = clamp(Number(light[index]) || 0, 0, 100);
       this.solidFraction[index] = 0;
     }
 
@@ -160,6 +160,23 @@ export class WaterTransportGrid {
       }
     }
     this.revision += 1;
+  }
+
+  /**
+   * Updates radiative heating without rebuilding obstacle coverage, heat
+   * capacity, conductivity, and flow resistance. Day/night changes only the
+   * source intensity; the transport geometry remains identical until a
+   * structure moves.
+   */
+  public setLightField(light: ArrayLike<number>): void {
+    this.copyLightField(light);
+    this.revision += 1;
+  }
+
+  private copyLightField(light: ArrayLike<number>): void {
+    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+      this.light[index] = clamp(Number(light[index]) || 0, 0, 100);
+    }
   }
 
   public advanceHeat(deltaSeconds: number, ambientTemperature = 22): void {

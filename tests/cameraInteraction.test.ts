@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { GROUND_Y, TANK_HEIGHT, TANK_WIDTH } from '../src/simulation/types';
 import {
+  CAMERA_SCENE_CENTER_X,
+  CAMERA_SCENE_CENTER_Y,
   CAMERA_SCENE_HEIGHT,
   CAMERA_SCENE_WIDTH,
   TANK_VISUAL_WATER_TOP,
@@ -14,6 +16,7 @@ import {
   isScreenDrag,
   isTankInteractionPoint,
   shouldStartCameraPan,
+  tankCameraCenterBounds,
   TANK_INTERACTION_LEFT,
   TANK_INTERACTION_RIGHT,
 } from '../src/renderer/tank/cameraInteraction';
@@ -28,7 +31,7 @@ describe('aquarium camera interactions', () => {
     expect(CAMERA_SCENE_WIDTH * tallScale).toBeGreaterThanOrEqual(1200);
     expect(CAMERA_SCENE_HEIGHT * tallScale).toBeGreaterThanOrEqual(900);
     expect(canPanTankCamera(1600, 720, 1)).toBe(true);
-    expect(canPanTankCamera(CAMERA_SCENE_WIDTH, CAMERA_SCENE_HEIGHT, 1)).toBe(false);
+    expect(canPanTankCamera(CAMERA_SCENE_WIDTH, CAMERA_SCENE_HEIGHT, 1)).toBe(true);
   });
 
   it('uses a dynamic fit zoom that reveals all four tank edges', () => {
@@ -46,7 +49,8 @@ describe('aquarium camera interactions', () => {
       expect(CAMERA_SCENE_WIDTH * fittedScale).toBeLessThanOrEqual(viewport.width + 0.001);
       expect(CAMERA_SCENE_HEIGHT * fittedScale).toBeLessThanOrEqual(viewport.height + 0.001);
       expect(fittedScale).toBeCloseTo(containTankScale(viewport.width, viewport.height));
-      expect(canPanTankCamera(viewport.width, viewport.height, fitZoom)).toBe(false);
+      // Even the fit view can be shifted away from floating HUD panels.
+      expect(canPanTankCamera(viewport.width, viewport.height, fitZoom)).toBe(true);
     }
 
     expect(fitTankZoom(1920, 1080)).toBeCloseTo((1080 / CAMERA_SCENE_HEIGHT) / (1920 / CAMERA_SCENE_WIDTH));
@@ -56,6 +60,22 @@ describe('aquarium camera interactions', () => {
   it('guards invalid viewport sizes when deriving the fit zoom', () => {
     expect(fitTankZoom(0, 0)).toBe(1);
     expect(fitTankZoom(Number.NaN, 720)).toBe(1);
+  });
+
+  it('allows controlled overscroll at fit zoom so every tank edge can clear a HUD panel', () => {
+    const width = 1600;
+    const height = 900;
+    const zoom = fitTankZoom(width, height);
+    const bounds = tankCameraCenterBounds(width, height, zoom);
+
+    expect(bounds.minX).toBeLessThan(CAMERA_SCENE_CENTER_X);
+    expect(bounds.maxX).toBeGreaterThan(CAMERA_SCENE_CENTER_X);
+    expect(bounds.minY).toBeLessThan(CAMERA_SCENE_CENTER_Y);
+    expect(bounds.maxY).toBeGreaterThan(CAMERA_SCENE_CENTER_Y);
+    // The permitted horizontal shift is large enough to clear a typical
+    // right-side observation panel, but remains bounded.
+    expect(bounds.maxX - CAMERA_SCENE_CENTER_X).toBeGreaterThan(350);
+    expect(bounds.maxX - CAMERA_SCENE_CENTER_X).toBeLessThan(500);
   });
 
   it('does not turn clicks outside the water and substrate area into edge clicks', () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import type { SpeciesId, Vec2 } from '../src/simulation/types';
+import { vallisneriaLeafPoint, vallisneriaLeaves } from '../src/simulation/vallisneriaGeometry';
 
 const placeSeed = (
   world: SimulationWorld,
@@ -22,6 +23,59 @@ const advanceTo = (world: SimulationWorld, targetSeconds: number): void => {
 };
 
 describe('Vallisneria ramet life cycle', () => {
+  it('casts translucent canopy shade without acting like an opaque rock', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
+    const target = substrate[Math.floor(substrate.length / 2)];
+    const unshaded = target.light;
+
+    placeSeed(world, 'vallisneria', target);
+    const shadedCell = world.snapshot().cells.find((cell) => cell.id === target.id)!;
+
+    expect(shadedCell.light).toBeLessThan(unshaded * 0.98);
+    expect(shadedCell.light).toBeGreaterThan(unshaded * 0.45);
+  });
+
+  it('selects the visible leaves and exposes the exact ramet instead of requiring a root click', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
+    const target = substrate[Math.floor(substrate.length / 2)];
+    placeSeed(world, 'vallisneria', target);
+    const planted = world.snapshot().plants[0];
+    const cell = world.snapshot().cells.find((candidate) => candidate.id === planted.cellId)!;
+    const leaves = vallisneriaLeaves(cell.index, cell, planted.structuralScale);
+    const leafPoint = vallisneriaLeafPoint(leaves[Math.floor(leaves.length / 2)], 0.55);
+
+    world.handle({ type: 'select-at', point: leafPoint, filter: 'organism' });
+    const selection = world.snapshot().selection;
+
+    expect(selection?.kind).toBe('colony');
+    expect(selection?.speciesId).toBe('vallisneria');
+    expect(selection?.plantId).toBe(planted.id);
+    expect(selection?.cellId).toBe(planted.cellId);
+  });
+
+  it('includes a ramet when a dragged observation region intersects its leaves', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
+    const target = substrate[Math.floor(substrate.length / 2)];
+    placeSeed(world, 'vallisneria', target);
+    const planted = world.snapshot().plants[0];
+    const cell = world.snapshot().cells.find((candidate) => candidate.id === planted.cellId)!;
+    const leaves = vallisneriaLeaves(cell.index, cell, planted.structuralScale);
+    const leafPoint = vallisneriaLeafPoint(leaves[Math.floor(leaves.length / 2)], 0.55);
+
+    world.handle({
+      type: 'select-region',
+      from: { x: leafPoint.x - 5, y: leafPoint.y - 5 },
+      to: { x: leafPoint.x + 5, y: leafPoint.y + 5 },
+      filter: 'organism',
+    });
+
+    expect(world.snapshot().selection?.kind).toBe('region');
+    expect(world.snapshot().selection?.cellIds).toContain(planted.cellId);
+  });
+
   it('grows from an established juvenile and reproduces by biomass-conserving runners', () => {
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
