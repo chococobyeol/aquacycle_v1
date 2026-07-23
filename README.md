@@ -19,6 +19,16 @@ npm test
 npm run package
 ```
 
+배포 전에는 장시간 생태 검사가 서로 CPU를 빼앗아 거짓 시간초과를 내지 않도록
+전체 회귀를 한 작업자에서 실행하고, 낮·밤 50주기까지 이어서 확인합니다.
+
+```bash
+npm run verify:release
+```
+
+현재 검증 계약과 실행 기록은
+[`docs/RELEASE_VERIFICATION.md`](./docs/RELEASE_VERIFICATION.md)에 남깁니다.
+
 macOS 패키지는 `out/AquaCycle-darwin-*`에 생성됩니다. Windows에서는 같은 프로젝트에서 Squirrel 패키지를 만들도록 Electron Forge가 설정되어 있습니다.
 
 ## 구현 구조

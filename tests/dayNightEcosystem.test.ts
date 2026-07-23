@@ -3,6 +3,7 @@ import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import { dayNightCycleDuration, dayNightStateAt } from '../src/simulation/dayNight';
 import { algaePhysiology } from '../src/simulation/growth';
 import { SCENARIOS } from '../src/simulation/config';
+import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import type { MicrobeGuildId, SpeciesId, Vec2 } from '../src/simulation/types';
 
 const placeSeed = (world: SimulationWorld, speciesId: SpeciesId, point: Vec2): void => {
@@ -128,14 +129,20 @@ describe('day/night producer metabolism', () => {
       return cell;
     };
     const used = new Set<string>();
+    const foodPoints: Vec2[] = [];
     // A player-like solution uses a handful of broad daylight positions rather
     // than exhausting every supplied inoculum or targeting hidden cell values.
     for (const x of [180, 450, 750, 1_020]) {
-      placeSeed(world, 'nitzschia', nearest(x, used));
+      const nitzschia = nearest(x, used);
+      placeSeed(world, 'nitzschia', nitzschia);
       placeSeed(world, 'oedogonium', nearest(x + 28, used));
+      foodPoints.push(nitzschia);
     }
     for (const x of [340, 600, 860]) placeSeed(world, 'vallisneria', nearest(x, used));
-    for (const x of [290, 430, 770, 910]) placeShrimp(world, { x, y: 600 });
+    // Supplied adults begin hungry. Placing them at the visible food patches is
+    // a normal player action and avoids making the fixture depend on a lucky
+    // first random walk before the local-search radius reaches food.
+    for (const point of foodPoints) placeShrimp(world, point);
     world.handle({ type: 'start' });
     advanceTo(world, 90);
     world.handle({ type: 'pause' });
@@ -157,9 +164,11 @@ describe('day/night producer metabolism', () => {
     expect(final.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
     expect(Math.min(...samples.map((sample) => sample.biogeochemistry.average.oxygen)))
       .toBeGreaterThan(30);
-    expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio)).toBeLessThan(0.0001);
-    expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio)).toBeLessThan(0.0001);
+    expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+    expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
     expect(Math.abs(final.biogeochemistry.materialBalance.oxygenEquivalentDriftRatio))
-      .toBeLessThan(0.0001);
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   }, 40_000);
 });

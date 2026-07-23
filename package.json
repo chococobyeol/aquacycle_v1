@@ -11,7 +11,9 @@
     "make": "electron-forge make",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:release": "vitest run --pool=threads --poolOptions.threads.singleThread",
     "test:watch": "vitest",
+    "verify:release": "npm run typecheck && npm run test:release && npm run verify:long-cycle",
     "verify:long-cycle": "vite-node scripts/verifyLongCycle.ts",
     "verify:day-night-performance": "vite-node scripts/verifyDayNightLightingPerformance.ts",
     "verify:worker-cadence": "vite-node scripts/verifyWorkerCadence.ts"

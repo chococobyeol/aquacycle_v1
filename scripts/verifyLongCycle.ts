@@ -1,4 +1,5 @@
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import type {
   MicrobeGuildId,
   SpeciesId,
@@ -121,11 +122,18 @@ const checks: Array<[string, boolean]> = [
   ['최대 평균 유기물 < 18', result.maximumOrganicMatter < 18],
   ['후반 산소 창 차이 < 6', result.lateOxygenWindowDifference < 6],
   ['후반 유기물 창 차이 < 1.5', result.lateOrganicWindowDifference < 1.5],
-  ['질소 상대 오차 < 0.01%', Math.abs(result.nitrogenDriftRatio) < 0.0001],
-  ['탄소 상대 오차 < 0.01%', Math.abs(result.carbonDriftRatio) < 0.0001],
   [
-    '산소 등가 상대 오차 < 0.01%',
-    Math.abs(result.oxygenEquivalentDriftRatio) < 0.0001,
+    '질소 상대 오차 < 0.00000001%',
+    Math.abs(result.nitrogenDriftRatio) < CLOSED_MATERIAL_RELATIVE_TOLERANCE,
+  ],
+  [
+    '탄소 상대 오차 < 0.00000001%',
+    Math.abs(result.carbonDriftRatio) < CLOSED_MATERIAL_RELATIVE_TOLERANCE,
+  ],
+  [
+    '산소 등가 상대 오차 < 0.00000001%',
+    Math.abs(result.oxygenEquivalentDriftRatio) <
+      CLOSED_MATERIAL_RELATIVE_TOLERANCE,
   ],
 ];
 

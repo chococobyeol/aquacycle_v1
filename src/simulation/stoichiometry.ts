@@ -1,5 +1,11 @@
 import { WATER_CYCLE_RULES } from './config';
 
+// A closed material ledger should drift only at floating-point rounding scale.
+// This one-part-in-ten-billion release limit leaves several orders of
+// cross-platform margin above the current ~1e-14 results while still catching
+// any ecologically meaningful leak immediately.
+export const CLOSED_MATERIAL_RELATIVE_TOLERANCE = 1e-10;
+
 export interface NitrifierStoichiometry {
   processedNitrogen: number;
   retainedNitrogen: number;

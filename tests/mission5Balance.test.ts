@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import { BiogeochemistryLedger } from '../src/simulation/biogeochemistry';
+import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import {
   GROUND_Y,
   WATER_TOP,
@@ -262,9 +263,9 @@ describe('mission 5 microbial cycle', () => {
     // swing, but the tank must still show both production and consumption.
     expect(hasRiseAndFall(toxic, 0.01)).toBe(true);
     expect(Math.abs(treatedFinal.biogeochemistry.materialBalance.nitrogenDriftRatio))
-      .toBeLessThan(0.0001);
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
     expect(Math.abs(treatedFinal.biogeochemistry.materialBalance.carbonDriftRatio))
-      .toBeLessThan(0.0001);
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   }, 30_000);
 
   it('lets a distributed established film process the local waste of ten adults', () => {

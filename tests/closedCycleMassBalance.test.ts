@@ -4,7 +4,10 @@ import {
   type BiofilmReactionSite,
 } from '../src/simulation/biogeochemistry';
 import { WATER_CYCLE_RULES } from '../src/simulation/config';
-import { oxygenEquivalentInventory } from '../src/simulation/stoichiometry';
+import {
+  CLOSED_MATERIAL_RELATIVE_TOLERANCE,
+  oxygenEquivalentInventory,
+} from '../src/simulation/stoichiometry';
 
 const totals = (
   ledger: BiogeochemistryLedger,
@@ -51,13 +54,13 @@ describe('closed material ledger', () => {
 
     const final = totals(ledger, sites);
     expect(Math.abs((final.nitrogen - initial.nitrogen) / initial.nitrogen))
-      .toBeLessThan(0.00002);
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
     expect(Math.abs((final.carbon - initial.carbon) / initial.carbon))
-      .toBeLessThan(0.00002);
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
     expect(Math.abs(
       (final.oxygenEquivalent - initial.oxygenEquivalent) /
       initial.oxygenEquivalent,
-    )).toBeLessThan(0.00002);
+    )).toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
     expect(ledger.materialState().dissolvedInorganicCarbon).toBeGreaterThanOrEqual(0);
     expect(ledger.materialState().headspaceCarbonDioxide).toBeGreaterThanOrEqual(0);
     expect(ledger.materialState().headspaceOxygen).toBeGreaterThanOrEqual(0);

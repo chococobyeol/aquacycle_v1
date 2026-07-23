@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import type {
   AnimalCarcassSnapshot,
   MicrobeGuildId,
@@ -173,11 +174,11 @@ it('keeps a closed mission-5 ecosystem alive through several shrimp generations'
   expect(deathCauses.has('hypoxia')).toBe(false);
   expect(deathCauses.has('toxicity')).toBe(false);
   expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio))
-    .toBeLessThan(0.0001);
+    .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio))
-    .toBeLessThan(0.0001);
+    .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   expect(Math.abs(final.biogeochemistry.materialBalance.oxygenEquivalentDriftRatio))
-    .toBeLessThan(0.0001);
+    .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
 // This is 7,200 simulated seconds with live population bookkeeping. Leave
 // enough wall-clock headroom for developers to run it while the Electron
 // build is also open; the assertions and simulated duration stay unchanged.

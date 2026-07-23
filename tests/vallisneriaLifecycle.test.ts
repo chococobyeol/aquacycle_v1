@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import {
   STRUCTURE_SUPPORT_Y,
   type SpeciesId,
@@ -370,8 +371,10 @@ describe('Vallisneria ramet life cycle', () => {
     })).toBe(true);
     // Runner-born daughters are ecology, not extra use of the supplied stock.
     expect(after.remainingSeeds.vallisneria).toBe(2);
-    expect(Math.abs(after.biogeochemistry.materialBalance.nitrogenDriftRatio)).toBeLessThan(0.0001);
-    expect(Math.abs(after.biogeochemistry.materialBalance.carbonDriftRatio)).toBeLessThan(0.0001);
+    expect(Math.abs(after.biogeochemistry.materialBalance.nitrogenDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+    expect(Math.abs(after.biogeochemistry.materialBalance.carbonDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   }, 60_000);
 
   it('keeps structural leaves stable through one night while reserve biomass breathes', () => {
@@ -406,8 +409,10 @@ describe('Vallisneria ramet life cycle', () => {
     const after = world.snapshot();
     expect(after.plants).toHaveLength(0);
     expect(after.totalBiomass.vallisneria).toBe(0);
-    expect(Math.abs(after.biogeochemistry.materialBalance.nitrogenDriftRatio)).toBeLessThan(0.0001);
-    expect(Math.abs(after.biogeochemistry.materialBalance.carbonDriftRatio)).toBeLessThan(0.0001);
+    expect(Math.abs(after.biogeochemistry.materialBalance.nitrogenDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+    expect(Math.abs(after.biogeochemistry.materialBalance.carbonDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   });
 
   it('preserves age, lifespan, leaf structure and runner progress in frozen aquariums', () => {

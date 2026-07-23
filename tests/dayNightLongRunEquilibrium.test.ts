@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import type {
   MicrobeGuildId,
   SpeciesId,
@@ -108,9 +109,9 @@ it('approaches a bounded producer-microbial orbit through ten closed day/night c
     averageOf(previousWindow, (sample) => sample.biogeochemistry.average.organicMatter),
   )).toBeLessThan(1.5);
   expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio))
-    .toBeLessThan(0.0001);
+    .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio))
-    .toBeLessThan(0.0001);
+    .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   expect(Math.abs(final.biogeochemistry.materialBalance.oxygenEquivalentDriftRatio))
-    .toBeLessThan(0.0001);
+    .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
 }, 300_000);
