@@ -36,8 +36,8 @@ const nearestUnusedCell = (
   const cell = cells
     .filter((candidate) => !used.has(candidate.id))
     .sort((left, right) =>
-      Math.abs(left.x - targetX) / 35 + Math.abs(left.light - targetLight) -
-      (Math.abs(right.x - targetX) / 35 + Math.abs(right.light - targetLight)))[0];
+      Math.abs(left.x - targetX) / 4 + Math.abs(left.light - targetLight) -
+      (Math.abs(right.x - targetX) / 4 + Math.abs(right.light - targetLight)))[0];
   if (!cell) throw new Error('long-run fixture needs another substrate cell');
   used.add(cell.id);
   return cell;

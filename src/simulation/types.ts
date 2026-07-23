@@ -499,6 +499,8 @@ export interface SavedAnimalState {
   energy: number;
   structuralBiomass: number;
   storedBiomass: number;
+  /** Conserved egg/reproduction buffer; optional only for version-1 save compatibility. */
+  reproductiveBiomass?: number;
   health: number;
   behavior: AnimalBehavior;
   behaviorTimer: number;

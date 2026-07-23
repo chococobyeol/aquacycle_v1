@@ -8,6 +8,9 @@ declare global {
         chrome: string;
         electron: string;
       };
+      onRenderingVisibilityChange?: (
+        listener: (visible: boolean) => void,
+      ) => () => void;
     };
   }
 }

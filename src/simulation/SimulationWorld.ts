@@ -213,6 +213,7 @@ interface AnimalState {
   energy: number;
   structuralBiomass: number;
   storedBiomass: number;
+  reproductiveBiomass: number;
   health: number;
   behavior: AnimalBehavior;
   behaviorTimer: number;
@@ -367,21 +368,24 @@ const SHRIMP_WATER_RECOVERY_RATE = SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerS
 const SHRIMP_FORAGE_START_ENERGY = 0.48;
 const SHRIMP_FORAGE_STOP_ENERGY = 0.7;
 // Grazing must remove enough visible algae for consumers to affect the tank.
-// The lower energy conversion keeps the energy gained per second near the
-// earlier tuning while making the removed biomass truthful. At the measured
-// sustained intake (~0.13 biomass/s), 0.08 leaves enough reserve above adult
-// grazing metabolism for genuinely food-rich tanks to support reproduction;
-// sparse/overgrazed tanks still fall below this intake and lose population.
+// Intake itself stays on the density-dependent functional response below;
+// survival is now determined by the conserved reserve/structure budget.
 const SHRIMP_BITE_RATE = SHRIMP_ECOLOGY_RULES.maximumBiteBiomassPerSecond;
-const SHRIMP_ENERGY_PER_BIOMASS = SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass;
 const SHRIMP_GRAZE_DISTANCE = 15;
-// Below this density the film is too sparse to be a useful grazing target.
-// Using one threshold for detection, retargeting, and actual removal prevents
-// shrimp from spending their energy on visible-but-nonnourishing specks.
-const SHRIMP_EDIBLE_BIOMASS = 0.04;
+// Target detection and ingestion are deliberately separate. Shrimp seek a
+// visibly established patch instead of being distracted by every microscopic
+// speck, while a shrimp already on a patch can keep grazing it continuously.
+const SHRIMP_FOOD_TARGET_BIOMASS = 0.04;
+// Ecology keeps trace film continuous instead of declaring an otherwise edible
+// cell empty at 0.04 biomass. The existing half-saturation curve makes intake
+// smoothly approach zero; this much smaller cutoff is only the point where the
+// remaining film is mineralised into detritus rather than numerically stranded.
+const SHRIMP_TRACE_GRAZABLE_BIOMASS = 0.0005;
 const SHRIMP_GRAZING_HALF_SATURATION = 0.02;
 const SHRIMP_LOCAL_FOOD_RADIUS = 64;
-const SHRIMP_EMERGENCY_FOOD_RADIUS = 520;
+// A hungry shrimp samples a somewhat wider nearby area, never the whole tank.
+// Longer-range discovery happens only through ordinary exploratory movement.
+const SHRIMP_EMERGENCY_FOOD_RADIUS = 180;
 const SHRIMP_EMERGENCY_SEARCH_ENERGY = 0.35;
 const SHRIMP_GRAZING_BOUT_BIOMASS = 1.4;
 // After a feeding bout, shrimp visibly leave the feeding surface before they
@@ -393,7 +397,34 @@ const SHRIMP_POST_GRAZE_ROAM_VARIANCE_SECONDS = 1.5;
 // gated by current reserve and recent access to food rather than a hidden
 // population-capacity formula.
 const SHRIMP_REPRODUCTION_ENERGY = SHRIMP_ECOLOGY_RULES.reproductionEnergy;
+// The visible 0..1 condition is derived from conserved animal matter instead
+// of being a second, independently drained hunger tank. Reserve and expendable
+// structure therefore pay maintenance, growth, and reproduction exactly once.
+const SHRIMP_MINIMUM_VIABLE_STRUCTURE_RATIO = 0.22;
+// The condition meter is reserve-led. Healthy structure contributes a small
+// baseline, but it is not treated as ordinary stored food; structure is only
+// catabolised after reserve is gone during true starvation.
+// A newly supplied adult carries 0.08 reserve and should begin at roughly
+// 0.36 condition: hungry enough to forage, but not biologically exhausted.
+const SHRIMP_STRUCTURE_CONDITION_SHARE = 0.28;
+const SHRIMP_RESERVE_CONDITION_SHARE = 1 - SHRIMP_STRUCTURE_CONDITION_SHARE;
+const SHRIMP_ENERGY_CAPACITY_PER_STRUCTURAL_BIOMASS =
+  WATER_CYCLE_RULES.shrimp.assimilationFraction /
+  SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass;
 const SHRIMP_NEW_ADULT_REPRODUCTION_COOLDOWN = 120;
+const SHRIMP_MINIMUM_BROOD_BIOMASS =
+  WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
+  SHRIMP_ECOLOGY_RULES.minimumClutchSize;
+const SHRIMP_MAXIMUM_BROOD_BIOMASS =
+  WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
+  SHRIMP_ECOLOGY_RULES.maximumClutchSize;
+// Adult females gradually allocate feeding surplus to eggs instead of needing
+// the complete clutch to appear in ordinary reserve at a single instant.
+const SHRIMP_REPRODUCTIVE_SOMATIC_RESERVE_FLOOR = 0.16;
+// Mating is a local encounter, not a tank-wide lookup. The radius is wider
+// than the grazing contact distance to stand in for short-range chemical and
+// tactile cues without revealing animals elsewhere in the aquarium.
+const SHRIMP_MATING_ENCOUNTER_RADIUS = 140;
 const SHRIMP_MATING_SECONDS = 3;
 const SHRIMP_GESTATION_SECONDS = 75;
 const SHRIMP_POST_BROOD_COOLDOWN = 160;
@@ -1205,7 +1236,10 @@ export class SimulationWorld {
           : undefined,
       };
     });
-    this.animals = data.animals.map((animal) => cloneAnimalState(animal));
+    this.animals = data.animals.map((animal) => cloneAnimalState({
+      ...animal,
+      reproductiveBiomass: animal.reproductiveBiomass ?? 0,
+    }));
     this.carcasses = data.carcasses.map((carcass) => ({
       ...carcass,
       position: { ...carcass.position },
@@ -1284,7 +1318,8 @@ export class SimulationWorld {
       cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria +
       cell.biofilm.decomposer + cell.biofilm.nitrifier, 0);
     const animalBiomass = this.animals.reduce(
-      (sum, animal) => sum + animal.structuralBiomass + animal.storedBiomass,
+      (sum, animal) => sum + animal.structuralBiomass +
+        animal.storedBiomass + animal.reproductiveBiomass,
       0,
     );
     const suspended = this.suspendedBiofilm.decomposer + this.suspendedBiofilm.nitrifier;
@@ -3117,7 +3152,8 @@ export class SimulationWorld {
         ? Math.sqrt(distanceSquared(animal.position, this.cellWorldPoint(currentTarget)))
         : Number.POSITIVE_INFINITY;
       const wasForaging = animal.behavior === 'traveling' ||
-        animal.behavior === 'grazing' || animal.behavior === 'starving';
+        animal.behavior === 'grazing' || animal.behavior === 'starving' ||
+        animal.behavior === 'exploring';
       const behaviorNoise = deterministicNoise(animal.randomSeed + animal.ageSeconds * 0.17);
       let forcedRoaming = animal.behavior === 'exploring' &&
         animal.behaviorTimer > 0 && animal.energy > SHRIMP_WEAK_ENERGY;
@@ -3136,7 +3172,7 @@ export class SimulationWorld {
           animal.grazingSessionIntake >= SHRIMP_GRAZING_BOUT_BIOMASS) &&
           animal.energy >= SHRIMP_FORAGE_START_ENERGY) ||
           animal.energy >= SHRIMP_FORAGE_STOP_ENERGY ||
-          targetFood < SHRIMP_EDIBLE_BIOMASS)
+          targetFood < SHRIMP_FOOD_TARGET_BIOMASS)
       ) {
         animal.targetCellId = null;
         animal.behavior = 'exploring';
@@ -3201,12 +3237,12 @@ export class SimulationWorld {
       if (
         animal.nextTargetEvaluation <= 0 ||
         (!currentTarget && animal.behavior !== 'resting') ||
-        (seeking && targetFood < SHRIMP_EDIBLE_BIOMASS && currentTargetDistance <= 24)
+        (seeking && targetFood < SHRIMP_FOOD_TARGET_BIOMASS && currentTargetDistance <= 24)
       ) {
         const foodTarget = seeking ? this.chooseFoodTarget(animal) : null;
         const retainExplorationTarget = Boolean(
           seeking && currentTarget &&
-          targetFood < SHRIMP_EDIBLE_BIOMASS && currentTargetDistance > 24,
+          targetFood < SHRIMP_FOOD_TARGET_BIOMASS && currentTargetDistance > 24,
         );
         animal.targetCellId = foodTarget?.id ??
           (retainExplorationTarget ? currentTarget!.id : this.chooseExplorationTarget(animal)?.id ?? null);
@@ -3230,7 +3266,7 @@ export class SimulationWorld {
       const dx = targetPoint.x - animal.position.x;
       const dy = targetPoint.y - animal.position.y;
       const distance = Math.max(0.001, Math.hypot(dx, dy));
-      const hasFood = this.edibleBiomass(target) >= SHRIMP_EDIBLE_BIOMASS;
+      const hasFood = this.edibleBiomass(target) >= SHRIMP_TRACE_GRAZABLE_BIOMASS;
       const grazing = seeking && hasFood &&
         distance <= Math.max(SHRIMP_GRAZE_DISTANCE, target.cellSize * 1.4);
       if (grazing) {
@@ -3467,6 +3503,7 @@ export class SimulationWorld {
       string,
       'hypoxia' | 'toxicity' | 'temperature'
     >();
+    const maintenanceRequests = new Map<string, number>();
 
     for (const animal of this.animals) {
       animal.ageSeconds += deltaSeconds;
@@ -3503,10 +3540,15 @@ export class SimulationWorld {
       const baseCost = animal.lifeStage === 'adult'
         ? SHRIMP_BASE_METABOLISM
         : SHRIMP_ECOLOGY_RULES.juvenileBaseMetabolismPerSecond;
-      animal.energy = Math.max(
-        0,
-        animal.energy - (baseCost + activityCost) *
-          metabolicTemperatureFactor * deltaSeconds,
+      // Convert the former abstract energy cost into real animal biomass. The
+      // conversion preserves the established food requirement because a bite's
+      // assimilated fraction replenishes the same reserve that pays this cost.
+      maintenanceRequests.set(
+        animal.id,
+        (baseCost + activityCost) *
+          this.animalEnergyCapacity(animal) *
+          metabolicTemperatureFactor *
+          deltaSeconds,
       );
 
       const water = this.biogeochemistry.effectsEnabled
@@ -3560,7 +3602,7 @@ export class SimulationWorld {
         const distance = Math.sqrt(distanceSquared(animal.position, targetPoint));
         const food = this.edibleBiomass(target);
         if (
-          food >= SHRIMP_EDIBLE_BIOMASS &&
+          food >= SHRIMP_TRACE_GRAZABLE_BIOMASS &&
           distance <= Math.max(SHRIMP_GRAZE_DISTANCE, target.cellSize * 1.4)
         ) {
           const requested = SHRIMP_BITE_RATE *
@@ -3602,9 +3644,6 @@ export class SimulationWorld {
         const consumed = actualNitzschia + actualOedogonium;
         consumedNitzschia += actualNitzschia;
         consumedOedogonium += actualOedogonium;
-        request.animal.energy = clamp01(
-          request.animal.energy + consumed * SHRIMP_ENERGY_PER_BIOMASS,
-        );
         request.animal.recentIntake += consumed;
         request.animal.consumedBiomass += consumed;
         request.animal.grazingSessionIntake += consumed;
@@ -3614,65 +3653,69 @@ export class SimulationWorld {
           request.animal.position,
           consumed,
         );
-        if (this.biogeochemistry.effectsEnabled) {
-          const reserveLimit = request.animal.lifeStage === 'adult'
-            ? WATER_CYCLE_RULES.shrimp.adultReserveBiomass
-            : WATER_CYCLE_RULES.shrimp.juvenileReserveBiomass;
-          const retained = Math.min(
-            assimilated,
-            Math.max(0, reserveLimit - request.animal.storedBiomass),
-          );
-          request.animal.storedBiomass += retained;
-          this.biogeochemistry.recordAnimalAssimilationOverflow(
-            request.animal.position,
-            assimilated - retained,
-          );
-        } else {
-          request.animal.storedBiomass += assimilated;
-        }
+        const reserveLimit = request.animal.lifeStage === 'adult'
+          ? WATER_CYCLE_RULES.shrimp.adultReserveBiomass
+          : WATER_CYCLE_RULES.shrimp.juvenileReserveBiomass;
+        const retained = Math.min(
+          assimilated,
+          Math.max(0, reserveLimit - request.animal.storedBiomass),
+        );
+        request.animal.storedBiomass += retained;
+        this.biogeochemistry.recordAnimalAssimilationOverflow(
+          request.animal.position,
+          assimilated - retained,
+        );
       }
       cell.biomass.nitzschia = Math.max(0, cell.biomass.nitzschia - consumedNitzschia);
       cell.biomass.oedogonium = Math.max(0, cell.biomass.oedogonium - consumedOedogonium);
-      if (cell.biomass.nitzschia < 0.0005) cell.biomass.nitzschia = 0;
-      if (cell.biomass.oedogonium < 0.0005) cell.biomass.oedogonium = 0;
+      let traceTurnover = 0;
+      if (
+        cell.biomass.nitzschia > 0 &&
+        cell.biomass.nitzschia < SHRIMP_TRACE_GRAZABLE_BIOMASS
+      ) {
+        traceTurnover += cell.biomass.nitzschia;
+        cell.biomass.nitzschia = 0;
+      }
+      if (
+        cell.biomass.oedogonium > 0 &&
+        cell.biomass.oedogonium < SHRIMP_TRACE_GRAZABLE_BIOMASS
+      ) {
+        traceTurnover += cell.biomass.oedogonium;
+        cell.biomass.oedogonium = 0;
+      }
+      if (traceTurnover > 0) {
+        this.biogeochemistry.recordAlgaeTurnover(
+          this.cellWorldPoint(cell),
+          traceTurnover,
+        );
+      }
     }
 
     const newborns: AnimalState[] = [];
     const living: AnimalState[] = [];
     for (const animal of this.animals) {
-      const maintenanceRate = animal.lifeStage === 'adult'
-        ? WATER_CYCLE_RULES.shrimp.adultMaintenanceBiomassPerSecond
-        : WATER_CYCLE_RULES.shrimp.juvenileMaintenanceBiomassPerSecond;
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
-      const metabolicTemperatureFactor = thetaTemperatureFactor(
-        temperature,
-        temperatureProfile.referenceTemperature,
-        temperatureProfile.metabolicTheta,
-        temperatureProfile.minimumMetabolicFactor,
-        temperatureProfile.maximumMetabolicFactor,
-      );
       const reproductionTemperatureFactor = interpolateTemperatureResponse(
         temperatureProfile.reproductionCurve,
         temperature,
       );
-      const maintenanceRequest = maintenanceRate * metabolicTemperatureFactor * deltaSeconds;
-      const availableForRespiration = this.biogeochemistry.effectsEnabled
-        ? animal.storedBiomass + animal.structuralBiomass
-        : maintenanceRequest;
+      const maintenanceRequest = maintenanceRequests.get(animal.id) ?? 0;
+      const minimumStructure = this.animalMinimumViableStructure(animal);
+      const availableForRespiration = animal.storedBiomass +
+        Math.max(0, animal.structuralBiomass - minimumStructure);
       const actualRespiration = this.biogeochemistry.recordAnimalRespiration(
         animal.position,
         Math.min(maintenanceRequest, availableForRespiration),
       );
-      if (this.biogeochemistry.effectsEnabled) {
-        const reserveLoss = Math.min(animal.storedBiomass, actualRespiration);
-        animal.storedBiomass -= reserveLoss;
-        const structuralLoss = Math.min(
-          animal.structuralBiomass,
-          Math.max(0, actualRespiration - reserveLoss),
-        );
-        animal.structuralBiomass -= structuralLoss;
-      }
+      const reserveLoss = Math.min(animal.storedBiomass, actualRespiration);
+      animal.storedBiomass -= reserveLoss;
+      const structuralLoss = Math.min(
+        Math.max(0, animal.structuralBiomass - minimumStructure),
+        Math.max(0, actualRespiration - reserveLoss),
+      );
+      animal.structuralBiomass -= structuralLoss;
+      this.synchroniseAnimalEnergy(animal);
 
       const environmentalDeathCause = environmentalDeathCauses.get(animal.id);
       if (environmentalDeathCause) {
@@ -3726,16 +3769,36 @@ export class SimulationWorld {
             );
           }
         }
+        this.synchroniseAnimalEnergy(animal);
       }
 
       if (animal.lifeStage === 'adult' && animal.sex === 'female') {
+        if (
+          animal.gestationRemaining === null &&
+          animal.reproductionCooldown <= 0 &&
+          animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
+          animal.reproductiveBiomass < SHRIMP_MAXIMUM_BROOD_BIOMASS
+        ) {
+          const allocation = Math.min(
+            Math.max(
+              0,
+              animal.storedBiomass - SHRIMP_REPRODUCTIVE_SOMATIC_RESERVE_FLOOR,
+            ),
+            SHRIMP_MAXIMUM_BROOD_BIOMASS - animal.reproductiveBiomass,
+          );
+          animal.storedBiomass -= allocation;
+          animal.reproductiveBiomass += allocation;
+          this.synchroniseAnimalEnergy(animal);
+        }
         if (animal.gestationRemaining !== null) {
-          // Embryo development pauses when the mother is no longer feeding;
-          // it resumes after she recovers instead of producing young from
-          // depleted reserves.
+          // Embryos were funded from the mother's conserved reserve when
+          // mating completed. Development therefore follows temperature and
+          // maternal health instead of stopping merely because the last bite
+          // was more than a few seconds ago.
           const gestationCanAdvance =
             animal.energy >= SHRIMP_ECOLOGY_RULES.gestationEnergy &&
-            animal.secondsSinceFood <= SHRIMP_ECOLOGY_RULES.gestationRecentFeedingSeconds;
+            animal.health > 0.5 &&
+            animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS;
           if (gestationCanAdvance) {
             animal.gestationRemaining -= deltaSeconds * reproductionTemperatureFactor;
           }
@@ -3752,11 +3815,12 @@ export class SimulationWorld {
               SHRIMP_TECHNICAL_POPULATION_LIMIT - this.animals.length - newborns.length,
             );
             const materialSlots = Math.floor(
-              animal.storedBiomass / WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
+              animal.reproductiveBiomass /
+                WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
             );
             const clutchSize = Math.min(desiredClutchSize, availableSlots, materialSlots);
             if (clutchSize >= SHRIMP_ECOLOGY_RULES.minimumClutchSize) {
-              animal.storedBiomass -=
+              animal.reproductiveBiomass -=
                 clutchSize * WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
               for (let index = 0; index < clutchSize; index += 1) {
                 const newborn = this.createJuvenileAnimalState(animal, index);
@@ -3765,20 +3829,18 @@ export class SimulationWorld {
               }
               animal.gestationRemaining = null;
               animal.reproductionCooldown = SHRIMP_POST_BROOD_COOLDOWN;
-              animal.energy = Math.max(0, animal.energy - 0.1);
+              this.synchroniseAnimalEnergy(animal);
             } else {
-              // Wait until a complete compressed brood can be born. This keeps
-              // material accounting exact and avoids creating a lone-sex brood.
+              // This can only occur after loading an older save whose gestation
+              // did not reserve a brood. Let the mother rebuild that conserved
+              // material instead of creating offspring from nothing.
               animal.gestationRemaining = 0;
             }
           }
         } else if (
           animal.reproductionCooldown <= 0 &&
           animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
-          animal.storedBiomass >=
-            WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
-            SHRIMP_ECOLOGY_RULES.minimumClutchSize &&
-          animal.secondsSinceFood < SHRIMP_ECOLOGY_RULES.matingRecentFeedingSeconds &&
+          animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
           this.animals.length + newborns.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
         ) {
           const eligibleMale = this.animals.find((candidate) =>
@@ -3786,8 +3848,9 @@ export class SimulationWorld {
             candidate.lifeStage === 'adult' &&
             candidate.sex === 'male' &&
             candidate.energy >= SHRIMP_ECOLOGY_RULES.maleReproductionEnergy &&
-            candidate.secondsSinceFood < SHRIMP_ECOLOGY_RULES.matingRecentFeedingSeconds &&
-            candidate.reproductionCooldown <= 0,
+            candidate.reproductionCooldown <= 0 &&
+            distanceSquared(candidate.position, animal.position) <=
+              SHRIMP_MATING_ENCOUNTER_RADIUS * SHRIMP_MATING_ENCOUNTER_RADIUS,
           );
           animal.matingAccumulator = eligibleMale
             ? animal.matingAccumulator + deltaSeconds * reproductionTemperatureFactor
@@ -3795,7 +3858,6 @@ export class SimulationWorld {
           if (animal.matingAccumulator >= SHRIMP_MATING_SECONDS) {
             animal.gestationRemaining = SHRIMP_GESTATION_SECONDS;
             animal.matingAccumulator = 0;
-            animal.energy = Math.max(0, animal.energy - 0.05);
             if (eligibleMale) {
               eligibleMale.reproductionCooldown = SHRIMP_MALE_POST_MATING_COOLDOWN;
             }
@@ -3815,7 +3877,11 @@ export class SimulationWorld {
           clamp01(animal.energy / SHRIMP_WEAK_ENERGY),
         );
       }
-      if (animal.energy <= 0) {
+      if (
+        animal.storedBiomass <= 1e-9 &&
+        animal.structuralBiomass <=
+          this.animalMinimumViableStructure(animal) + 1e-9
+      ) {
         this.killAnimal(animal, 'starvation');
         continue;
       }
@@ -3848,7 +3914,8 @@ export class SimulationWorld {
     this.biogeochemistry.recordDeath(
       animal.position,
       this.biogeochemistry.effectsEnabled
-        ? animal.structuralBiomass + animal.storedBiomass
+        ? animal.structuralBiomass + animal.storedBiomass +
+          animal.reproductiveBiomass
         : animal.lifeStage === 'adult'
           ? WATER_CYCLE_RULES.shrimp.adultStructuralBiomass
           : WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
@@ -3860,6 +3927,44 @@ export class SimulationWorld {
 
   private edibleBiomass(cell: SurfaceCellState): number {
     return cell.biomass.nitzschia + cell.biomass.oedogonium * 0.72;
+  }
+
+  private animalTargetStructuralBiomass(animal: AnimalState): number {
+    if (animal.lifeStage === 'adult') {
+      return WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+    }
+    const birth = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
+    return birth + (
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass - birth
+    ) * clamp01(animal.growthProgress);
+  }
+
+  private animalEnergyCapacity(animal: AnimalState): number {
+    return this.animalTargetStructuralBiomass(animal) *
+      SHRIMP_ENERGY_CAPACITY_PER_STRUCTURAL_BIOMASS;
+  }
+
+  private animalMinimumViableStructure(animal: AnimalState): number {
+    return this.animalTargetStructuralBiomass(animal) *
+      SHRIMP_MINIMUM_VIABLE_STRUCTURE_RATIO;
+  }
+
+  private synchroniseAnimalEnergy(animal: AnimalState): void {
+    const availableReserve = Math.max(0, animal.storedBiomass);
+    const reserveCapacity = animal.lifeStage === 'adult'
+      ? WATER_CYCLE_RULES.shrimp.adultReserveBiomass
+      : WATER_CYCLE_RULES.shrimp.juvenileReserveBiomass;
+    const structuralCondition = clamp01(
+      animal.structuralBiomass /
+        Math.max(1e-9, this.animalTargetStructuralBiomass(animal)),
+    );
+    const reserveCondition = clamp01(
+      availableReserve / Math.max(1e-9, reserveCapacity),
+    );
+    animal.energy = clamp01(
+      structuralCondition * SHRIMP_STRUCTURE_CONDITION_SHARE +
+      reserveCondition * SHRIMP_RESERVE_CONDITION_SHARE,
+    );
   }
 
   private chooseFoodTarget(animal: AnimalState): SurfaceCellState | null {
@@ -3874,7 +3979,7 @@ export class SimulationWorld {
     let best: { cell: SurfaceCellState; score: number } | null = null;
     for (const cell of this.allCells()) {
       const food = this.edibleBiomass(cell);
-      if (food < SHRIMP_EDIBLE_BIOMASS) continue;
+      if (food < SHRIMP_FOOD_TARGET_BIOMASS) continue;
       const point = this.cellWorldPoint(cell);
       const distance = Math.sqrt(distanceSquared(animal.position, point));
       if (distance > detectionRadius) continue;
@@ -3887,8 +3992,7 @@ export class SimulationWorld {
         animal.randomSeed + cell.index * 1.7 + point.x * 0.01,
       ) * 3;
       // Food search is an encounter, not omniscience: choose a nearby edible
-      // surface instead of steering toward the globally densest colony. Only a
-      // severely hungry shrimp gets the wider emergency detection radius.
+      // surface instead of steering toward the globally densest colony.
       const score = -distance - congestion * 20 + targetCommitment + noise;
       if (!best || score > best.score) best = { cell, score };
     }
@@ -3899,6 +4003,13 @@ export class SimulationWorld {
     const cells = this.allCells();
     if (!cells.length) return null;
     const phase = Math.floor(animal.ageSeconds / 4.5);
+    const heading =
+      deterministicNoise(animal.randomSeed + phase * 19 + 0.37) * Math.PI * 2;
+    const roamingDistance = 170;
+    const desiredPoint = {
+      x: animal.position.x + Math.cos(heading) * roamingDistance,
+      y: animal.position.y + Math.sin(heading) * roamingDistance,
+    };
     let best: { cell: SurfaceCellState; score: number } | null = null;
     const samples = Math.min(48, cells.length);
     for (let index = 0; index < samples; index += 1) {
@@ -3907,10 +4018,14 @@ export class SimulationWorld {
       ) * cells.length);
       const cell = cells[sampleIndex];
       const point = this.cellWorldPoint(cell);
-      const distance = Math.sqrt(distanceSquared(animal.position, point));
-      const preferredDistance = Math.abs(distance - 150);
-      const foodPenalty = Math.min(90, this.edibleBiomass(cell) * 120);
-      const score = -preferredDistance - foodPenalty - (point.y < WATER_TOP + 80 ? 120 : 0);
+      // Roaming has no hidden knowledge of food outside the local sensing
+      // radius. A time-varying individual heading defines a local random walk,
+      // and the closest reachable surface is chosen from geometry alone;
+      // food can only become a target after the shrimp physically approaches
+      // it and chooseFoodTarget detects it locally.
+      const score =
+        -Math.sqrt(distanceSquared(point, desiredPoint)) -
+        (point.y < WATER_TOP + 80 ? 120 : 0);
       if (!best || score > best.score) best = { cell, score };
     }
     return best?.cell ?? cells[0];
@@ -4626,7 +4741,7 @@ export class SimulationWorld {
         : animal.lifeStage === 'adult' &&
           animal.reproductionCooldown <= 0 &&
           animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
-          animal.secondsSinceFood < 8 &&
+          animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
           this.animals.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
           ? 'ready'
           : 'none';
@@ -4907,6 +5022,7 @@ export class SimulationWorld {
       energy: 0.52 + ((numericId - 1) % 4) * 0.01,
       structuralBiomass: WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
       storedBiomass: WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass,
+      reproductiveBiomass: 0,
       health: 1,
       behavior: 'resting',
       behaviorTimer: 1 + deterministicNoise(numericId * 2.7) * 2,
@@ -4955,6 +5071,7 @@ export class SimulationWorld {
       energy: 0.46,
       structuralBiomass: WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
       storedBiomass: 0,
+      reproductiveBiomass: 0,
       health: 1,
       behavior: 'resting',
       behaviorTimer: deterministicNoise(numericId * 4.1),

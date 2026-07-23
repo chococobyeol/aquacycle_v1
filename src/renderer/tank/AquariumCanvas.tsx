@@ -3140,6 +3140,7 @@ export function AquariumCanvas({
     let rendererRecoveryFrame: number | null = null;
     let releaseGlobalResourcesOnDestroy = false;
     let pixiContextRestoredListener: EventListener | null = null;
+    let removeRenderingVisibilityListener: (() => void) | undefined;
     const app = new Application();
     const ownedTextures = new Map<string, Texture>();
     const ownedDisplays = new Map<string, StructureDisplay>();
@@ -3445,6 +3446,29 @@ export function AquariumCanvas({
       };
       app.ticker.add(renderTicker, undefined, UPDATE_PRIORITY.LOW);
       app.start();
+      removeRenderingVisibilityListener =
+        window.aquacycleDesktop?.onRenderingVisibilityChange?.((visible) => {
+          if (!isCurrentGeneration()) return;
+          if (!visible) {
+            app.stop();
+            return;
+          }
+          app.start();
+          requestAnimationFrame(() => {
+            if (!isCurrentGeneration()) return;
+            applyViewport(true);
+            try {
+              app.render();
+            } catch (error) {
+              console.error(
+                '[AquaCycle] Pixi resume paint failed; rebuilding renderer.',
+                error,
+              );
+              app.stop();
+              requestFullRendererRecovery();
+            }
+          });
+        });
 
       await Promise.all(Object.values(STRUCTURES).map(async (definition) => {
         try {
@@ -3575,6 +3599,7 @@ export function AquariumCanvas({
       if (effectGenerationRef.current === generation) effectGenerationRef.current += 1;
       observer.disconnect();
       window.removeEventListener('keydown', handleKeyDown);
+      removeRenderingVisibilityListener?.();
       rendererCanvas?.removeEventListener('webglcontextlost', handleWebGlContextLost);
       rendererCanvas?.removeEventListener('webglcontextrestored', handleWebGlContextRestored);
       if (rendererRecoveryFrame !== null) cancelAnimationFrame(rendererRecoveryFrame);

@@ -8,10 +8,13 @@ import type { Vec2 } from '../src/simulation/types';
 const SHRIMP = 'cherry-shrimp' as const;
 
 interface ReproductionAnimalState {
+  position: Vec2;
   sex: 'female' | 'male';
   energy: number;
   recentIntake: number;
+  structuralBiomass: number;
   storedBiomass: number;
+  reproductiveBiomass: number;
   secondsSinceFood: number;
   reproductionCooldown: number;
   gestationRemaining: number | null;
@@ -21,6 +24,7 @@ interface ReproductionAnimalState {
 interface ReproductionWorldInternals {
   animals: ReproductionAnimalState[];
   stepAnimalEcology(deltaSeconds: number): void;
+  chooseFoodTarget(animal: ReproductionAnimalState): { id: string } | null;
 }
 
 type WorldSnapshot = ReturnType<SimulationWorld['snapshot']>;
@@ -93,6 +97,22 @@ const advanceTo = (
 };
 
 describe('shrimp population safety contract', () => {
+  it('derives condition from conserved body matter instead of killing on a stale hunger value', () => {
+    const world = new SimulationWorld('laboratory');
+    placeShrimp(world, { x: 600, y: 590 });
+    const internals = reproductionInternals(world);
+    const animal = internals.animals[0];
+
+    animal.energy = 0;
+    animal.structuralBiomass = 1;
+    animal.storedBiomass = 0.08;
+    internals.stepAnimalEcology(0.1);
+
+    expect(world.snapshot().animals).toHaveLength(1);
+    expect(world.snapshot().animals[0].energy).toBeGreaterThan(0);
+    expect(world.snapshot().animalPopulationEventTotals.deathsByCause.starvation).toBe(0);
+  });
+
   it('uses only a thousands-level technical guard and permits a brood above the old 8/12 cap', () => {
     expect(SHRIMP_TECHNICAL_POPULATION_LIMIT).toBeGreaterThanOrEqual(2_000);
     expect(SHRIMP_TECHNICAL_POPULATION_LIMIT).toBeGreaterThan(12);
@@ -111,6 +131,7 @@ describe('shrimp population safety contract', () => {
     mother.recentIntake = 1;
     mother.secondsSinceFood = 0;
     mother.storedBiomass = 0.5;
+    mother.reproductiveBiomass = 0.5;
     mother.gestationRemaining = 1;
 
     internals.stepAnimalEcology(1);
@@ -121,7 +142,7 @@ describe('shrimp population safety contract', () => {
     );
   });
 
-  it('requires energy and recent feeding before mating, then food-supported gestation before birth', () => {
+  it('requires a conserved brood reserve and a nearby mate before gestation and birth', () => {
     const depletedWorld = new SimulationWorld('laboratory');
     const depleted = configureReadyPair(depletedWorld, false);
     const depletedFemale = depleted.animals.find((animal) => animal.sex === 'female');
@@ -142,13 +163,53 @@ describe('shrimp population safety contract', () => {
     expect(depletedWorld.snapshot().animalPopulation[SHRIMP].total).toBe(2);
     expect(nourishedFemale.gestationRemaining).not.toBeNull();
 
-    nourishedFemale.energy = 0.9;
-    nourishedFemale.recentIntake = 1;
-    nourishedFemale.secondsSinceFood = 0;
+    // Once the brood has been funded, a short gap since the last bite must not
+    // freeze embryo development. Its material is already protected in reserve.
+    nourishedFemale.secondsSinceFood = 120;
     nourishedFemale.gestationRemaining = 1;
     nourished.stepAnimalEcology(1);
 
     expect(nourishedWorld.snapshot().animalPopulation[SHRIMP].total).toBeGreaterThan(2);
+  });
+
+  it('does not detect a reproductive partner across the whole tank', () => {
+    const world = new SimulationWorld('laboratory');
+    const internals = configureReadyPair(world, true);
+    const female = internals.animals.find((animal) => animal.sex === 'female');
+    const male = internals.animals.find((animal) => animal.sex === 'male');
+    if (!female || !male) throw new Error('local mating fixture needs both sexes');
+    female.storedBiomass = 0.5;
+    male.position = { x: 1_100, y: 590 };
+
+    for (let second = 0; second < 5; second += 1) {
+      internals.stepAnimalEcology(1);
+    }
+
+    expect(female.gestationRemaining).toBeNull();
+  });
+
+  it('cannot target a food colony outside its local sensing radius', () => {
+    const world = new SimulationWorld('laboratory');
+    const farCell = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === 'substrate' && cell.x > 1_000)
+      .sort((a, b) => b.x - a.x)[0];
+    if (!farCell) throw new Error('local food fixture needs a far substrate cell');
+    world.handle({
+      type: 'pick-seed',
+      speciesId: 'nitzschia',
+      point: farCell,
+    });
+    world.handle({ type: 'drop-held', point: farCell });
+    placeShrimp(world, { x: 120, y: farCell.y });
+
+    const internals = reproductionInternals(world);
+    const shrimp = internals.animals[0];
+    shrimp.energy = 0.1;
+
+    expect(internals.chooseFoodTarget(shrimp)).toBeNull();
+
+    shrimp.position = { x: farCell.x - 80, y: farCell.y };
+    expect(internals.chooseFoodTarget(shrimp)).not.toBeNull();
   });
 
   it('keeps persistent and snapshot arrays bounded with 64 live shrimp', () => {

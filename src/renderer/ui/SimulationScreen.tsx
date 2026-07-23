@@ -3610,8 +3610,19 @@ const ClosedCycleHistoryChart = memo(function ClosedCycleHistoryChart({
 
 function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
   const definition = ANIMALS[speciesId];
-  const adultMaintenance = WATER_CYCLE_RULES.shrimp.adultMaintenanceBiomassPerSecond;
-  const juvenileMaintenance = WATER_CYCLE_RULES.shrimp.juvenileMaintenanceBiomassPerSecond;
+  const energyCapacityPerStructure =
+    WATER_CYCLE_RULES.shrimp.assimilationFraction /
+    SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass;
+  const adultMaintenance = (
+    SHRIMP_ECOLOGY_RULES.adultBaseMetabolismPerSecond +
+    SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond
+  ) * WATER_CYCLE_RULES.shrimp.adultStructuralBiomass *
+    energyCapacityPerStructure;
+  const juvenileMaintenance = (
+    SHRIMP_ECOLOGY_RULES.juvenileBaseMetabolismPerSecond +
+    SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond
+  ) * WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
+    energyCapacityPerStructure;
   const oxygenPerAdultSecond = adultMaintenance * WATER_CYCLE_RULES.biomassCarbon *
     WATER_CYCLE_RULES.oxygenPerOrganicCarbon;
   return (
@@ -3637,10 +3648,11 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
           <div><dt>수온</dt><dd><b>{definition.temperature.referenceTemperature}°C</b> 기준 대사율에 1°C당 <b>×{definition.temperature.metabolicTheta}</b>를 적용합니다. 성장·번식은 별도 종 곡선을 사용하며 33°C에서는 번식 진행이 멈춥니다.</dd></div>
           <div><dt>회복</dt><dd>저산소·독성·수온 스트레스가 없을 때 체력 <b>{(SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 세 피해는 합산됩니다.</dd></div>
           <div><dt>먹이의 행방</dt><dd>먹은 조류의 <b>{Math.round(WATER_CYCLE_RULES.shrimp.assimilationFraction * 100)}%</b>는 몸과 번식 자원, <b>{Math.round(WATER_CYCLE_RULES.shrimp.fecesFraction * 100)}%</b>는 유기성 찌꺼기, 나머지는 호흡·배설로 돌아갑니다.</dd></div>
-          <div><dt>기초 대사</dt><dd>성체는 몸·저장량 <b>{adultMaintenance.toFixed(6)}</b>, 어린 새우는 <b>{juvenileMaintenance.toFixed(6)}</b> /마리·초를 사용합니다.</dd></div>
+          <div><dt>휴식 대사</dt><dd>성체는 몸·저장량 <b>{adultMaintenance.toFixed(6)}</b>, 갓 태어난 새우는 <b>{juvenileMaintenance.toFixed(6)}</b> /마리·초를 사용합니다. 이동 중에는 행동 비용만큼 더 사용합니다.</dd></div>
           <div><dt>산소 소비</dt><dd>성체 기초 대사만으로 약 <b>{oxygenPerAdultSecond.toFixed(6)}</b> /마리·초를 소비하며, 먹이 호흡분도 같은 질량 장부로 계산됩니다.</dd></div>
-          <div><dt>사체·배설물</dt><dd>먹지 못하고 남은 몸과 저장량, 배설물은 유기성 찌꺼기가 되어 분해균의 먹이로 되돌아갑니다.</dd></div>
-          <div><dt>굶주림</dt><dd>성체 에너지는 기본 <b>{(SHRIMP_ECOLOGY_RULES.adultBaseMetabolismPerSecond * 100).toFixed(1)}/초</b>와 행동 비용만큼 줄고, 조류 1.0을 먹으면 <b>{(SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass * 100).toFixed(0)}</b> 회복. 에너지 0이면 죽습니다.</dd></div>
+          <div><dt>번식 자원</dt><dd>암컷은 체력 비축분을 넘는 먹이 동화분을 별도 번식 저장량에 조금씩 모읍니다. 가까운 수컷과 실제로 만난 뒤 이 질량만큼 새끼가 태어납니다.</dd></div>
+          <div><dt>사체·배설물</dt><dd>남은 몸·일반 저장량·번식 저장량과 배설물은 유기성 찌꺼기가 되어 분해균의 먹이로 되돌아갑니다.</dd></div>
+          <div><dt>굶주림</dt><dd>영양 상태는 일반 저장량을 중심으로 몸의 건전도를 함께 반영합니다. 먹이가 끊기면 번식과 성장이 먼저 멈추고 일반 저장량과 생존 가능한 범위의 몸체를 모두 소모한 뒤 아사합니다.</dd></div>
           <div><dt>수명</dt><dd>성체 기준 약 <b>{formatTime(SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds)}–{formatTime(SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds)}</b>.</dd></div>
         </dl>
       </section>

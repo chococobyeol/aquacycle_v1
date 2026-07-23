@@ -172,8 +172,12 @@ export class BiogeochemistryLedger {
     const quality = this.sampleAt(point);
     const mineralNitrogen = quality.toxicWaste + quality.nutrients;
     const carbon = this.dissolvedInorganicCarbon[this.indexAt(point)];
+    const waterClarity = Math.exp(
+      -WATER_CYCLE_RULES.algae.organicLightAttenuation * quality.organicMatter,
+    );
     return saturation(mineralNitrogen, WATER_CYCLE_RULES.mineralNutrientHalfSaturation) *
-      saturation(carbon, WATER_CYCLE_RULES.carbonHalfSaturation);
+      saturation(carbon, WATER_CYCLE_RULES.carbonHalfSaturation) *
+      waterClarity;
   }
 
   /**
@@ -308,15 +312,17 @@ export class BiogeochemistryLedger {
     if (!this.effectsEnabled) {
       const feces = consumed * WATER_CYCLE_RULES.shrimp.fecesFraction;
       const respired = consumed * WATER_CYCLE_RULES.shrimp.respirationFraction;
+      const assimilated = consumed * WATER_CYCLE_RULES.shrimp.assimilationFraction;
       this.detritus[this.indexAt(point)] += feces;
       this.cumulativeOxygenDemand += organicCarbonOxygenDemand(
         respired * WATER_CYCLE_RULES.biomassCarbon,
       );
       this.cumulativeDissolvedWaste += respired * WATER_CYCLE_RULES.biomassNitrogen;
-      // Earlier missions deliberately do not enforce the closed material
-      // ledger. Preserve their established food/energy balance while still
-      // publishing the potential downstream fluxes for diagnostics.
-      return consumed;
+      // Earlier missions do not apply water-quality effects, but the animal's
+      // internal budget must still use the same assimilation fraction. Returning
+      // the whole bite here used to create reserve mass and made the tutorial
+      // shrimp obey a different feeding model from the closed-cycle missions.
+      return assimilated;
     }
     const index = this.indexAt(point);
     const assimilated = consumed * WATER_CYCLE_RULES.shrimp.assimilationFraction;

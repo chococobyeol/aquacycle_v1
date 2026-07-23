@@ -57,4 +57,31 @@ describe('background simulation continuity', () => {
     );
     expect(mainSource).toContain('backgroundThrottling: false');
   });
+
+  it('pauses only Pixi painting while the desktop window is hidden', () => {
+    const preloadSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/preload.ts'),
+      'utf8',
+    );
+    const canvasSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/renderer/tank/AquariumCanvas.tsx'),
+      'utf8',
+    );
+    expect(preloadSource).toContain('aquacycle:rendering-visibility');
+    expect(canvasSource).toContain('onRenderingVisibilityChange');
+    expect(canvasSource).toContain('app.stop();');
+    expect(canvasSource).toContain('app.start();');
+  });
+
+  it('forces stale visible compositor surfaces to repaint and records process loss', () => {
+    const mainSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/main.ts'),
+      'utf8',
+    );
+    expect(mainSource).toContain('window.webContents.invalidate()');
+    expect(mainSource).toContain("window.webContents.on('render-process-gone'");
+    expect(mainSource).toContain('window.webContents.reload()');
+    expect(mainSource).toContain("app.on('child-process-gone'");
+    expect(mainSource).toContain('renderer-health.log');
+  });
 });

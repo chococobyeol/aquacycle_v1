@@ -116,6 +116,11 @@ export const WATER_CYCLE_RULES = {
     // Ammonium is used first, with nitrate/other mineral nutrients filling the
     // remainder.  Uptake is charged only for newly fixed biomass.
     ammoniumPreference: 0.72,
+    // Dissolved/suspended organic load makes the water progressively murkier.
+    // This Beer-Lambert-like gameplay coefficient leaves clean water almost
+    // unchanged but prevents a saturated, undecomposed organic pool from
+    // remaining optically harmless to producers.
+    organicLightAttenuation: 0.025,
   },
   shrimp: {
     assimilationFraction: 0.30,
@@ -217,8 +222,6 @@ export const SHRIMP_ECOLOGY_RULES = {
   reproductionEnergy: 0.34,
   maleReproductionEnergy: 0.34,
   gestationEnergy: 0.30,
-  matingRecentFeedingSeconds: 12,
-  gestationRecentFeedingSeconds: 24,
   maturationSeconds: 180,
   // Supplied adults are not a synchronized laboratory cohort. Spreading their
   // first reproductive opportunity prevents every female from brooding at
