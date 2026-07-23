@@ -42,6 +42,7 @@ import {
   vallisneriaHitDistance,
   vallisneriaLeafPoint,
   vallisneriaLeaves,
+  vallisneriaRenderDepth,
 } from './vallisneriaGeometry';
 import {
   DEFAULT_SIMULATION_SPEED,
@@ -1655,6 +1656,9 @@ export class SimulationWorld {
 
   private selectAt(point: Vec2, filter: SelectionFilter): void {
     const exact = this.clampPointer(point);
+    const structureAtPoint = filter === 'structure' || filter === 'all'
+      ? this.structureAtPoint(exact)
+      : undefined;
     if (filter === 'measurement' || filter === 'all') {
       const nearestMeasurement = this.measurements.reduce<{
         measurement: MeasurementState;
@@ -1707,24 +1711,38 @@ export class SimulationWorld {
         return;
       }
       const plantHit = this.nearestVallisneria(exact);
-      // Strap leaves are visually thin; a generous water-space tolerance
-      // makes the whole rosette easy to inspect without demanding pixel-perfect clicks.
-      if (plantHit && plantHit.distance <= 22) {
-        const cell = this.cellById(plantHit.placement.cellId);
-        if (cell) {
-          this.selection = {
-            kind: 'colony',
-            ...exact,
-            ownerLabel: '나사말 포기',
-            cellId: cell.id,
-            plantId: plantHit.placement.id,
-            speciesId: 'vallisneria',
-            speciesIds: ['vallisneria'],
-            microbeGuildIds: [],
-          };
-          this.message = '나사말 포기를 선택했습니다. 잎·저장량·러너 상태를 관찰할 수 있습니다.';
-          return;
-        }
+      const plantCell = plantHit ? this.cellById(plantHit.placement.cellId) : undefined;
+      const plantRoot = plantHit && plantCell
+        ? this.vallisneriaRootPosition(plantHit.placement, plantCell)
+        : undefined;
+      // In open water a small allowance keeps thin leaves practical to click.
+      // Over a structure, only the actually painted front ribbon may win; a
+      // back-layer leaf is visually occluded and must not intercept the stone.
+      const plantHitTolerance = structureAtPoint ? 2 : 10;
+      const plantIsVisibleAtPoint = Boolean(
+        plantHit &&
+        plantCell &&
+        plantRoot &&
+        plantHit.distance <= plantHitTolerance &&
+        (
+          filter === 'organism' ||
+          !structureAtPoint ||
+          vallisneriaRenderDepth(plantRoot) === 'front'
+        )
+      );
+      if (plantHit && plantCell && plantIsVisibleAtPoint) {
+        this.selection = {
+          kind: 'colony',
+          ...exact,
+          ownerLabel: '나사말 포기',
+          cellId: plantCell.id,
+          plantId: plantHit.placement.id,
+          speciesId: 'vallisneria',
+          speciesIds: ['vallisneria'],
+          microbeGuildIds: [],
+        };
+        this.message = '나사말 포기를 선택했습니다. 잎·저장량·러너 상태를 관찰할 수 있습니다.';
+        return;
       }
       const nearest = this.nearestCell(exact);
       if (nearest && nearest.distance <= Math.max(13, nearest.cell.cellSize * 1.55)) {
@@ -1760,20 +1778,15 @@ export class SimulationWorld {
     }
 
     if (filter === 'structure' || filter === 'all') {
-      const hits = Query.point(this.structures.map((structure) => structure.body), exact);
-      const body = hits.at(-1);
-      const structure = body
-        ? this.structures.find((item) => item.body.id === body.id)
-        : undefined;
-      if (structure) {
+      if (structureAtPoint) {
         this.selection = {
           kind: 'structure',
-          x: structure.body.position.x,
-          y: structure.body.position.y,
-          ownerLabel: STRUCTURES[structure.definitionId].label,
-          structureId: structure.id,
+          x: structureAtPoint.body.position.x,
+          y: structureAtPoint.body.position.y,
+          ownerLabel: STRUCTURES[structureAtPoint.definitionId].label,
+          structureId: structureAtPoint.id,
         };
-        this.message = `${STRUCTURES[structure.definitionId].label}을 선택했습니다.`;
+        this.message = `${STRUCTURES[structureAtPoint.definitionId].label}을 선택했습니다.`;
         return;
       }
       if (filter === 'structure') {
@@ -1817,8 +1830,10 @@ export class SimulationWorld {
         ? selection.speciesId
         : [...speciesIds].sort((first, second) =>
           cell.biomass[second] - cell.biomass[first])[0];
+    // Keep the marker where the user actually clicked. Moving it to the root
+    // on every snapshot made a correct leaf click look like an offset hit.
     const point = activePlant
-      ? this.vallisneriaRootPosition(activePlant, cell)
+      ? { x: selection.x, y: selection.y }
       : this.cellWorldPoint(cell);
 
     this.selection = {
@@ -5199,24 +5214,26 @@ export class SimulationWorld {
         anchor,
         placement.plant.structuralScale,
       );
-      const canopy = vallisneriaCanopyBounds(
-        cell.index,
-        anchor,
-        placement.plant.structuralScale,
-      );
-      const boundsDx = Math.max(canopy.minX - point.x, 0, point.x - canopy.maxX);
-      const boundsDy = Math.max(canopy.minY - point.y, 0, point.y - canopy.maxY);
-      // The whole rosette silhouette is one inspectable organism. The leaf
-      // centreline remains the precise path, while the canopy envelope fills
-      // narrow gaps between overlapping ribbons for comfortable selection.
-      const distance = Math.min(leafDistance, Math.hypot(boundsDx, boundsDy));
-      if (!nearest || distance < nearest.distance) nearest = { placement, distance };
+      // Only the painted ribbons receive a hit area. Treating the entire
+      // canopy bounding rectangle as the plant made its transparent gaps
+      // intercept clicks intended for stones and other objects behind it.
+      if (!nearest || leafDistance < nearest.distance) {
+        nearest = { placement, distance: leafDistance };
+      }
     }
     return nearest;
   }
 
   private structureById(id: string): StructureState | undefined {
     return this.structures.find((structure) => structure.id === id);
+  }
+
+  private structureAtPoint(point: Vec2): StructureState | undefined {
+    const hits = Query.point(this.structures.map((structure) => structure.body), point);
+    const body = hits.at(-1);
+    return body
+      ? this.structures.find((structure) => structure.body.id === body.id)
+      : undefined;
   }
 
   private isHeldStructure(id: string): boolean {

@@ -67,6 +67,7 @@ import {
   historyTimeBounds,
   historyTimeX,
 } from './ecologyHistory';
+import { observationSelectionIdentity } from './observationSelection';
 
 interface SimulationScreenProps {
   scenarioId: ScenarioId;
@@ -594,8 +595,9 @@ export function SimulationScreen({
   );
   pendingInventoryRef.current = pendingInventory;
 
-  const observationSelectionKey = snapshot?.selection
-    ? JSON.stringify(snapshot.selection)
+  const simulationSelectionKey = observationSelectionIdentity(snapshot?.selection ?? null);
+  const observationSelectionKey = simulationSelectionKey
+    ? simulationSelectionKey
     : catalogSpecies
       ? `species:${catalogSpecies}`
       : catalogAnimal
@@ -623,6 +625,12 @@ export function SimulationScreen({
     setWaterQualityMapVisible(previous.visible);
     setWaterQualityLegendCollapsed(previous.legendCollapsed);
   }, []);
+
+  const clearObservationSelection = useCallback((): void => {
+    setCatalogSpecies(null);
+    setCatalogAnimal(null);
+    send({ type: 'clear-selection' });
+  }, [send]);
 
   const toggleWaterQualityLayer = useCallback((layer: WaterQualityLayer): void => {
     setWaterQualityMapVisible(true);
@@ -1959,6 +1967,7 @@ export function SimulationScreen({
                     onConsumePendingInventory={consumePendingInventory}
                     onPendingInventoryReady={finishPendingInventoryHandoff}
                     onToolComplete={completeCanvasInteraction}
+                    onClearSelection={clearObservationSelection}
                     onCameraChange={setCameraTransform}
                     cameraResetToken={cameraResetToken}
                     showGoalGuide={showGoalGuide}

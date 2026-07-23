@@ -8,6 +8,8 @@ import {
 } from '../src/simulation/types';
 import {
   compareVallisneriaDepth,
+  vallisneriaCanopyBounds,
+  vallisneriaHitDistance,
   vallisneriaLeafHeightScale,
   vallisneriaLeafPoint,
   vallisneriaLeaves,
@@ -43,6 +45,23 @@ const advanceTo = (world: SimulationWorld, targetSeconds: number): void => {
     guard += 1;
   }
   expect(guard).toBeLessThan(5_000);
+};
+
+const findLeafPointInsideStructure = (
+  world: SimulationWorld,
+  plant: ReturnType<SimulationWorld['snapshot']>['plants'][number],
+  cellIndex: number,
+  structureId: string,
+): Vec2 | null => {
+  const leaves = vallisneriaLeaves(cellIndex, plant, plant.structuralScale);
+  for (const leaf of leaves) {
+    for (let sample = 2; sample <= 18; sample += 1) {
+      const point = vallisneriaLeafPoint(leaf, sample / 20);
+      world.handle({ type: 'select-at', point, filter: 'structure' });
+      if (world.snapshot().selection?.structureId === structureId) return point;
+    }
+  }
+  return null;
 };
 
 describe('Vallisneria ramet life cycle', () => {
@@ -173,6 +192,100 @@ describe('Vallisneria ramet life cycle', () => {
     expect(selection?.speciesId).toBe('vallisneria');
     expect(selection?.plantId).toBe(planted.id);
     expect(selection?.cellId).toBe(planted.cellId);
+    expect(selection?.x).toBeCloseTo(leafPoint.x, 6);
+    expect(selection?.y).toBeCloseTo(leafPoint.y, 6);
+
+    // Repeated snapshots used to move the marker to the root.
+    const refreshedSelection = world.snapshot().selection;
+    expect(refreshedSelection?.x).toBeCloseTo(leafPoint.x, 6);
+    expect(refreshedSelection?.y).toBeCloseTo(leafPoint.y, 6);
+  });
+
+  it('lets a visible stone receive clicks through empty gaps in a plant canopy', () => {
+    const world = new SimulationWorld('laboratory');
+    const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
+    const target = substrate[Math.floor(substrate.length / 2)];
+    placeSeed(world, 'vallisneria', target);
+    placeStructure(world, 'flat-stone', { x: target.x, y: 300 });
+
+    const snapshot = world.snapshot();
+    const planted = snapshot.plants[0];
+    const cell = snapshot.cells.find((candidate) => candidate.id === planted.cellId)!;
+    const structure = snapshot.structures[0];
+    const root = { x: planted.x, y: planted.y };
+    const canopy = vallisneriaCanopyBounds(cell.index, root, planted.structuralScale);
+    let stoneGap: Vec2 | null = null;
+
+    for (let y = canopy.minY; y <= canopy.maxY && !stoneGap; y += 4) {
+      for (let x = canopy.minX; x <= canopy.maxX; x += 4) {
+        if (vallisneriaHitDistance({ x, y }, cell.index, root, planted.structuralScale) <= 10) {
+          continue;
+        }
+        world.handle({ type: 'select-at', point: { x, y }, filter: 'structure' });
+        if (world.snapshot().selection?.structureId === structure.id) {
+          stoneGap = { x, y };
+          break;
+        }
+      }
+    }
+
+    expect(stoneGap).not.toBeNull();
+    if (!stoneGap) throw new Error('fixture needs a visible stone gap between leaves');
+    world.handle({ type: 'select-at', point: stoneGap, filter: 'all' });
+    expect(world.snapshot().selection).toMatchObject({
+      kind: 'structure',
+      structureId: structure.id,
+    });
+  });
+
+  it('lets a stone occlude a back-layer Vallisneria leaf during hit testing', () => {
+    const world = new SimulationWorld('mission-6');
+    placeSeed(world, 'vallisneria', {
+      x: 600,
+      y: STRUCTURE_SUPPORT_Y - 10,
+    });
+    placeStructure(world, 'flat-stone', { x: 600, y: 300 });
+
+    const snapshot = world.snapshot();
+    const plant = snapshot.plants[0];
+    const cell = snapshot.cells.find((candidate) => candidate.id === plant.cellId)!;
+    const structure = snapshot.structures[0];
+    expect(vallisneriaRenderDepth(plant)).toBe('back');
+    const overlap = findLeafPointInsideStructure(world, plant, cell.index, structure.id);
+
+    expect(overlap).not.toBeNull();
+    if (!overlap) throw new Error('fixture needs a back leaf crossing the stone');
+    world.handle({ type: 'select-at', point: overlap, filter: 'all' });
+    expect(world.snapshot().selection).toMatchObject({
+      kind: 'structure',
+      structureId: structure.id,
+    });
+  });
+
+  it('selects an actually painted front leaf over a stone and keeps the marker at the click', () => {
+    const world = new SimulationWorld('mission-6');
+    placeSeed(world, 'vallisneria', {
+      x: 600,
+      y: STRUCTURE_SUPPORT_Y + 8,
+    });
+    placeStructure(world, 'flat-stone', { x: 600, y: 300 });
+
+    const snapshot = world.snapshot();
+    const plant = snapshot.plants[0];
+    const cell = snapshot.cells.find((candidate) => candidate.id === plant.cellId)!;
+    const structure = snapshot.structures[0];
+    expect(vallisneriaRenderDepth(plant)).toBe('front');
+    const overlap = findLeafPointInsideStructure(world, plant, cell.index, structure.id);
+
+    expect(overlap).not.toBeNull();
+    if (!overlap) throw new Error('fixture needs a front leaf crossing the stone');
+    world.handle({ type: 'select-at', point: overlap, filter: 'all' });
+    expect(world.snapshot().selection).toMatchObject({
+      kind: 'colony',
+      plantId: plant.id,
+      x: overlap.x,
+      y: overlap.y,
+    });
   });
 
   it('updates a selected plant surface to the diatom colony that replaces a dead ramet', () => {

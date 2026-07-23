@@ -128,7 +128,9 @@ describe('inventory preview rendering contract', () => {
     expect(canvasSource).toContain('rendererRecoveryFrame = requestAnimationFrame');
     expect(canvasSource).toContain('releaseGlobalResourcesOnDestroy = true;');
     expect(canvasSource).toContain('setRendererRecoveryToken((token) => token + 1)');
-    expect(canvasSource).toContain('[onToolComplete, rendererRecoveryToken, send]');
+    expect(canvasSource).toContain(
+      '[onClearSelection, onToolComplete, rendererRecoveryToken, send]',
+    );
     expect(canvasSource).not.toContain('app.renderer.render(app.stage)');
   });
 

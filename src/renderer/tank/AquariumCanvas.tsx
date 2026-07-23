@@ -97,6 +97,7 @@ interface AquariumCanvasProps {
   onConsumePendingInventory: (point: Vec2) => void;
   onPendingInventoryReady: () => void;
   onToolComplete: (completedTool: InteractionTool) => void;
+  onClearSelection: () => void;
   onCameraChange?: (transform: AquariumCameraTransform) => void;
   cameraResetToken?: number;
   showGoalGuide?: boolean;
@@ -2918,6 +2919,7 @@ export function AquariumCanvas({
   onConsumePendingInventory,
   onPendingInventoryReady,
   onToolComplete,
+  onClearSelection,
   onCameraChange,
   cameraResetToken = 0,
   showGoalGuide = false,
@@ -3560,8 +3562,10 @@ export function AquariumCanvas({
         (target instanceof HTMLElement && target.isContentEditable)
       ) return;
       if (event.key === 'Escape') {
+        event.preventDefault();
         pendingConsumedRef.current = false;
         send({ type: 'cancel-held' });
+        onClearSelection();
         if (hasPendingInventoryRef.current) onPendingInventoryReadyRef.current();
         onToolComplete(
           snapshotRef.current.holding || hasPendingInventoryRef.current
@@ -3629,7 +3633,7 @@ export function AquariumCanvas({
       destroyOwnedApp();
       destroyOwnedTextures();
     };
-  }, [onToolComplete, rendererRecoveryToken, send]);
+  }, [onClearSelection, onToolComplete, rendererRecoveryToken, send]);
 
   useEffect(() => {
     const layers = layersRef.current;

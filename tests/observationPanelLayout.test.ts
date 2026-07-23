@@ -17,6 +17,12 @@ describe('scalable observation panel layout', () => {
     expect(screenSource).toContain("observationView === 'selection'");
     expect(screenSource).toContain("observationView === 'overview'");
     expect(screenSource).toContain('disabled={!hasObservationSelection}');
+    expect(screenSource).toContain('observationSelectionIdentity(snapshot?.selection ?? null)');
+  });
+
+  it('clears the current target with Escape without treating live snapshot changes as new selections', () => {
+    expect(screenSource).toContain('onClearSelection={clearObservationSelection}');
+    expect(screenSource).not.toContain('JSON.stringify(snapshot.selection)');
   });
 
   it('lets overview categories expand independently and detach into comparison panels', () => {
