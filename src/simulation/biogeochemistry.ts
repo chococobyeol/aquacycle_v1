@@ -306,13 +306,18 @@ export class BiogeochemistryLedger {
    * The assimilated share is returned so SimulationWorld can store it on the
    * individual animal and later transfer it into growth, offspring or a corpse.
    */
-  public recordAnimalFeeding(point: Vec2, consumedBiomass: number): number {
+  public recordAnimalFeeding(
+    point: Vec2,
+    consumedBiomass: number,
+    consumer: 'shrimp' | 'ricefish' = 'shrimp',
+  ): number {
     const consumed = Math.max(0, consumedBiomass);
     if (consumed <= 0) return 0;
+    const partition = WATER_CYCLE_RULES[consumer];
     if (!this.effectsEnabled) {
-      const feces = consumed * WATER_CYCLE_RULES.shrimp.fecesFraction;
-      const respired = consumed * WATER_CYCLE_RULES.shrimp.respirationFraction;
-      const assimilated = consumed * WATER_CYCLE_RULES.shrimp.assimilationFraction;
+      const feces = consumed * partition.fecesFraction;
+      const respired = consumed * partition.respirationFraction;
+      const assimilated = consumed * partition.assimilationFraction;
       this.detritus[this.indexAt(point)] += feces;
       this.cumulativeOxygenDemand += organicCarbonOxygenDemand(
         respired * WATER_CYCLE_RULES.biomassCarbon,
@@ -325,8 +330,8 @@ export class BiogeochemistryLedger {
       return assimilated;
     }
     const index = this.indexAt(point);
-    const assimilated = consumed * WATER_CYCLE_RULES.shrimp.assimilationFraction;
-    const feces = consumed * WATER_CYCLE_RULES.shrimp.fecesFraction;
+    const assimilated = consumed * partition.assimilationFraction;
+    const feces = consumed * partition.fecesFraction;
     const respired = consumed - assimilated - feces;
     this.detritus[index] += feces;
     const actuallyRespired = this.releaseRespiredBiomass(index, respired);

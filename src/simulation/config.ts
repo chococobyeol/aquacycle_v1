@@ -14,8 +14,10 @@ import type { DayNightCycleDefinition } from './dayNight';
 // Selection and removal use the same value so anything visible can be cleaned.
 export const ALGAE_VISIBLE_BIOMASS = 0.001;
 
-/** Starting temperature of a tank whose fixed lamp was already running. */
-export const initialWaterTemperatureForLight = (lightOutput: number): number =>
+/** Starting temperature of a tank whose configured light was already running. */
+export const initialWaterTemperatureForLight = (
+  lightOutput: number,
+): number =>
   22 + 1.2 + (lightOutput / 120) * 1.8;
 
 export interface AnimalDefinition {
@@ -78,6 +80,47 @@ export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
       summary: '20~28°C에서는 생존·번식이 안정적입니다. 낮은 수온은 대사와 발생을 늦추고, 33°C에서는 번식이 멈추며 극단적인 고·저온은 장기 생존을 해칩니다.',
     },
   },
+  'japanese-ricefish': {
+    id: 'japanese-ricefish',
+    displayName: '송사리',
+    scientificName: 'Oryzias latipes',
+    description:
+      '수면 가까운 물속을 헤엄치며 움직이는 작은 먹이를 찾는 토종 소형어입니다. 가는 수초와 실 모양 조류에 알을 붙입니다.',
+    diet:
+      '어린 체리새우 같은 작은 동물성 먹이를 선호하고, 가까운 미세 조류는 생존을 보조하는 낮은 효율의 먹이로 이용합니다.',
+    adultLength: '성체 약 3~4cm',
+    color: 0xc6b77e,
+    accentColor: '#9a8145',
+    temperature: {
+      referenceTemperature: 25,
+      metabolicTheta: 1.075,
+      minimumMetabolicFactor: 0.45,
+      maximumMetabolicFactor: 1.8,
+      reproductionCurve: [
+        { temperature: 8, response: 0 },
+        { temperature: 14, response: 0.08 },
+        { temperature: 18, response: 0.5 },
+        { temperature: 23, response: 0.9 },
+        { temperature: 27, response: 1 },
+        { temperature: 30, response: 0.65 },
+        { temperature: 33, response: 0 },
+        { temperature: 38, response: 0 },
+      ],
+      healthCurve: [
+        { temperature: 4, response: 0.05 },
+        { temperature: 8, response: 0.45 },
+        { temperature: 14, response: 0.86 },
+        { temperature: 20, response: 1 },
+        { temperature: 28, response: 1 },
+        { temperature: 32, response: 0.64 },
+        { temperature: 36, response: 0 },
+        { temperature: 40, response: 0 },
+      ],
+      maximumThermalDamagePerSecond: 0.005,
+      summary:
+        '약 20~28°C에서 활동과 번식이 안정적입니다. 더 낮은 수온에서는 발생과 산란이 느려지고, 장기간의 극단적인 수온은 생존을 해칩니다.',
+    },
+  },
 };
 
 /**
@@ -137,6 +180,19 @@ export const WATER_CYCLE_RULES = {
     // carbon/nitrogen sink and an eventual oversized pollution pulse.
     adultReserveBiomass: 0.72,
     juvenileReserveBiomass: 1.05,
+  },
+  ricefish: {
+    assimilationFraction: 0.38,
+    fecesFraction: 0.34,
+    respirationFraction: 0.28,
+    adultStructuralBiomass: 1.8,
+    juvenileStructuralBiomass: 0.72,
+    fryBirthBiomass: 0.18,
+    eggBiomass: 0.075,
+    suppliedReserveBiomass: 0.65,
+    adultReserveBiomass: 1.05,
+    juvenileReserveBiomass: 0.72,
+    fryReserveBiomass: 0.38,
   },
 } as const;
 
@@ -233,6 +289,60 @@ export const SHRIMP_ECOLOGY_RULES = {
   // assigned alternately), avoiding a one-offspring demographic dead end.
   minimumClutchSize: 2,
   maximumClutchSize: 3,
+} as const;
+
+/**
+ * One coherent ricefish rule set is shared by challenge and laboratory
+ * scenarios. Durations are gameplay-compressed, while the ordering of egg,
+ * fry, juvenile and adult stages and the relative temperature/oxygen effects
+ * follow the medaka literature recorded in the mission 7 implementation note.
+ */
+export const RICEFISH_ECOLOGY_RULES = {
+  minimumLifespanSeconds: 2_400,
+  maximumLifespanSeconds: 3_300,
+  suppliedAdultMinimumAgeSeconds: 620,
+  suppliedAdultMaximumAgeSeconds: 900,
+  fryStageSeconds: 150,
+  maturationSeconds: 480,
+  eggIncubationSecondsAt25C: 95,
+  carriedEggSeconds: 12,
+  adultLength: 44,
+  juvenileLength: 27,
+  fryLength: 10,
+  adultBaseMetabolismPerSecond: 0.0038,
+  juvenileBaseMetabolismPerSecond: 0.0025,
+  fryBaseMetabolismPerSecond: 0.0013,
+  eggBaseMetabolismPerSecond: 0.00018,
+  restingActivityCostPerSecond: 0.00025,
+  swimmingActivityCostPerSecond: 0.0011,
+  huntingActivityCostPerSecond: 0.0022,
+  oxygenStressStart: 36,
+  oxygenSevereStress: 18,
+  oxygenMaximumDamagePerSecond: 0.022,
+  toxicWasteStressStart: 5,
+  toxicWasteFullStress: 20,
+  toxicMaximumDamagePerSecond: 0.028,
+  healthyWaterRecoveryPerSecond: 0.0035,
+  forageStartEnergy: 0.5,
+  forageStopEnergy: 0.76,
+  reproductionEnergy: 0.64,
+  reproductionReserveFloor: 0.34,
+  eggClutchMinimum: 2,
+  eggClutchMaximum: 4,
+  postSpawnCooldownSeconds: 150,
+  matingEncounterRadius: 180,
+  matingSeconds: 4,
+  animalPreyDetectionRadius: 210,
+  algaeDetectionRadius: 145,
+  strikeDistance: 32,
+  strikeCooldownSeconds: 2.2,
+  juvenileShrimpPreference: 1,
+  adultShrimpPreference: 0,
+  diatomAssimilationMultiplier: 0.26,
+  oedogoniumAssimilationMultiplier: 0.12,
+  maximumAlgaeBiteBiomassPerSecond: 0.12,
+  minimumVisibleAlgaeFood: 0.025,
+  technicalPopulationLimit: 512,
 } as const;
 
 export interface MicrobeDefinition {
@@ -525,6 +635,13 @@ export interface ScenarioDefinition {
   lightOutput: number;
   /** Broad diffuse daylight before the day/night multiplier. */
   naturalLightOutput: number;
+  /**
+   * Finite producer biomass supported by the simplified nutrient background
+   * before the explicit water cycle is unlocked. Null keeps the earlier
+   * producer-only missions unrestricted. Water-cycle scenarios use their real
+   * local nutrient field instead.
+   */
+  backgroundProducerCapacity: number | null;
   dayNightCycle: DayNightCycleDefinition | null;
   dayNightCycleInitiallyEnabled: boolean;
   seedBudget: Record<SpeciesId, number | null>;
@@ -572,8 +689,16 @@ export interface ScenarioDefinition {
         label: string;
       }
     | {
-        type: 'population-survival';
+      type: 'population-survival';
+      speciesId: AnimalSpeciesId;
+      count: number;
+      holdSeconds: number;
+      label: string;
+    }
+    | {
+        type: 'born-stage';
         speciesId: AnimalSpeciesId;
+        lifeStage: 'fry' | 'juvenile' | 'adult';
         count: number;
         holdSeconds: number;
         label: string;
@@ -599,8 +724,9 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     timeLimitSeconds: 140,
     lightOutput: 92,
     naturalLightOutput: 0,
+    backgroundProducerCapacity: null,
     seedBudget: { oedogonium: 1, nitzschia: 0, vallisneria: 0 },
-    animalBudget: { 'cherry-shrimp': 0 },
+    animalBudget: { 'cherry-shrimp': 0, 'japanese-ricefish': 0 },
     structureBudget: { 'flat-stone': 1, 'round-stone': 0, 'tall-stone': 0 },
     requiredStructures: { 'flat-stone': 1 },
     allowedSpecies: ['oedogonium'],
@@ -629,8 +755,9 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     timeLimitSeconds: 260,
     lightOutput: 104,
     naturalLightOutput: 0,
+    backgroundProducerCapacity: null,
     seedBudget: { oedogonium: 0, nitzschia: 4, vallisneria: 0 },
-    animalBudget: { 'cherry-shrimp': 0 },
+    animalBudget: { 'cherry-shrimp': 0, 'japanese-ricefish': 0 },
     structureBudget: { 'flat-stone': 3, 'round-stone': 4, 'tall-stone': 3 },
     requiredStructures: {},
     allowedSpecies: ['nitzschia'],
@@ -665,8 +792,9 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     timeLimitSeconds: 300,
     lightOutput: 52,
     naturalLightOutput: 0,
+    backgroundProducerCapacity: null,
     seedBudget: { oedogonium: 2, nitzschia: 0, vallisneria: 0 },
-    animalBudget: { 'cherry-shrimp': 0 },
+    animalBudget: { 'cherry-shrimp': 0, 'japanese-ricefish': 0 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
     allowedSpecies: ['oedogonium'],
@@ -700,8 +828,14 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     timeLimitSeconds: 300,
     lightOutput: 68,
     naturalLightOutput: 0,
+    // The consumer tutorial uses a finite simplified nutrient reserve. This
+    // limits total producer matter across every surface, so adding unlimited
+    // stones cannot turn the tank into an unlimited food generator. Grazing
+    // reopens the spent share, allowing producers to recover instead of being
+    // frozen at a hard biomass cap.
+    backgroundProducerCapacity: 60,
     seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
-    animalBudget: { 'cherry-shrimp': 4 },
+    animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia'],
@@ -735,8 +869,9 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     timeLimitSeconds: 1_800,
     lightOutput: 88,
     naturalLightOutput: 0,
+    backgroundProducerCapacity: null,
     seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
-    animalBudget: { 'cherry-shrimp': 4 },
+    animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia'],
@@ -783,8 +918,9 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     // the whole water surface receives broad sky light.
     lightOutput: 0,
     naturalLightOutput: 92,
+    backgroundProducerCapacity: null,
     seedBudget: { oedogonium: 8, nitzschia: 8, vallisneria: 3 },
-    animalBudget: { 'cherry-shrimp': 4 },
+    animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
@@ -819,29 +955,86 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     targetIncludesSubstrate: true,
   },
+  'mission-7': {
+    id: 'mission-7',
+    mode: 'challenge',
+    title: '일곱 번째 실험 · 먹고 먹히는 사이',
+    subtitle: '송사리의 첫 세대',
+    instruction:
+      '먹이와 산란할 곳을 갖춘 수조에서 지급된 송사리가 다음 세대를 남기도록 하세요.',
+    briefing: {
+      question: '먹이와 피난처가 같은 수조에 있을 때 송사리는 다음 세대를 남길 수 있을까요?',
+      goal: '수조에서 산란한 알이 부화해 송사리 치어가 1마리 이상 나타나도록 하세요.',
+      success:
+        '구조물 수나 특정 배치는 채점하지 않습니다. 지급 성체가 먹이를 얻고 산란한 알에서 치어가 부화하면 성공합니다.',
+      supplied:
+        '송사리 성체 3마리 · 체리새우 성체 8마리 · 두 조류 접종 각 8회 · 나사말 5포기 · 구조물과 두 균 필름 무제한 · 수질 탐침',
+    },
+    timeLimitSeconds: 1_500,
+    lightOutput: 0,
+    naturalLightOutput: 90,
+    backgroundProducerCapacity: null,
+    seedBudget: { oedogonium: 8, nitzschia: 8, vallisneria: 5 },
+    animalBudget: { 'cherry-shrimp': 8, 'japanese-ricefish': 3 },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    requiredStructures: {},
+    allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
+    requiredSeedSpecies: [],
+    allowedAnimals: ['cherry-shrimp', 'japanese-ricefish'],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    waterCycle: {
+      initial: {
+        organicMatter: 1.5,
+        toxicWaste: 0.8,
+        nutrients: 18,
+        oxygen: 82,
+      },
+      microbeBudget: { decomposer: null, nitrifier: null },
+      allowedMicrobes: ['decomposer', 'nitrifier'],
+    },
+    dayNightCycle: {
+      dawnSeconds: 30,
+      daySeconds: 240,
+      duskSeconds: 30,
+      nightSeconds: 60,
+      nightLightMultiplier: 0.045,
+      startingOffsetSeconds: 30,
+    },
+    dayNightCycleInitiallyEnabled: true,
+    target: {
+      type: 'born-stage',
+      speciesId: 'japanese-ricefish',
+      lifeStage: 'fry',
+      count: 1,
+      holdSeconds: 1,
+      label: '수조에서 부화한 송사리 치어',
+    },
+    targetIncludesSubstrate: true,
+  },
   laboratory: {
     id: 'laboratory',
     mode: 'laboratory',
     title: '실험실',
     subtitle: '수중 생태계 자유 실험',
     instruction:
-      '돌, 조류, 체리새우, 균막과 수질 순환을 자유롭게 시험하세요. 실행한 뒤에는 일시정지해야 배치를 다시 바꿀 수 있습니다.',
+      '돌, 조류, 체리새우, 송사리, 균막과 수질 순환을 자유롭게 시험하세요. 실행한 뒤에는 일시정지해야 배치를 다시 바꿀 수 있습니다.',
     briefing: {
       question: '자유 실험실에서 어떤 수중 환경을 만들고 싶나요?',
       goal: '정해진 성공 조건 없이 구조, 빛, 온도, 군락과 개체군 변화를 관찰합니다.',
       success: '실험실에는 성공·실패 판정이 없습니다.',
-      supplied: '모든 구조물 · 두 조류와 나사말 · 체리새우 · 두 균 필름 · 수질 탐침 · 전등·자연광·낮밤 조절',
+      supplied: '모든 구조물 · 두 조류와 나사말 · 체리새우와 송사리 · 두 균 필름 · 수질 탐침 · 전등·자연광·낮밤 조절',
     },
     timeLimitSeconds: null,
     lightOutput: 90,
     naturalLightOutput: 0,
+    backgroundProducerCapacity: null,
     seedBudget: { oedogonium: null, nitzschia: null, vallisneria: null },
-    animalBudget: { 'cherry-shrimp': null },
+    animalBudget: { 'cherry-shrimp': null, 'japanese-ricefish': null },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
     requiredSeedSpecies: [],
-    allowedAnimals: ['cherry-shrimp'],
+    allowedAnimals: ['cherry-shrimp', 'japanese-ricefish'],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
     waterCycle: {
       initial: {

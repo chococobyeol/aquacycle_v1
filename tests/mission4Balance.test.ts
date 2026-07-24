@@ -154,6 +154,9 @@ describe("mission 4 consumer balance", () => {
     const world = new SimulationWorld("mission-4");
     const initial = world.snapshot();
 
+    expect(SCENARIOS["mission-4"].backgroundProducerCapacity).toBe(60);
+    expect(initial.waterTemperature).toBeGreaterThan(24);
+    expect(initial.waterTemperature).toBeLessThan(25);
     expect(initial.structures).toHaveLength(0);
     expect(initial.seeds).toHaveLength(0);
     expect(initial.animals).toHaveLength(0);

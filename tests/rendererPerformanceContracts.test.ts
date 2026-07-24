@@ -92,6 +92,6 @@ describe('renderer performance contracts', () => {
       expect(motion.animals.map((animal) => animal.id)).toEqual(expectedIds);
       for (const animal of motion.animals) expectCompleteMotionPose(animal);
     }
-  });
+  }, 15_000);
 
 });

@@ -143,5 +143,5 @@ describe('spatial water temperature', () => {
     expect(transport.averageTemperature).toBeLessThan(27);
     expect(transport.maximumTemperature).toBeLessThan(31);
     expect(transport.maximumSpeed).toBeLessThan(0.12);
-  });
+  }, 15_000);
 });

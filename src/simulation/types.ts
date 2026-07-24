@@ -27,13 +27,14 @@ export type ScenarioId =
   | 'mission-4'
   | 'mission-5'
   | 'mission-6'
+  | 'mission-7'
   | 'laboratory';
 export type SimulationMode = 'challenge' | 'laboratory';
 export type SimulationPhase = 'setup' | 'running' | 'paused';
 export type MissionOutcome = 'pending' | 'success' | 'failure';
 export type SpeciesId = 'oedogonium' | 'nitzschia' | 'vallisneria';
-export type AnimalSpeciesId = 'cherry-shrimp';
-export type AnimalLifeStage = 'juvenile' | 'adult';
+export type AnimalSpeciesId = 'cherry-shrimp' | 'japanese-ricefish';
+export type AnimalLifeStage = 'egg' | 'fry' | 'juvenile' | 'adult';
 export type AnimalSex = 'female' | 'male';
 export type AnimalBehavior =
   | 'held'
@@ -41,15 +42,31 @@ export type AnimalBehavior =
   | 'traveling'
   | 'grazing'
   | 'resting'
-  | 'starving';
-export type AnimalReproductiveState = 'none' | 'ready' | 'berried';
+  | 'starving'
+  | 'hunting'
+  | 'courting'
+  | 'carrying-eggs'
+  | 'incubating';
+export type AnimalReproductiveState =
+  | 'none'
+  | 'ready'
+  | 'berried'
+  | 'carrying-eggs'
+  | 'incubating';
 export type AnimalDeathCause =
   | 'starvation'
   | 'old-age'
   | 'hypoxia'
   | 'toxicity'
-  | 'temperature';
-export type AnimalPopulationEventKind = 'introduced' | 'removed' | 'birth' | 'matured' | 'death';
+  | 'temperature'
+  | 'predation';
+export type AnimalPopulationEventKind =
+  | 'introduced'
+  | 'removed'
+  | 'birth'
+  | 'hatched'
+  | 'matured'
+  | 'death';
 export type StructureDefinitionId = 'flat-stone' | 'round-stone' | 'tall-stone';
 export type MicrobeGuildId = 'decomposer' | 'nitrifier';
 export type WaterQualityVariable = 'organicMatter' | 'toxicWaste' | 'nutrients' | 'oxygen';
@@ -172,6 +189,11 @@ export interface AnimalSnapshot {
   reproductiveState: AnimalReproductiveState;
   recentIntake: number;
   consumedBiomass: number;
+  recentFood?: string | null;
+  attachmentLabel?: string | null;
+  developmentProgress?: number | null;
+  oxygen?: number | null;
+  toxicWaste?: number | null;
   temperature: number;
   metabolicTemperatureFactor: number;
   reproductionTemperatureFactor: number;
@@ -203,6 +225,8 @@ export interface AnimalCarcassSnapshot {
 
 export interface AnimalPopulationSnapshot {
   total: number;
+  eggs: number;
+  fry: number;
   adults: number;
   juveniles: number;
   adultFemales: number;
@@ -238,6 +262,7 @@ export interface AnimalPopulationEventTotals {
   introduced: number;
   removed: number;
   births: number;
+  hatches: number;
   maturations: number;
   deaths: number;
   deathsByCause: Record<AnimalDeathCause, number>;
@@ -381,7 +406,13 @@ export interface SelectionSnapshot {
 export interface MissionProgressSnapshot {
   current: number;
   target: number;
-  unit: 'coverage' | 'habitat-coverage' | 'biomass' | 'adult-count' | 'population-count';
+  unit:
+    | 'coverage'
+    | 'habitat-coverage'
+    | 'biomass'
+    | 'adult-count'
+    | 'population-count'
+    | 'born-count';
   label: string;
   ratio: number;
   holdCurrent: number;
@@ -505,6 +536,14 @@ export interface SavedAnimalState {
   behavior: AnimalBehavior;
   behaviorTimer: number;
   targetCellId: string | null;
+  /** Optional so version-1 shrimp-only frozen aquariums remain loadable. */
+  targetAnimalId?: string | null;
+  /** Egg attachment surface; null for mobile life stages. */
+  attachmentCellId?: string | null;
+  /** Remaining embryo development time for ricefish eggs. */
+  incubationRemaining?: number | null;
+  /** Last consumed item, used by observation rather than feeding logic. */
+  recentFood?: string | null;
   nextTargetEvaluation: number;
   recentIntake: number;
   consumedBiomass: number;

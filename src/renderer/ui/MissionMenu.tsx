@@ -109,6 +109,23 @@ const MISSION_CARDS: readonly MissionCardDefinition[] = [
       </>
     ),
   },
+  {
+    id: 'mission-7',
+    stamp: '실험 7',
+    className: 'mission-seven',
+    title: '먹고 먹히는 사이',
+    description: '송사리가 먹이를 찾고 수조에서 다음 세대를 남기도록 하세요.',
+    tags: '송사리 · 국소 포식 · 피난처 · 산란 · 치어',
+    illustrationClassName: 'ricefish-foodweb',
+    illustration: (
+      <>
+        <i className="mini-ricefish" />
+        <i className="mini-fry" />
+        <i className="mini-vallisneria" />
+        <i className="mini-shrimp-water" />
+      </>
+    ),
+  },
 ];
 export const MISSION_IDS: readonly MissionId[] = MISSION_CARDS.map(({ id }) => id);
 

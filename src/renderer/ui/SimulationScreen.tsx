@@ -13,6 +13,7 @@ import {
   ANIMALS,
   MICROBE_ECOLOGY_RULES,
   MICROBES,
+  RICEFISH_ECOLOGY_RULES,
   SCENARIOS,
   SHRIMP_ECOLOGY_RULES,
   SPECIES,
@@ -103,6 +104,11 @@ interface EcologyHistoryPoint {
   shrimpAdultFemales: number;
   shrimpAdultMales: number;
   shrimpJuveniles: number;
+  ricefishCount: number;
+  ricefishEggs: number;
+  ricefishFry: number;
+  ricefishJuveniles: number;
+  ricefishAdults: number;
   cumulativeBirths: number;
   cumulativeDeaths: number;
   organicMatter: number;
@@ -230,8 +236,39 @@ const closedHudPanels = (): Record<HudPanelId, boolean> => ({
 
 const STRUCTURE_IDS: StructureDefinitionId[] = ['flat-stone', 'round-stone', 'tall-stone'];
 const SPECIES_IDS: SpeciesId[] = ['oedogonium', 'nitzschia', 'vallisneria'];
-const ANIMAL_IDS: AnimalSpeciesId[] = ['cherry-shrimp'];
+const ANIMAL_IDS: AnimalSpeciesId[] = ['cherry-shrimp', 'japanese-ricefish'];
 const MICROBE_IDS: MicrobeGuildId[] = ['decomposer', 'nitrifier'];
+
+function AnimalThumb({
+  speciesId,
+  large = false,
+  carcass = false,
+}: {
+  speciesId: AnimalSpeciesId;
+  large?: boolean;
+  carcass?: boolean;
+}) {
+  if (speciesId === 'japanese-ricefish') {
+    return (
+      <span
+        className={`animal-thumb ricefish-thumb${large ? ' large' : ''}${carcass ? ' carcass' : ''}`}
+        aria-hidden="true"
+      >
+        <i className="ricefish-body" />
+        <i className="ricefish-tail" />
+        <i className="ricefish-eye" />
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`animal-thumb cherry-shrimp-thumb${large ? ' large' : ''}${carcass ? ' carcass' : ''}`}
+      aria-hidden="true"
+    >
+      <i className="shrimp-body" /><i className="shrimp-tail" /><i className="shrimp-antenna" />
+    </span>
+  );
+}
 
 const WATER_QUALITY_CHANNELS: readonly {
   id: WaterQualityLayer;
@@ -286,7 +323,9 @@ const formatProgressValue = (
   progress: NonNullable<SimulationSnapshot['missionProgress']>,
 ): string => progress.unit === 'biomass'
   ? `${progress.current.toFixed(1)} / ${progress.target.toFixed(1)}`
-  : progress.unit === 'adult-count' || progress.unit === 'population-count'
+  : progress.unit === 'adult-count' ||
+      progress.unit === 'population-count' ||
+      progress.unit === 'born-count'
     ? `${Math.round(progress.current)} / ${Math.round(progress.target)}마리`
     : `${Math.round(progress.current * 100)} / ${Math.round(progress.target * 100)}%`;
 
@@ -727,6 +766,11 @@ export function SimulationScreen({
       shrimpAdultFemales: snapshot.animalPopulation['cherry-shrimp'].adultFemales,
       shrimpAdultMales: snapshot.animalPopulation['cherry-shrimp'].adultMales,
       shrimpJuveniles: snapshot.animalPopulation['cherry-shrimp'].juveniles,
+      ricefishCount: snapshot.animalPopulation['japanese-ricefish'].total,
+      ricefishEggs: snapshot.animalPopulation['japanese-ricefish'].eggs,
+      ricefishFry: snapshot.animalPopulation['japanese-ricefish'].fry,
+      ricefishJuveniles: snapshot.animalPopulation['japanese-ricefish'].juveniles,
+      ricefishAdults: snapshot.animalPopulation['japanese-ricefish'].adults,
       cumulativeBirths: snapshot.animalPopulationEventTotals.births,
       cumulativeDeaths: snapshot.animalPopulationEventTotals.deaths,
       organicMatter: snapshot.biogeochemistry.average.organicMatter,
@@ -1600,7 +1644,9 @@ export function SimulationScreen({
                 <i className="hud-progress-badge">
                   {snapshot.outcome === 'success'
                     ? '✓'
-                    : progress.unit === 'adult-count' || progress.unit === 'population-count'
+                    : progress.unit === 'adult-count' ||
+                        progress.unit === 'population-count' ||
+                        progress.unit === 'born-count'
                       ? Math.round(progress.current)
                       : Math.min(99, Math.round(progress.ratio * 100))}
                 </i>
@@ -1807,9 +1853,7 @@ export function SimulationScreen({
                           setActiveTool('move');
                         }}
                       >
-                        <span className="inventory-thumb animal-thumb cherry-shrimp-thumb" aria-hidden="true">
-                          <i className="shrimp-body" /><i className="shrimp-tail" /><i className="shrimp-antenna" />
-                        </span>
+                        <AnimalThumb speciesId={speciesId} />
                         <span className="inventory-copy">
                           <strong>{animal.displayName}</strong>
                           <small>{animal.scientificName}</small>
@@ -2071,7 +2115,11 @@ export function SimulationScreen({
                   </div>
                   <div className="progress-track"><span style={{ width: `${Math.min(100, progress.ratio * 100)}%` }} /></div>
                   {snapshot.outcome === 'pending' &&
-                    (snapshot.currentTargetMet || progress.unit === 'adult-count' || progress.unit === 'population-count') && (
+                    (
+                      snapshot.currentTargetMet ||
+                      progress.unit === 'adult-count' ||
+                      progress.unit === 'population-count'
+                    ) && (
                     <>
                       {(progress.unit === 'adult-count' || progress.unit === 'population-count') && (
                         <div className="progress-track hold-progress-track">
@@ -2533,9 +2581,10 @@ function ObservationSectionContent({
 }) {
   const scenario = SCENARIOS[snapshot.scenarioId];
   const hasShrimpRecord = snapshot.animalPopulation['cherry-shrimp'].total > 0 ||
-    snapshot.animalPopulationEventTotals.births > 0 ||
-    snapshot.animalPopulationEventTotals.deaths > 0 ||
-    snapshot.carcasses.length > 0;
+    snapshot.animalPopulationEvents.some((event) => event.speciesId === 'cherry-shrimp');
+  const hasRicefishRecord = snapshot.animalPopulation['japanese-ricefish'].total > 0 ||
+    snapshot.animalPopulationEvents.some((event) => event.speciesId === 'japanese-ricefish');
+  const hasAnimalRecord = hasShrimpRecord || hasRicefishRecord || snapshot.carcasses.length > 0;
   const hasAlgaeRecord = snapshot.totalBiomass.oedogonium > ALGAE_VISIBLE_BIOMASS ||
     snapshot.totalBiomass.nitzschia > ALGAE_VISIBLE_BIOMASS ||
     snapshot.totalBiomass.vallisneria > ALGAE_VISIBLE_BIOMASS;
@@ -2549,10 +2598,23 @@ function ObservationSectionContent({
             <div><dt>성체 수컷</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].adultMales}마리</dd></div>
             <div><dt>어린 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].juveniles}마리</dd></div>
             <div><dt>전체 새우</dt><dd>{snapshot.animalPopulation['cherry-shrimp'].total}마리</dd></div>
-            <div className="birth-total"><dt>누적 출생</dt><dd>{snapshot.animalPopulationEventTotals.births}마리</dd></div>
-            <div className="carcass-total"><dt>누적 사망</dt><dd>{snapshot.animalPopulationEventTotals.deaths}마리</dd></div>
-            {snapshot.carcasses.length > 0 && <div><dt>현재 남은 사체</dt><dd>{snapshot.carcasses.length}마리</dd></div>}
             <div className="consumption-total"><dt>새우가 먹은 조류</dt><dd>{snapshot.totalAlgaeConsumed.toFixed(1)}</dd></div>
+          </>
+        )}
+        {hasRicefishRecord && (
+          <>
+            <div><dt><i className="species-dot japanese-ricefish" />송사리 성체</dt><dd>{snapshot.animalPopulation['japanese-ricefish'].adults}마리</dd></div>
+            <div><dt>어린 송사리</dt><dd>{snapshot.animalPopulation['japanese-ricefish'].juveniles}마리</dd></div>
+            <div><dt>송사리 치어</dt><dd>{snapshot.animalPopulation['japanese-ricefish'].fry}마리</dd></div>
+            <div><dt>붙어 있는 알</dt><dd>{snapshot.animalPopulation['japanese-ricefish'].eggs}개</dd></div>
+          </>
+        )}
+        {hasAnimalRecord && (
+          <>
+            <div className="birth-total"><dt>동물 누적 출생</dt><dd>{snapshot.animalPopulationEventTotals.births}마리</dd></div>
+            <div><dt>송사리 누적 부화</dt><dd>{snapshot.animalPopulationEventTotals.hatches}마리</dd></div>
+            <div className="carcass-total"><dt>동물 누적 사망</dt><dd>{snapshot.animalPopulationEventTotals.deaths}마리</dd></div>
+            {snapshot.carcasses.length > 0 && <div><dt>현재 남은 사체</dt><dd>{snapshot.carcasses.length}마리</dd></div>}
           </>
         )}
         {snapshot.totalBiomass.oedogonium > ALGAE_VISIBLE_BIOMASS && (
@@ -2564,7 +2626,7 @@ function ObservationSectionContent({
         {snapshot.totalBiomass.vallisneria > ALGAE_VISIBLE_BIOMASS && (
           <div><dt><i className="species-dot vallisneria" />나사말 총량</dt><dd>{snapshot.totalBiomass.vallisneria.toFixed(1)}</dd></div>
         )}
-        {!hasShrimpRecord && !hasAlgaeRecord && (
+        {!hasAnimalRecord && !hasAlgaeRecord && (
           <div className="observation-empty-row"><dt>현재 관찰되는 생물</dt><dd>없음</dd></div>
         )}
         {!scenario.allowedAnimals.length && !snapshot.animals.length && (
@@ -2641,12 +2703,18 @@ function ObservationSectionContent({
           >+</button>
         </div>
       </div>
-      {(hasShrimpRecord || scenario.allowedAnimals.length > 0) && (
+      {(hasAnimalRecord || scenario.allowedAnimals.length > 0) && (
         <>
           <EcologyHistoryChart
             points={visibleEcologyHistory}
             windowSeconds={historyWindowSeconds}
           />
+          {(hasRicefishRecord || scenario.allowedAnimals.includes('japanese-ricefish')) && (
+            <RicefishHistoryChart
+              points={visibleEcologyHistory}
+              windowSeconds={historyWindowSeconds}
+            />
+          )}
           <AnimalPopulationEventLog snapshot={snapshot} />
         </>
       )}
@@ -2668,7 +2736,7 @@ function ObservationSectionContent({
           windowSeconds={historyWindowSeconds}
         />
       )}
-      {!scenario.waterCycle && !hasShrimpRecord && (
+      {!scenario.waterCycle && !hasAnimalRecord && (
         <p className="observation-empty-copy">기록할 변화가 생기면 여기에 표시됩니다.</p>
       )}
     </>
@@ -3164,6 +3232,10 @@ const animalBehaviorLabel: Record<SimulationSnapshot['animals'][number]['behavio
   grazing: '조류를 뜯어 먹는 중',
   resting: '쉬며 몸을 다듬는 중',
   starving: '먹이가 부족해 쇠약함',
+  hunting: '가까운 먹이를 추적하는 중',
+  courting: '짝과 구애 행동 중',
+  'carrying-eggs': '수정란을 달고 산란할 곳을 찾는 중',
+  incubating: '붙은 알에서 발생 중',
 };
 
 const animalDeathCauseLabel: Record<SimulationSnapshot['carcasses'][number]['cause'], string> = {
@@ -3172,6 +3244,17 @@ const animalDeathCauseLabel: Record<SimulationSnapshot['carcasses'][number]['cau
   hypoxia: '용존산소 부족',
   toxicity: '암모니아 독성 누적',
   temperature: '생존 범위를 벗어난 수온',
+  predation: '포식자에게 먹힘',
+};
+
+const animalLifeStageLabel: Record<
+  SimulationSnapshot['animals'][number]['lifeStage'],
+  string
+> = {
+  egg: '알',
+  fry: '치어',
+  juvenile: '어린 개체',
+  adult: '성체',
 };
 
 function AnimalInspector({
@@ -3193,38 +3276,81 @@ function AnimalInspector({
         : '굶주림';
   const reproduction = animal.sex === 'male'
     ? '수컷'
-    : animal.reproductiveState === 'berried'
+    : animal.reproductiveState === 'carrying-eggs'
+      ? '수정란을 달고 있음'
+      : animal.reproductiveState === 'incubating'
+        ? '알에서 발생 중'
+        : animal.reproductiveState === 'berried'
       ? '알을 품고 있음'
       : animal.reproductiveState === 'ready'
         ? '번식 가능한 상태'
         : '번식 조건 미충족';
-  const feedingState = animal.behavior === 'grazing' && animal.recentIntake > 0.001
-    ? '지금 조류를 먹는 중'
+  const feedingState = animal.recentIntake > 0.001 &&
+      (animal.behavior === 'grazing' || animal.behavior === 'hunting')
+    ? `지금 ${animal.recentFood ?? '먹이'}를 먹는 중`
     : animal.recentIntake >= 0.01
-      ? '방금 조류를 먹었음'
+      ? `방금 ${animal.recentFood ?? '먹이'}를 먹었음`
       : '최근 먹지 않음';
+  const isRicefish = animal.speciesId === 'japanese-ricefish';
+  const waterRules = isRicefish ? RICEFISH_ECOLOGY_RULES : SHRIMP_ECOLOGY_RULES;
+  const stageLabel = animalLifeStageLabel[animal.lifeStage];
+  const sexLabel = animal.lifeStage === 'egg'
+    ? ''
+    : ` · ${animal.sex === 'female' ? '암컷' : '수컷'}`;
   return (
     <section className="paper-panel animal-inspector">
       <div className="animal-inspector-heading">
-        <span className="animal-thumb cherry-shrimp-thumb large" aria-hidden="true">
-          <i className="shrimp-body" /><i className="shrimp-tail" /><i className="shrimp-antenna" />
-        </span>
+        <AnimalThumb speciesId={animal.speciesId} large />
         <div><span className="panel-label">선택한 동물</span><h3>{definition.displayName}</h3><small>{definition.scientificName}</small></div>
       </div>
       <dl className="species-facts">
-        <div><dt>생활 단계</dt><dd>{animal.lifeStage === 'adult' ? '성체' : '어린 새우'} · {animal.sex === 'female' ? '암컷' : '수컷'}</dd></div>
+        <div><dt>생활 단계</dt><dd>{stageLabel}{sexLabel}</dd></div>
         <div><dt>시뮬레이션 나이</dt><dd>{formatTime(animal.ageSeconds)} / 수명 약 {formatTime(animal.lifespanSeconds)}</dd></div>
         <div><dt>현재 행동</dt><dd>{animalBehaviorLabel[animal.behavior]}</dd></div>
         <div><dt>영양 상태</dt><dd>{nutrition} · {Math.round(animal.energy * 100)} / 100</dd></div>
-        <div><dt>최근 섭식</dt><dd>{feedingState}</dd></div>
-        <div><dt>먹은 조류</dt><dd>누적 {animal.consumedBiomass.toFixed(1)}</dd></div>
-        <div><dt>번식 상태</dt><dd>{animal.lifeStage === 'juvenile' ? '아직 성장 중' : reproduction}</dd></div>
+        {animal.lifeStage !== 'egg' && <div><dt>최근 섭식</dt><dd>{feedingState}</dd></div>}
+        {animal.lifeStage !== 'egg' && (
+          <div><dt>누적 섭식량</dt><dd>{animal.consumedBiomass.toFixed(1)}</dd></div>
+        )}
+        <div>
+          <dt>{animal.lifeStage === 'egg' ? '부화 진행' : '번식 상태'}</dt>
+          <dd>
+            {animal.lifeStage === 'egg'
+              ? `${Math.round((animal.developmentProgress ?? 0) * 100)}%`
+              : animal.lifeStage === 'fry' || animal.lifeStage === 'juvenile'
+                ? '아직 성장 중'
+                : reproduction}
+          </dd>
+        </div>
+        {animal.attachmentLabel && <div><dt>알 부착 위치</dt><dd>{animal.attachmentLabel}</dd></div>}
         <div><dt>현재 수온</dt><dd>{animal.temperature.toFixed(1)}°C</dd></div>
-        <div><dt>대사 속도</dt><dd>24°C 기준 ×{animal.metabolicTemperatureFactor.toFixed(2)}</dd></div>
-        <div><dt>성장·번식 속도</dt><dd>24°C 기준 ×{animal.reproductionTemperatureFactor.toFixed(2)}</dd></div>
+        {animal.oxygen != null && animal.toxicWaste != null && (
+          <>
+            <div>
+              <dt>현재 용존산소</dt>
+              <dd>
+                {animal.oxygen.toFixed(1)}
+                <small> · 피해 시작 {waterRules.oxygenStressStart} 미만</small>
+              </dd>
+            </div>
+            <div>
+              <dt>현재 암모니아</dt>
+              <dd>
+                {animal.toxicWaste.toFixed(1)}
+                <small> · 피해 시작 {waterRules.toxicWasteStressStart} 초과</small>
+              </dd>
+            </div>
+          </>
+        )}
+        <div><dt>대사 속도</dt><dd>{isRicefish ? '25' : '24'}°C 기준 ×{animal.metabolicTemperatureFactor.toFixed(2)}</dd></div>
+        <div><dt>성장·번식 속도</dt><dd>{isRicefish ? '25' : '24'}°C 기준 ×{animal.reproductionTemperatureFactor.toFixed(2)}</dd></div>
         <div><dt>수온 생존 적합도</dt><dd>{Math.round(animal.thermalHealthSuitability * 100)} / 100</dd></div>
       </dl>
-      <p className="animal-note">실제로 먹은 만큼 표면의 조류가 줄고, 확보한 에너지가 생존·성장·번식에 사용됩니다.</p>
+      <p className="animal-note">
+        {isRicefish
+          ? '시야 안의 작은 먹이만 추적합니다. 수초는 어린 새우의 은신처이자 송사리 알이 붙는 산란 장소가 됩니다.'
+          : '실제로 먹은 만큼 표면의 조류가 줄고, 확보한 에너지가 생존·성장·번식에 사용됩니다.'}
+      </p>
       {canRetrieve && onRetrieve && (
         <div className="manual-removal-actions">
           <button type="button" onClick={onRetrieve}>수조에서 회수하기</button>
@@ -3241,12 +3367,13 @@ function AnimalCarcassInspector({
   carcass: SimulationSnapshot['carcasses'][number];
 }) {
   const definition = ANIMALS[carcass.speciesId];
+  const waterRules = carcass.speciesId === 'japanese-ricefish'
+    ? RICEFISH_ECOLOGY_RULES
+    : SHRIMP_ECOLOGY_RULES;
   return (
     <section className="paper-panel animal-inspector animal-carcass-inspector">
       <div className="animal-inspector-heading">
-        <span className="animal-thumb cherry-shrimp-thumb large carcass" aria-hidden="true">
-          <i className="shrimp-body" /><i className="shrimp-tail" /><i className="shrimp-antenna" />
-        </span>
+        <AnimalThumb speciesId={carcass.speciesId} large carcass />
         <div>
           <span className="panel-label">선택한 죽은 개체</span>
           <h3>{definition.displayName}</h3>
@@ -3255,12 +3382,12 @@ function AnimalCarcassInspector({
       </div>
       <dl className="species-facts">
         <div><dt>상태</dt><dd>죽은 개체</dd></div>
-        <div><dt>생활 단계</dt><dd>{carcass.lifeStage === 'adult' ? '성체' : '어린 새우'}</dd></div>
+        <div><dt>생활 단계</dt><dd>{animalLifeStageLabel[carcass.lifeStage]}</dd></div>
         <div><dt>사망 원인</dt><dd>{animalDeathCauseLabel[carcass.cause]}</dd></div>
         {carcass.waterAtDeath && (
           <>
-            <div><dt>사망 당시 암모니아</dt><dd>{carcass.waterAtDeath.toxicWaste.toFixed(2)} / 피해 시작 {SHRIMP_ECOLOGY_RULES.toxicWasteStressStart}</dd></div>
-            <div><dt>사망 당시 산소</dt><dd>{carcass.waterAtDeath.oxygen.toFixed(2)} / 피해 시작 {SHRIMP_ECOLOGY_RULES.oxygenStressStart} 미만</dd></div>
+            <div><dt>사망 당시 암모니아</dt><dd>{carcass.waterAtDeath.toxicWaste.toFixed(2)} / 피해 시작 {waterRules.toxicWasteStressStart}</dd></div>
+            <div><dt>사망 당시 산소</dt><dd>{carcass.waterAtDeath.oxygen.toFixed(2)} / 피해 시작 {waterRules.oxygenStressStart} 미만</dd></div>
             <div><dt>사망 당시 유기물</dt><dd>{carcass.waterAtDeath.organicMatter.toFixed(2)}</dd></div>
           </>
         )}
@@ -3279,25 +3406,42 @@ function AnimalGroupInspector({
 }: {
   animals: SimulationSnapshot['animals'];
 }) {
-  const adults = animals.filter((animal) => animal.lifeStage === 'adult').length;
-  const juveniles = animals.length - adults;
   const averageEnergy = animals.reduce((sum, animal) => sum + animal.energy, 0) /
     Math.max(1, animals.length);
-  const grazing = animals.filter((animal) => animal.behavior === 'grazing').length;
+  const feeding = animals.filter((animal) =>
+    animal.behavior === 'grazing' || animal.behavior === 'hunting').length;
   const consumedBiomass = animals.reduce((sum, animal) => sum + animal.consumedBiomass, 0);
+  const bySpecies = ANIMAL_IDS
+    .map((speciesId) => ({
+      speciesId,
+      animals: animals.filter((animal) => animal.speciesId === speciesId),
+    }))
+    .filter((entry) => entry.animals.length > 0);
+  const heading = bySpecies.length === 1
+    ? `${ANIMALS[bySpecies[0]!.speciesId].displayName} ${animals.length}마리`
+    : `동물 ${animals.length}마리`;
   return (
     <section className="paper-panel animal-inspector animal-group-inspector">
       <div className="animal-inspector-heading">
-        <span className="animal-thumb cherry-shrimp-thumb large" aria-hidden="true">
-          <i className="shrimp-body" /><i className="shrimp-tail" /><i className="shrimp-antenna" />
-        </span>
-        <div><span className="panel-label">선택 영역의 동물</span><h3>체리새우 {animals.length}마리</h3></div>
+        <AnimalThumb speciesId={bySpecies[0]?.speciesId ?? 'cherry-shrimp'} large />
+        <div><span className="panel-label">선택 영역의 동물</span><h3>{heading}</h3></div>
       </div>
       <dl className="species-facts">
-        <div><dt>개체 구성</dt><dd>성체 {adults} · 어린 새우 {juveniles}</dd></div>
+        {bySpecies.map(({ speciesId, animals: speciesAnimals }) => (
+          <div key={speciesId}>
+            <dt>{ANIMALS[speciesId].displayName}</dt>
+            <dd>
+              {speciesAnimals.length}마리
+              {' · '}
+              {speciesAnimals.filter((animal) => animal.lifeStage === 'adult').length} 성체
+              {speciesId === 'japanese-ricefish' &&
+                ` · ${speciesAnimals.filter((animal) => animal.lifeStage === 'egg').length} 알`}
+            </dd>
+          </div>
+        ))}
         <div><dt>평균 에너지</dt><dd>{Math.round(averageEnergy * 100)} / 100</dd></div>
-        <div><dt>현재 섭식</dt><dd>{grazing}마리</dd></div>
-        <div><dt>먹은 조류</dt><dd>누적 {consumedBiomass.toFixed(1)}</dd></div>
+        <div><dt>현재 섭식·사냥</dt><dd>{feeding}마리</dd></div>
+        <div><dt>누적 섭식량</dt><dd>{consumedBiomass.toFixed(1)}</dd></div>
       </dl>
     </section>
   );
@@ -3307,6 +3451,7 @@ const animalPopulationEventLabel: Record<AnimalPopulationEventSnapshot['kind'], 
   introduced: '수조에 방류',
   removed: '수조에서 회수',
   birth: '새끼 출생',
+  hatched: '알에서 부화',
   matured: '성체로 성장',
   death: '개체 사망',
 };
@@ -3314,11 +3459,13 @@ const animalPopulationEventLabel: Record<AnimalPopulationEventSnapshot['kind'], 
 function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }) {
   const totals = snapshot.animalPopulationEventTotals;
   const recentEvents = snapshot.animalPopulationEvents.slice(-10).reverse();
-  const population = snapshot.animalPopulation['cherry-shrimp'];
+  const shrimpPopulation = snapshot.animalPopulation['cherry-shrimp'];
+  const ricefishPopulation = snapshot.animalPopulation['japanese-ricefish'];
 
   const eventDetail = (event: AnimalPopulationEventSnapshot): string => {
+    const species = ANIMALS[event.speciesId].displayName;
     const sex = event.sex === 'female' ? '암컷' : '수컷';
-    const stage = event.lifeStage === 'adult' ? '성체' : '어린 새우';
+    const stage = animalLifeStageLabel[event.lifeStage];
     if (event.kind === 'death' && event.cause) {
       const water = event.water
         ? ` · 산소 ${event.water.oxygen.toFixed(1)} · 암모니아 ${event.water.toxicWaste.toFixed(1)}`
@@ -3326,20 +3473,32 @@ function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }
       const temperature = event.temperature == null
         ? ''
         : ` · 수온 ${event.temperature.toFixed(1)}°C`;
-      return `${sex} ${stage} · ${animalDeathCauseLabel[event.cause]}${water}${temperature}`;
+      return `${species} ${sex} ${stage} · ${animalDeathCauseLabel[event.cause]}${water}${temperature}`;
     }
-    if (event.kind === 'birth') return `${sex} 새끼 · 어미 개체에서 태어남`;
-    return `${sex} ${stage}`;
+    if (event.kind === 'birth') {
+      return event.speciesId === 'japanese-ricefish'
+        ? `${species} 알 · 수초나 표면에 부착됨`
+        : `${species} ${sex} 새끼 · 어미 개체에서 태어남`;
+    }
+    if (event.kind === 'hatched') return `${species} ${sex} 치어 · 알에서 부화함`;
+    return `${species} ${sex} ${stage}`;
   };
 
   return (
     <div className="animal-event-log">
       <div className="animal-event-heading">
         <div><strong>개체군 변화 기록</strong><small>최근 사건 10건 · 누계는 전체 실험</small></div>
-        <span>현재 ♀ {population.adultFemales} · ♂ {population.adultMales}</span>
+        <span>
+          새우 {shrimpPopulation.total} · 송사리 {ricefishPopulation.total}
+        </span>
       </div>
-      <div className="animal-event-totals" aria-label="새우 누적 변화">
+      <div className="animal-population-species-summary">
+        <span>새우 성체 ♀ {shrimpPopulation.adultFemales} · ♂ {shrimpPopulation.adultMales} · 어린 개체 {shrimpPopulation.juveniles}</span>
+        <span>송사리 성체 {ricefishPopulation.adults} · 어린 개체 {ricefishPopulation.juveniles} · 치어 {ricefishPopulation.fry} · 알 {ricefishPopulation.eggs}</span>
+      </div>
+      <div className="animal-event-totals" aria-label="동물 누적 변화">
         <div><span>출생</span><strong>{totals.births}</strong></div>
+        <div><span>부화</span><strong>{totals.hatches}</strong></div>
         <div><span>성체 전환</span><strong>{totals.maturations}</strong></div>
         <div><span>사망</span><strong>{totals.deaths}</strong></div>
         <div><span>방류/회수</span><strong>{totals.introduced}/{totals.removed}</strong></div>
@@ -3351,6 +3510,7 @@ function AnimalPopulationEventLog({ snapshot }: { snapshot: SimulationSnapshot }
           <span>산소 부족 <b>{totals.deathsByCause.hypoxia}</b></span>
           <span>암모니아 <b>{totals.deathsByCause.toxicity}</b></span>
           <span>수온 <b>{totals.deathsByCause.temperature}</b></span>
+          <span>포식 <b>{totals.deathsByCause.predation}</b></span>
         </div>
       )}
       {recentEvents.length ? (
@@ -3462,6 +3622,11 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
     shrimpAdultFemales: 0,
     shrimpAdultMales: 0,
     shrimpJuveniles: 0,
+    ricefishCount: 0,
+    ricefishEggs: 0,
+    ricefishFry: 0,
+    ricefishJuveniles: 0,
+    ricefishAdults: 0,
     cumulativeBirths: 0,
     cumulativeDeaths: 0,
     organicMatter: 0,
@@ -3504,6 +3669,48 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
         <span className="juvenile">어린 새우 <b>{latest.shrimpJuveniles}</b></span>
       </div>
       <small className="ecology-history-note">모든 개체군 선은 0부터 같은 눈금을 사용합니다.</small>
+    </div>
+  );
+});
+
+const RicefishHistoryChart = memo(function RicefishHistoryChart({
+  points,
+  windowSeconds,
+}: {
+  points: EcologyHistoryPoint[];
+  windowSeconds: number;
+}) {
+  if (!points.length) return null;
+  const latestElapsedSeconds = points.at(-1)?.elapsedSeconds ?? 0;
+  const timeBounds = historyTimeBounds(latestElapsedSeconds, windowSeconds);
+  const maximum = Math.max(1, ...points.map((point) => point.ricefishCount));
+  const line = (values: number[]): string => values.map((value, index) => {
+    const x = historyTimeX(points[index]?.elapsedSeconds ?? 0, timeBounds, 39, 222);
+    const y = 55 - (value / maximum) * 38;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const latest = points.at(-1)!;
+  return (
+    <div className="ricefish-history">
+      <div className="ecology-history-heading">
+        <strong>송사리 세대 변화</strong>
+        <small>{formatTime(timeBounds.start)}–{formatTime(timeBounds.end)}</small>
+      </div>
+      <svg viewBox="0 0 240 64" role="img" aria-label="송사리 알, 치어, 어린 개체와 성체 수 변화">
+        <path className="ecology-history-guide" d="M39 56H222" />
+        <text x="5" y="20">개체</text>
+        <polyline className="ricefish-history-line total" points={line(points.map((point) => point.ricefishCount))} />
+        <polyline className="ricefish-history-line adults" points={line(points.map((point) => point.ricefishAdults))} />
+        <polyline className="ricefish-history-line fry" points={line(points.map((point) => point.ricefishFry))} />
+        <polyline className="ricefish-history-line eggs" points={line(points.map((point) => point.ricefishEggs))} />
+        <text className="ricefish-history-value" x="236" y="20" textAnchor="end">{latest.ricefishCount}마리</text>
+      </svg>
+      <div className="ricefish-history-legend">
+        <span className="adult">성체 <b>{latest.ricefishAdults}</b></span>
+        <span className="juvenile">어린 개체 <b>{latest.ricefishJuveniles}</b></span>
+        <span className="fry">치어 <b>{latest.ricefishFry}</b></span>
+        <span className="egg">알 <b>{latest.ricefishEggs}</b></span>
+      </div>
     </div>
   );
 });
@@ -3619,14 +3826,20 @@ const ClosedCycleHistoryChart = memo(function ClosedCycleHistoryChart({
 
 function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
   const definition = ANIMALS[speciesId];
+  const isRicefish = speciesId === 'japanese-ricefish';
+  const ecologyRules = isRicefish ? RICEFISH_ECOLOGY_RULES : SHRIMP_ECOLOGY_RULES;
+  const matterRules = isRicefish ? WATER_CYCLE_RULES.ricefish : WATER_CYCLE_RULES.shrimp;
   const energyCapacityPerStructure =
     WATER_CYCLE_RULES.shrimp.assimilationFraction /
     SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass;
-  const adultMaintenance = (
-    SHRIMP_ECOLOGY_RULES.adultBaseMetabolismPerSecond +
-    SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond
-  ) * WATER_CYCLE_RULES.shrimp.adultStructuralBiomass *
-    energyCapacityPerStructure;
+  const adultMaintenance = isRicefish
+    ? RICEFISH_ECOLOGY_RULES.adultBaseMetabolismPerSecond +
+      RICEFISH_ECOLOGY_RULES.restingActivityCostPerSecond
+    : (
+      SHRIMP_ECOLOGY_RULES.adultBaseMetabolismPerSecond +
+      SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond
+    ) * WATER_CYCLE_RULES.shrimp.adultStructuralBiomass *
+      energyCapacityPerStructure;
   const juvenileMaintenance = (
     SHRIMP_ECOLOGY_RULES.juvenileBaseMetabolismPerSecond +
     SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond
@@ -3637,32 +3850,37 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
   return (
     <section className="paper-panel animal-inspector animal-guide">
       <div className="animal-inspector-heading">
-        <span className="animal-thumb cherry-shrimp-thumb large" aria-hidden="true">
-          <i className="shrimp-body" /><i className="shrimp-tail" /><i className="shrimp-antenna" />
-        </span>
+        <AnimalThumb speciesId={speciesId} large />
         <div><span className="panel-label">동물 정보</span><h3>{definition.displayName}</h3><small>{definition.scientificName}</small></div>
       </div>
       <p>{definition.description}</p>
       <dl className="species-facts">
         <div><dt>먹이</dt><dd>{definition.diet}</dd></div>
         <div><dt>성체 크기</dt><dd>{definition.adultLength}</dd></div>
-        <div><dt>번식</dt><dd>충분히 먹은 성체 암수가 번식합니다. 먹이가 부족해지면 번식과 성장이 멈추고, 오래 굶으면 죽습니다.</dd></div>
+        <div>
+          <dt>번식</dt>
+          <dd>
+            {isRicefish
+              ? '실제로 먹은 건강한 성체 암수가 가까이 만나면 구애합니다. 암컷은 알을 잠시 달고 다니다 가는 식생이나 표면에 붙입니다.'
+              : '충분히 먹은 성체 암수가 번식합니다. 먹이가 부족해지면 번식과 성장이 멈추고, 오래 굶으면 죽습니다.'}
+          </dd>
+        </div>
         <div><dt>수온 반응</dt><dd>{definition.temperature.summary}</dd></div>
       </dl>
       <section className="ecology-rules-card">
         <div className="ecology-rules-heading"><strong>게임 생존·수질 기준</strong><span>수질 농도 0–100</span></div>
         <dl>
-          <div><dt>용존산소</dt><dd><b>{SHRIMP_ECOLOGY_RULES.oxygenStressStart} 이상</b>은 저산소 피해 없음. 그 아래부터 피해가 커져 0에서 체력 <b>{(SHRIMP_ECOLOGY_RULES.oxygenMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
-          <div><dt>암모니아성 노폐물</dt><dd><b>{SHRIMP_ECOLOGY_RULES.toxicWasteStressStart} 이하</b>는 독성 피해 없음. {SHRIMP_ECOLOGY_RULES.toxicWasteStressStart}–{SHRIMP_ECOLOGY_RULES.toxicWasteFullStress}에서 증가해 {SHRIMP_ECOLOGY_RULES.toxicWasteFullStress} 이상이면 체력 <b>{(SHRIMP_ECOLOGY_RULES.toxicMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
+          <div><dt>용존산소</dt><dd><b>{ecologyRules.oxygenStressStart} 이상</b>은 저산소 피해 없음. 그 아래부터 피해가 커져 0에서 체력 <b>{(ecologyRules.oxygenMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
+          <div><dt>암모니아성 노폐물</dt><dd><b>{ecologyRules.toxicWasteStressStart} 이하</b>는 독성 피해 없음. {ecologyRules.toxicWasteStressStart}–{ecologyRules.toxicWasteFullStress}에서 증가해 {ecologyRules.toxicWasteFullStress} 이상이면 체력 <b>{(ecologyRules.toxicMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
           <div><dt>수온</dt><dd><b>{definition.temperature.referenceTemperature}°C</b> 기준 대사율에 1°C당 <b>×{definition.temperature.metabolicTheta}</b>를 적용합니다. 성장·번식은 별도 종 곡선을 사용하며 33°C에서는 번식 진행이 멈춥니다.</dd></div>
-          <div><dt>회복</dt><dd>저산소·독성·수온 스트레스가 없을 때 체력 <b>{(SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 세 피해는 합산됩니다.</dd></div>
-          <div><dt>먹이의 행방</dt><dd>먹은 조류의 <b>{Math.round(WATER_CYCLE_RULES.shrimp.assimilationFraction * 100)}%</b>는 몸과 번식 자원, <b>{Math.round(WATER_CYCLE_RULES.shrimp.fecesFraction * 100)}%</b>는 유기성 찌꺼기, 나머지는 호흡·배설로 돌아갑니다.</dd></div>
-          <div><dt>휴식 대사</dt><dd>성체는 몸·저장량 <b>{adultMaintenance.toFixed(6)}</b>, 갓 태어난 새우는 <b>{juvenileMaintenance.toFixed(6)}</b> /마리·초를 사용합니다. 이동 중에는 행동 비용만큼 더 사용합니다.</dd></div>
+          <div><dt>회복</dt><dd>저산소·독성·수온 스트레스가 없을 때 체력 <b>{(ecologyRules.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 세 피해는 합산됩니다.</dd></div>
+          <div><dt>먹이의 행방</dt><dd>먹은 먹이의 <b>{Math.round(matterRules.assimilationFraction * 100)}%</b>는 몸과 번식 자원, <b>{Math.round(matterRules.fecesFraction * 100)}%</b>는 유기성 찌꺼기, 나머지는 호흡·용존 배출로 돌아갑니다.</dd></div>
+          <div><dt>휴식 대사</dt><dd>성체는 몸·저장량 <b>{adultMaintenance.toFixed(6)}</b> /마리·초를 사용합니다. 이동·사냥 중에는 행동 비용만큼 더 사용합니다.{!isRicefish && <> 갓 태어난 새우는 <b>{juvenileMaintenance.toFixed(6)}</b> /마리·초를 사용합니다.</>}</dd></div>
           <div><dt>산소 소비</dt><dd>성체 기초 대사만으로 약 <b>{oxygenPerAdultSecond.toFixed(6)}</b> /마리·초를 소비하며, 먹이 호흡분도 같은 질량 장부로 계산됩니다.</dd></div>
-          <div><dt>번식 자원</dt><dd>암컷은 체력 비축분을 넘는 먹이 동화분을 별도 번식 저장량에 조금씩 모읍니다. 가까운 수컷과 실제로 만난 뒤 이 질량만큼 새끼가 태어납니다.</dd></div>
+          <div><dt>번식 자원</dt><dd>{isRicefish ? '암컷은 먹이 동화분을 번식 저장량에 모읍니다. 가까운 수컷과 구애한 뒤 이 질량으로 2–4개의 알을 만들며, 알은 국소 수온·산소·암모니아 조건에 따라 발생합니다.' : '암컷은 체력 비축분을 넘는 먹이 동화분을 별도 번식 저장량에 조금씩 모읍니다. 가까운 수컷과 실제로 만난 뒤 이 질량만큼 새끼가 태어납니다.'}</dd></div>
           <div><dt>사체·배설물</dt><dd>남은 몸·일반 저장량·번식 저장량과 배설물은 유기성 찌꺼기가 되어 분해균의 먹이로 되돌아갑니다.</dd></div>
           <div><dt>굶주림</dt><dd>영양 상태는 일반 저장량을 중심으로 몸의 건전도를 함께 반영합니다. 먹이가 끊기면 번식과 성장이 먼저 멈추고 일반 저장량과 생존 가능한 범위의 몸체를 모두 소모한 뒤 아사합니다.</dd></div>
-          <div><dt>수명</dt><dd>성체 기준 약 <b>{formatTime(SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds)}–{formatTime(SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds)}</b>.</dd></div>
+          <div><dt>수명</dt><dd>게임 압축 수명 약 <b>{formatTime(ecologyRules.minimumLifespanSeconds)}–{formatTime(ecologyRules.maximumLifespanSeconds)}</b>.</dd></div>
         </dl>
       </section>
     </section>

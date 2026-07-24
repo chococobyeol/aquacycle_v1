@@ -5,6 +5,7 @@ import {
   initialWaterTemperatureForLight,
   MICROBE_ECOLOGY_RULES,
   MICROBES,
+  RICEFISH_ECOLOGY_RULES,
   SCENARIOS,
   SHRIMP_ECOLOGY_RULES,
   SPECIES,
@@ -219,6 +220,10 @@ interface AnimalState {
   behavior: AnimalBehavior;
   behaviorTimer: number;
   targetCellId: string | null;
+  targetAnimalId: string | null;
+  attachmentCellId: string | null;
+  incubationRemaining: number | null;
+  recentFood: string | null;
   nextTargetEvaluation: number;
   recentIntake: number;
   consumedBiomass: number;
@@ -431,6 +436,7 @@ const SHRIMP_GESTATION_SECONDS = 75;
 const SHRIMP_POST_BROOD_COOLDOWN = 160;
 const SHRIMP_MALE_POST_MATING_COOLDOWN = 45;
 const SHRIMP_CARCASS_LIFETIME_SECONDS = 55;
+const RICEFISH_CARCASS_LIFETIME_SECONDS = 70;
 const MAX_ANIMAL_POPULATION_EVENTS = 240;
 // This is not an ecological carrying capacity. It is only a last-resort guard
 // against allocating an unbounded clutch after a corrupted/extreme run. Under
@@ -460,6 +466,7 @@ const emptyAnimalPopulationEventTotals = (): AnimalPopulationEventTotals => ({
   introduced: 0,
   removed: 0,
   births: 0,
+  hatches: 0,
   maturations: 0,
   deaths: 0,
   deathsByCause: {
@@ -468,6 +475,7 @@ const emptyAnimalPopulationEventTotals = (): AnimalPopulationEventTotals => ({
     hypoxia: 0,
     toxicity: 0,
     temperature: 0,
+    predation: 0,
   },
 });
 
@@ -533,7 +541,10 @@ export class SimulationWorld {
   private animalPopulationEventTotals = emptyAnimalPopulationEventTotals();
   private animalPopulationEventSequence = 0;
   private totalAlgaeConsumed = 0;
-  private animalInventoryUsed: Record<AnimalSpeciesId, number> = { 'cherry-shrimp': 0 };
+  private animalInventoryUsed: Record<AnimalSpeciesId, number> = {
+    'cherry-shrimp': 0,
+    'japanese-ricefish': 0,
+  };
   private microbeInventoryUsed: Record<MicrobeGuildId, number> = {
     decomposer: 0,
     nitrifier: 0,
@@ -612,7 +623,7 @@ export class SimulationWorld {
     this.animalPopulationEventTotals = emptyAnimalPopulationEventTotals();
     this.animalPopulationEventSequence = 0;
     this.totalAlgaeConsumed = 0;
-    this.animalInventoryUsed = { 'cherry-shrimp': 0 };
+    this.animalInventoryUsed = { 'cherry-shrimp': 0, 'japanese-ricefish': 0 };
     this.microbeInventoryUsed = { decomposer: 0, nitrifier: 0 };
     this.suspendedBiofilm = emptyBiofilm();
     this.biofilmSettlementCursor = 0;
@@ -1014,6 +1025,7 @@ export class SimulationWorld {
       },
       remainingAnimals: {
         'cherry-shrimp': this.remainingAnimals('cherry-shrimp'),
+        'japanese-ricefish': this.remainingAnimals('japanese-ricefish'),
       },
       remainingMicrobes: {
         decomposer: this.remainingMicrobes('decomposer'),
@@ -1028,6 +1040,7 @@ export class SimulationWorld {
       totalAlgaeConsumed: this.totalAlgaeConsumed,
       animalPopulation: {
         'cherry-shrimp': this.animalPopulation('cherry-shrimp'),
+        'japanese-ricefish': this.animalPopulation('japanese-ricefish'),
       },
       animalPopulationEvents: this.animalPopulationEvents.map((event) => ({
         ...event,
@@ -1240,6 +1253,10 @@ export class SimulationWorld {
     this.animals = data.animals.map((animal) => cloneAnimalState({
       ...animal,
       reproductiveBiomass: animal.reproductiveBiomass ?? 0,
+      targetAnimalId: animal.targetAnimalId ?? null,
+      attachmentCellId: animal.attachmentCellId ?? null,
+      incubationRemaining: animal.incubationRemaining ?? null,
+      recentFood: animal.recentFood ?? null,
     }));
     this.carcasses = data.carcasses.map((carcass) => ({
       ...carcass,
@@ -1258,14 +1275,19 @@ export class SimulationWorld {
     }));
     this.animalPopulationEventTotals = {
       ...data.animalPopulationEventTotals,
+      hatches: data.animalPopulationEventTotals.hatches ?? 0,
       deathsByCause: {
         ...data.animalPopulationEventTotals.deathsByCause,
         temperature: data.animalPopulationEventTotals.deathsByCause.temperature ?? 0,
+        predation: data.animalPopulationEventTotals.deathsByCause.predation ?? 0,
       },
     };
     this.animalPopulationEventSequence = data.animalPopulationEventSequence;
     this.totalAlgaeConsumed = data.totalAlgaeConsumed;
-    this.animalInventoryUsed = { ...data.animalInventoryUsed };
+    this.animalInventoryUsed = {
+      'cherry-shrimp': data.animalInventoryUsed['cherry-shrimp'] ?? 0,
+      'japanese-ricefish': data.animalInventoryUsed['japanese-ricefish'] ?? 0,
+    };
     this.microbeInventoryUsed = { ...data.microbeInventoryUsed };
     this.suspendedBiofilm = { ...data.suspendedBiofilm };
     this.biofilmSettlementCursor = data.biofilmSettlementCursor;
@@ -3161,6 +3183,10 @@ export class SimulationWorld {
     for (const animal of this.animals) {
       animal.nextTargetEvaluation -= deltaSeconds;
       animal.behaviorTimer = Math.max(0, animal.behaviorTimer - deltaSeconds);
+      if (animal.speciesId === 'japanese-ricefish') {
+        this.stepRicefishMotion(animal, deltaSeconds);
+        continue;
+      }
       let currentTarget = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
       let targetFood = currentTarget ? this.edibleBiomass(currentTarget) : 0;
       let currentTargetDistance = currentTarget
@@ -3336,6 +3362,193 @@ export class SimulationWorld {
     }
   }
 
+  private stepRicefishMotion(animal: AnimalState, deltaSeconds: number): void {
+    if (animal.lifeStage === 'egg') {
+      const attachment = animal.attachmentCellId
+        ? this.cellById(animal.attachmentCellId)
+        : undefined;
+      if (attachment) animal.position = this.cellWorldPoint(attachment);
+      animal.velocity.x = 0;
+      animal.velocity.y = 0;
+      animal.poseAngle = 0;
+      animal.behavior = 'incubating';
+      return;
+    }
+
+    const rules = RICEFISH_ECOLOGY_RULES;
+    const water = this.biogeochemistry.effectsEnabled
+      ? this.biogeochemistry.sampleAt(animal.position)
+      : null;
+    const oxygenActivity = water
+      ? clamp((water.oxygen - rules.oxygenSevereStress) /
+        (rules.oxygenStressStart - rules.oxygenSevereStress), 0.35, 1)
+      : 1;
+    const isNight = this.currentDayNightState()?.phase === 'night';
+    const stageSpeed = animal.lifeStage === 'fry'
+      ? 0.58
+      : animal.lifeStage === 'juvenile'
+        ? 0.82
+        : 1;
+    const activityScale = oxygenActivity * (isNight ? 0.58 : 1) * stageSpeed;
+    const matingReady = animal.lifeStage === 'adult' &&
+      animal.sex === 'female' &&
+      animal.reproductionCooldown <= 0 &&
+      animal.reproductiveBiomass >=
+        rules.eggClutchMinimum * WATER_CYCLE_RULES.ricefish.eggBiomass &&
+      animal.health > 0.72 &&
+      animal.energy >= 0.35 &&
+      animal.recentFood !== null;
+    const mate = matingReady
+      ? this.animals
+        .filter((candidate) =>
+          candidate.id !== animal.id &&
+          candidate.speciesId === 'japanese-ricefish' &&
+          candidate.lifeStage === 'adult' &&
+          candidate.sex === 'male' &&
+          candidate.health > 0.72 &&
+          distanceSquared(candidate.position, animal.position) <= 420 * 420 &&
+          this.ricefishHasLineOfSight(animal.position, candidate.position))
+        .sort((left, right) =>
+          distanceSquared(animal.position, left.position) -
+          distanceSquared(animal.position, right.position))[0]
+      : undefined;
+
+    let prey = animal.targetAnimalId
+      ? this.animals.find((candidate) =>
+        candidate.id === animal.targetAnimalId &&
+        this.isRicefishAnimalPrey(animal, candidate))
+      : undefined;
+    if (
+      prey &&
+      (
+        distanceSquared(animal.position, prey.position) >
+          rules.animalPreyDetectionRadius * rules.animalPreyDetectionRadius ||
+        !this.ricefishHasLineOfSight(animal.position, prey.position)
+      )
+    ) {
+      prey = undefined;
+      animal.targetAnimalId = null;
+    }
+
+    const hungry = animal.energy <= rules.forageStartEnergy ||
+      (
+        (animal.behavior === 'hunting' || animal.behavior === 'grazing') &&
+        animal.energy < rules.forageStopEnergy
+      );
+    if (mate) {
+      animal.targetAnimalId = null;
+      animal.targetCellId = null;
+    } else if (hungry && animal.nextTargetEvaluation <= 0) {
+      prey = this.chooseRicefishPrey(animal) ?? undefined;
+      animal.targetAnimalId = prey?.id ?? null;
+      if (prey) animal.targetCellId = null;
+      if (!prey) {
+        const algae = this.chooseRicefishAlgaeTarget(animal);
+        animal.targetCellId = algae?.id ?? null;
+      }
+      animal.nextTargetEvaluation = prey ? 0.45 : 1.1;
+    } else if (!hungry) {
+      animal.targetAnimalId = null;
+      animal.targetCellId = null;
+    }
+
+    let targetPoint: Vec2;
+    if (mate) {
+      targetPoint = mate.position;
+      animal.behavior = 'courting';
+    } else if (prey) {
+      targetPoint = prey.position;
+      animal.behavior = 'hunting';
+    } else {
+      const algaeTarget = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
+      if (hungry && algaeTarget) {
+        targetPoint = this.cellWorldPoint(algaeTarget);
+        const distance = Math.sqrt(distanceSquared(animal.position, targetPoint));
+        animal.behavior = distance <= 19 ? 'grazing' : 'traveling';
+      } else {
+        const phase = Math.floor(animal.ageSeconds / 3.8);
+        const forwardBias = animal.facing * 0.2;
+        const xNoise = deterministicNoise(animal.randomSeed + phase * 17.31);
+        const yNoise = deterministicNoise(animal.randomSeed + phase * 23.17 + 4.9);
+        const verticalBias = hungry ? Math.pow(yNoise, 0.72) : Math.pow(yNoise, 1.35);
+        targetPoint = {
+          x: 70 + xNoise * (TANK_WIDTH - 140),
+          // Satiated fish spend more time high in the water. Hungry fish still
+          // search locally, but sample the lower water column often enough to
+          // discover attached algae instead of requiring a tank-wide radar.
+          y: WATER_TOP + 42 + verticalBias * (GROUND_Y - WATER_TOP - 86),
+        };
+        targetPoint.x += forwardBias * 60;
+        animal.behavior = isNight ? 'resting' : 'exploring';
+      }
+    }
+
+    const dx = targetPoint.x - animal.position.x;
+    const dy = targetPoint.y - animal.position.y;
+    const distance = Math.max(0.001, Math.hypot(dx, dy));
+    const baseSpeed = prey ? 126 : animal.behavior === 'traveling' ? 80 : 54;
+    let desiredX = (dx / distance) * baseSpeed * activityScale;
+    let desiredY = (dy / distance) * baseSpeed * activityScale;
+
+    // Weak schooling: local neighbours influence heading and cohesion, but do
+    // not force every fish onto one identical point or target.
+    let neighbourCount = 0;
+    let centreX = 0;
+    let centreY = 0;
+    let headingX = 0;
+    let headingY = 0;
+    for (const other of this.animals) {
+      if (
+        other.id === animal.id ||
+        other.speciesId !== 'japanese-ricefish' ||
+        other.lifeStage === 'egg'
+      ) continue;
+      const d2 = distanceSquared(animal.position, other.position);
+      if (d2 > 220 * 220) continue;
+      neighbourCount += 1;
+      centreX += other.position.x;
+      centreY += other.position.y;
+      headingX += other.velocity.x;
+      headingY += other.velocity.y;
+      if (d2 < 28 * 28 && d2 > 0.001) {
+        const d = Math.sqrt(d2);
+        desiredX += (animal.position.x - other.position.x) / d * 28;
+        desiredY += (animal.position.y - other.position.y) / d * 28;
+      }
+    }
+    if (neighbourCount > 0 && !prey) {
+      centreX /= neighbourCount;
+      centreY /= neighbourCount;
+      desiredX += (centreX - animal.position.x) * 0.11 + headingX / neighbourCount * 0.12;
+      desiredY += (centreY - animal.position.y) * 0.11 + headingY / neighbourCount * 0.12;
+    }
+
+    const proposed = {
+      x: animal.position.x + desiredX * deltaSeconds,
+      y: animal.position.y + desiredY * deltaSeconds,
+    };
+    if (!this.ricefishHasLineOfSight(animal.position, proposed)) {
+      desiredX = -desiredY * 0.72;
+      desiredY = animal.facing * Math.abs(desiredX) * 0.32;
+      animal.targetAnimalId = null;
+      animal.targetCellId = null;
+      animal.nextTargetEvaluation = 0.2;
+    }
+
+    const response = 1 - Math.exp(-deltaSeconds * (prey ? 7.2 : 4.1));
+    animal.velocity.x += (desiredX - animal.velocity.x) * response;
+    animal.velocity.y += (desiredY - animal.velocity.y) * response;
+    animal.position.x += animal.velocity.x * deltaSeconds;
+    animal.position.y += animal.velocity.y * deltaSeconds;
+    animal.position = this.clampAnimalPoint(animal.position);
+    if (Math.abs(animal.velocity.x) > 2.5) animal.facing = animal.velocity.x < 0 ? -1 : 1;
+    animal.poseAngle = clamp(
+      Math.atan2(animal.velocity.y, Math.max(12, Math.abs(animal.velocity.x))),
+      -0.42,
+      0.42,
+    );
+  }
+
   private recordAlgaeBiogeochemistry(deltaSeconds: number): void {
     for (const cell of this.allCells()) {
       this.biogeochemistry.recordAlgae(
@@ -3497,7 +3710,11 @@ export class SimulationWorld {
     if (this.carcasses.length) {
       this.carcasses = this.carcasses
         .map((carcass) => ({ ...carcass, ageSeconds: carcass.ageSeconds + deltaSeconds }))
-        .filter((carcass) => carcass.ageSeconds < SHRIMP_CARCASS_LIFETIME_SECONDS);
+        .filter((carcass) => carcass.ageSeconds < (
+          carcass.speciesId === 'japanese-ricefish'
+            ? RICEFISH_CARCASS_LIFETIME_SECONDS
+            : SHRIMP_CARCASS_LIFETIME_SECONDS
+        ));
       if (
         this.selection?.kind === 'carcass' &&
         !this.carcasses.some((carcass) => carcass.id === this.selection?.carcassId)
@@ -3506,7 +3723,11 @@ export class SimulationWorld {
       }
       this.snapshotDirty = true;
     }
+    this.stepRicefishEcology(deltaSeconds);
     if (!this.animals.length) return;
+    const shrimpAnimals = this.animals.filter((animal) =>
+      animal.speciesId === 'cherry-shrimp');
+    if (!shrimpAnimals.length) return;
     interface GrazingRequest {
       animal: AnimalState;
       cell: SurfaceCellState;
@@ -3520,7 +3741,7 @@ export class SimulationWorld {
     >();
     const maintenanceRequests = new Map<string, number>();
 
-    for (const animal of this.animals) {
+    for (const animal of shrimpAnimals) {
       animal.ageSeconds += deltaSeconds;
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
@@ -3708,7 +3929,7 @@ export class SimulationWorld {
 
     const newborns: AnimalState[] = [];
     const living: AnimalState[] = [];
-    for (const animal of this.animals) {
+    for (const animal of shrimpAnimals) {
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
       const reproductionTemperatureFactor = interpolateTemperatureResponse(
@@ -3827,7 +4048,7 @@ export class SimulationWorld {
               ));
             const availableSlots = Math.max(
               0,
-              SHRIMP_TECHNICAL_POPULATION_LIMIT - this.animals.length - newborns.length,
+              SHRIMP_TECHNICAL_POPULATION_LIMIT - shrimpAnimals.length - newborns.length,
             );
             const materialSlots = Math.floor(
               animal.reproductiveBiomass /
@@ -3856,10 +4077,11 @@ export class SimulationWorld {
           animal.reproductionCooldown <= 0 &&
           animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
           animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
-          this.animals.length + newborns.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
+          shrimpAnimals.length + newborns.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
         ) {
-          const eligibleMale = this.animals.find((candidate) =>
+          const eligibleMale = shrimpAnimals.find((candidate) =>
             candidate.id !== animal.id &&
+            candidate.speciesId === 'cherry-shrimp' &&
             candidate.lifeStage === 'adult' &&
             candidate.sex === 'male' &&
             candidate.energy >= SHRIMP_ECOLOGY_RULES.maleReproductionEnergy &&
@@ -3902,7 +4124,353 @@ export class SimulationWorld {
       }
       living.push(animal);
     }
-    this.animals = [...living, ...newborns];
+    this.animals = [
+      ...this.animals.filter((animal) => animal.speciesId !== 'cherry-shrimp'),
+      ...living,
+      ...newborns,
+    ];
+    this.snapshotDirty = true;
+  }
+
+  private stepRicefishEcology(deltaSeconds: number): void {
+    const ricefish = this.animals.filter((animal) =>
+      animal.speciesId === 'japanese-ricefish');
+    if (!ricefish.length) return;
+    const rules = RICEFISH_ECOLOGY_RULES;
+    const eatenAnimalIds = new Set<string>();
+    const newbornEggs: AnimalState[] = [];
+    const livingFish: AnimalState[] = [];
+
+    for (const fish of ricefish) {
+      fish.ageSeconds += deltaSeconds;
+      fish.recentIntake *= Math.exp(-deltaSeconds / 10);
+      fish.secondsSinceFood += deltaSeconds;
+      const temperature = this.biogeochemistry.temperatureAt(fish.position);
+      const profile = ANIMALS[fish.speciesId].temperature;
+      const metabolicTemperatureFactor = thetaTemperatureFactor(
+        temperature,
+        profile.referenceTemperature,
+        profile.metabolicTheta,
+        profile.minimumMetabolicFactor,
+        profile.maximumMetabolicFactor,
+      );
+      const reproductionTemperatureFactor = interpolateTemperatureResponse(
+        profile.reproductionCurve,
+        temperature,
+      );
+      const thermalSuitability = interpolateTemperatureResponse(
+        profile.healthCurve,
+        temperature,
+      );
+      fish.reproductionCooldown = Math.max(
+        0,
+        fish.reproductionCooldown - deltaSeconds * reproductionTemperatureFactor,
+      );
+
+      const water = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.sampleAt(fish.position)
+        : null;
+      const oxygenStress = water
+        ? clamp(
+          (rules.oxygenStressStart - water.oxygen) / rules.oxygenStressStart,
+          0,
+          1,
+        )
+        : 0;
+      const toxicStress = water
+        ? clamp(
+          (water.toxicWaste - rules.toxicWasteStressStart) /
+            (rules.toxicWasteFullStress - rules.toxicWasteStressStart),
+          0,
+          1,
+        )
+        : 0;
+      const thermalStress = clamp(1 - thermalSuitability, 0, 1);
+      const damageRate =
+        Math.pow(oxygenStress, 1.35) * rules.oxygenMaximumDamagePerSecond +
+        Math.pow(toxicStress, 1.25) * rules.toxicMaximumDamagePerSecond +
+        Math.pow(thermalStress, 1.35) * profile.maximumThermalDamagePerSecond;
+      const recovery = Math.max(
+        0,
+        1 - Math.max(oxygenStress, toxicStress, thermalStress),
+      ) * rules.healthyWaterRecoveryPerSecond;
+      fish.health = clamp01(fish.health + (recovery - damageRate) * deltaSeconds);
+      if (fish.health <= 0) {
+        const strongest = Math.max(oxygenStress, toxicStress, thermalStress);
+        this.killAnimal(
+          fish,
+          strongest === thermalStress
+            ? 'temperature'
+            : strongest === oxygenStress
+              ? 'hypoxia'
+              : 'toxicity',
+        );
+        continue;
+      }
+
+      const baseMetabolism = fish.lifeStage === 'egg'
+        ? rules.eggBaseMetabolismPerSecond
+        : fish.lifeStage === 'fry'
+          ? rules.fryBaseMetabolismPerSecond
+          : fish.lifeStage === 'juvenile'
+            ? rules.juvenileBaseMetabolismPerSecond
+            : rules.adultBaseMetabolismPerSecond;
+      const activity = fish.lifeStage === 'egg' || fish.behavior === 'resting'
+        ? rules.restingActivityCostPerSecond
+        : fish.behavior === 'hunting'
+          ? rules.huntingActivityCostPerSecond
+          : rules.swimmingActivityCostPerSecond;
+      const requestedRespiration = (
+        baseMetabolism + (fish.lifeStage === 'egg' ? 0 : activity)
+      ) * metabolicTemperatureFactor * deltaSeconds;
+      const minimumStructure = this.ricefishMinimumViableStructure(fish);
+      const availableForRespiration = fish.storedBiomass +
+        Math.max(0, fish.structuralBiomass - minimumStructure);
+      const actualRespiration = this.biogeochemistry.recordAnimalRespiration(
+        fish.position,
+        Math.min(requestedRespiration, availableForRespiration),
+      );
+      const reserveLoss = Math.min(fish.storedBiomass, actualRespiration);
+      fish.storedBiomass -= reserveLoss;
+      fish.structuralBiomass -= Math.min(
+        Math.max(0, fish.structuralBiomass - minimumStructure),
+        Math.max(0, actualRespiration - reserveLoss),
+      );
+
+      if (fish.lifeStage === 'egg') {
+        const developmentFactor = reproductionTemperatureFactor *
+          (water ? clamp((water.oxygen - 12) / 28, 0, 1) : 1) *
+          (water ? clamp((14 - water.toxicWaste) / 10, 0, 1) : 1);
+        fish.incubationRemaining = Math.max(
+          0,
+          (fish.incubationRemaining ?? rules.eggIncubationSecondsAt25C) -
+            deltaSeconds * developmentFactor,
+        );
+        fish.energy = clamp01(fish.health);
+        if (fish.incubationRemaining <= 0) {
+          fish.lifeStage = 'fry';
+          fish.behavior = 'resting';
+          fish.bodyLength = rules.fryLength;
+          fish.attachmentCellId = null;
+          fish.incubationRemaining = null;
+          fish.velocity = { x: 0, y: 0 };
+          fish.secondsSinceFood = 0;
+          this.recordAnimalPopulationEvent('hatched', fish);
+        }
+        livingFish.push(fish);
+        continue;
+      }
+
+      const targetPrey = fish.targetAnimalId
+        ? this.animals.find((candidate) =>
+          candidate.id === fish.targetAnimalId &&
+          !eatenAnimalIds.has(candidate.id) &&
+          this.isRicefishAnimalPrey(fish, candidate))
+        : undefined;
+      if (
+        targetPrey &&
+        fish.behavior === 'hunting' &&
+        fish.behaviorTimer <= 0 &&
+        distanceSquared(fish.position, targetPrey.position) <=
+          rules.strikeDistance * rules.strikeDistance &&
+        this.ricefishHasLineOfSight(fish.position, targetPrey.position)
+      ) {
+        const shelter = this.ricefishShelterAt(targetPrey.position);
+        const approach = clamp(
+          1 - Math.sqrt(distanceSquared(fish.position, targetPrey.position)) /
+            rules.strikeDistance,
+          0,
+          1,
+        );
+        const captureProbability = clamp(
+          0.42 + approach * 0.42 - shelter * 0.62,
+          0.06,
+          0.9,
+        );
+        const attempt = Math.floor(fish.ageSeconds / Math.max(deltaSeconds, 0.01));
+        if (deterministicNoise(fish.randomSeed + attempt * 9.17) < captureProbability) {
+          const consumed = targetPrey.structuralBiomass +
+            targetPrey.storedBiomass +
+            targetPrey.reproductiveBiomass;
+          eatenAnimalIds.add(targetPrey.id);
+          this.recordAnimalPopulationEvent('death', targetPrey, { cause: 'predation' });
+          const assimilated = this.biogeochemistry.recordAnimalFeeding(
+            fish.position,
+            consumed,
+            'ricefish',
+          );
+          this.addRicefishReserve(fish, assimilated);
+          fish.recentIntake += consumed;
+          fish.consumedBiomass += consumed;
+          fish.recentFood = '어린 체리새우';
+          fish.secondsSinceFood = 0;
+        }
+        fish.behaviorTimer = rules.strikeCooldownSeconds;
+        fish.targetAnimalId = null;
+        fish.nextTargetEvaluation = rules.strikeCooldownSeconds * 0.55;
+      }
+
+      const algaeTarget = fish.targetCellId ? this.cellById(fish.targetCellId) : undefined;
+      if (algaeTarget && fish.behavior === 'grazing') {
+        const point = this.cellWorldPoint(algaeTarget);
+        if (distanceSquared(fish.position, point) <= 24 * 24) {
+          const nitzschiaWeight = algaeTarget.biomass.nitzschia;
+          const oedogoniumWeight = algaeTarget.biomass.oedogonium * 0.45;
+          const weighted = nitzschiaWeight + oedogoniumWeight;
+          if (weighted > 0) {
+            const bite = Math.min(
+              weighted,
+              rules.maximumAlgaeBiteBiomassPerSecond * deltaSeconds,
+            );
+            const eatenNitzschia = Math.min(
+              algaeTarget.biomass.nitzschia,
+              bite * nitzschiaWeight / weighted,
+            );
+            const eatenOedogonium = Math.min(
+              algaeTarget.biomass.oedogonium,
+              bite * oedogoniumWeight / weighted,
+            );
+            algaeTarget.biomass.nitzschia -= eatenNitzschia;
+            algaeTarget.biomass.oedogonium -= eatenOedogonium;
+            const actual = eatenNitzschia + eatenOedogonium;
+            const digestible = eatenNitzschia * rules.diatomAssimilationMultiplier +
+              eatenOedogonium * rules.oedogoniumAssimilationMultiplier;
+            const indigestible = Math.max(0, actual - digestible);
+            const assimilated = this.biogeochemistry.recordAnimalFeeding(
+              fish.position,
+              digestible,
+              'ricefish',
+            );
+            if (indigestible > 0) {
+              this.biogeochemistry.recordAnimalAssimilationOverflow(
+                fish.position,
+                indigestible,
+              );
+            }
+            this.addRicefishReserve(fish, assimilated);
+            fish.recentIntake += actual;
+            fish.consumedBiomass += actual;
+            fish.recentFood = eatenNitzschia >= eatenOedogonium
+              ? '표면 규조류'
+              : '붓뚜껑말 끝부분';
+            fish.secondsSinceFood = 0;
+            this.totalAlgaeConsumed += actual;
+          }
+        }
+      }
+
+      this.growRicefish(fish, deltaSeconds, reproductionTemperatureFactor);
+      this.synchroniseRicefishEnergy(fish);
+
+      if (fish.lifeStage === 'adult' && fish.sex === 'female') {
+        const minimumEggMatter = rules.eggClutchMinimum *
+          WATER_CYCLE_RULES.ricefish.eggBiomass;
+        const maximumEggMatter = rules.eggClutchMaximum *
+          WATER_CYCLE_RULES.ricefish.eggBiomass;
+        if (
+          fish.gestationRemaining === null &&
+          fish.reproductionCooldown <= 0 &&
+          fish.energy >= rules.reproductionEnergy &&
+          fish.reproductiveBiomass < maximumEggMatter
+        ) {
+          const allocation = Math.min(
+            Math.max(0, fish.storedBiomass - rules.reproductionReserveFloor),
+            maximumEggMatter - fish.reproductiveBiomass,
+          );
+          fish.storedBiomass -= allocation;
+          fish.reproductiveBiomass += allocation;
+          this.synchroniseRicefishEnergy(fish);
+        }
+        if (fish.gestationRemaining !== null) {
+          fish.behavior = 'carrying-eggs';
+          fish.gestationRemaining -= deltaSeconds * reproductionTemperatureFactor;
+          if (fish.gestationRemaining <= 0) {
+            const attachment = this.chooseRicefishEggAttachmentCell(fish);
+            if (attachment) {
+              const clutchSize = Math.min(
+                rules.eggClutchMaximum,
+                Math.floor(
+                  fish.reproductiveBiomass /
+                    WATER_CYCLE_RULES.ricefish.eggBiomass,
+                ),
+                Math.max(
+                  0,
+                  rules.technicalPopulationLimit - ricefish.length - newbornEggs.length,
+                ),
+              );
+              if (clutchSize >= rules.eggClutchMinimum) {
+                fish.reproductiveBiomass -=
+                  clutchSize * WATER_CYCLE_RULES.ricefish.eggBiomass;
+                for (let index = 0; index < clutchSize; index += 1) {
+                  const egg = this.createRicefishEggState(fish, attachment, index);
+                  newbornEggs.push(egg);
+                  this.recordAnimalPopulationEvent('birth', egg, { parentId: fish.id });
+                }
+                fish.gestationRemaining = null;
+                fish.reproductionCooldown = rules.postSpawnCooldownSeconds;
+                fish.behavior = 'resting';
+              }
+            }
+          }
+        } else if (
+          fish.reproductionCooldown <= 0 &&
+          fish.reproductiveBiomass >= minimumEggMatter &&
+          fish.health > 0.72 &&
+          fish.energy >= 0.35 &&
+          fish.recentFood !== null
+        ) {
+          const male = ricefish.find((candidate) =>
+            candidate.id !== fish.id &&
+            candidate.lifeStage === 'adult' &&
+            candidate.sex === 'male' &&
+            candidate.health > 0.72 &&
+            distanceSquared(candidate.position, fish.position) <=
+              rules.matingEncounterRadius * rules.matingEncounterRadius,
+          );
+          fish.matingAccumulator = male
+            ? fish.matingAccumulator + deltaSeconds * reproductionTemperatureFactor
+            : Math.max(0, fish.matingAccumulator - deltaSeconds);
+          if (male) {
+            fish.behavior = 'courting';
+            male.behavior = 'courting';
+          }
+          if (fish.matingAccumulator >= rules.matingSeconds) {
+            fish.gestationRemaining = rules.carriedEggSeconds;
+            fish.matingAccumulator = 0;
+            if (male) male.reproductionCooldown = 35;
+          }
+        } else {
+          fish.matingAccumulator = Math.max(0, fish.matingAccumulator - deltaSeconds);
+        }
+      }
+
+      if (fish.ageSeconds >= fish.lifespanSeconds) {
+        this.killAnimal(fish, 'old-age');
+        continue;
+      }
+      if (
+        fish.storedBiomass <= 1e-9 &&
+        fish.structuralBiomass <= this.ricefishMinimumViableStructure(fish) + 1e-9
+      ) {
+        this.killAnimal(fish, 'starvation');
+        continue;
+      }
+      livingFish.push(fish);
+    }
+
+    if (eatenAnimalIds.size) {
+      if (
+        this.selection?.kind === 'animal' &&
+        this.selection.animalId &&
+        eatenAnimalIds.has(this.selection.animalId)
+      ) this.selection = null;
+      this.animals = this.animals.filter((animal) => !eatenAnimalIds.has(animal.id));
+    }
+    this.animals = [
+      ...this.animals.filter((animal) => animal.speciesId !== 'japanese-ricefish'),
+      ...livingFish,
+      ...newbornEggs,
+    ];
     this.snapshotDirty = true;
   }
 
@@ -3931,9 +4499,12 @@ export class SimulationWorld {
       this.biogeochemistry.effectsEnabled
         ? animal.structuralBiomass + animal.storedBiomass +
           animal.reproductiveBiomass
-        : animal.lifeStage === 'adult'
-          ? WATER_CYCLE_RULES.shrimp.adultStructuralBiomass
-          : WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
+        : animal.speciesId === 'japanese-ricefish'
+          ? animal.structuralBiomass + animal.storedBiomass +
+            animal.reproductiveBiomass
+          : animal.lifeStage === 'adult'
+            ? WATER_CYCLE_RULES.shrimp.adultStructuralBiomass
+            : WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
     );
     if (this.selection?.kind === 'animal' && this.selection.animalId === animal.id) {
       this.selection = null;
@@ -3942,6 +4513,233 @@ export class SimulationWorld {
 
   private edibleBiomass(cell: SurfaceCellState): number {
     return cell.biomass.nitzschia + cell.biomass.oedogonium * 0.72;
+  }
+
+  private isRicefishAnimalPrey(predator: AnimalState, candidate: AnimalState): boolean {
+    if (
+      predator.speciesId !== 'japanese-ricefish' ||
+      candidate.speciesId !== 'cherry-shrimp' ||
+      candidate.lifeStage !== 'juvenile'
+    ) return false;
+    return candidate.bodyLength <= predator.bodyLength * 0.48;
+  }
+
+  private ricefishHasLineOfSight(from: Vec2, to: Vec2): boolean {
+    if (distanceSquared(from, to) < 4) return true;
+    return Query.ray(
+      this.structures.map((structure) => structure.body),
+      from,
+      to,
+      2,
+    ).length === 0;
+  }
+
+  private ricefishShelterAt(point: Vec2): number {
+    let opticalDepth = 0;
+    for (const placement of this.seedPlacements) {
+      if (placement.speciesId !== 'vallisneria' || !placement.plant) continue;
+      const cell = this.cellById(placement.cellId);
+      if (!cell) continue;
+      const root = this.vallisneriaRootPosition(placement, cell);
+      const bounds = vallisneriaCanopyBounds(
+        cell.index,
+        root,
+        placement.plant.structuralScale,
+      );
+      if (
+        point.x < bounds.minX - 16 ||
+        point.x > bounds.maxX + 16 ||
+        point.y < bounds.minY - 12 ||
+        point.y > bounds.maxY + 18
+      ) continue;
+      const horizontal = clamp(
+        1 - Math.abs(point.x - (bounds.minX + bounds.maxX) / 2) /
+          Math.max(1, (bounds.maxX - bounds.minX) / 2 + 16),
+        0,
+        1,
+      );
+      opticalDepth += horizontal * placement.plant.structuralScale * 0.42;
+    }
+    return clamp(1 - Math.exp(-opticalDepth), 0, 0.86);
+  }
+
+  private chooseRicefishPrey(predator: AnimalState): AnimalState | null {
+    const rules = RICEFISH_ECOLOGY_RULES;
+    const reserved = new Set(
+      this.animals
+        .filter((animal) =>
+          animal.speciesId === 'japanese-ricefish' &&
+          animal.id !== predator.id &&
+          animal.targetAnimalId)
+        .map((animal) => animal.targetAnimalId as string),
+    );
+    let best: { prey: AnimalState; score: number } | null = null;
+    for (const candidate of this.animals) {
+      if (!this.isRicefishAnimalPrey(predator, candidate)) continue;
+      const distance = Math.sqrt(distanceSquared(predator.position, candidate.position));
+      if (distance > rules.animalPreyDetectionRadius) continue;
+      if (!this.ricefishHasLineOfSight(predator.position, candidate.position)) continue;
+      const shelter = this.ricefishShelterAt(candidate.position);
+      const detectionChance = clamp(1 - shelter * 0.76, 0.16, 1);
+      const epoch = Math.floor(predator.ageSeconds / 0.7);
+      if (
+        deterministicNoise(
+          predator.randomSeed + epoch * 11.7 + candidate.randomSeed * 0.13,
+        ) > detectionChance
+      ) continue;
+      const reservationPenalty = reserved.has(candidate.id) ? 80 : 0;
+      const score = -distance - reservationPenalty - shelter * 90 +
+        deterministicNoise(predator.randomSeed + candidate.randomSeed) * 8;
+      if (!best || score > best.score) best = { prey: candidate, score };
+    }
+    return best?.prey ?? null;
+  }
+
+  private chooseRicefishAlgaeTarget(fish: AnimalState): SurfaceCellState | null {
+    let best: { cell: SurfaceCellState; score: number } | null = null;
+    for (const cell of this.allCells()) {
+      const food = cell.biomass.nitzschia +
+        cell.biomass.oedogonium * RICEFISH_ECOLOGY_RULES.oedogoniumAssimilationMultiplier;
+      if (food < RICEFISH_ECOLOGY_RULES.minimumVisibleAlgaeFood) continue;
+      const point = this.cellWorldPoint(cell);
+      const distance = Math.sqrt(distanceSquared(fish.position, point));
+      if (distance > RICEFISH_ECOLOGY_RULES.algaeDetectionRadius) continue;
+      if (!this.ricefishHasLineOfSight(fish.position, point)) continue;
+      const score = -distance + Math.min(20, food * 12) +
+        deterministicNoise(fish.randomSeed + cell.index * 3.7) * 4;
+      if (!best || score > best.score) best = { cell, score };
+    }
+    return best?.cell ?? null;
+  }
+
+  private chooseRicefishEggAttachmentCell(fish: AnimalState): SurfaceCellState | null {
+    let best: { cell: SurfaceCellState; score: number } | null = null;
+    for (const cell of this.allCells()) {
+      const point = this.cellWorldPoint(cell);
+      const distance = Math.sqrt(distanceSquared(fish.position, point));
+      if (distance > 260) continue;
+      const vallisneria = cell.biomass.vallisneria;
+      const filamentous = cell.biomass.oedogonium;
+      const roughAlternative = cell.surfaceKind === 'structure-face' ? 0.25 : 0.08;
+      const substrateQuality = vallisneria > ALGAE_VISIBLE_BIOMASS
+        ? 1 + Math.min(0.5, vallisneria)
+        : filamentous > 0.04
+          ? 0.78 + Math.min(0.3, filamentous)
+          : roughAlternative;
+      const score = substrateQuality * 180 - distance +
+        deterministicNoise(fish.randomSeed + cell.index * 5.9) * 9;
+      if (!best || score > best.score) best = { cell, score };
+    }
+    return best?.cell ?? null;
+  }
+
+  private ricefishTargetStructuralBiomass(fish: AnimalState): number {
+    if (fish.lifeStage === 'egg') return WATER_CYCLE_RULES.ricefish.eggBiomass;
+    if (fish.lifeStage === 'fry') return WATER_CYCLE_RULES.ricefish.fryBirthBiomass;
+    if (fish.lifeStage === 'juvenile') {
+      const progress = clamp01(
+        (fish.ageSeconds - RICEFISH_ECOLOGY_RULES.fryStageSeconds) /
+          Math.max(
+            1,
+            RICEFISH_ECOLOGY_RULES.maturationSeconds -
+              RICEFISH_ECOLOGY_RULES.fryStageSeconds,
+          ),
+      );
+      return WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass +
+        (
+          WATER_CYCLE_RULES.ricefish.adultStructuralBiomass -
+          WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass
+        ) * progress;
+    }
+    return WATER_CYCLE_RULES.ricefish.adultStructuralBiomass;
+  }
+
+  private ricefishReserveCapacity(fish: AnimalState): number {
+    return fish.lifeStage === 'fry'
+      ? WATER_CYCLE_RULES.ricefish.fryReserveBiomass
+      : fish.lifeStage === 'juvenile'
+        ? WATER_CYCLE_RULES.ricefish.juvenileReserveBiomass
+        : WATER_CYCLE_RULES.ricefish.adultReserveBiomass;
+  }
+
+  private ricefishMinimumViableStructure(fish: AnimalState): number {
+    return this.ricefishTargetStructuralBiomass(fish) * 0.24;
+  }
+
+  private synchroniseRicefishEnergy(fish: AnimalState): void {
+    if (fish.lifeStage === 'egg') {
+      fish.energy = fish.health;
+      return;
+    }
+    const structural = clamp01(
+      fish.structuralBiomass /
+        Math.max(1e-9, this.ricefishTargetStructuralBiomass(fish)),
+    );
+    const reserve = clamp01(
+      fish.storedBiomass / Math.max(1e-9, this.ricefishReserveCapacity(fish)),
+    );
+    fish.energy = clamp01(structural * 0.28 + reserve * 0.72);
+  }
+
+  private addRicefishReserve(fish: AnimalState, biomass: number): void {
+    if (biomass <= 0) return;
+    const capacity = this.ricefishReserveCapacity(fish);
+    const retained = Math.min(biomass, Math.max(0, capacity - fish.storedBiomass));
+    fish.storedBiomass += retained;
+    this.biogeochemistry.recordAnimalAssimilationOverflow(
+      fish.position,
+      biomass - retained,
+    );
+    this.synchroniseRicefishEnergy(fish);
+  }
+
+  private growRicefish(
+    fish: AnimalState,
+    deltaSeconds: number,
+    temperatureFactor: number,
+  ): void {
+    if (fish.lifeStage === 'adult' || fish.lifeStage === 'egg') return;
+    const nextTarget = fish.lifeStage === 'fry'
+      ? WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass
+      : this.ricefishTargetStructuralBiomass(fish);
+    if (fish.energy >= 0.42 && fish.secondsSinceFood < 18) {
+      const desired = Math.min(
+        nextTarget - fish.structuralBiomass,
+        deltaSeconds * temperatureFactor * 0.005,
+        fish.storedBiomass,
+      );
+      fish.structuralBiomass += Math.max(0, desired);
+      fish.storedBiomass -= Math.max(0, desired);
+    }
+    if (
+      fish.lifeStage === 'fry' &&
+      fish.ageSeconds >= RICEFISH_ECOLOGY_RULES.fryStageSeconds &&
+      fish.structuralBiomass >= WATER_CYCLE_RULES.ricefish.fryBirthBiomass * 0.72
+    ) {
+      fish.lifeStage = 'juvenile';
+    }
+    if (
+      fish.lifeStage === 'juvenile' &&
+      fish.ageSeconds >= RICEFISH_ECOLOGY_RULES.maturationSeconds &&
+      fish.structuralBiomass >= WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass
+    ) {
+      fish.lifeStage = 'adult';
+      fish.reproductionCooldown = 120;
+      this.recordAnimalPopulationEvent('matured', fish);
+    }
+    const juvenileProgress = clamp01(
+      (fish.structuralBiomass - WATER_CYCLE_RULES.ricefish.fryBirthBiomass) /
+        (
+          WATER_CYCLE_RULES.ricefish.adultStructuralBiomass -
+          WATER_CYCLE_RULES.ricefish.fryBirthBiomass
+        ),
+    );
+    fish.growthProgress = juvenileProgress;
+    fish.bodyLength = RICEFISH_ECOLOGY_RULES.fryLength +
+      (
+        RICEFISH_ECOLOGY_RULES.adultLength -
+        RICEFISH_ECOLOGY_RULES.fryLength
+      ) * juvenileProgress;
   }
 
   private animalTargetStructuralBiomass(animal: AnimalState): number {
@@ -4381,6 +5179,15 @@ export class SimulationWorld {
     const byId = new Map(cells.map((cell) => [cell.id, cell]));
     const original = new Map(cells.map((cell) => [cell.id, cloneBiomass(cell.biomass)]));
     const next = new Map<string, SpeciesBiomass>();
+    const currentProducerBiomass = cells.reduce((sum, cell) =>
+      sum + cell.biomass.oedogonium +
+        cell.biomass.nitzschia + cell.biomass.vallisneria, 0);
+    const backgroundProducerCapacity = this.scenario.waterCycle
+      ? null
+      : this.scenario.backgroundProducerCapacity;
+    const backgroundNutrientFactor = backgroundProducerCapacity === null
+      ? 1
+      : clamp01(1 - currentProducerBiomass / backgroundProducerCapacity);
 
     for (const cell of cells) {
       const current = original.get(cell.id)!;
@@ -4397,7 +5204,9 @@ export class SimulationWorld {
           : cell.light;
         const localTemperature = this.biogeochemistry.temperatureAt(activityPoint);
         const response = algaePhysiology(speciesId, activityLight, localTemperature);
-        const resourceFactor = this.biogeochemistry.algaeResourceFactor(activityPoint);
+        const resourceFactor =
+          this.biogeochemistry.algaeResourceFactor(activityPoint) *
+          backgroundNutrientFactor;
         physiology.set(speciesId, response);
         resourceFactors.set(speciesId, resourceFactor);
         rates[speciesId] = response.netGrowth > 0
@@ -4580,7 +5389,10 @@ export class SimulationWorld {
   }
 
   private stepTemperature(deltaSeconds: number): void {
-    this.biogeochemistry.advanceTemperature(deltaSeconds, 22);
+    this.biogeochemistry.advanceTemperature(
+      deltaSeconds,
+      22,
+    );
     this.waterTemperature = this.biogeochemistry.averageTemperature();
     if (this.probe) this.setProbe(this.probe);
   }
@@ -4615,6 +5427,22 @@ export class SimulationWorld {
   private missionProgress(coverageRatio: number): MissionProgressSnapshot | null {
     const target = this.scenario.target;
     if (!target) return null;
+    if (target.type === 'born-stage') {
+      const current = this.animals.filter((animal) =>
+        animal.speciesId === target.speciesId &&
+        animal.origin === 'born' &&
+        animal.lifeStage === target.lifeStage,
+      ).length;
+      return {
+        current,
+        target: target.count,
+        unit: 'born-count',
+        label: target.label,
+        ratio: current / target.count,
+        holdCurrent: this.successHoldAccumulator,
+        holdTarget: target.holdSeconds,
+      };
+    }
     if (target.type === 'population-survival') {
       const current = this.animalPopulation(target.speciesId).total;
       return {
@@ -4751,17 +5579,44 @@ export class SimulationWorld {
       snapshot.behavior = this.held?.kind === 'animal' && this.held.animalId === animal.id
         ? 'held'
         : animal.behavior;
-      snapshot.reproductiveState = animal.gestationRemaining !== null
-        ? 'berried'
-        : animal.lifeStage === 'adult' &&
-          animal.reproductionCooldown <= 0 &&
-          animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
-          animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
-          this.animals.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
-          ? 'ready'
-          : 'none';
+      snapshot.reproductiveState = animal.speciesId === 'japanese-ricefish'
+        ? animal.lifeStage === 'egg'
+          ? 'incubating'
+          : animal.gestationRemaining !== null
+            ? 'carrying-eggs'
+            : animal.lifeStage === 'adult' &&
+              animal.reproductionCooldown <= 0 &&
+              animal.reproductiveBiomass >=
+                RICEFISH_ECOLOGY_RULES.eggClutchMinimum *
+                WATER_CYCLE_RULES.ricefish.eggBiomass
+              ? 'ready'
+              : 'none'
+        : animal.gestationRemaining !== null
+          ? 'berried'
+          : animal.lifeStage === 'adult' &&
+            animal.reproductionCooldown <= 0 &&
+            animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
+            animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
+            this.animals.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
+            ? 'ready'
+            : 'none';
       snapshot.recentIntake = animal.recentIntake;
       snapshot.consumedBiomass = animal.consumedBiomass;
+      snapshot.recentFood = animal.recentFood;
+      snapshot.attachmentLabel = animal.attachmentCellId
+        ? this.cellById(animal.attachmentCellId)?.ownerLabel ?? null
+        : null;
+      snapshot.developmentProgress = animal.lifeStage === 'egg'
+        ? clamp01(
+          1 - (animal.incubationRemaining ?? RICEFISH_ECOLOGY_RULES.eggIncubationSecondsAt25C) /
+            RICEFISH_ECOLOGY_RULES.eggIncubationSecondsAt25C,
+        )
+        : null;
+      const localWater = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.sampleAt(animal.position)
+        : null;
+      snapshot.oxygen = localWater?.oxygen ?? null;
+      snapshot.toxicWaste = localWater?.toxicWaste ?? null;
       snapshot.temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
       snapshot.metabolicTemperatureFactor = thetaTemperatureFactor(
@@ -4800,13 +5655,21 @@ export class SimulationWorld {
       waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
       temperatureAtDeath: carcass.temperatureAtDeath,
       ageSeconds: carcass.ageSeconds,
-      lifetimeSeconds: SHRIMP_CARCASS_LIFETIME_SECONDS,
-      progress: clamp01(carcass.ageSeconds / SHRIMP_CARCASS_LIFETIME_SECONDS),
+      lifetimeSeconds: carcass.speciesId === 'japanese-ricefish'
+        ? RICEFISH_CARCASS_LIFETIME_SECONDS
+        : SHRIMP_CARCASS_LIFETIME_SECONDS,
+      progress: clamp01(carcass.ageSeconds / (
+        carcass.speciesId === 'japanese-ricefish'
+          ? RICEFISH_CARCASS_LIFETIME_SECONDS
+          : SHRIMP_CARCASS_LIFETIME_SECONDS
+      )),
     }));
   }
 
   private animalPopulation(speciesId: AnimalSpeciesId): {
     total: number;
+    eggs: number;
+    fry: number;
     adults: number;
     juveniles: number;
     adultFemales: number;
@@ -4815,19 +5678,25 @@ export class SimulationWorld {
     juvenileMales: number;
   } {
     const animals = this.animals.filter((animal) => animal.speciesId === speciesId);
+    const eggs = animals.filter((animal) => animal.lifeStage === 'egg').length;
+    const fry = animals.filter((animal) => animal.lifeStage === 'fry').length;
     const adultFemales = animals.filter((animal) =>
       animal.lifeStage === 'adult' && animal.sex === 'female').length;
     const adultMales = animals.filter((animal) =>
       animal.lifeStage === 'adult' && animal.sex === 'male').length;
     const juvenileFemales = animals.filter((animal) =>
-      animal.lifeStage === 'juvenile' && animal.sex === 'female').length;
+      (animal.lifeStage === 'juvenile' || animal.lifeStage === 'fry') &&
+      animal.sex === 'female').length;
     const juvenileMales = animals.filter((animal) =>
-      animal.lifeStage === 'juvenile' && animal.sex === 'male').length;
+      (animal.lifeStage === 'juvenile' || animal.lifeStage === 'fry') &&
+      animal.sex === 'male').length;
     const adults = adultFemales + adultMales;
     return {
       total: animals.length,
+      eggs,
+      fry,
       adults,
-      juveniles: animals.length - adults,
+      juveniles: animals.length - adults - eggs,
       adultFemales,
       adultMales,
       juvenileFemales,
@@ -4877,6 +5746,7 @@ export class SimulationWorld {
     if (kind === 'introduced') this.animalPopulationEventTotals.introduced += 1;
     if (kind === 'removed') this.animalPopulationEventTotals.removed += 1;
     if (kind === 'birth') this.animalPopulationEventTotals.births += 1;
+    if (kind === 'hatched') this.animalPopulationEventTotals.hatches += 1;
     if (kind === 'matured') this.animalPopulationEventTotals.maturations += 1;
     if (kind === 'death' && cause) {
       this.animalPopulationEventTotals.deaths += 1;
@@ -5016,6 +5886,9 @@ export class SimulationWorld {
     point: Vec2,
     origin: 'supplied' | 'born',
   ): AnimalState {
+    if (speciesId === 'japanese-ricefish') {
+      return this.createAdultRicefishState(id, point, origin);
+    }
     const numericId = Number.parseInt(id.split('-').at(-1) ?? '1', 10) || 1;
     return {
       id,
@@ -5042,6 +5915,10 @@ export class SimulationWorld {
       behavior: 'resting',
       behaviorTimer: 1 + deterministicNoise(numericId * 2.7) * 2,
       targetCellId: null,
+      targetAnimalId: null,
+      attachmentCellId: null,
+      incubationRemaining: null,
+      recentFood: null,
       nextTargetEvaluation: 0,
       recentIntake: 0,
       consumedBiomass: 0,
@@ -5091,6 +5968,10 @@ export class SimulationWorld {
       behavior: 'resting',
       behaviorTimer: deterministicNoise(numericId * 4.1),
       targetCellId: parent.targetCellId,
+      targetAnimalId: null,
+      attachmentCellId: null,
+      incubationRemaining: null,
+      recentFood: null,
       nextTargetEvaluation: deterministicNoise(numericId * 2.3) * 0.5,
       recentIntake: 0,
       consumedBiomass: 0,
@@ -5101,6 +5982,129 @@ export class SimulationWorld {
       gestationRemaining: null,
       matingAccumulator: 0,
       randomSeed: numericId * 17.17,
+    };
+  }
+
+  private createAdultRicefishState(
+    id: string,
+    point: Vec2,
+    origin: 'supplied' | 'born',
+  ): AnimalState {
+    const numericId = Number.parseInt(id.split('-').at(-1) ?? '1', 10) || 1;
+    const characteristicSeed = deterministicStringSeed(`${id}:ricefish`);
+    const ageNoise = deterministicNoise(characteristicSeed * 0.013 + 7.1);
+    const lifespanNoise = deterministicNoise(characteristicSeed * 0.019 + 13.7);
+    const sexNoise = deterministicNoise(characteristicSeed * 0.023 + 29.3);
+    // The supplied trio is deliberately 2F/1M without deriving age or lifespan
+    // from its serial number. Later fish use their independent characteristic seed.
+    const suppliedIndex = this.animals.filter((animal) =>
+      animal.speciesId === 'japanese-ricefish' &&
+      animal.origin === 'supplied').length % 3;
+    const sex = origin === 'supplied'
+      ? suppliedIndex === 1 ? 'male' : 'female'
+      : sexNoise < 0.5 ? 'female' : 'male';
+    return {
+      id,
+      speciesId: 'japanese-ricefish',
+      origin,
+      position: this.clampAnimalPoint(point),
+      velocity: { x: 0, y: 0 },
+      facing: deterministicNoise(characteristicSeed * 0.031) < 0.5 ? -1 : 1,
+      poseAngle: 0,
+      bodyLength: RICEFISH_ECOLOGY_RULES.adultLength *
+        (0.93 + deterministicNoise(characteristicSeed * 0.037) * 0.14),
+      lifeStage: 'adult',
+      sex,
+      ageSeconds: RICEFISH_ECOLOGY_RULES.suppliedAdultMinimumAgeSeconds +
+        ageNoise * (
+          RICEFISH_ECOLOGY_RULES.suppliedAdultMaximumAgeSeconds -
+          RICEFISH_ECOLOGY_RULES.suppliedAdultMinimumAgeSeconds
+        ),
+      lifespanSeconds: RICEFISH_ECOLOGY_RULES.minimumLifespanSeconds +
+        lifespanNoise * (
+          RICEFISH_ECOLOGY_RULES.maximumLifespanSeconds -
+          RICEFISH_ECOLOGY_RULES.minimumLifespanSeconds
+        ),
+      energy: 0.48,
+      structuralBiomass: WATER_CYCLE_RULES.ricefish.adultStructuralBiomass,
+      storedBiomass: WATER_CYCLE_RULES.ricefish.suppliedReserveBiomass,
+      reproductiveBiomass: sex === 'female' && origin === 'supplied'
+        ? RICEFISH_ECOLOGY_RULES.eggClutchMinimum *
+          WATER_CYCLE_RULES.ricefish.eggBiomass
+        : 0,
+      health: 1,
+      behavior: 'exploring',
+      behaviorTimer: 0,
+      targetCellId: null,
+      targetAnimalId: null,
+      attachmentCellId: null,
+      incubationRemaining: null,
+      recentFood: null,
+      nextTargetEvaluation: deterministicNoise(characteristicSeed * 0.041) * 1.2,
+      recentIntake: 0,
+      consumedBiomass: 0,
+      grazingSessionIntake: 0,
+      secondsSinceFood: Number.POSITIVE_INFINITY,
+      growthProgress: 1,
+      reproductionCooldown: 55 + deterministicNoise(characteristicSeed * 0.043) * 55,
+      gestationRemaining: null,
+      matingAccumulator: 0,
+      randomSeed: characteristicSeed * 0.001,
+    };
+  }
+
+  private createRicefishEggState(
+    parent: AnimalState,
+    cell: SurfaceCellState,
+    clutchIndex: number,
+  ): AnimalState {
+    const id = `animal-${++this.animalCounter}`;
+    const seed = deterministicStringSeed(`${id}:egg:${parent.id}`);
+    const point = this.cellWorldPoint(cell);
+    const angle = deterministicNoise(seed * 0.017 + clutchIndex) * Math.PI * 2;
+    const radius = 3 + deterministicNoise(seed * 0.023 + clutchIndex * 2.1) * 6;
+    return {
+      id,
+      speciesId: 'japanese-ricefish',
+      origin: 'born',
+      position: this.clampAnimalPoint({
+        x: point.x + Math.cos(angle) * radius,
+        y: point.y + Math.sin(angle) * radius,
+      }),
+      velocity: { x: 0, y: 0 },
+      facing: 1,
+      poseAngle: 0,
+      bodyLength: 6,
+      lifeStage: 'egg',
+      sex: deterministicNoise(seed * 0.031) < 0.5 ? 'female' : 'male',
+      ageSeconds: 0,
+      lifespanSeconds: RICEFISH_ECOLOGY_RULES.minimumLifespanSeconds +
+        deterministicNoise(seed * 0.037) * (
+          RICEFISH_ECOLOGY_RULES.maximumLifespanSeconds -
+          RICEFISH_ECOLOGY_RULES.minimumLifespanSeconds
+        ),
+      energy: 1,
+      structuralBiomass: WATER_CYCLE_RULES.ricefish.eggBiomass,
+      storedBiomass: 0,
+      reproductiveBiomass: 0,
+      health: 1,
+      behavior: 'incubating',
+      behaviorTimer: 0,
+      targetCellId: null,
+      targetAnimalId: null,
+      attachmentCellId: cell.id,
+      incubationRemaining: RICEFISH_ECOLOGY_RULES.eggIncubationSecondsAt25C,
+      recentFood: null,
+      nextTargetEvaluation: 0,
+      recentIntake: 0,
+      consumedBiomass: 0,
+      grazingSessionIntake: 0,
+      secondsSinceFood: 0,
+      growthProgress: 0,
+      reproductionCooldown: 0,
+      gestationRemaining: null,
+      matingAccumulator: 0,
+      randomSeed: seed * 0.001,
     };
   }
 

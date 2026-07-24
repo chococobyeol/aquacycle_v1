@@ -232,6 +232,8 @@ interface StructureDisplay {
 }
 
 interface AnimalRenderTarget {
+  speciesId: AnimalSnapshot['speciesId'];
+  lifeStage: AnimalSnapshot['lifeStage'];
   x: number;
   y: number;
   facing: -1 | 1;
@@ -255,6 +257,8 @@ interface AnimalMotionProfile {
 }
 
 interface AnimalDisplay {
+  speciesId: AnimalSnapshot['speciesId'];
+  lifeStage: AnimalSnapshot['lifeStage'];
   container: Container;
   selection: Graphics;
   placement: Graphics;
@@ -281,6 +285,7 @@ interface AnimalDisplay {
 }
 
 interface AnimalCarcassDisplay {
+  speciesId: AnimalCarcassSnapshot['speciesId'];
   container: Container;
   art: Container;
   head: Container;
@@ -1221,6 +1226,8 @@ const syncStructures = (
 const SHRIMP_DRAW_LENGTH = 48;
 const SHRIMP_ADULT_LENGTH = 36;
 const SHRIMP_ABDOMEN_X = [-4, -10, -16, -21];
+const RICEFISH_DRAW_LENGTH = 52;
+const RICEFISH_ADULT_LENGTH = 44;
 
 const animalHash = (id: string): number => {
   let value = 2166136261;
@@ -1348,7 +1355,151 @@ const drawShrimpGrazingFeedback = (): {
   return { group, mouth, flecks };
 };
 
+const emptyAnimalPart = (): Container => new Container();
+
+const drawRicefishBody = (): Container => {
+  const group = new Container();
+  const body = new Graphics()
+    .moveTo(-20, 0)
+    .bezierCurveTo(-12, -8.5, 5, -9.5, 20, -3)
+    .quadraticCurveTo(25, 0, 20, 3.5)
+    .bezierCurveTo(5, 9, -12, 7.5, -20, 0)
+    .closePath()
+    .fill({ color: 0xd8d2ad, alpha: 0.92 })
+    .stroke({ color: 0x303c3a, width: 1.85, alpha: 0.96, join: 'round' });
+  const back = new Graphics()
+    .moveTo(-15, -3.2)
+    .bezierCurveTo(-4, -7.2, 10, -6.6, 18, -2.4)
+    .stroke({ color: 0x8e956f, width: 2.2, alpha: 0.62, cap: 'round' })
+    .moveTo(-14, 2.6)
+    .bezierCurveTo(-3, 4.6, 9, 4, 18, 1.4)
+    .stroke({ color: 0xf2e8bd, width: 1.7, alpha: 0.8, cap: 'round' });
+  const lateral = new Graphics()
+    .moveTo(-14, 0.4)
+    .bezierCurveTo(-2, 1.5, 10, 1.1, 19, -0.2)
+    .stroke({ color: 0xa88b48, width: 1.2, alpha: 0.72, cap: 'round' });
+  const eye = new Graphics()
+    .circle(16.5, -2.9, 2.45)
+    .fill({ color: 0xf8f2d8, alpha: 1 })
+    .stroke({ color: 0x303c3a, width: 1.05, alpha: 1 })
+    .circle(17.1, -2.9, 1.1)
+    .fill({ color: 0x26312f, alpha: 1 });
+  const mouth = new Graphics()
+    .moveTo(20.2, 0.2)
+    .quadraticCurveTo(23.4, 1.2, 25, 0.2)
+    .stroke({ color: 0x303c3a, width: 1.05, alpha: 0.9, cap: 'round' });
+  group.addChild(body, back, lateral, eye, mouth);
+  return group;
+};
+
+const drawRicefishTail = (): Container => {
+  const group = new Container();
+  const tail = new Graphics()
+    .moveTo(0, 0)
+    .quadraticCurveTo(-11, -11, -16, -8)
+    .quadraticCurveTo(-13, 0, -16, 8)
+    .quadraticCurveTo(-9, 11, 0, 0)
+    .closePath()
+    .fill({ color: 0xc8c49e, alpha: 0.72 })
+    .stroke({ color: 0x303c3a, width: 1.55, alpha: 0.9, join: 'round' })
+    .moveTo(-2, 0)
+    .lineTo(-13, -6)
+    .moveTo(-2, 0)
+    .lineTo(-13, 6)
+    .stroke({ color: 0x8b8c70, width: 0.75, alpha: 0.62 });
+  group.addChild(tail);
+  return group;
+};
+
+const drawRicefishFins = (): Container => {
+  const group = new Container();
+  const fins = new Graphics()
+    .moveTo(-2, -6.5)
+    .quadraticCurveTo(-7, -13, 2, -8)
+    .closePath()
+    .fill({ color: 0xc9c8a8, alpha: 0.5 })
+    .stroke({ color: 0x3c4743, width: 1, alpha: 0.66 })
+    .moveTo(3, 5.3)
+    .quadraticCurveTo(-1, 12, 8, 6)
+    .closePath()
+    .fill({ color: 0xc9c8a8, alpha: 0.48 })
+    .stroke({ color: 0x3c4743, width: 1, alpha: 0.64 })
+    .moveTo(8, 1.2)
+    .quadraticCurveTo(3, 8.5, 13, 4.2)
+    .closePath()
+    .fill({ color: 0xe2d9ae, alpha: 0.54 })
+    .stroke({ color: 0x3c4743, width: 0.9, alpha: 0.62 });
+  group.addChild(fins);
+  return group;
+};
+
+const createRicefishDisplay = (
+  id: string,
+  target: AnimalRenderTarget,
+): AnimalDisplay => {
+  const container = new Container();
+  const selection = new Graphics()
+    .ellipse(0, 0, target.lifeStage === 'egg' ? 9 : 30, target.lifeStage === 'egg' ? 9 : 13)
+    .stroke({ color: 0xf8edc7, width: 5.5, alpha: 0.7 })
+    .stroke({ color: 0xa88b48, width: 2, alpha: 0.94 });
+  const placement = new Graphics()
+    .ellipse(0, 0, 31, 14)
+    .stroke({ color: 0xffffff, width: 3, alpha: 0.9 });
+  const art = new Container();
+  const head = target.lifeStage === 'egg' ? new Container() : drawRicefishBody();
+  const tail = target.lifeStage === 'egg' ? new Container() : drawRicefishTail();
+  const fins = target.lifeStage === 'egg' ? new Container() : drawRicefishFins();
+  if (target.lifeStage === 'egg') {
+    const egg = new Graphics()
+      .circle(0, 0, 5.2)
+      .fill({ color: 0xf0e7b8, alpha: 0.5 })
+      .stroke({ color: 0x8d845d, width: 1.2, alpha: 0.9 })
+      .circle(0.9, 0.4, 2)
+      .fill({ color: 0x8d8a64, alpha: 0.72 })
+      .circle(1.8, -0.2, 0.55)
+      .fill({ color: 0x26312f, alpha: 0.9 });
+    head.addChild(egg);
+  } else {
+    tail.position.set(-18.5, 0);
+  }
+  art.addChild(tail, fins, head);
+  container.addChild(selection, placement, art);
+  const empty = emptyAnimalPart();
+  const eggs = new Graphics();
+  const feedback = emptyAnimalPart();
+  return {
+    speciesId: 'japanese-ricefish',
+    lifeStage: target.lifeStage,
+    container,
+    selection,
+    placement,
+    art,
+    head,
+    abdomen: [],
+    tail,
+    legs: fins,
+    antennae: empty,
+    eggs,
+    grazingFeedback: feedback,
+    grazingMouth: new Graphics(),
+    grazingFlecks: [],
+    target,
+    renderX: target.x,
+    renderY: target.y,
+    renderFacing: target.facing,
+    renderPoseAngle: target.poseAngle,
+    renderBodyLength: target.bodyLength,
+    renderMotion: { ...ANIMAL_MOTION_PROFILES[target.behavior] },
+    grazingWeight: 0,
+    phase: 0,
+    phaseOffset: animalHash(id) * Math.PI * 2,
+  };
+};
+
 const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisplay => {
+  if (target.speciesId === 'japanese-ricefish') {
+    return createRicefishDisplay(id, target);
+  }
   const container = new Container();
   const selection = new Graphics()
     .ellipse(0, 0, 26, 12)
@@ -1377,6 +1528,8 @@ const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisp
   container.addChild(selection, placement, art);
   const phaseOffset = animalHash(id) * Math.PI * 2;
   return {
+    speciesId: 'cherry-shrimp',
+    lifeStage: target.lifeStage,
     container,
     selection,
     placement,
@@ -1406,6 +1559,34 @@ const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisp
 const createAnimalCarcassDisplay = (
   target: AnimalCarcassSnapshot,
 ): AnimalCarcassDisplay => {
+  if (target.speciesId === 'japanese-ricefish') {
+    const container = new Container();
+    const art = new Container();
+    const head = drawRicefishBody();
+    const tail = drawRicefishTail();
+    const fins = drawRicefishFins();
+    const empty = emptyAnimalPart();
+    tail.position.set(-18.5, 0);
+    art.addChild(tail, fins, head);
+    art.tint = 0xbcbba8;
+    container.addChild(art);
+    return {
+      speciesId: target.speciesId,
+      container,
+      art,
+      head,
+      abdomen: [],
+      tail,
+      legs: fins,
+      antennae: empty,
+      target,
+      renderX: target.x,
+      renderY: target.y,
+      renderFacing: target.facing,
+      renderBodyLength: target.bodyLength,
+      phaseOffset: animalHash(target.id) * Math.PI * 2,
+    };
+  }
   const container = new Container();
   const art = new Container();
   const head = drawShrimpHead();
@@ -1433,6 +1614,7 @@ const createAnimalCarcassDisplay = (
   art.tint = 0xc3c3ad;
   container.addChild(art);
   return {
+    speciesId: target.speciesId,
     container,
     art,
     head,
@@ -1478,6 +1660,8 @@ const animalTarget = (
   selected: boolean,
   interpolatedPosition: boolean,
 ): AnimalRenderTarget => ({
+  speciesId: animal.speciesId,
+  lifeStage: animal.lifeStage,
   x: animal.x,
   y: animal.y,
   facing: animal.facing,
@@ -1526,12 +1710,25 @@ const syncAnimals = (
   for (const animal of animals) {
     const target = animalTarget(animal, selectedIds.has(animal.id), interpolatedPosition);
     let display = displays.get(animal.id);
+    if (
+      display &&
+      (
+        display.speciesId !== animal.speciesId ||
+        (display.lifeStage === 'egg') !== (animal.lifeStage === 'egg')
+      )
+    ) {
+      layer.removeChild(display.container);
+      display.container.destroy({ children: true });
+      displays.delete(animal.id);
+      display = undefined;
+    }
     if (!display) {
       display = createAnimalDisplay(animal.id, target);
       displays.set(animal.id, display);
       layer.addChild(display.container);
     }
     display.target = target;
+    display.lifeStage = animal.lifeStage;
     display.container.visible = true;
   }
 
@@ -1539,11 +1736,17 @@ const syncAnimals = (
     let display = displays.get(heldId);
     const previous = display?.target;
     const target: AnimalRenderTarget = {
+      speciesId: held.animalSpeciesId ?? previous?.speciesId ?? 'cherry-shrimp',
+      lifeStage: previous?.lifeStage ?? 'adult',
       x: held.x,
       y: held.y,
       facing: previous?.facing ?? 1,
       poseAngle: 0,
-      bodyLength: previous?.bodyLength ?? SHRIMP_ADULT_LENGTH,
+      bodyLength: previous?.bodyLength ?? (
+        held.animalSpeciesId === 'japanese-ricefish'
+          ? RICEFISH_ADULT_LENGTH
+          : SHRIMP_ADULT_LENGTH
+      ),
       behavior: 'held',
       health: previous?.health ?? 1,
       selected: false,
@@ -1572,6 +1775,8 @@ const applyAnimalMotion = (
     const display = displays.get(animal.id);
     if (!display) continue;
     const target = display.target;
+    target.speciesId = animal.speciesId;
+    target.lifeStage = animal.lifeStage;
     target.x = animal.x;
     target.y = animal.y;
     target.facing = animal.facing;
@@ -1604,6 +1809,10 @@ const ANIMAL_MOTION_PROFILES: Record<AnimalSnapshot['behavior'], AnimalMotionPro
   resting: { rate: 1.6, bend: 0.018, bob: 0.12, head: 0.018, legs: 0.018 },
   starving: { rate: 1.05, bend: 0.012, bob: 0.08, head: 0.012, legs: 0.01 },
   held: { rate: 2.3, bend: 0.026, bob: 0.28, head: 0.025, legs: 0.03 },
+  hunting: { rate: 9.4, bend: 0.105, bob: 0.25, head: 0.02, legs: 0.02 },
+  courting: { rate: 6.8, bend: 0.07, bob: 0.35, head: 0.025, legs: 0.02 },
+  'carrying-eggs': { rate: 4.4, bend: 0.04, bob: 0.25, head: 0.02, legs: 0.02 },
+  incubating: { rate: 0, bend: 0, bob: 0, head: 0, legs: 0 },
 };
 
 const animateAnimals = (
@@ -1658,6 +1867,35 @@ const animateAnimals = (
     display.art.alpha = target.held
       ? 0.58
       : Math.max(0.56, 0.74 + target.health * 0.26);
+
+    if (display.speciesId === 'japanese-ricefish') {
+      const isEgg = display.lifeStage === 'egg';
+      const fishScale = isEgg
+        ? 1
+        : Math.max(0.2, display.renderBodyLength / RICEFISH_DRAW_LENGTH);
+      display.art.scale.set(isEgg ? 1 : display.renderFacing * fishScale, fishScale);
+      display.art.rotation = isEgg
+        ? 0
+        : display.renderPoseAngle * facingSign;
+      display.art.position.set(0, isEgg ? Math.sin(phase * 0.45) * 0.25 : bob * 0.72);
+      display.selection.visible = target.selected && !target.held;
+      display.selection.rotation = isEgg ? 0 : display.renderPoseAngle * facingSign;
+      display.selection.scale.set(isEgg ? 0.8 : Math.max(0.62, fishScale * 1.08));
+      display.placement.visible = target.held;
+      display.placement.rotation = isEgg ? 0 : display.renderPoseAngle * facingSign;
+      display.placement.scale.set(isEgg ? 0.75 : Math.max(0.62, fishScale * 1.08));
+      display.placement.tint = target.placementValid ? 0xf0c85e : 0xd7605b;
+      if (!isEgg) {
+        const tailWave = Math.sin(phase * (target.behavior === 'hunting' ? 1.35 : 1));
+        display.tail.rotation = tailWave * motion.bend * 2.2;
+        display.legs.rotation = -tailWave * motion.bend * 0.42;
+        display.head.rotation = Math.sin(phase * 0.34) * motion.head * 0.35;
+      } else {
+        const developmentPulse = 0.98 + Math.sin(phase * 0.28) * 0.025;
+        display.head.scale.set(developmentPulse);
+      }
+      continue;
+    }
 
     const selectionScale = Math.max(0.58, display.renderBodyLength / SHRIMP_ADULT_LENGTH);
     display.selection.visible = target.selected && !target.held;
@@ -1742,6 +1980,16 @@ const animateAnimalCarcasses = (
     display.art.scale.set(facingSign * artScale, artScale * 0.9);
     display.art.rotation = facingSign * 0.24 + settlingRock;
     display.art.alpha = Math.max(0, fade) * 0.86;
+
+    if (display.speciesId === 'japanese-ricefish') {
+      const fishScale = Math.max(0.2, display.renderBodyLength / RICEFISH_DRAW_LENGTH);
+      display.art.scale.set(facingSign * fishScale, fishScale * 0.92);
+      display.art.rotation = facingSign * (0.42 + settle * 0.42) + settlingRock;
+      display.tail.rotation = Math.sin(age * 1.4 + display.phaseOffset) *
+        0.06 * Math.exp(-age * 0.8);
+      display.legs.alpha = 0.48;
+      continue;
+    }
 
     // A fixed comma-shaped curl reads as limp and settled, and deliberately
     // avoids the rhythmic joint movement used by living shrimp.

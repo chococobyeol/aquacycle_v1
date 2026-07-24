@@ -28,6 +28,16 @@ const placeShrimp = (world: SimulationWorld, point: Vec2): void => {
   world.handle({ type: 'drop-held', point });
 };
 
+const placeStructure = (
+  world: SimulationWorld,
+  definitionId: 'flat-stone' | 'tall-stone',
+  point: Vec2,
+): void => {
+  world.handle({ type: 'pick-structure', definitionId, point });
+  world.handle({ type: 'drop-held', point });
+  for (let index = 0; index < 720; index += 1) world.tick(1 / 60);
+};
+
 const nearestUnusedCell = (
   cells: SurfaceCellSnapshot[],
   targetX: number,
@@ -47,15 +57,14 @@ const nearestUnusedCell = (
 };
 
 const populateMissionFour = (world: SimulationWorld): void => {
-  const substrate = world
-    .snapshot()
-    .cells
-    .filter((cell) => cell.surfaceKind === 'substrate');
+  placeStructure(world, 'flat-stone', { x: 480, y: 420 });
+  placeStructure(world, 'tall-stone', { x: 860, y: 320 });
+  const surfaces = world.snapshot().cells;
   const used = new Set<string>();
 
   for (const targetX of [260, 470, 730, 940]) {
-    placeSeed(world, 'nitzschia', nearestUnusedCell(substrate, targetX, 38, used));
-    placeSeed(world, 'oedogonium', nearestUnusedCell(substrate, targetX + 24, 68, used));
+    placeSeed(world, 'nitzschia', nearestUnusedCell(surfaces, targetX, 38, used));
+    placeSeed(world, 'oedogonium', nearestUnusedCell(surfaces, targetX + 24, 68, used));
   }
   for (const point of [
     { x: 290, y: 600 },
@@ -165,6 +174,9 @@ describe('mission 4 long-run performance contract', () => {
     let snapshot = baseline;
     let realFrames = 0;
     let publishedSnapshots = 0;
+    let peakShrimpPopulation = baseline.animalPopulation['cherry-shrimp'].total;
+    let peakProducerBiomass =
+      baseline.totalBiomass.oedogonium + baseline.totalBiomass.nitzschia;
 
     while (snapshot.elapsedSeconds < LONG_RUN_SECONDS) {
       const shouldPublish = world.tick(REAL_FRAME_SECONDS);
@@ -173,6 +185,14 @@ describe('mission 4 long-run performance contract', () => {
 
       snapshot = world.snapshot();
       publishedSnapshots += 1;
+      peakShrimpPopulation = Math.max(
+        peakShrimpPopulation,
+        snapshot.animalPopulation['cherry-shrimp'].total,
+      );
+      peakProducerBiomass = Math.max(
+        peakProducerBiomass,
+        snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia,
+      );
       assertBoundedMissionFourSnapshot(snapshot, baselineArrayEntries);
       expect(stableWorldArrayEntryCount(world)).toBeLessThanOrEqual(
         baselineWorldArrayEntries + MAX_STABLE_ARRAY_ENTRY_DRIFT,
@@ -197,6 +217,15 @@ describe('mission 4 long-run performance contract', () => {
     );
     expect(publishedSnapshots).toBeLessThanOrEqual(realFrames);
     expect(snapshot.elapsedSeconds).toBeGreaterThanOrEqual(LONG_RUN_SECONDS);
+    // Mission 4 is a consumer introduction, not an unlimited hatchery. Food
+    // can support reproduction, but the finite simplified nutrient reserve
+    // must prevent the former 70–100 animal boom within roughly half an hour.
+    expect(snapshot.animalPopulationEventTotals.births).toBeGreaterThan(0);
+    expect(snapshot.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
+    expect(peakShrimpPopulation).toBeLessThanOrEqual(30);
+    expect(peakProducerBiomass).toBeLessThanOrEqual(65);
+    expect(snapshot.waterTemperature).toBeGreaterThan(23);
+    expect(snapshot.waterTemperature).toBeLessThan(25);
     assertBoundedMissionFourSnapshot(snapshot, baselineArrayEntries);
   }, 30_000);
 
