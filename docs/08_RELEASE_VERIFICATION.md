@@ -1,4 +1,4 @@
-# 배포본 검증 계약과 실행 기록
+# 08. 배포 검증 기록
 
 > 갱신일: 2026-07-24
 > 대상: 현재 `main` 작업본의 미션 1~6, 실험실, 생태·물질 순환 및 관찰 기능
@@ -74,8 +74,8 @@ npm run verify:release
 함께 확인했다.
 
 세부 과학적·수치적 근거는
-[생태·수질·열수송 모델](./SIMULATION_MODEL_AND_REFERENCES.md), 장주기 물질 장부
-수식과 기준은 [화학량론 장부 구현 기록](./STOICHIOMETRIC_LEDGER_IMPLEMENTATION.md)을
+[생태·수질·열수송 모델](./04_SIMULATION_MODEL.md), 장주기 물질 장부
+수식과 기준은 [화학량론 장부 구현 기록](./06_STOICHIOMETRIC_LEDGER.md)을
 따른다.
 
 ## 5. 2026-07-24 macOS 수동 화면 검증
