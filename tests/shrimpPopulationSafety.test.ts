@@ -27,6 +27,8 @@ interface ReproductionAnimalState {
   reproductiveBiomass: number;
   secondsSinceFood: number;
   reproductionCooldown: number;
+  ovarianProgress: number;
+  reproductiveCycleIndex: number;
   gestationRemaining: number | null;
   matingAccumulator: number;
 }
@@ -81,6 +83,8 @@ const configureReadyPair = (
     animal.recentIntake = nourished ? 1 : 0;
     animal.secondsSinceFood = nourished ? 0 : 30;
     animal.reproductionCooldown = 0;
+    animal.ovarianProgress = nourished ? 1 : 0;
+    animal.reproductiveCycleIndex = 0;
     animal.gestationRemaining = null;
     animal.matingAccumulator = 0;
   }
@@ -227,12 +231,12 @@ describe('shrimp population safety contract', () => {
     expect(nourishedWorld.snapshot().animalPopulation[SHRIMP].total).toBeGreaterThan(2);
   });
 
-  it('does not allocate a new brood when recent assimilation falls below maintenance', () => {
+  it('does not allocate a new brood below the protected somatic reserve', () => {
     const world = new SimulationWorld('laboratory');
     const internals = configureReadyPair(world, true);
     const female = internals.animals.find((animal) => animal.sex === 'female');
     if (!female) throw new Error('surplus fixture needs a female shrimp');
-    female.storedBiomass = 0.5;
+    female.storedBiomass = 0.16;
     female.reproductiveBiomass = 0;
     female.recentIntake = 0;
 
@@ -264,18 +268,22 @@ describe('shrimp population safety contract', () => {
     expect(female.gestationRemaining).toBeLessThan(20);
   });
 
-  it('allocates only the recent assimilation surplus to the brood reserve', () => {
+  it('allocates a limited conserved somatic surplus to the brood reserve', () => {
     const world = new SimulationWorld('laboratory');
     const internals = configureReadyPair(world, true);
     const female = internals.animals.find((animal) => animal.sex === 'female');
     if (!female) throw new Error('allocation fixture needs a female shrimp');
     female.storedBiomass = 0.5;
     female.reproductiveBiomass = 0;
+    const totalBefore =
+      female.storedBiomass + female.reproductiveBiomass;
 
     internals.stepAnimalEcology(1);
 
     expect(female.reproductiveBiomass).toBeGreaterThan(0);
     expect(female.reproductiveBiomass).toBeLessThan(0.05);
+    expect(female.storedBiomass + female.reproductiveBiomass)
+      .toBeLessThanOrEqual(totalBefore);
   });
 
   it('provisions the next conserved brood during cooldown without mating early', () => {
@@ -285,7 +293,7 @@ describe('shrimp population safety contract', () => {
     if (!female) throw new Error('cooldown fixture needs a female shrimp');
     female.storedBiomass = 0.5;
     female.reproductiveBiomass = 0;
-    female.reproductionCooldown = 120;
+    female.ovarianProgress = 0.5;
 
     internals.stepAnimalEcology(1);
 

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import {
+  SHRIMP_TECHNICAL_POPULATION_LIMIT,
+  SimulationWorld,
+} from '../src/simulation/SimulationWorld';
 import type { SpeciesId, SurfaceCellSnapshot, Vec2 } from '../src/simulation/types';
 import {
   ECOLOGY_HISTORY_MAX_POINTS,
@@ -8,7 +11,8 @@ import {
 
 type WorldSnapshot = ReturnType<SimulationWorld['snapshot']>;
 
-const LONG_RUN_SECONDS = 1_800;
+const LONG_RUN_SECONDS = 3_600;
+const TAIL_START_SECONDS = 1_800;
 const REAL_FRAME_SECONDS = 0.1;
 const FULL_SNAPSHOT_REAL_SECONDS = 1;
 const MAX_STABLE_ARRAY_ENTRY_DRIFT = 32;
@@ -161,13 +165,14 @@ const assertBoundedMissionFourSnapshot = (
 };
 
 describe('mission 4 long-run performance contract', () => {
-  it('runs 30 simulated minutes at 64x without accumulating snapshot state', () => {
+  it('runs 60 simulated minutes at 64x with lineage renewal and bounded state', () => {
     const world = new SimulationWorld('mission-4');
     populateMissionFour(world);
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 64 });
 
     const baseline = world.snapshot();
+    const founderIds = new Set(baseline.animals.map((animal) => animal.id));
     expect(baseline.speed).toBe(64);
     const baselineArrayEntries = stableSnapshotArrayEntryCount(baseline);
     const baselineWorldArrayEntries = stableWorldArrayEntryCount(world);
@@ -177,6 +182,7 @@ describe('mission 4 long-run performance contract', () => {
     let peakShrimpPopulation = baseline.animalPopulation['cherry-shrimp'].total;
     let peakProducerBiomass =
       baseline.totalBiomass.oedogonium + baseline.totalBiomass.nitzschia;
+    let minimumTailShrimpPopulation = Number.POSITIVE_INFINITY;
 
     while (snapshot.elapsedSeconds < LONG_RUN_SECONDS) {
       const shouldPublish = world.tick(REAL_FRAME_SECONDS);
@@ -193,6 +199,12 @@ describe('mission 4 long-run performance contract', () => {
         peakProducerBiomass,
         snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia,
       );
+      if (snapshot.elapsedSeconds >= TAIL_START_SECONDS) {
+        minimumTailShrimpPopulation = Math.min(
+          minimumTailShrimpPopulation,
+          snapshot.animalPopulation['cherry-shrimp'].total,
+        );
+      }
       assertBoundedMissionFourSnapshot(snapshot, baselineArrayEntries);
       expect(stableWorldArrayEntryCount(world)).toBeLessThanOrEqual(
         baselineWorldArrayEntries + MAX_STABLE_ARRAY_ENTRY_DRIFT,
@@ -217,17 +229,27 @@ describe('mission 4 long-run performance contract', () => {
     );
     expect(publishedSnapshots).toBeLessThanOrEqual(realFrames);
     expect(snapshot.elapsedSeconds).toBeGreaterThanOrEqual(LONG_RUN_SECONDS);
-    // Mission 4 is a consumer introduction, not an unlimited hatchery. Food
-    // can support reproduction, but the finite simplified nutrient reserve
-    // must prevent the former 70–100 animal boom within roughly half an hour.
+    // The mission's 120-second UI target is irrelevant here. The long-run
+    // contract requires population renewal after founder lifespans overlap.
+    const tailEvents = snapshot.animalPopulationEvents.filter(
+      (event) =>
+        event.speciesId === 'cherry-shrimp' &&
+        event.elapsedSeconds >= TAIL_START_SECONDS,
+    );
     expect(snapshot.animalPopulationEventTotals.births).toBeGreaterThan(0);
-    expect(snapshot.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
-    expect(peakShrimpPopulation).toBeLessThanOrEqual(30);
+    expect(minimumTailShrimpPopulation).toBeGreaterThan(0);
+    expect(tailEvents.some((event) => event.kind === 'birth')).toBe(true);
+    expect(tailEvents.some((event) => event.kind === 'matured')).toBe(true);
+    expect(snapshot.animals.some((animal) => !founderIds.has(animal.id)))
+      .toBe(true);
+    expect(peakShrimpPopulation).toBeLessThan(
+      SHRIMP_TECHNICAL_POPULATION_LIMIT,
+    );
     expect(peakProducerBiomass).toBeLessThanOrEqual(65);
     expect(snapshot.waterTemperature).toBeGreaterThan(23);
     expect(snapshot.waterTemperature).toBeLessThan(25);
     assertBoundedMissionFourSnapshot(snapshot, baselineArrayEntries);
-  }, 30_000);
+  }, 90_000);
 
   it('keeps the renderer ecology trace explicitly bounded', () => {
     // Two-second samples need 1,801 entries for a complete 60-minute view.

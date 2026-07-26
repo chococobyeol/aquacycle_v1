@@ -514,6 +514,11 @@ export const PLANKTON_ECOLOGY_RULES = {
       DAPHNIA_BODY_BUDGET.adultStructuralBiomass *
       DAPHNIA_BODY_BUDGET.maturationStructuralFraction,
     maturationSeconds: 240,
+    // Juveniles mature after a food-funded size threshold and an individual
+    // number of molts. The reference duration only compresses the molt clock;
+    // it is no longer a second hard maturity gate shared by a whole cohort.
+    maturationInstarsMinimum: 4,
+    maturationInstarsMaximum: 6,
     // Daphnia turn over much faster than Neocaridina.  The simulation
     // compresses both life histories, but must preserve that ordering so a
     // population is maintained by successive broods rather than by immortal
@@ -531,10 +536,13 @@ export const PLANKTON_ECOLOGY_RULES = {
     // tenth of a lifespan. The compressed clock preserves those ratios:
     // maturation is allowed at 25% of final structural mass, just above the
     // adult viability floor. A newly mature
-    // female can provision her first brood immediately, and later broods use
-    // 40 seconds of development plus a 50-second recovery interval.
-    broodDevelopmentSeconds: 40,
+    // female can provision her first brood immediately. Embryos complete
+    // development within an ordinary adult molt cycle and are released at the
+    // following molt instead of on an independent hatching timer.
+    broodDevelopmentSeconds: 170,
     broodCooldownSeconds: 220,
+    adultMoltCycleMinimumFactor: 0.82,
+    adultMoltCycleMaximumFactor: 1.18,
     minimumBroodSize: 1,
     // One rendered neonate is released per compressed brood. Real D. magna
     // clutches contain more offspring, but the game's visible individual is a
@@ -720,11 +728,6 @@ export const SHRIMP_ECOLOGY_RULES = {
   reproductionEnergy: 0.34,
   maleReproductionEnergy: 0.34,
   gestationEnergy: 0.30,
-  // Only part of the recent assimilated surplus is routed to eggs. The rest
-  // remains available to refill somatic reserve (or returns to detritus after
-  // the finite reserve fills), preventing one productive interval from
-  // synchronising a whole cohort without imposing a carrying-capacity cap.
-  reproductionSurplusAllocationFraction: 0.5,
   // Supplied young-adult females already carry a partly developed ovary, just
   // as supplied ricefish carry pre-allocated egg matter. It is conserved
   // biomass, not a free brood: the remainder still has to come from positive
@@ -732,12 +735,29 @@ export const SHRIMP_ECOLOGY_RULES = {
   // conserved matter without requiring both animals' short feeding windows to
   // overlap.
   suppliedFemaleBroodReserveFraction: 0.75,
-  maturationSeconds: 180,
-  // Supplied adults are not a synchronized laboratory cohort. Spreading their
-  // first reproductive opportunity prevents every female from brooding at
-  // once while leaving later reproduction governed by food and life history.
-  suppliedAdultReproductionCooldownMin: 100,
-  suppliedAdultReproductionCooldownMax: 400,
+  // Maturity is still paid by conserved somatic growth. This range is an
+  // individual target, not a random delay applied after the animal is grown.
+  // Poor feeding can therefore postpone maturity beyond the target, while
+  // animals born together do not all cross one shared 180-second edge.
+  maturationMinimumSeconds: 150,
+  maturationMaximumSeconds: 240,
+  // Ovarian readiness replaces the fixed post-brood countdown. It advances
+  // continuously from temperature and individual condition while egg matter
+  // is funded independently from conserved somatic reserve.
+  ovarianCycleMinimumSeconds: 260,
+  ovarianCycleMaximumSeconds: 500,
+  ovarianProgressEnergyFloor: 0.30,
+  // The nominal ovarian-cycle range is the realised rate for a healthy,
+  // feeding adult. The former 1.0-energy denominator made an ordinary
+  // 0.45–0.55 adult take three to five times the documented compressed cycle,
+  // so a healthy daughter could die of old age before her first clutch.
+  ovarianFullSpeedEnergy: 0.50,
+  ovarianAllocationPerSecond: 0.0014,
+  suppliedOvarianProgressMinimum: 0.18,
+  suppliedOvarianProgressMaximum: 0.78,
+  newAdultOvarianProgressMaximum: 0.14,
+  gestationMinimumSeconds: 68,
+  gestationMaximumSeconds: 82,
   // The visual population represents a compressed colony. Every completed
   // brood therefore contains at least one individual of each sex (IDs are
   // assigned alternately), avoiding a one-offspring demographic dead end.

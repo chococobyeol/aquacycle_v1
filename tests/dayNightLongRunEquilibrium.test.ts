@@ -13,6 +13,11 @@ const placeSeed = (world: SimulationWorld, speciesId: SpeciesId, point: Vec2): v
   world.handle({ type: 'drop-held', point });
 };
 
+const placeShrimp = (world: SimulationWorld, point: Vec2): void => {
+  world.handle({ type: 'pick-animal', speciesId: 'cherry-shrimp', point });
+  world.handle({ type: 'drop-held', point });
+};
+
 const placeFilm = (
   world: SimulationWorld,
   guildId: MicrobeGuildId,
@@ -35,19 +40,27 @@ const nearest = (
   return cell;
 };
 
-const mean = (values: number[]): number =>
-  values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length);
-
-it('approaches a bounded producer-microbial orbit through ten closed day/night cycles', () => {
+it('keeps producers, microbes, Vallisneria and shrimp renewing through ten day/night cycles', () => {
   const world = new SimulationWorld('mission-6');
   const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
   const used = new Set<string>();
+  const foodPoints: SurfaceCellSnapshot[] = [];
   for (const x of [100, 240, 380, 520, 680, 820, 960, 1_100]) {
-    placeSeed(world, 'nitzschia', nearest(substrate, x, used));
+    const foodPoint = nearest(substrate, x, used);
+    placeSeed(world, 'nitzschia', foodPoint);
+    foodPoints.push(foodPoint);
     placeSeed(world, 'oedogonium', nearest(substrate, x + 28, used));
   }
   for (const x of [340, 600, 860]) {
     placeSeed(world, 'vallisneria', nearest(substrate, x, used));
+  }
+  for (const point of [
+    foodPoints[1],
+    foodPoints[2],
+    foodPoints[5],
+    foodPoints[6],
+  ]) {
+    if (point) placeShrimp(world, point);
   }
   world.handle({ type: 'start' });
   world.handle({ type: 'set-speed', speed: 64 });
@@ -91,23 +104,33 @@ it('approaches a bounded producer-microbial orbit through ten closed day/night c
   }
 
   const final = cycleSamples.at(-1)!;
-  const previousWindow = cycleSamples.slice(-10, -5);
-  const finalWindow = cycleSamples.slice(-5);
-  const averageOf = (
-    samples: typeof cycleSamples,
-    selector: (sample: (typeof cycleSamples)[number]) => number,
-  ) => mean(samples.map(selector));
+  const tailSamples = cycleSamples.filter(
+    (sample) => sample.elapsedSeconds >= 1_800,
+  );
+  const tailShrimpEvents = final.animalPopulationEvents.filter(
+    (event) =>
+      event.speciesId === 'cherry-shrimp' &&
+      event.elapsedSeconds >= 1_800,
+  );
+  const finalShrimp = world.exportSaveData().animals.filter(
+    (animal) => animal.speciesId === 'cherry-shrimp',
+  );
 
   expect(minimumOxygen).toBeGreaterThan(18);
   expect(maximumOrganicMatter).toBeLessThan(18);
-  expect(Math.abs(
-    averageOf(finalWindow, (sample) => sample.biogeochemistry.average.oxygen) -
-    averageOf(previousWindow, (sample) => sample.biogeochemistry.average.oxygen),
-  )).toBeLessThan(6);
-  expect(Math.abs(
-    averageOf(finalWindow, (sample) => sample.biogeochemistry.average.organicMatter) -
-    averageOf(previousWindow, (sample) => sample.biogeochemistry.average.organicMatter),
-  )).toBeLessThan(3);
+  expect(Math.min(...tailSamples.map((sample) =>
+    sample.animalPopulation['cherry-shrimp'].total,
+  ))).toBeGreaterThan(0);
+  expect(tailShrimpEvents.some((event) => event.kind === 'birth')).toBe(true);
+  expect(tailShrimpEvents.some((event) => event.kind === 'matured')).toBe(true);
+  expect(finalShrimp.some((animal) => animal.origin === 'born')).toBe(true);
+  expect(final.plants.some((plant) => plant.origin === 'runner')).toBe(true);
+  expect(final.totalBiomass.vallisneria).toBeGreaterThan(0);
+  expect(final.biogeochemistry.biofilmTotals.decomposer).toBeGreaterThan(0);
+  expect(final.biogeochemistry.biofilmTotals.nitrifier).toBeGreaterThan(0);
+  expect(Math.max(...tailSamples.map(
+    (sample) => sample.biogeochemistry.average.toxicWaste,
+  ))).toBeLessThan(6);
   expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio))
     .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio))

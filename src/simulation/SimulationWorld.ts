@@ -241,6 +241,13 @@ interface AnimalState {
   growthProgress: number;
   reproductionCooldown: number;
   gestationRemaining: number | null;
+  maturationTargetSeconds?: number;
+  maturationTargetInstars?: number;
+  ovarianProgress?: number;
+  reproductiveCycleIndex?: number;
+  moltProgress?: number;
+  moltCycleSeconds?: number;
+  moltCount?: number;
   /** Daphnia clutch size fixed when embryo development begins. */
   gestatingBroodSize?: number | null;
   matingAccumulator: number;
@@ -384,10 +391,9 @@ const BIOFILM_INOCULUM_BIOMASS = 0.18;
 const PICK_SEED_DISTANCE = 18;
 const SHRIMP_ADULT_LENGTH = 36;
 const SHRIMP_JUVENILE_LENGTH = 14;
-const SHRIMP_MATURITY_SECONDS = SHRIMP_ECOLOGY_RULES.maturationSeconds;
-// Two real-world months are compressed to the 180-second maturation period.
-// The configured 15–30 minute range represents broad individual variation and
-// prevents cohort-wide deaths while keeping replay results reproducible.
+// Real juvenile development is compressed into an individual 150–240-second
+// target. Conserved structural growth remains a second requirement, so this
+// range distributes cohorts without turning age into free maturation.
 const SHRIMP_MIN_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds;
 const SHRIMP_MAX_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds;
 const SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS =
@@ -446,10 +452,6 @@ const SHRIMP_GRAZING_PROFIT_SAMPLE_SECONDS = 3;
 // graze -> roam -> forage state transition rather than a per-cell memory model.
 const SHRIMP_POST_GRAZE_ROAM_MIN_SECONDS = 2.5;
 const SHRIMP_POST_GRAZE_ROAM_VARIANCE_SECONDS = 1.5;
-// `recentIntake` is an exponentially decaying eight-second integral of real
-// consumed biomass. Converting that window to retained biomass per second lets
-// reproduction compare the same material units as maintenance respiration.
-const SHRIMP_RECENT_INTAKE_WINDOW_SECONDS = 8;
 // In a healthy tank adults settle near 0.5 energy. Reproduction is therefore
 // gated by current reserve and recent access to food rather than a hidden
 // population-capacity formula.
@@ -468,7 +470,6 @@ const SHRIMP_RESERVE_CONDITION_SHARE = 1 - SHRIMP_STRUCTURE_CONDITION_SHARE;
 const SHRIMP_ENERGY_CAPACITY_PER_STRUCTURAL_BIOMASS =
   WATER_CYCLE_RULES.shrimp.assimilationFraction /
   SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass;
-const SHRIMP_NEW_ADULT_REPRODUCTION_COOLDOWN = 120;
 const SHRIMP_MINIMUM_BROOD_BIOMASS =
   WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
   SHRIMP_ECOLOGY_RULES.minimumClutchSize;
@@ -492,12 +493,6 @@ const SHRIMP_MATING_ENCOUNTER_RADIUS = 300;
 // to food discovery, so sparse adults can meet without gaining a tank radar.
 const SHRIMP_MATING_ATTRACTION_RADIUS = 420;
 const SHRIMP_MATING_SECONDS = 3;
-const SHRIMP_GESTATION_SECONDS = 75;
-// A completed brood does not consume a third of the animal's compressed
-// lifetime. Keeping the interval near the real clutch-to-lifespan proportion
-// lets parent and offspring cohorts overlap without guaranteeing survival or
-// adding a population floor.
-const SHRIMP_POST_BROOD_COOLDOWN = 360;
 const SHRIMP_MALE_POST_MATING_COOLDOWN = 45;
 const SHRIMP_CARCASS_LIFETIME_SECONDS = 55;
 const DAPHNIA_CARCASS_LIFETIME_SECONDS = 140;
@@ -562,6 +557,68 @@ const deterministicStringSeed = (value: string): number => {
     hash = Math.imul(hash, 16777619);
   }
   return hash >>> 0;
+};
+
+const seededRange = (
+  seed: number,
+  minimum: number,
+  maximum: number,
+): number => minimum + deterministicNoise(seed) * (maximum - minimum);
+
+const shrimpMaturationTargetSeconds = (seed: number): number =>
+  seededRange(
+    seed * 0.053 + 17.3,
+    SHRIMP_ECOLOGY_RULES.maturationMinimumSeconds,
+    SHRIMP_ECOLOGY_RULES.maturationMaximumSeconds,
+  );
+
+const shrimpOvarianCycleSeconds = (
+  seed: number,
+  cycleIndex: number,
+): number =>
+  seededRange(
+    seed * 0.071 + cycleIndex * 19.31 + 23.7,
+    SHRIMP_ECOLOGY_RULES.ovarianCycleMinimumSeconds,
+    SHRIMP_ECOLOGY_RULES.ovarianCycleMaximumSeconds,
+  );
+
+const shrimpGestationSeconds = (
+  seed: number,
+  cycleIndex: number,
+): number =>
+  seededRange(
+    seed * 0.083 + cycleIndex * 13.73 + 41.9,
+    SHRIMP_ECOLOGY_RULES.gestationMinimumSeconds,
+    SHRIMP_ECOLOGY_RULES.gestationMaximumSeconds,
+  );
+
+const daphniaMaturationInstarTarget = (seed: number): number =>
+  PLANKTON_ECOLOGY_RULES.daphnia.maturationInstarsMinimum +
+  Math.floor(
+    deterministicNoise(seed * 0.061 + 29.1) * (
+      PLANKTON_ECOLOGY_RULES.daphnia.maturationInstarsMaximum -
+      PLANKTON_ECOLOGY_RULES.daphnia.maturationInstarsMinimum + 1
+    ),
+  );
+
+const daphniaJuvenileMoltCycleSeconds = (
+  seed: number,
+  instarTarget: number,
+): number =>
+  PLANKTON_ECOLOGY_RULES.daphnia.maturationSeconds /
+  Math.max(1, instarTarget) *
+  seededRange(seed * 0.067 + 31.7, 0.88, 1.12);
+
+const daphniaAdultMoltCycleSeconds = (
+  seed: number,
+  moltCount: number,
+): number => {
+  const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+  return rules.broodCooldownSeconds * seededRange(
+    seed * 0.073 + moltCount * 11.17 + 37.1,
+    rules.adultMoltCycleMinimumFactor,
+    rules.adultMoltCycleMaximumFactor,
+  );
 };
 
 const countByDefinition = (
@@ -1336,17 +1393,66 @@ export class SimulationWorld {
           : undefined,
       };
     });
-    this.animals = data.animals.map((animal) => cloneAnimalState({
-      ...animal,
-      reproductiveBiomass: animal.reproductiveBiomass ?? 0,
-      generation: animal.generation ?? 0,
-      parentId: animal.parentId ?? null,
-      targetAnimalId: animal.targetAnimalId ?? null,
-      attachmentCellId: animal.attachmentCellId ?? null,
-      incubationRemaining: animal.incubationRemaining ?? null,
-      recentFood: animal.recentFood ?? null,
-      gestatingBroodSize: animal.gestatingBroodSize ?? null,
-    }));
+    this.animals = data.animals.map((animal) => {
+      const daphniaInstars = animal.maturationTargetInstars ??
+        daphniaMaturationInstarTarget(animal.randomSeed);
+      const daphniaMoltCount = animal.moltCount ?? (
+        animal.speciesId === 'daphnia' && animal.lifeStage === 'adult'
+          ? daphniaInstars
+          : 0
+      );
+      const daphniaMoltSeconds = animal.moltCycleSeconds ?? (
+        animal.speciesId === 'daphnia'
+          ? animal.lifeStage === 'adult'
+            ? daphniaAdultMoltCycleSeconds(
+              animal.randomSeed,
+              daphniaMoltCount,
+            )
+            : daphniaJuvenileMoltCycleSeconds(
+              animal.randomSeed,
+              daphniaInstars,
+            )
+          : 0
+      );
+      const shrimpCycleIndex = animal.reproductiveCycleIndex ?? 0;
+      const shrimpCycleSeconds = shrimpOvarianCycleSeconds(
+        animal.randomSeed,
+        shrimpCycleIndex,
+      );
+      return cloneAnimalState({
+        ...animal,
+        reproductiveBiomass: animal.reproductiveBiomass ?? 0,
+        maturationTargetSeconds: animal.maturationTargetSeconds ?? (
+          animal.speciesId === 'cherry-shrimp'
+            ? shrimpMaturationTargetSeconds(animal.randomSeed)
+            : 0
+        ),
+        maturationTargetInstars: daphniaInstars,
+        ovarianProgress: animal.ovarianProgress ?? (
+          animal.speciesId === 'cherry-shrimp' &&
+          animal.lifeStage === 'adult' &&
+          animal.sex === 'female'
+            ? clamp01(1 - animal.reproductionCooldown / shrimpCycleSeconds)
+            : 0
+        ),
+        reproductiveCycleIndex: shrimpCycleIndex,
+        moltProgress: animal.moltProgress ?? (
+          animal.speciesId === 'daphnia'
+            ? clamp01(1 - animal.reproductionCooldown /
+              Math.max(1, daphniaMoltSeconds))
+            : 0
+        ),
+        moltCycleSeconds: daphniaMoltSeconds,
+        moltCount: daphniaMoltCount,
+        generation: animal.generation ?? 0,
+        parentId: animal.parentId ?? null,
+        targetAnimalId: animal.targetAnimalId ?? null,
+        attachmentCellId: animal.attachmentCellId ?? null,
+        incubationRemaining: animal.incubationRemaining ?? null,
+        recentFood: animal.recentFood ?? null,
+        gestatingBroodSize: animal.gestatingBroodSize ?? null,
+      });
+    });
     this.carcasses = data.carcasses.map((carcass) => ({
       ...carcass,
       position: { ...carcass.position },
@@ -3483,7 +3589,7 @@ export class SimulationWorld {
       const readyToMate = animal.lifeStage === 'adult' &&
         animal.sex === 'female' &&
         animal.gestationRemaining === null &&
-        animal.reproductionCooldown <= 0 &&
+        (animal.ovarianProgress ?? 0) >= 1 &&
         animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
         animal.energy >= SHRIMP_REPRODUCTION_ENERGY;
       const nearbyMate = readyToMate
@@ -4276,10 +4382,13 @@ export class SimulationWorld {
         temperatureProfile.healthCurve,
         temperature,
       );
-      animal.reproductionCooldown = Math.max(
-        0,
-        animal.reproductionCooldown - deltaSeconds * reproductionTemperatureFactor,
-      );
+      if (animal.sex === 'male') {
+        animal.reproductionCooldown = Math.max(
+          0,
+          animal.reproductionCooldown -
+            deltaSeconds * reproductionTemperatureFactor,
+        );
+      }
       animal.recentIntake *= Math.exp(-deltaSeconds / 8);
       animal.secondsSinceFood += deltaSeconds;
 
@@ -4547,17 +4656,6 @@ export class SimulationWorld {
 
     const newborns: AnimalState[] = [];
     const living: AnimalState[] = [];
-    const recentNetAssimilationSurplusRate = (animal: AnimalState): number => {
-      const maintenanceRequest = maintenanceRequests.get(animal.id) ?? 0;
-      const recentAssimilationRate =
-        animal.recentIntake *
-        WATER_CYCLE_RULES.shrimp.assimilationFraction /
-        SHRIMP_RECENT_INTAKE_WINDOW_SECONDS;
-      const maintenanceRate = deltaSeconds > 0
-        ? maintenanceRequest / deltaSeconds
-        : 0;
-      return Math.max(0, recentAssimilationRate - maintenanceRate);
-    };
     for (const animal of shrimpAnimals) {
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
@@ -4596,9 +4694,14 @@ export class SimulationWorld {
       if (animal.lifeStage === 'juvenile') {
         const birthBiomass = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
         const adultBiomass = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+        const maturationTargetSeconds =
+          animal.maturationTargetSeconds ??
+          shrimpMaturationTargetSeconds(animal.randomSeed);
+        animal.maturationTargetSeconds = maturationTargetSeconds;
         const maximumGrowth = (
           adultBiomass - birthBiomass
-        ) * deltaSeconds * reproductionTemperatureFactor / SHRIMP_MATURITY_SECONDS;
+        ) * deltaSeconds * reproductionTemperatureFactor /
+          maturationTargetSeconds;
         const materialUsed = Math.min(
           Math.max(0, adultBiomass - animal.structuralBiomass),
           maximumGrowth,
@@ -4614,10 +4717,24 @@ export class SimulationWorld {
         );
         animal.bodyLength = SHRIMP_JUVENILE_LENGTH +
           (SHRIMP_ADULT_LENGTH - SHRIMP_JUVENILE_LENGTH) * animal.growthProgress;
-        if (animal.ageSeconds >= SHRIMP_MATURITY_SECONDS && animal.growthProgress >= 1) {
+        if (
+          animal.ageSeconds >= maturationTargetSeconds &&
+          animal.growthProgress >= 1
+        ) {
           animal.lifeStage = 'adult';
           animal.bodyLength = SHRIMP_ADULT_LENGTH;
-          animal.reproductionCooldown = SHRIMP_NEW_ADULT_REPRODUCTION_COOLDOWN;
+          animal.reproductiveCycleIndex = 0;
+          animal.ovarianProgress = animal.sex === 'female'
+            ? deterministicNoise(animal.randomSeed * 0.091 + 47.3) *
+              SHRIMP_ECOLOGY_RULES.newAdultOvarianProgressMaximum
+            : 0;
+          const ovarianCycleSeconds = shrimpOvarianCycleSeconds(
+            animal.randomSeed,
+            0,
+          );
+          animal.reproductionCooldown = animal.sex === 'female'
+            ? (1 - animal.ovarianProgress) * ovarianCycleSeconds
+            : 0;
           this.recordAnimalPopulationEvent('matured', animal);
           const overflow = Math.max(
             0,
@@ -4635,27 +4752,58 @@ export class SimulationWorld {
       }
 
       if (animal.lifeStage === 'adult' && animal.sex === 'female') {
-        const reproductiveSurplusRate =
-          recentNetAssimilationSurplusRate(animal);
-        const hasReproductiveSurplus = reproductiveSurplusRate > 1e-9;
-        // Cooldown delays the next mating/brood; it does not switch ovarian
-        // provisioning off. Letting a well-fed female bank conserved egg
-        // matter during that interval prevents every generation from waiting
-        // until its mate is already near the end of its lifespan.
+        const cycleIndex = animal.reproductiveCycleIndex ?? 0;
+        animal.reproductiveCycleIndex = cycleIndex;
+        const ovarianCycleSeconds = shrimpOvarianCycleSeconds(
+          animal.randomSeed,
+          cycleIndex,
+        );
+        const ovarianEnergyFactor = clamp(
+          (
+            animal.energy -
+              SHRIMP_ECOLOGY_RULES.ovarianProgressEnergyFloor
+          ) /
+            Math.max(
+              1e-6,
+              SHRIMP_ECOLOGY_RULES.ovarianFullSpeedEnergy -
+                SHRIMP_ECOLOGY_RULES.ovarianProgressEnergyFloor,
+            ),
+          0,
+          1,
+        );
+        if (animal.gestationRemaining === null) {
+          animal.ovarianProgress = clamp01(
+            (animal.ovarianProgress ?? 0) +
+              deltaSeconds *
+                reproductionTemperatureFactor *
+                ovarianEnergyFactor *
+                animal.health /
+                ovarianCycleSeconds,
+          );
+        }
+        animal.reproductionCooldown = Math.max(
+          0,
+          (1 - (animal.ovarianProgress ?? 0)) * ovarianCycleSeconds,
+        );
+
+        // Egg matter is a conserved transfer from somatic reserve. Ovarian
+        // readiness and egg funding advance independently, so a shared food
+        // pulse cannot reset every female onto one hard countdown edge.
         if (
           animal.gestationRemaining === null &&
           animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
-          hasReproductiveSurplus &&
           animal.reproductiveBiomass < SHRIMP_MAXIMUM_BROOD_BIOMASS
         ) {
+          const allocationCondition =
+            ovarianEnergyFactor * animal.health *
+            reproductionTemperatureFactor;
           const allocation = Math.min(
             Math.max(
               0,
               animal.storedBiomass - SHRIMP_REPRODUCTIVE_SOMATIC_RESERVE_FLOOR,
             ),
-            reproductiveSurplusRate *
-              SHRIMP_ECOLOGY_RULES.reproductionSurplusAllocationFraction *
-              deltaSeconds,
+            SHRIMP_ECOLOGY_RULES.ovarianAllocationPerSecond *
+              allocationCondition * deltaSeconds,
             SHRIMP_MAXIMUM_BROOD_BIOMASS - animal.reproductiveBiomass,
           );
           animal.storedBiomass -= allocation;
@@ -4701,7 +4849,12 @@ export class SimulationWorld {
                 this.recordAnimalPopulationEvent('birth', newborn, { parentId: animal.id });
               }
               animal.gestationRemaining = null;
-              animal.reproductionCooldown = SHRIMP_POST_BROOD_COOLDOWN;
+              animal.reproductiveCycleIndex = cycleIndex + 1;
+              animal.ovarianProgress = 0;
+              animal.reproductionCooldown = shrimpOvarianCycleSeconds(
+                animal.randomSeed,
+                cycleIndex + 1,
+              );
               this.synchroniseAnimalEnergy(animal);
             } else {
               // This can only occur after loading an older save whose gestation
@@ -4711,7 +4864,7 @@ export class SimulationWorld {
             }
           }
         } else if (
-          animal.reproductionCooldown <= 0 &&
+          (animal.ovarianProgress ?? 0) >= 1 &&
           animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
           animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
           shrimpAnimals.length + newborns.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
@@ -4730,7 +4883,10 @@ export class SimulationWorld {
             ? animal.matingAccumulator + deltaSeconds * reproductionTemperatureFactor
             : Math.max(0, animal.matingAccumulator - deltaSeconds);
           if (animal.matingAccumulator >= SHRIMP_MATING_SECONDS) {
-            animal.gestationRemaining = SHRIMP_GESTATION_SECONDS;
+            animal.gestationRemaining = shrimpGestationSeconds(
+              animal.randomSeed,
+              cycleIndex,
+            );
             animal.matingAccumulator = 0;
             if (eligibleMale) {
               eligibleMale.reproductionCooldown = SHRIMP_MALE_POST_MATING_COOLDOWN;
@@ -4780,10 +4936,6 @@ export class SimulationWorld {
     const newborns: AnimalState[] = [];
     for (const animal of daphnia) {
       animal.ageSeconds += deltaSeconds;
-      animal.reproductionCooldown = Math.max(
-        0,
-        animal.reproductionCooldown - deltaSeconds,
-      );
       animal.recentIntake *= Math.exp(-deltaSeconds / 6);
       animal.secondsSinceFood += deltaSeconds;
       const local = this.biogeochemistry.planktonAt(animal.position);
@@ -4882,6 +5034,10 @@ export class SimulationWorld {
         temperatureProfile.minimumMetabolicFactor,
         temperatureProfile.maximumMetabolicFactor,
       );
+      const reproductionTemperatureFactor = interpolateTemperatureResponse(
+        temperatureProfile.reproductionCurve,
+        temperature,
+      );
       const maintenanceRequest = continuousBodyMassMaintenance(
         bodyMass,
         rules.representativeAdultBiomass,
@@ -4918,6 +5074,26 @@ export class SimulationWorld {
       );
 
       if (animal.lifeStage === 'juvenile') {
+        const instarTarget = animal.maturationTargetInstars ??
+          daphniaMaturationInstarTarget(animal.randomSeed);
+        animal.maturationTargetInstars = instarTarget;
+        const juvenileMoltSeconds = animal.moltCycleSeconds && animal.moltCycleSeconds > 0
+          ? animal.moltCycleSeconds
+          : daphniaJuvenileMoltCycleSeconds(
+            animal.randomSeed,
+            instarTarget,
+          );
+        animal.moltCycleSeconds = juvenileMoltSeconds;
+        animal.moltProgress = (animal.moltProgress ?? 0) +
+          deltaSeconds * reproductionTemperatureFactor /
+            juvenileMoltSeconds;
+        while ((animal.moltProgress ?? 0) >= 1) {
+          animal.moltProgress = (animal.moltProgress ?? 0) - 1;
+          animal.moltCount = (animal.moltCount ?? 0) + 1;
+        }
+        animal.reproductionCooldown =
+          (1 - (animal.moltProgress ?? 0)) * juvenileMoltSeconds;
+
         // A neonate must keep a small metabolic reserve. Converting the entire
         // birth reserve into structure in the first few seconds made its energy
         // read zero and killed it before local filtration could fund growth.
@@ -4940,18 +5116,48 @@ export class SimulationWorld {
         );
         animal.bodyLength = 4.6 + animal.growthProgress * 4.4;
         if (
-          animal.ageSeconds >= rules.maturationSeconds &&
+          (animal.moltCount ?? 0) >= instarTarget &&
           animal.structuralBiomass >= rules.maturationStructuralBiomass
         ) {
           animal.lifeStage = 'adult';
           // Maturation is a label change at the animal's current conserved
           // structure, not a free jump to full adult size. Daphnia continue
           // indeterminate somatic growth after their first reproductive stage.
-          animal.reproductionCooldown = 0;
+          animal.moltCount = instarTarget;
+          animal.moltProgress = seededRange(
+            animal.randomSeed * 0.097 + 53.7,
+            0.55,
+            0.9,
+          );
+          animal.moltCycleSeconds = daphniaAdultMoltCycleSeconds(
+            animal.randomSeed,
+            instarTarget,
+          );
+          animal.reproductionCooldown =
+            (1 - animal.moltProgress) * animal.moltCycleSeconds;
           this.biogeochemistry.recordDaphniaMaturation();
           this.recordAnimalPopulationEvent('matured', animal);
         }
       } else {
+        const priorMoltCount = animal.moltCount ??
+          animal.maturationTargetInstars ??
+          rules.maturationInstarsMinimum;
+        const adultMoltSeconds = animal.moltCycleSeconds &&
+            animal.moltCycleSeconds > 0
+          ? animal.moltCycleSeconds
+          : daphniaAdultMoltCycleSeconds(
+            animal.randomSeed,
+            priorMoltCount,
+          );
+        animal.moltCycleSeconds = adultMoltSeconds;
+        animal.moltProgress = (animal.moltProgress ?? 0) +
+          deltaSeconds * reproductionTemperatureFactor /
+            adultMoltSeconds;
+        const moltOccurred = (animal.moltProgress ?? 0) >= 1;
+        if (moltOccurred) {
+          animal.moltProgress = (animal.moltProgress ?? 0) - 1;
+        }
+
         // A newly mature Daphnia is reproductive before reaching final adult
         // structure. Somatic growth and egg provisioning compete for the same
         // genuinely assimilated reserve; this transfer cannot create matter.
@@ -5036,6 +5242,9 @@ export class SimulationWorld {
         );
         const broodReserveCapacity = rules.maximumBroodSize *
           rules.juvenileBirthBiomass;
+        const lockedBroodBiomass =
+          (animal.gestatingBroodSize ?? 0) *
+          rules.juvenileBirthBiomass;
         // Low-quality bacterioplankton can pay part of somatic maintenance,
         // leaving genuinely assimilated phytoplankton available for eggs. It
         // still cannot create a brood on its own: the eligible surplus is
@@ -5052,70 +5261,38 @@ export class SimulationWorld {
           currentPhytoplanktonAssimilation -
             maintenanceNotCoveredByBacteria,
         );
-        // Once embryo development begins the clutch is closed. Continuing to
-        // provision another egg behind it created a food-independent backlog
-        // that could hatch after the producer had already collapsed.
-        const allocation = animal.gestationRemaining === null
-          ? Math.min(
-            reserveAboveFloor,
-            Math.max(0, broodReserveCapacity - animal.reproductiveBiomass),
-            rules.reproductionAllocationPerSecondIndividual *
-              reproductiveFoodFactor *
-              maternalCondition * deltaSeconds,
-            currentReproductiveSurplus *
-              (1 - rules.adultSomaticGrowthAllocationFraction),
-          )
-          : 0;
+        // The brood chamber and ovary overlap in real time. Locked embryo mass
+        // remains in this conserved compartment while current food can fund at
+        // most one following brood. Nothing hatches from that reserve until a
+        // later molt actually deposits and then releases it.
+        const reproductiveCapacity =
+          lockedBroodBiomass + broodReserveCapacity;
+        const allocation = Math.min(
+          reserveAboveFloor,
+          Math.max(
+            0,
+            reproductiveCapacity - animal.reproductiveBiomass,
+          ),
+          rules.reproductionAllocationPerSecondIndividual *
+            reproductiveFoodFactor *
+            maternalCondition * deltaSeconds,
+          currentReproductiveSurplus *
+            (1 - rules.adultSomaticGrowthAllocationFraction),
+        );
         animal.storedBiomass -= allocation;
         animal.reproductiveBiomass += allocation;
-        if (
-          animal.gestationRemaining === null &&
-          animal.reproductionCooldown <= 0 &&
-          animal.health >= 0.3 &&
-          animal.reproductiveBiomass >=
-            rules.minimumBroodSize * rules.juvenileBirthBiomass
-        ) {
-          // Egg biomass was funded only while both current food and maternal
-          // condition passed their gates. Lock the affordable clutch now:
-          // embryo development may finish through a short trough, but neither
-          // spare egg biomass nor later filtering can queue a hidden brood.
-          const affordableBrood = Math.floor(
-            animal.reproductiveBiomass / rules.juvenileBirthBiomass,
-          );
-          const highFoodBrood = phytoResponse >=
-              rules.highFoodBroodResponseThreshold
-            ? rules.maximumBroodSize
-            : rules.minimumBroodSize;
-          animal.gestatingBroodSize = Math.min(
-            highFoodBrood,
-            affordableBrood,
-          );
-          const lockedClutchBiomass =
-            animal.gestatingBroodSize * rules.juvenileBirthBiomass;
-          const excessEggBiomass = Math.max(
-            0,
-            animal.reproductiveBiomass - lockedClutchBiomass,
-          );
-          if (excessEggBiomass > 0) {
-            const returnedToReserve = Math.min(
-              excessEggBiomass,
-              Math.max(0, adultReserveCapacity - animal.storedBiomass),
-            );
-            animal.storedBiomass += returnedToReserve;
-            animal.reproductiveBiomass -= excessEggBiomass;
-            this.biogeochemistry.recordAnimalAssimilationOverflow(
-              animal.position,
-              excessEggBiomass - returnedToReserve,
-            );
-          }
-          animal.gestationRemaining = rules.broodDevelopmentSeconds;
-        }
         if (animal.gestationRemaining !== null) {
           animal.gestationRemaining = Math.max(
             0,
-            animal.gestationRemaining - deltaSeconds,
+            animal.gestationRemaining -
+              deltaSeconds * reproductionTemperatureFactor,
           );
-          if (animal.gestationRemaining <= 0) {
+        }
+        if (moltOccurred) {
+          if (
+            animal.gestationRemaining !== null &&
+            animal.gestationRemaining <= 0
+          ) {
             const desiredBrood =
               animal.gestatingBroodSize ?? rules.minimumBroodSize;
             const affordableBrood = Math.floor(
@@ -5139,13 +5316,39 @@ export class SimulationWorld {
             }
             animal.gestationRemaining = null;
             animal.gestatingBroodSize = null;
-            animal.reproductionCooldown = rules.broodCooldownSeconds * (
-              0.78 + deterministicNoise(
-                animal.randomSeed + animal.ageSeconds * 0.023,
-              ) * 0.44
-            );
           }
+          if (
+            animal.gestationRemaining === null &&
+            animal.health >= 0.3 &&
+            animal.reproductiveBiomass >=
+              rules.minimumBroodSize * rules.juvenileBirthBiomass
+          ) {
+            const affordableBrood = Math.floor(
+              animal.reproductiveBiomass /
+                rules.juvenileBirthBiomass,
+            );
+            const highFoodBrood = phytoResponse >=
+                rules.highFoodBroodResponseThreshold
+              ? rules.maximumBroodSize
+              : rules.minimumBroodSize;
+            animal.gestatingBroodSize = Math.min(
+              highFoodBrood,
+              affordableBrood,
+            );
+            animal.gestationRemaining =
+              rules.broodDevelopmentSeconds;
+          }
+          animal.moltCount = priorMoltCount + 1;
+          animal.moltCycleSeconds = daphniaAdultMoltCycleSeconds(
+            animal.randomSeed,
+            animal.moltCount,
+          );
         }
+        animal.reproductionCooldown = Math.max(
+          0,
+          (1 - (animal.moltProgress ?? 0)) *
+            (animal.moltCycleSeconds ?? adultMoltSeconds),
+        );
       }
 
       const finalAdultSizeScale = clamp(
@@ -7224,15 +7427,18 @@ export class SimulationWorld {
           ? animal.gestationRemaining !== null
             ? 'carrying-eggs'
             : animal.lifeStage === 'adult' &&
-              animal.reproductionCooldown <= 0 &&
+              (animal.moltProgress ?? 0) >= 0.75 &&
               animal.energy >=
-                PLANKTON_ECOLOGY_RULES.daphnia.reproductionStartEnergy
+                PLANKTON_ECOLOGY_RULES.daphnia.reproductionStartEnergy &&
+              animal.reproductiveBiomass >=
+                PLANKTON_ECOLOGY_RULES.daphnia.minimumBroodSize *
+                PLANKTON_ECOLOGY_RULES.daphnia.juvenileBirthBiomass
               ? 'ready'
               : 'none'
         : animal.gestationRemaining !== null
           ? 'berried'
           : animal.lifeStage === 'adult' &&
-            animal.reproductionCooldown <= 0 &&
+            (animal.ovarianProgress ?? 0) >= 1 &&
             animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
             animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
             this.animals.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
@@ -7567,6 +7773,15 @@ export class SimulationWorld {
       animal.speciesId === 'cherry-shrimp' && animal.origin === 'supplied').length;
     const lifespanNoise = deterministicNoise(characteristicSeed * 0.019 + 13.7);
     const motionNoise = deterministicNoise(characteristicSeed * 0.031 + 31.1);
+    const individualSeed = characteristicSeed * 0.001;
+    const isFemale = suppliedIndex % 2 === 0;
+    const ovarianProgress = isFemale
+      ? seededRange(
+        characteristicSeed * 0.059 + 43.1,
+        SHRIMP_ECOLOGY_RULES.suppliedOvarianProgressMinimum,
+        SHRIMP_ECOLOGY_RULES.suppliedOvarianProgressMaximum,
+      )
+      : 0;
     return {
       id,
       speciesId,
@@ -7578,7 +7793,7 @@ export class SimulationWorld {
       bodyLength: SHRIMP_ADULT_LENGTH *
         (0.94 + deterministicNoise(characteristicSeed * 0.037) * 0.12),
       lifeStage: 'adult',
-      sex: suppliedIndex % 2 === 0 ? 'female' : 'male',
+      sex: isFemale ? 'female' : 'male',
       ageSeconds: SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS +
         deterministicNoise(characteristicSeed * 0.013 + 7.1) *
         (SHRIMP_SUPPLIED_ADULT_MAX_AGE_SECONDS - SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS),
@@ -7589,7 +7804,7 @@ export class SimulationWorld {
       structuralBiomass: WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
       storedBiomass: WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass,
       reproductiveBiomass:
-        suppliedIndex % 2 === 0 && origin === 'supplied'
+        isFemale && origin === 'supplied'
           ? SHRIMP_MINIMUM_BROOD_BIOMASS *
             SHRIMP_ECOLOGY_RULES.suppliedFemaleBroodReserveFraction
           : 0,
@@ -7607,15 +7822,18 @@ export class SimulationWorld {
       grazingSessionIntake: 0,
       secondsSinceFood: 0,
       growthProgress: 1,
-      reproductionCooldown:
-        SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMin +
-        deterministicNoise(characteristicSeed * 0.047) * (
-          SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMax -
-          SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMin
-        ),
+      reproductionCooldown: isFemale
+        ? (1 - ovarianProgress) *
+          shrimpOvarianCycleSeconds(individualSeed, 0)
+        : deterministicNoise(characteristicSeed * 0.047) *
+          SHRIMP_MALE_POST_MATING_COOLDOWN,
       gestationRemaining: null,
+      maturationTargetSeconds:
+        shrimpMaturationTargetSeconds(individualSeed),
+      ovarianProgress,
+      reproductiveCycleIndex: 0,
       matingAccumulator: 0,
-      randomSeed: characteristicSeed * 0.001,
+      randomSeed: individualSeed,
     };
   }
 
@@ -7629,6 +7847,14 @@ export class SimulationWorld {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
     const seed = deterministicStringSeed(`${id}:daphnia`);
     const lifespanNoise = deterministicNoise(seed * 0.019 + 13.7);
+    const instarTarget = daphniaMaturationInstarTarget(seed * 0.001);
+    const moltCount = instarTarget +
+      Math.floor(deterministicNoise(seed * 0.041 + 19.7) * 3);
+    const moltCycleSeconds = daphniaAdultMoltCycleSeconds(
+      seed * 0.001,
+      moltCount,
+    );
+    const moltProgress = seededRange(seed * 0.047 + 23.3, 0.08, 0.86);
     return {
       id,
       speciesId: 'daphnia',
@@ -7667,9 +7893,12 @@ export class SimulationWorld {
       grazingSessionIntake: 0,
       secondsSinceFood: 0,
       growthProgress: 1,
-      reproductionCooldown: rules.broodCooldownSeconds *
-        (0.55 + deterministicNoise(seed * 0.043) * 0.65),
+      reproductionCooldown: (1 - moltProgress) * moltCycleSeconds,
       gestationRemaining: null,
+      maturationTargetInstars: instarTarget,
+      moltProgress,
+      moltCycleSeconds,
+      moltCount,
       matingAccumulator: 0,
       randomSeed: seed * 0.001,
       generation,
@@ -7688,6 +7917,11 @@ export class SimulationWorld {
       Math.PI * 2;
     const distance = 4 + deterministicNoise(parent.randomSeed + broodIndex * 3.17) * 7;
     const initialStructure = rules.juvenileMinimumStructure;
+    const instarTarget = daphniaMaturationInstarTarget(seed * 0.001);
+    const moltCycleSeconds = daphniaJuvenileMoltCycleSeconds(
+      seed * 0.001,
+      instarTarget,
+    );
     return {
       id,
       speciesId: 'daphnia',
@@ -7731,6 +7965,10 @@ export class SimulationWorld {
       growthProgress: initialStructure / rules.adultStructuralBiomass,
       reproductionCooldown: 0,
       gestationRemaining: null,
+      maturationTargetInstars: instarTarget,
+      moltProgress: 0,
+      moltCycleSeconds,
+      moltCount: 0,
       matingAccumulator: 0,
       randomSeed: seed * 0.001,
       generation: (parent.generation ?? 0) + 1,
@@ -7789,6 +8027,10 @@ export class SimulationWorld {
       growthProgress: 0,
       reproductionCooldown: 0,
       gestationRemaining: null,
+      maturationTargetSeconds:
+        shrimpMaturationTargetSeconds(characteristicSeed * 0.001),
+      ovarianProgress: 0,
+      reproductiveCycleIndex: 0,
       matingAccumulator: 0,
       randomSeed: characteristicSeed * 0.001,
     };

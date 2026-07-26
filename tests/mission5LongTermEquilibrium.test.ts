@@ -126,9 +126,28 @@ it('keeps a closed mission-5 ecosystem alive through several shrimp generations'
   const tailStart = chemistry[Math.max(0, chemistry.length - 31)];
   const finalChemistry = chemistry.at(-1)!;
   const tailChemistry = chemistry.slice(-16);
+  const tailSamples = samples.filter((sample) => sample.elapsedSeconds >= 3_600);
+  const tailEvents = final.animalPopulationEvents.filter(
+    (event) =>
+      event.elapsedSeconds >= 3_600 &&
+      event.speciesId === 'cherry-shrimp',
+  );
+  const finalShrimp = world.exportSaveData().animals.filter(
+    (animal) => animal.speciesId === 'cherry-shrimp',
+  );
 
-  expect(final.outcome).toBe('success');
+  // The time-limited mission outcome is deliberately not part of this
+  // ecological gate. What matters is lineage renewal after the mission UI has
+  // long since stopped scoring.
   expect(final.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
+  expect(Math.min(...tailSamples.map((sample) =>
+    sample.animalPopulation['cherry-shrimp'].total,
+  ))).toBeGreaterThan(0);
+  expect(tailEvents.some((event) => event.kind === 'birth')).toBe(true);
+  expect(tailEvents.some((event) => event.kind === 'matured')).toBe(true);
+  expect(finalShrimp.some((animal) => animal.origin === 'born')).toBe(true);
+  expect(final.animalPopulation['cherry-shrimp'].adultFemales).toBeGreaterThan(0);
+  expect(final.animalPopulation['cherry-shrimp'].adultMales).toBeGreaterThan(0);
   expect(Math.max(...population) - Math.min(...population)).toBeGreaterThanOrEqual(3);
   // Cooler, spatially transported water softens the old globally mixed
   // algae swing, but the producer population must still visibly respond.

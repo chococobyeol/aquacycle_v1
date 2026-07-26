@@ -8,6 +8,60 @@ const settle = (world: SimulationWorld): void => {
 };
 
 describe('frozen aquarium saves', () => {
+  it('preserves individual shrimp ovarian and Daphnia molt clocks', () => {
+    const world = new SimulationWorld('mission-7');
+    for (const point of [
+      { x: 500, y: 600 },
+      { x: 540, y: 600 },
+    ]) {
+      world.handle({
+        type: 'pick-animal',
+        speciesId: 'cherry-shrimp',
+        point,
+      });
+      world.handle({ type: 'drop-held', point });
+    }
+    const daphniaPoint = { x: 620, y: 330 };
+    world.handle({
+      type: 'pick-plankton',
+      planktonKind: 'daphnia',
+      point: daphniaPoint,
+    });
+    world.handle({ type: 'drop-held', point: daphniaPoint });
+    world.handle({ type: 'start' });
+    world.handle({ type: 'set-speed', speed: 16 });
+    while (world.snapshot().elapsedSeconds < 60) world.tick(0.1);
+
+    const save = world.exportSaveData();
+    const reproductiveClock = (animal: (typeof save.animals)[number]) =>
+      animal.speciesId === 'daphnia'
+        ? {
+          id: animal.id,
+          speciesId: animal.speciesId,
+          maturationTargetInstars: animal.maturationTargetInstars,
+          moltProgress: animal.moltProgress,
+          moltCycleSeconds: animal.moltCycleSeconds,
+          moltCount: animal.moltCount,
+          gestatingBroodSize: animal.gestatingBroodSize ?? null,
+          gestationRemaining: animal.gestationRemaining,
+        }
+        : {
+          id: animal.id,
+          speciesId: animal.speciesId,
+          maturationTargetSeconds: animal.maturationTargetSeconds,
+          ovarianProgress: animal.ovarianProgress,
+          reproductiveCycleIndex: animal.reproductiveCycleIndex,
+          gestationRemaining: animal.gestationRemaining,
+        };
+    const before = save.animals.map(reproductiveClock);
+
+    const restored = new SimulationWorld('mission-1');
+    restored.loadSaveData(save);
+    const after = restored.exportSaveData().animals.map(reproductiveClock);
+
+    expect(after).toEqual(before);
+  });
+
   it('restores structures, surface ecology, instruments, time, and water chemistry', () => {
     const world = new SimulationWorld('mission-5');
     world.handle({ type: 'pick-structure', definitionId: 'flat-stone', point: { x: 360, y: 470 } });

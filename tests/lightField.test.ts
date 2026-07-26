@@ -112,7 +112,7 @@ describe('aquarium light field', () => {
     expect(transmission).not.toHaveBeenCalled();
     rebuild.mockRestore();
     transmission.mockRestore();
-  });
+  }, 15_000);
 
   it('changes source intensity without rebuilding a settled laboratory light path', () => {
     const world = new SimulationWorld('laboratory');

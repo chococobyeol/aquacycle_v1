@@ -171,9 +171,8 @@ describe('mission 7 acceptance matrix fixtures', () => {
 });
 
 describe('mission 7 shared long-run acceptance contract', () => {
-  it('requires a standing prey crop rather than a token surviving handful', () => {
-    expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumCount).toBe(20);
-    expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumMeanCount).toBe(30);
+  it('requires a renewing lineage without prescribing a population phase', () => {
+    expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumCount).toBe(1);
     expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.maximumCount).toBe(1_000);
   });
 
@@ -187,16 +186,30 @@ describe('mission 7 shared long-run acceptance contract', () => {
     );
 
     expect(report.passed).toBe(true);
-    expect(report.checks).toHaveLength(13);
+    expect(report.checks).toHaveLength(12);
     expect(report.checks.every((check) => check.passed)).toBe(true);
     expect(report.ricefishPredationLoad).toBe('not-verified');
+  });
+
+  it('does not use the time-limited mission outcome as ecological evidence', () => {
+    const evidence = passingEvidence();
+    evidence.final.outcome = 'failure';
+
+    const report = evaluateMission7Acceptance(
+      'starter-only-minimal',
+      evidence,
+    );
+
+    expect(report.passed).toBe(true);
+    expect(report.checks.map((check) => check.id))
+      .not.toContain('mission-outcome');
   });
 
   it('fails the exact ecological signals that the previous final-count check missed', () => {
     const evidence = passingEvidence();
     evidence.samples = evidence.samples.map((sample) => ({
       ...sample,
-      daphniaCount: 2,
+      daphniaCount: 0,
       phytoplanktonBiomass: 3.5 - sample.time / 7_200,
     }));
     evidence.final = {

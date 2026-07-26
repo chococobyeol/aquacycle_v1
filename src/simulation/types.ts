@@ -612,6 +612,21 @@ export interface SavedAnimalState {
   growthProgress: number;
   reproductionCooldown: number;
   gestationRemaining: number | null;
+  /**
+   * Species-specific juvenile schedule. Shrimp use seconds and Daphnia use
+   * the instar target below. Optional so version-1 frozen aquariums hydrate
+   * deterministic defaults instead of becoming unloadable.
+   */
+  maturationTargetSeconds?: number;
+  maturationTargetInstars?: number;
+  /** Female shrimp ovarian/molt readiness, independent of funded egg matter. */
+  ovarianProgress?: number;
+  /** Completed shrimp broods; seeds stable per-cycle life-history variation. */
+  reproductiveCycleIndex?: number;
+  /** Daphnia molt state. Broods are deposited and released only at a molt. */
+  moltProgress?: number;
+  moltCycleSeconds?: number;
+  moltCount?: number;
   /** Locked Daphnia clutch size; optional for older frozen aquariums. */
   gestatingBroodSize?: number | null;
   matingAccumulator: number;

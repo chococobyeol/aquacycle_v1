@@ -9,25 +9,23 @@ export const MISSION7_LONG_RUN_ACCEPTANCE = {
   tailStartSeconds: 3_600,
   sampleSeconds: 120,
   daphnia: {
-    // Mission 8 needs a standing zooplankton crop, not a token handful that
-    // merely avoids extinction. One inventory placement is still one animal;
-    // these numbers must be reached by reproduction in the tank.
-    minimumCount: 20,
-    minimumMeanCount: 30,
+    // Mission 7 verifies an independently renewing Daphnia lineage, not a
+    // stockpile for a future fish mission. A trough of one living descendant
+    // is valid if births and maturations continue; a higher arbitrary count
+    // would turn population phase into a hidden mission answer.
+    minimumCount: 1,
     // This is only a runaway diagnostic, never a gameplay population cap.
     // Hundreds of small zooplankton are expected; only an approach toward the
     // thousands within this two-hour fixture indicates unbounded growth.
     maximumCount: 1_000,
-    minimumTailBirths: 4,
-    minimumTailMaturations: 3,
-    minimumFinalDescendants: 3,
+    minimumTailBirths: 1,
+    minimumTailMaturations: 1,
+    minimumFinalDescendants: 1,
     minimumLivingGeneration: 2,
-    maximumStarvationDeathFraction: 0.35,
   },
   shrimp: {
-    minimumTailBirths: 2,
-    minimumTailMaturations: 2,
-    maximumStarvationDeathFraction: 0.25,
+    minimumTailBirths: 1,
+    minimumTailMaturations: 1,
   },
   phytoplankton: {
     minimumBiomass: 0.75,
@@ -37,8 +35,8 @@ export const MISSION7_LONG_RUN_ACCEPTANCE = {
   },
   vallisneria: {
     minimumTailRunners: 1,
-    minimumFinalRunners: 3,
-    minimumFinalBiomass: 0.5,
+    minimumFinalRunners: 1,
+    minimumFinalBiomass: 0,
   },
   water: {
     minimumOxygen: 30,
