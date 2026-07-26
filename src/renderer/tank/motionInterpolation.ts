@@ -67,6 +67,7 @@ const holdingIdentity = (holding: HoldingSnapshot | null): string | null => {
     case 'animal': return `${holding.source}:${holding.kind}:${holding.animalId}`;
     case 'seed': return `${holding.source}:${holding.kind}:${holding.speciesId}`;
     case 'biofilm': return `${holding.source}:${holding.kind}:${holding.microbeGuildId}`;
+    case 'plankton': return `${holding.source}:${holding.kind}:${holding.planktonKind}`;
   }
 };
 
@@ -130,6 +131,7 @@ const matchingHolding = (
     case 'animal': return previous.animalId === current.animalId;
     case 'seed': return previous.speciesId === current.speciesId;
     case 'biofilm': return previous.microbeGuildId === current.microbeGuildId;
+    case 'plankton': return previous.planktonKind === current.planktonKind;
   }
 };
 

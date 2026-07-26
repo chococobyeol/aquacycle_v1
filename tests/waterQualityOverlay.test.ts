@@ -3,8 +3,12 @@ import type { SimulationSnapshot } from '../src/simulation/types';
 import {
   analysisLayerStatistics,
   biofilmPlacementLayers,
+  normalizePelagicForDisplay,
   normalizeWaterQualityForDisplay,
   normalizeWaterQualityValue,
+  pelagicOverlayAlpha,
+  pelagicRenderPlan,
+  pelagicVisualMaximum,
   waterQualityOverlayAlpha,
   waterQualityVisualRange,
 } from '../src/renderer/tank/waterQualityOverlay';
@@ -20,6 +24,8 @@ const overlaySnapshot = {
       toxicWaste: [0.2, 0.8, 2],
       nutrients: [20, 40, 60],
       oxygen: [30, 60, 90],
+      planktonicDecomposer: [0.2, 1.5, 3.2],
+      phytoplankton: [0.4, 2.5, 9],
     },
     transport: {
       temperature: [22, 23, 25],
@@ -34,6 +40,41 @@ describe('water-quality analysis overlay', () => {
     expect(biofilmPlacementLayers('decomposer')).toEqual(['organicMatter', 'decomposer']);
     expect(biofilmPlacementLayers('nitrifier')).toEqual(['toxicWaste', 'nitrifier']);
   });
+
+  it('keeps activation order and assigns only one continuous pelagic map', () => {
+    expect(pelagicRenderPlan([
+      'decomposer',
+      'phytoplankton',
+      'planktonicDecomposer',
+      'oxygen',
+      'flow',
+    ])).toEqual({
+      primary: 'phytoplankton',
+      secondary: ['planktonicDecomposer'],
+    });
+    expect(pelagicRenderPlan([
+      'planktonicDecomposer',
+      'phytoplankton',
+      'planktonicDecomposer',
+    ])).toEqual({
+      primary: 'planktonicDecomposer',
+      secondary: ['phytoplankton'],
+    });
+  });
+
+  it('uses a fixed pelagic scale so a real biomass decrease stays visible', () => {
+    const emptyishMaximum = pelagicVisualMaximum('phytoplankton', [0, 0.05, 0.2]);
+    expect(emptyishMaximum).toBe(12);
+    expect(normalizePelagicForDisplay(0.2, emptyishMaximum)).toBeLessThan(0.02);
+    const bloomMaximum = pelagicVisualMaximum('phytoplankton', [0, 4, 20]);
+    expect(bloomMaximum).toBe(12);
+    expect(normalizePelagicForDisplay(20, bloomMaximum)).toBe(1);
+    expect(normalizePelagicForDisplay(2, bloomMaximum))
+      .toBeCloseTo(normalizePelagicForDisplay(4, bloomMaximum) / 2);
+    expect(pelagicOverlayAlpha(0)).toBe(0);
+    expect(pelagicOverlayAlpha(0.2)).toBeLessThan(pelagicOverlayAlpha(0.8));
+  });
+
   it('uses the lower ecological scale for organic matter and toxic waste', () => {
     expect(normalizeWaterQualityValue('organicMatter', 12)).toBeCloseTo(0.5);
     expect(normalizeWaterQualityValue('toxicWaste', 24)).toBe(1);
@@ -76,6 +117,13 @@ describe('water-quality analysis overlay', () => {
     expect(stats.minimum).toBe(0);
     expect(stats.average).toBeCloseTo(9);
     expect(stats.maximum).toBeCloseTo(18);
+  });
+
+  it('reports pelagic layers from their own water-column grids', () => {
+    expect(analysisLayerStatistics(overlaySnapshot, 'phytoplankton').average)
+      .toBeCloseTo((0.4 + 2.5 + 9) / 3);
+    expect(analysisLayerStatistics(overlaySnapshot, 'planktonicDecomposer').maximum)
+      .toBeCloseTo(3.2);
   });
 
   it('reports spatial temperature and water speed for the same legend', () => {

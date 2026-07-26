@@ -17,6 +17,11 @@ import {
   SPECIES,
   STRUCTURES,
 } from '../../simulation/config';
+import {
+  animalCarcassVisualDrop,
+  daphniaVisualScale,
+  shrimpVisualScale,
+} from '../../simulation/animalPresentation';
 import type { SimulationMotionSource } from '../hooks/useSimulation';
 import {
   GROUND_Y,
@@ -50,6 +55,7 @@ import {
   clampTankInteractionPoint,
   coverTankScale,
   fitTankZoom,
+  minimumTankZoom,
   isScreenDrag,
   isTankInteractionPoint,
   shouldStartCameraPan,
@@ -79,11 +85,17 @@ import {
 } from './motionInterpolation';
 import {
   normalizeWaterQualityForDisplay,
+  normalizePelagicForDisplay,
   normalizeWaterQualityValue,
+  pelagicOverlayAlpha,
+  pelagicRenderPlan,
+  pelagicVisualMaximum,
   waterQualityVisualRange,
   waterQualityOverlayAlpha,
+  type PelagicLayer,
   type WaterQualityLayer,
 } from './waterQualityOverlay';
+import { createPhytoplanktonVisualPlan } from './phytoplanktonPresentation';
 
 interface AquariumCanvasProps {
   snapshot: SimulationSnapshot;
@@ -154,6 +166,18 @@ export const algaeParticleAlpha = (visualLevel: number): number => {
   return 0.22 + visible * 0.78;
 };
 
+export const algaeDetailCount = (
+  maximumCount: number,
+  visualLevel: number,
+): number => {
+  if (maximumCount <= 0 || visualLevel <= 0) return 0;
+  const visible = Math.max(
+    0,
+    Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT),
+  );
+  return Math.max(1, Math.round(maximumCount * (0.2 + visible * 0.8)));
+};
+
 export const isInventoryHandoffCaughtUp = (
   holding: SimulationSnapshot['holding'],
   latestPointer: Vec2 | null,
@@ -214,7 +238,7 @@ const defaultCamera = (): CameraState => ({
 });
 
 const clampCamera = (camera: CameraState, width: number, height: number): CameraState => {
-  const zoom = Math.max(fitTankZoom(width, height), Math.min(CAMERA_MAX_ZOOM, camera.zoom));
+  const zoom = Math.max(minimumTankZoom(width, height), Math.min(CAMERA_MAX_ZOOM, camera.zoom));
   const scale = coverTankScale(width, height) * zoom;
   if (!Number.isFinite(scale) || scale <= 0) return { ...defaultCamera(), zoom };
   const bounds = tankCameraCenterBounds(width, height, zoom);
@@ -305,6 +329,7 @@ interface AquariumLayers {
   lamp: Graphics;
   base: Graphics;
   light: Sprite;
+  plankton: Graphics;
   substrateAlgae: Container;
   foreground: Graphics;
   structures: Container;
@@ -628,6 +653,20 @@ const isMicrobeLayer = (
   layer: WaterQualityLayer | null,
 ): layer is MicrobeGuildId => layer === 'decomposer' || layer === 'nitrifier';
 
+const isPelagicLayer = (layer: WaterQualityLayer): layer is PelagicLayer =>
+  layer === 'planktonicDecomposer' || layer === 'phytoplankton';
+const PELAGIC_PALETTES: Record<PelagicLayer, { low: number; high: number; contour: string }> = {
+  planktonicDecomposer: { low: 0xe2d8bd, high: 0x9b7449, contour: '#8a633f' },
+  phytoplankton: { low: 0xdce9c4, high: 0x4c8a4f, contour: '#3f7f48' },
+};
+
+const pelagicValues = (
+  snapshot: SimulationSnapshot,
+  layer: PelagicLayer,
+): readonly number[] => layer === 'planktonicDecomposer'
+  ? snapshot.biogeochemistry.water.planktonicDecomposer
+  : snapshot.biogeochemistry.water.phytoplankton;
+
 const SECONDARY_WATER_COLORS: Record<WaterQualityVariable, string> = {
   organicMatter: '#6f4c2f',
   toxicWaste: '#c64358',
@@ -650,11 +689,14 @@ const analysisOverlayKey = (
   selectedLayers: readonly WaterQualityLayer[],
 ): string => {
   const needsDissolvedGrid = selectedLayers.some(isDissolvedLayer);
+  const needsPelagicGrid = selectedLayers.some(isPelagicLayer);
   const needsTransportGrid = selectedLayers.includes('temperature') ||
     selectedLayers.includes('flow');
   const { decomposer, nitrifier } = snapshot.biogeochemistry.biofilmTotals;
   return [
-    needsDissolvedGrid ? snapshot.biogeochemistry.water.revision : 'water-idle',
+    needsDissolvedGrid || needsPelagicGrid
+      ? snapshot.biogeochemistry.water.revision
+      : 'water-idle',
     needsTransportGrid ? snapshot.biogeochemistry.transport.revision : 'transport-idle',
     decomposer.toFixed(3),
     nitrifier.toFixed(3),
@@ -759,6 +801,133 @@ const drawWaterQualityContours = (
         }
       }
     }
+    context.stroke();
+  }
+  context.restore();
+};
+
+/**
+ * Additional pelagic fields use isolines rather than another translucent
+ * colour wash. Hollow peak markers keep a spatially uniform bloom legible
+ * (where marching-squares would otherwise have no boundary) without turning
+ * every occupied cell into a cloud of particles.
+ */
+const drawPelagicContours = (
+  context: CanvasRenderingContext2D,
+  snapshot: SimulationSnapshot,
+  selectedLayer: PelagicLayer,
+  rasterWidth: number,
+  rasterHeight: number,
+): void => {
+  const water = snapshot.biogeochemistry.water;
+  if (water.columns < 2 || water.rows < 2) return;
+  const values = pelagicValues(snapshot, selectedLayer);
+  const displayMaximum = pelagicVisualMaximum(selectedLayer, values);
+  const normalizedValues = values.map((value) =>
+    normalizePelagicForDisplay(value, displayMaximum));
+  const pointAt = (column: number, row: number): ContourPoint => ({
+    x: ((column + 0.5) / water.columns) * rasterWidth,
+    y: ((row + 0.5) / water.rows) * rasterHeight,
+  });
+  const valueAt = (column: number, row: number): number =>
+    normalizedValues[row * water.columns + column] ?? 0;
+  const drawSegment = (first: ContourPoint, second: ContourPoint): void => {
+    context.moveTo(first.x, first.y);
+    context.lineTo(second.x, second.y);
+  };
+
+  context.save();
+  context.strokeStyle = PELAGIC_PALETTES[selectedLayer].contour;
+  context.lineWidth = 1.35;
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+  for (const [thresholdIndex, threshold] of [0.3, 0.58, 0.84].entries()) {
+    context.globalAlpha = 0.58 + thresholdIndex * 0.12;
+    context.setLineDash(thresholdIndex === 0 ? [4, 2.5] : []);
+    context.beginPath();
+    for (let row = 0; row < water.rows - 1; row += 1) {
+      for (let column = 0; column < water.columns - 1; column += 1) {
+        const points = [
+          pointAt(column, row),
+          pointAt(column + 1, row),
+          pointAt(column + 1, row + 1),
+          pointAt(column, row + 1),
+        ];
+        const samples = [
+          valueAt(column, row),
+          valueAt(column + 1, row),
+          valueAt(column + 1, row + 1),
+          valueAt(column, row + 1),
+        ];
+        const crossings = [
+          contourCrossing(points[0], points[1], samples[0], samples[1], threshold),
+          contourCrossing(points[1], points[2], samples[1], samples[2], threshold),
+          contourCrossing(points[2], points[3], samples[2], samples[3], threshold),
+          contourCrossing(points[3], points[0], samples[3], samples[0], threshold),
+        ].filter((point): point is ContourPoint => Boolean(point));
+        if (crossings.length === 2) {
+          drawSegment(crossings[0], crossings[1]);
+        } else if (crossings.length === 4) {
+          const centre = samples.reduce((sum, value) => sum + value, 0) / 4;
+          if (centre >= threshold) {
+            drawSegment(crossings[0], crossings[3]);
+            drawSegment(crossings[1], crossings[2]);
+          } else {
+            drawSegment(crossings[0], crossings[1]);
+            drawSegment(crossings[2], crossings[3]);
+          }
+        }
+      }
+    }
+    context.stroke();
+  }
+
+  const peakCandidates: Array<{ column: number; row: number; value: number }> = [];
+  for (let row = 1; row < water.rows - 1; row += 1) {
+    for (let column = 1; column < water.columns - 1; column += 1) {
+      const value = valueAt(column, row);
+      if (value < 0.24) continue;
+      let localMaximum = true;
+      let hasMeaningfullyLowerNeighbour = false;
+      for (let rowOffset = -1; rowOffset <= 1 && localMaximum; rowOffset += 1) {
+        for (let columnOffset = -1; columnOffset <= 1; columnOffset += 1) {
+          if (rowOffset === 0 && columnOffset === 0) continue;
+          const neighbour = valueAt(
+            column + columnOffset,
+            row + rowOffset,
+          );
+          if (neighbour > value + 0.008) {
+            localMaximum = false;
+            break;
+          }
+          if (neighbour < value - 0.035) {
+            hasMeaningfullyLowerNeighbour = true;
+          }
+        }
+      }
+      // A flat, well-mixed field has no spatial hotspot. Treating every cell
+      // on a plateau as a local maximum produced a regular field of hollow
+      // dots—the same visual clutter the contour mode is meant to remove.
+      if (localMaximum && hasMeaningfullyLowerNeighbour) {
+        peakCandidates.push({ column, row, value });
+      }
+    }
+  }
+  peakCandidates.sort((first, second) => second.value - first.value);
+  const peaks: typeof peakCandidates = [];
+  for (const candidate of peakCandidates) {
+    if (peaks.length >= 18) break;
+    if (peaks.some((peak) =>
+      Math.hypot(peak.column - candidate.column, peak.row - candidate.row) < 3.5)) continue;
+    peaks.push(candidate);
+  }
+  context.setLineDash([]);
+  context.globalAlpha = 0.82;
+  context.lineWidth = 1.15;
+  for (const peak of peaks) {
+    const point = pointAt(peak.column, peak.row);
+    context.beginPath();
+    context.arc(point.x, point.y, 1.4 + peak.value * 1.1, 0, Math.PI * 2);
     context.stroke();
   }
   context.restore();
@@ -956,11 +1125,17 @@ const drawAnalysisOverlay = (
   const selectedWaterLayers = WATER_QUALITY_DRAW_ORDER.filter((layerId) =>
     selectedWaterLayerSet.has(layerId));
   const temperatureSelected = selectedLayers.includes('temperature');
-  const flowSelected = selectedLayers.includes('flow');
-  const scalarLayerCount = selectedWaterLayers.length + (temperatureSelected ? 1 : 0);
+  const pelagicPlan = pelagicRenderPlan(selectedLayers);
+  const selectedPelagicLayerCount = (pelagicPlan.primary ? 1 : 0) +
+    pelagicPlan.secondary.length;
+  const scalarLayerCount = selectedWaterLayers.length +
+    selectedPelagicLayerCount +
+    (temperatureSelected ? 1 : 0);
   const primaryWaterLayer = scalarLayerCount === 1 && selectedWaterLayers.length === 1
     ? selectedWaterLayers[0]
     : null;
+  const primaryPelagicLayer = pelagicPlan.primary;
+  const flowSelected = selectedLayers.includes('flow');
   if (primaryWaterLayer) {
     const water = snapshot.biogeochemistry.water;
     const grid = getAnalysisGridSurface(layer, water.columns, water.rows);
@@ -986,6 +1161,31 @@ const drawAnalysisOverlay = (
         pixels.data[offset + 3] = Math.round(
           waterQualityOverlayAlpha(primaryWaterLayer, value, normalized) * 255,
         );
+      }
+      grid.context.putImageData(pixels, 0, 0);
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.drawImage(grid.canvas, 0, 0, rasterWidth, rasterHeight);
+    }
+  }
+
+  if (primaryPelagicLayer) {
+    const water = snapshot.biogeochemistry.water;
+    const grid = getAnalysisGridSurface(layer, water.columns, water.rows);
+    if (grid) {
+      const values = pelagicValues(snapshot, primaryPelagicLayer);
+      const palette = PELAGIC_PALETTES[primaryPelagicLayer];
+      const displayMaximum = pelagicVisualMaximum(primaryPelagicLayer, values);
+      const pixels = getReusableImageData(grid.context, water.columns, water.rows);
+      for (let index = 0; index < water.columns * water.rows; index += 1) {
+        const value = Math.max(0, values[index] ?? 0);
+        const normalized = normalizePelagicForDisplay(value, displayMaximum);
+        const color = mixColor(palette.low, palette.high, normalized);
+        const offset = index * 4;
+        pixels.data[offset] = (color >> 16) & 0xff;
+        pixels.data[offset + 1] = (color >> 8) & 0xff;
+        pixels.data[offset + 2] = color & 0xff;
+        pixels.data[offset + 3] = Math.round(pelagicOverlayAlpha(normalized) * 255);
       }
       grid.context.putImageData(pixels, 0, 0);
       context.imageSmoothingEnabled = true;
@@ -1022,6 +1222,15 @@ const drawAnalysisOverlay = (
 
   for (const contourLayer of scalarLayerCount > 1 ? selectedWaterLayers : []) {
     drawWaterQualityContours(
+      context,
+      snapshot,
+      contourLayer,
+      rasterWidth,
+      rasterHeight,
+    );
+  }
+  for (const contourLayer of pelagicPlan.secondary) {
+    drawPelagicContours(
       context,
       snapshot,
       contourLayer,
@@ -1223,7 +1432,6 @@ const syncStructures = (
   }
 };
 
-const SHRIMP_DRAW_LENGTH = 48;
 const SHRIMP_ADULT_LENGTH = 36;
 const SHRIMP_ABDOMEN_X = [-4, -10, -16, -21];
 const RICEFISH_DRAW_LENGTH = 52;
@@ -1360,35 +1568,65 @@ const emptyAnimalPart = (): Container => new Container();
 const drawRicefishBody = (): Container => {
   const group = new Container();
   const body = new Graphics()
-    .moveTo(-20, 0)
-    .bezierCurveTo(-12, -8.5, 5, -9.5, 20, -3)
-    .quadraticCurveTo(25, 0, 20, 3.5)
-    .bezierCurveTo(5, 9, -12, 7.5, -20, 0)
+    // Wild medaka are long and nearly straight-backed rather than the deep,
+    // oval silhouette used by the first placeholder.
+    .moveTo(-23.5, -2.1)
+    .bezierCurveTo(-15, -4.7, -2, -6.1, 10.5, -5.4)
+    .bezierCurveTo(18.3, -5, 23.4, -3.4, 27.1, -1.1)
+    .quadraticCurveTo(29.1, 0.1, 26.8, 1.7)
+    .bezierCurveTo(22.3, 4.5, 14.2, 5.8, 4.2, 5.9)
+    .bezierCurveTo(-7.2, 5.8, -17.4, 4.2, -23.5, 2.2)
     .closePath()
-    .fill({ color: 0xd8d2ad, alpha: 0.92 })
-    .stroke({ color: 0x303c3a, width: 1.85, alpha: 0.96, join: 'round' });
-  const back = new Graphics()
-    .moveTo(-15, -3.2)
-    .bezierCurveTo(-4, -7.2, 10, -6.6, 18, -2.4)
-    .stroke({ color: 0x8e956f, width: 2.2, alpha: 0.62, cap: 'round' })
-    .moveTo(-14, 2.6)
-    .bezierCurveTo(-3, 4.6, 9, 4, 18, 1.4)
-    .stroke({ color: 0xf2e8bd, width: 1.7, alpha: 0.8, cap: 'round' });
+    .fill({ color: 0xc9c8a4, alpha: 0.8 })
+    .stroke({ color: 0x34423f, width: 1.45, alpha: 0.96, join: 'round' });
+  const translucentBody = new Graphics()
+    .moveTo(-20.5, -1)
+    .bezierCurveTo(-8, -3.6, 7, -4.2, 20.5, -1.7)
+    .bezierCurveTo(14.5, -0.2, 7.5, 1, -0.5, 1.4)
+    .bezierCurveTo(-8.5, 1.7, -15.4, 1, -20.5, -1)
+    .closePath()
+    .fill({ color: 0x8f9d7c, alpha: 0.23 });
+  const belly = new Graphics()
+    .moveTo(-18.5, 2.5)
+    .bezierCurveTo(-6.5, 5.1, 9, 4.9, 22.3, 1.8)
+    .stroke({ color: 0xf1e7be, width: 1.5, alpha: 0.78, cap: 'round' });
   const lateral = new Graphics()
-    .moveTo(-14, 0.4)
-    .bezierCurveTo(-2, 1.5, 10, 1.1, 19, -0.2)
-    .stroke({ color: 0xa88b48, width: 1.2, alpha: 0.72, cap: 'round' });
+    .moveTo(-20, 0.2)
+    .bezierCurveTo(-7, 1, 8, 0.8, 22.5, -0.3)
+    .stroke({ color: 0x9a8655, width: 0.9, alpha: 0.64, cap: 'round' });
+  const gill = new Graphics()
+    .moveTo(13.2, -3.6)
+    .quadraticCurveTo(10.3, 0, 13.1, 3.4)
+    .stroke({ color: 0x68726a, width: 0.9, alpha: 0.62, cap: 'round' });
+  const melanophores = new Graphics();
+  for (const [x, y, radius] of [
+    [-15, -2.4, 0.48], [-10.5, -2.8, 0.38], [-6, -3, 0.43],
+    [-1.5, -3.2, 0.34], [3.2, -3.25, 0.4], [7.7, -3, 0.33],
+    [-12.5, 1.1, 0.32], [-5.8, 1.5, 0.28], [1.3, 1.4, 0.3],
+    [7.5, 1.1, 0.27],
+  ] as const) {
+    melanophores.circle(x, y, radius).fill({ color: 0x505d54, alpha: 0.55 });
+  }
   const eye = new Graphics()
-    .circle(16.5, -2.9, 2.45)
-    .fill({ color: 0xf8f2d8, alpha: 1 })
-    .stroke({ color: 0x303c3a, width: 1.05, alpha: 1 })
-    .circle(17.1, -2.9, 1.1)
+    .circle(19.5, -2.25, 2.65)
+    .fill({ color: 0xd9c36f, alpha: 0.95 })
+    .stroke({ color: 0x34423f, width: 1, alpha: 1 })
+    .circle(20, -2.25, 1.35)
     .fill({ color: 0x26312f, alpha: 1 });
   const mouth = new Graphics()
-    .moveTo(20.2, 0.2)
-    .quadraticCurveTo(23.4, 1.2, 25, 0.2)
-    .stroke({ color: 0x303c3a, width: 1.05, alpha: 0.9, cap: 'round' });
-  group.addChild(body, back, lateral, eye, mouth);
+    .moveTo(25.1, 0.45)
+    .quadraticCurveTo(27.8, 0.15, 29.2, -0.85)
+    .stroke({ color: 0x34423f, width: 0.95, alpha: 0.9, cap: 'round' });
+  group.addChild(
+    body,
+    translucentBody,
+    belly,
+    lateral,
+    gill,
+    melanophores,
+    eye,
+    mouth,
+  );
   return group;
 };
 
@@ -1396,17 +1634,19 @@ const drawRicefishTail = (): Container => {
   const group = new Container();
   const tail = new Graphics()
     .moveTo(0, 0)
-    .quadraticCurveTo(-11, -11, -16, -8)
-    .quadraticCurveTo(-13, 0, -16, 8)
-    .quadraticCurveTo(-9, 11, 0, 0)
+    .quadraticCurveTo(-8.5, -8.2, -15.3, -7)
+    .bezierCurveTo(-17.1, -4.7, -17.1, 4.7, -15.3, 7)
+    .quadraticCurveTo(-8.5, 8.2, 0, 0)
     .closePath()
-    .fill({ color: 0xc8c49e, alpha: 0.72 })
-    .stroke({ color: 0x303c3a, width: 1.55, alpha: 0.9, join: 'round' })
-    .moveTo(-2, 0)
-    .lineTo(-13, -6)
-    .moveTo(-2, 0)
-    .lineTo(-13, 6)
-    .stroke({ color: 0x8b8c70, width: 0.75, alpha: 0.62 });
+    .fill({ color: 0xd9d2aa, alpha: 0.45 })
+    .stroke({ color: 0x46534e, width: 1.05, alpha: 0.78, join: 'round' })
+    .moveTo(-1.5, 0)
+    .lineTo(-13.6, -5.7)
+    .moveTo(-1.5, 0)
+    .lineTo(-13.6, 5.7)
+    .moveTo(-1.5, 0)
+    .lineTo(-15.6, 0)
+    .stroke({ color: 0x7f886f, width: 0.62, alpha: 0.55 });
   group.addChild(tail);
   return group;
 };
@@ -1414,21 +1654,35 @@ const drawRicefishTail = (): Container => {
 const drawRicefishFins = (): Container => {
   const group = new Container();
   const fins = new Graphics()
-    .moveTo(-2, -6.5)
-    .quadraticCurveTo(-7, -13, 2, -8)
+    // The dorsal and anal fins sit far back, one of the clearest medaka
+    // silhouettes at this display size.
+    .moveTo(-16.5, -3.5)
+    .quadraticCurveTo(-13.5, -11, -5.5, -5.2)
     .closePath()
-    .fill({ color: 0xc9c8a8, alpha: 0.5 })
-    .stroke({ color: 0x3c4743, width: 1, alpha: 0.66 })
-    .moveTo(3, 5.3)
-    .quadraticCurveTo(-1, 12, 8, 6)
+    .fill({ color: 0xd7d2ad, alpha: 0.4 })
+    .stroke({ color: 0x46534e, width: 0.85, alpha: 0.62 })
+    .moveTo(-16.5, 3.9)
+    .quadraticCurveTo(-11.5, 12.2, 0.5, 5.5)
     .closePath()
-    .fill({ color: 0xc9c8a8, alpha: 0.48 })
-    .stroke({ color: 0x3c4743, width: 1, alpha: 0.64 })
-    .moveTo(8, 1.2)
-    .quadraticCurveTo(3, 8.5, 13, 4.2)
+    .fill({ color: 0xd7d2ad, alpha: 0.38 })
+    .stroke({ color: 0x46534e, width: 0.85, alpha: 0.6 })
+    .moveTo(11.2, 1.2)
+    .quadraticCurveTo(4.5, 8.5, 14.6, 4.2)
     .closePath()
-    .fill({ color: 0xe2d9ae, alpha: 0.54 })
-    .stroke({ color: 0x3c4743, width: 0.9, alpha: 0.62 });
+    .fill({ color: 0xe7dfb9, alpha: 0.42 })
+    .stroke({ color: 0x46534e, width: 0.78, alpha: 0.55 })
+    .moveTo(1.8, 4.6)
+    .quadraticCurveTo(-2.5, 9.4, 5.6, 5.4)
+    .closePath()
+    .fill({ color: 0xe7dfb9, alpha: 0.34 })
+    .stroke({ color: 0x46534e, width: 0.72, alpha: 0.48 })
+    .moveTo(-14.8, -4.2)
+    .lineTo(-11.8, -8.4)
+    .moveTo(-11.4, 4.7)
+    .lineTo(-8.6, 9.1)
+    .moveTo(-7.2, 4.9)
+    .lineTo(-4.4, 8.3)
+    .stroke({ color: 0x858c74, width: 0.55, alpha: 0.5 });
   group.addChild(fins);
   return group;
 };
@@ -1439,11 +1693,11 @@ const createRicefishDisplay = (
 ): AnimalDisplay => {
   const container = new Container();
   const selection = new Graphics()
-    .ellipse(0, 0, target.lifeStage === 'egg' ? 9 : 30, target.lifeStage === 'egg' ? 9 : 13)
+    .ellipse(0, 0, target.lifeStage === 'egg' ? 9 : 36, target.lifeStage === 'egg' ? 9 : 12.5)
     .stroke({ color: 0xf8edc7, width: 5.5, alpha: 0.7 })
     .stroke({ color: 0xa88b48, width: 2, alpha: 0.94 });
   const placement = new Graphics()
-    .ellipse(0, 0, 31, 14)
+    .ellipse(0, 0, 37, 13.5)
     .stroke({ color: 0xffffff, width: 3, alpha: 0.9 });
   const art = new Container();
   const head = target.lifeStage === 'egg' ? new Container() : drawRicefishBody();
@@ -1460,7 +1714,7 @@ const createRicefishDisplay = (
       .fill({ color: 0x26312f, alpha: 0.9 });
     head.addChild(egg);
   } else {
-    tail.position.set(-18.5, 0);
+    tail.position.set(-23, 0);
   }
   art.addChild(tail, fins, head);
   container.addChild(selection, placement, art);
@@ -1496,9 +1750,101 @@ const createRicefishDisplay = (
   };
 };
 
+const createDaphniaDisplay = (
+  id: string,
+  target: AnimalRenderTarget,
+): AnimalDisplay => {
+  const container = new Container();
+  const selection = new Graphics()
+    .ellipse(0, 0, 11, 13)
+    .stroke({ color: 0xf8edc7, width: 3.5, alpha: 0.72 })
+    .stroke({ color: 0xb76e68, width: 1.4, alpha: 0.95 });
+  const placement = new Graphics()
+    .ellipse(0, 0, 12, 14)
+    .stroke({ color: 0xffffff, width: 2.2, alpha: 0.92 });
+  const art = new Container();
+  const head = new Container();
+  const shell = new Graphics()
+    .moveTo(3.8, -7.5)
+    .bezierCurveTo(-2.7, -9.6, -8.8, -5.2, -8.4, 1.8)
+    .bezierCurveTo(-8, 7.1, -2.8, 9.2, 2.1, 6.1)
+    .bezierCurveTo(6, 3.6, 7.2, -2.7, 3.8, -7.5)
+    .closePath()
+    .fill({ color: 0xe7b7ad, alpha: 0.48 })
+    .stroke({ color: 0x594c49, width: 1.15, alpha: 0.94, join: 'round' });
+  const inner = new Graphics()
+    .moveTo(-3.4, -4.8)
+    .bezierCurveTo(-5.8, -0.8, -5.1, 4.4, -1.1, 5.7)
+    .bezierCurveTo(1.6, 3.5, 2.8, -0.5, 1.1, -4.6)
+    .stroke({ color: 0x9d6f67, width: 1.4, alpha: 0.48, cap: 'round' });
+  const eye = new Graphics()
+    .circle(3.3, -4.6, 1.75)
+    .fill({ color: 0x303a38, alpha: 0.98 })
+    .circle(3.8, -5.1, 0.45)
+    .fill({ color: 0xf7e8c5, alpha: 0.9 });
+  head.addChild(shell, inner, eye);
+  const antennae = new Container();
+  antennae.addChild(new Graphics()
+    .moveTo(4.8, -5.3)
+    .bezierCurveTo(9, -9.4, 12.2, -10, 15.5, -8.1)
+    .moveTo(5.1, -4.6)
+    .bezierCurveTo(10, -5.8, 13, -4.2, 15.2, -1.7)
+    .stroke({ color: 0x514744, width: 0.8, alpha: 0.82, cap: 'round' }));
+  const legs = new Container();
+  legs.addChild(new Graphics()
+    .moveTo(2, 0.2).quadraticCurveTo(7.1, 1.2, 8.1, 4.5)
+    .moveTo(1.2, 1.8).quadraticCurveTo(5.3, 4.2, 5, 7.2)
+    .moveTo(0.1, 3).quadraticCurveTo(2.7, 6.2, 1.4, 8.1)
+    .stroke({ color: 0x725a55, width: 0.65, alpha: 0.67, cap: 'round' }));
+  const tail = new Container();
+  tail.addChild(new Graphics()
+    .moveTo(-2.2, 6.3)
+    .quadraticCurveTo(-5.2, 10.2, -7.2, 12.7)
+    .stroke({ color: 0x514744, width: 0.85, alpha: 0.82, cap: 'round' }));
+  const eggs = new Graphics();
+  for (const [x, y] of [[-2.6, -2.2], [-3.3, 0], [-2.2, 2.1]] as const) {
+    eggs.circle(x, y, 1.35)
+      .fill({ color: 0xd98f72, alpha: 0.83 })
+      .stroke({ color: 0x76524c, width: 0.45, alpha: 0.7 });
+  }
+  const empty = emptyAnimalPart();
+  art.addChild(tail, antennae, legs, head, eggs);
+  container.addChild(selection, placement, art);
+  return {
+    speciesId: 'daphnia',
+    lifeStage: target.lifeStage,
+    container,
+    selection,
+    placement,
+    art,
+    head,
+    abdomen: [],
+    tail,
+    legs,
+    antennae,
+    eggs,
+    grazingFeedback: empty,
+    grazingMouth: new Graphics(),
+    grazingFlecks: [],
+    target,
+    renderX: target.x,
+    renderY: target.y,
+    renderFacing: target.facing,
+    renderPoseAngle: target.poseAngle,
+    renderBodyLength: target.bodyLength,
+    renderMotion: { ...ANIMAL_MOTION_PROFILES[target.behavior] },
+    grazingWeight: 0,
+    phase: 0,
+    phaseOffset: animalHash(id) * Math.PI * 2,
+  };
+};
+
 const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisplay => {
   if (target.speciesId === 'japanese-ricefish') {
     return createRicefishDisplay(id, target);
+  }
+  if (target.speciesId === 'daphnia') {
+    return createDaphniaDisplay(id, target);
   }
   const container = new Container();
   const selection = new Graphics()
@@ -1559,6 +1905,44 @@ const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisp
 const createAnimalCarcassDisplay = (
   target: AnimalCarcassSnapshot,
 ): AnimalCarcassDisplay => {
+  if (target.speciesId === 'daphnia') {
+    const living = createDaphniaDisplay(target.id, {
+      speciesId: 'daphnia',
+      lifeStage: target.lifeStage,
+      x: target.x,
+      y: target.y,
+      facing: target.facing,
+      poseAngle: target.poseAngle,
+      bodyLength: target.bodyLength,
+      behavior: 'resting',
+      health: 0,
+      selected: false,
+      held: false,
+      placementValid: true,
+      reproductiveState: 'none',
+      interpolatedPosition: false,
+    });
+    living.selection.visible = false;
+    living.placement.visible = false;
+    living.eggs.visible = false;
+    living.art.tint = 0xb9b8a9;
+    return {
+      speciesId: target.speciesId,
+      container: living.container,
+      art: living.art,
+      head: living.head,
+      abdomen: living.abdomen,
+      tail: living.tail,
+      legs: living.legs,
+      antennae: living.antennae,
+      target,
+      renderX: target.x,
+      renderY: target.y,
+      renderFacing: target.facing,
+      renderBodyLength: target.bodyLength,
+      phaseOffset: animalHash(target.id) * Math.PI * 2,
+    };
+  }
   if (target.speciesId === 'japanese-ricefish') {
     const container = new Container();
     const art = new Container();
@@ -1566,7 +1950,7 @@ const createAnimalCarcassDisplay = (
     const tail = drawRicefishTail();
     const fins = drawRicefishFins();
     const empty = emptyAnimalPart();
-    tail.position.set(-18.5, 0);
+    tail.position.set(-23, 0);
     art.addChild(tail, fins, head);
     art.tint = 0xbcbba8;
     container.addChild(art);
@@ -1635,6 +2019,7 @@ const syncAnimalCarcasses = (
   layer: Container,
   snapshot: SimulationSnapshot,
   displays: Map<string, AnimalCarcassDisplay>,
+  livingDisplays?: Map<string, AnimalDisplay>,
 ): void => {
   const carcasses = snapshot.carcasses;
   const currentIds = new Set(carcasses.map((carcass) => carcass.id));
@@ -1648,12 +2033,31 @@ const syncAnimalCarcasses = (
     let display = displays.get(carcass.id);
     if (!display) {
       display = createAnimalCarcassDisplay(carcass);
+      const living = livingDisplays?.get(carcass.sourceAnimalId);
+      if (living) {
+        // A full ecology snapshot can replace a living, interpolated animal
+        // with a carcass between two motion samples. Start the carcass at the
+        // exact rendered pose the player just saw, then ease toward the
+        // authoritative death coordinate.
+        display.renderX = living.renderX;
+        display.renderY = living.renderY;
+        display.renderFacing = living.renderFacing < 0 ? -1 : 1;
+        display.renderBodyLength = living.renderBodyLength;
+        display.container.position.set(living.renderX, living.renderY);
+      } else {
+        display.container.position.set(carcass.x, carcass.y);
+      }
       displays.set(carcass.id, display);
       layer.addChild(display.container);
     }
     display.target = carcass;
   }
 };
+
+export const daphniaCarcassSinkingOffset = (
+  ageSeconds: number,
+  availableDrop: number,
+): number => animalCarcassVisualDrop('daphnia', ageSeconds, availableDrop);
 
 const animalTarget = (
   animal: AnimalSnapshot,
@@ -1745,6 +2149,8 @@ const syncAnimals = (
       bodyLength: previous?.bodyLength ?? (
         held.animalSpeciesId === 'japanese-ricefish'
           ? RICEFISH_ADULT_LENGTH
+          : held.animalSpeciesId === 'daphnia'
+            ? 9
           : SHRIMP_ADULT_LENGTH
       ),
       behavior: 'held',
@@ -1856,7 +2262,7 @@ const animateAnimals = (
     }
     const phase = display.phase + display.phaseOffset;
     const facingSign = display.renderFacing < 0 ? -1 : 1;
-    const artScale = Math.max(0.18, display.renderBodyLength / SHRIMP_DRAW_LENGTH);
+    const artScale = shrimpVisualScale(display.renderBodyLength);
     const bob = Math.sin(phase * 0.72) * motion.bob;
 
     display.container.position.set(display.renderX, display.renderY);
@@ -1897,7 +2303,31 @@ const animateAnimals = (
       continue;
     }
 
-    const selectionScale = Math.max(0.58, display.renderBodyLength / SHRIMP_ADULT_LENGTH);
+    if (display.speciesId === 'daphnia') {
+      const daphniaScale = daphniaVisualScale(display.renderBodyLength);
+      const hopPulse = Math.max(0, Math.sin(phase));
+      display.art.scale.set(
+        display.renderFacing * daphniaScale,
+        daphniaScale * (0.98 + hopPulse * 0.035),
+      );
+      display.art.rotation = display.renderPoseAngle * facingSign;
+      display.art.position.set(0, bob * 0.48 - hopPulse * 0.45);
+      display.selection.visible = target.selected && !target.held;
+      display.selection.rotation = display.art.rotation;
+      display.selection.scale.set(daphniaScale);
+      display.placement.visible = target.held;
+      display.placement.rotation = display.art.rotation;
+      display.placement.scale.set(daphniaScale);
+      display.placement.tint = target.placementValid ? 0xf0c85e : 0xd7605b;
+      display.eggs.visible = target.reproductiveState === 'carrying-eggs';
+      display.antennae.rotation = Math.sin(phase * 0.72 + 0.5) * 0.12 -
+        hopPulse * 0.08;
+      display.legs.rotation = Math.sin(phase * 1.35) * 0.08;
+      display.tail.rotation = Math.sin(phase * 0.63) * 0.045;
+      continue;
+    }
+
+    const selectionScale = shrimpVisualScale(display.renderBodyLength) * 1.08;
     display.selection.visible = target.selected && !target.held;
     display.selection.rotation = display.renderPoseAngle * facingSign;
     display.selection.scale.set(selectionScale);
@@ -1968,10 +2398,12 @@ const animateAnimalCarcasses = (
     const lifeProgress = Math.min(1, age / lifetime);
     const settle = 1 - Math.exp(-age * 1.35);
     const availableDrop = Math.max(0, GROUND_Y - 8 - target.y);
-    const drop = Math.min(8, availableDrop) * settle;
+    const drop = display.speciesId === 'daphnia'
+      ? daphniaCarcassSinkingOffset(age, availableDrop)
+      : Math.min(8, availableDrop) * settle;
     const lastMoments = Math.max(0, (lifeProgress - 0.72) / 0.28);
     const fade = 1 - lastMoments * lastMoments * (3 - 2 * lastMoments);
-    const artScale = Math.max(0.18, display.renderBodyLength / SHRIMP_DRAW_LENGTH);
+    const artScale = shrimpVisualScale(display.renderBodyLength);
     const facingSign = display.renderFacing < 0 ? -1 : 1;
     const settlingRock = Math.sin(age * 2.2 + display.phaseOffset) * 0.045 * Math.exp(-age * 0.75);
 
@@ -1988,6 +2420,17 @@ const animateAnimalCarcasses = (
       display.tail.rotation = Math.sin(age * 1.4 + display.phaseOffset) *
         0.06 * Math.exp(-age * 0.8);
       display.legs.alpha = 0.48;
+      continue;
+    }
+
+    if (display.speciesId === 'daphnia') {
+      const daphniaScale = daphniaVisualScale(display.renderBodyLength);
+      display.art.scale.set(facingSign * daphniaScale, daphniaScale * 0.92);
+      display.art.rotation = facingSign * 0.46 + settlingRock;
+      display.antennae.rotation = 0.18;
+      display.legs.rotation = -0.2;
+      display.tail.rotation = 0.12;
+      display.legs.alpha = 0.42;
       continue;
     }
 
@@ -2493,6 +2936,7 @@ const algaeDetailGeometryKey = (
   return [
     cell.id,
     generation,
+    algaeVisualLevel(cell.biomass[speciesId]),
     algaeKeyNumber(cell.x),
     algaeKeyNumber(cell.y),
     algaeKeyNumber(cell.cellSize),
@@ -2522,12 +2966,16 @@ const rebuildAlgaeDetailGeometry = (
   if (speciesId === 'oedogonium') {
     for (const cell of cells) {
       const generation = surface.colonization.oedogonium.get(cell.id)?.generation ?? 1;
+      const detailCount = algaeDetailCount(
+        ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL,
+        algaeVisualLevel(cell.biomass.oedogonium),
+      );
       const surfaceAngle = cell.surfaceKind === 'structure-face'
         ? structureAngles.get(cell.ownerId) ?? 0
         : 0;
       for (
         let index = 0;
-        index < ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL;
+        index < detailCount;
         index += 1
       ) {
         appendOedogoniumFilament(
@@ -2552,12 +3000,16 @@ const rebuildAlgaeDetailGeometry = (
 
   for (const cell of cells) {
     const generation = surface.colonization.nitzschia.get(cell.id)?.generation ?? 1;
+    const detailCount = algaeDetailCount(
+      ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL,
+      algaeVisualLevel(cell.biomass.nitzschia),
+    );
     const surfaceAngle = cell.surfaceKind === 'structure-face'
       ? structureAngles.get(cell.ownerId) ?? 0
       : 0;
     for (
       let index = 0;
-      index < ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL;
+      index < detailCount;
       index += 1
     ) {
       appendNitzschiaSpeck(
@@ -2921,6 +3373,25 @@ const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void =
     .fill({ color: 0x173349, alpha: darkness * 0.34 });
 };
 
+const drawPhytoplankton = (layer: Graphics, snapshot: SimulationSnapshot): void => {
+  layer.clear();
+  const water = snapshot.biogeochemistry.water;
+  if (!water.columns || !water.rows) return;
+  const plan = createPhytoplanktonVisualPlan(
+    water.phytoplankton,
+    water.columns,
+    water.rows,
+  );
+  for (const haze of plan.haze) {
+    layer.ellipse(haze.x, haze.y, haze.radiusX, haze.radiusY)
+      .fill({ color: 0x729f5a, alpha: haze.alpha });
+  }
+  for (const speck of plan.specks) {
+    layer.circle(speck.x, speck.y, speck.radius)
+      .fill({ color: speck.color, alpha: speck.alpha });
+  }
+};
+
 const drawInteraction = (
   layer: Graphics,
   snapshot: SimulationSnapshot,
@@ -2947,6 +3418,30 @@ const drawInteraction = (
       .fill({ color: 0xf9f2d9, alpha: 0.7 })
       .stroke({ color, width: 4, alpha: 0.95 });
     layer.circle(held.x, held.y, 4).fill({ color, alpha: 0.95 });
+    return;
+  }
+  if (held.kind === 'plankton' && held.planktonKind) {
+    const color = held.valid
+      ? held.planktonKind === 'phytoplankton' ? 0x78a95a : 0xc88d7d
+      : 0xcf5f5a;
+    layer.circle(held.x, held.y, held.planktonKind === 'daphnia' ? 18 : 14)
+      .fill({ color: 0xf9f2d9, alpha: 0.62 })
+      .stroke({ color, width: 3, alpha: 0.94 });
+    if (held.planktonKind === 'daphnia') {
+      layer.ellipse(held.x, held.y, 6.5, 9.5)
+        .fill({ color, alpha: 0.56 })
+        .stroke({ color: 0x765f58, width: 1.4 });
+      layer.circle(held.x + 2, held.y - 3, 1.2).fill({ color: 0x35423f });
+    } else {
+      for (let index = 0; index < 7; index += 1) {
+        const angle = index / 7 * Math.PI * 2;
+        layer.circle(
+          held.x + Math.cos(angle) * (index % 2 ? 7 : 4),
+          held.y + Math.sin(angle) * (index % 2 ? 6 : 4),
+          1.8,
+        ).fill({ color, alpha: 0.82 });
+      }
+    }
     return;
   }
   if (held.kind !== 'biofilm' || !held.microbeGuildId) return;
@@ -2987,6 +3482,8 @@ const drawProbe = (
       ? selectedLayer
         ? isMicrobeLayer(selectedLayer)
           ? MICROBES[selectedLayer].color
+          : isPelagicLayer(selectedLayer)
+            ? PELAGIC_PALETTES[selectedLayer].high
           : selectedLayer === 'temperature'
             ? 0xd47c4d
             : selectedLayer === 'flow'
@@ -3137,7 +3634,25 @@ const drawSelection = (layer: Graphics, snapshot: SimulationSnapshot): void => {
   }
   if (selection.kind === 'carcass') {
     const carcass = snapshot.carcasses.find((candidate) => candidate.id === selection.carcassId);
-    const selectionScale = Math.max(0.58, (carcass?.bodyLength ?? SHRIMP_ADULT_LENGTH) / SHRIMP_ADULT_LENGTH);
+    if (carcass?.speciesId === 'daphnia') {
+      const scale = daphniaVisualScale(carcass.bodyLength);
+      layer
+        .ellipse(
+          selection.x,
+          selection.y,
+          Math.max(5.5, 11 * scale + 1),
+          Math.max(5.5, 13 * scale + 1),
+        )
+        .stroke({ color: 0xf7edc9, width: 4, alpha: 0.68 })
+        .stroke({ color: 0x8c7770, width: 1.8, alpha: 0.94 });
+      return;
+    }
+    const selectionScale = carcass?.speciesId === 'cherry-shrimp'
+      ? shrimpVisualScale(carcass.bodyLength) * 1.08
+      : Math.max(
+        0.58,
+        (carcass?.bodyLength ?? SHRIMP_ADULT_LENGTH) / SHRIMP_ADULT_LENGTH,
+      );
     layer
       .ellipse(selection.x, selection.y + 6, 29 * selectionScale, 15 * selectionScale)
       .stroke({ color: 0xf7edc9, width: 6, alpha: 0.65 })
@@ -3281,7 +3796,11 @@ export function AquariumCanvas({
   ): boolean => {
     const layers = layersRef.current;
     if (!layers || !holding || holding.source !== 'inventory') return false;
-    if (holding.kind === 'seed' || holding.kind === 'biofilm') {
+    if (
+      holding.kind === 'seed' ||
+      holding.kind === 'biofilm' ||
+      holding.kind === 'plankton'
+    ) {
       drawInteraction(layers.interaction, { ...snapshotRef.current, holding }, false);
       return true;
     }
@@ -3456,10 +3975,11 @@ export function AquariumCanvas({
         )) < CAMERA_EPSILON &&
         Math.abs(cameraRef.current.centerX - CAMERA_SCENE_CENTER_X) < 0.5 &&
         Math.abs(cameraRef.current.centerY - CAMERA_SCENE_CENTER_Y) < 0.5;
-      const minimumZoom = fitTankZoom(width, height);
+      const fittedZoom = fitTankZoom(width, height);
+      const minimumZoom = minimumTankZoom(width, height);
       const requestedCamera = resizeRenderer && wasFit
         ? {
-          zoom: minimumZoom,
+          zoom: fittedZoom,
           centerX: CAMERA_SCENE_CENTER_X,
           centerY: CAMERA_SCENE_CENTER_Y,
         }
@@ -3472,7 +3992,7 @@ export function AquariumCanvas({
       setCameraMinimumZoom(minimumZoom);
       setCameraCanPan(canPanTankCamera(width, height, camera.zoom));
       setCameraIsFit(
-        Math.abs(camera.zoom - minimumZoom) < CAMERA_EPSILON &&
+        Math.abs(camera.zoom - fittedZoom) < CAMERA_EPSILON &&
         Math.abs(camera.centerX - CAMERA_SCENE_CENTER_X) < 0.5 &&
         Math.abs(camera.centerY - CAMERA_SCENE_CENTER_Y) < 0.5,
       );
@@ -3523,6 +4043,7 @@ export function AquariumCanvas({
         lamp: new Graphics(),
         base: new Graphics(),
         light: new Sprite(Texture.EMPTY),
+        plankton: new Graphics(),
         substrateAlgae: createAlgaeParticleLayer('substrate'),
         foreground: new Graphics(),
         structures: new Container(),
@@ -3557,6 +4078,7 @@ export function AquariumCanvas({
       scene.addChild(
         layers.base,
         layers.light,
+        layers.plankton,
         layers.substrateAlgae,
         layers.foreground,
         layers.plantsBack,
@@ -3594,6 +4116,7 @@ export function AquariumCanvas({
       const initialRenderState = reconcileMotionWithSnapshot(initialSnapshot, initialMotion);
       const initialShowsLight = activeToolRef.current === 'light-probe';
       drawLightField(layers.light, initialSnapshot, initialShowsLight);
+      drawPhytoplankton(layers.plankton, initialSnapshot);
       drawAnalysisOverlay(layers.analysis, initialSnapshot, waterQualityLayersRef.current);
       syncStructures(
         layers.structures,
@@ -3625,7 +4148,12 @@ export function AquariumCanvas({
         true,
         isPendingInventoryHandoff(),
       );
-      syncAnimalCarcasses(layers.animals, initialSnapshot, ownedAnimalCarcassDisplays);
+      syncAnimalCarcasses(
+        layers.animals,
+        initialSnapshot,
+        ownedAnimalCarcassDisplays,
+        ownedAnimalDisplays,
+      );
       drawAquaticPlants(layers.plantsBack, initialSnapshot, 'back');
       drawAquaticPlants(layers.plantsFront, initialSnapshot, 'front');
       lastPlantsDrawRef.current = vallisneriaVisualKey(initialSnapshot);
@@ -3893,6 +4421,7 @@ export function AquariumCanvas({
       drawLightField(layers.light, snapshot, activeTool === 'light-probe');
       lastLightDrawRef.current = lightKey;
     }
+    drawPhytoplankton(layers.plankton, snapshot);
     const analysisKey = analysisOverlayKey(snapshot, waterQualityLayers);
     if (lastAnalysisDrawRef.current !== analysisKey) {
       drawAnalysisOverlay(layers.analysis, snapshot, waterQualityLayers);
@@ -3906,6 +4435,14 @@ export function AquariumCanvas({
       renderState.structures,
       isPendingInventoryHandoff(),
     );
+    // Create a new carcass while the last living display still exists so the
+    // rendered pose can be handed off without a one-frame teleport.
+    syncAnimalCarcasses(
+      layers.animals,
+      snapshot,
+      animalCarcassDisplaysRef.current,
+      animalDisplaysRef.current,
+    );
     syncAnimals(
       layers.animals,
       snapshot,
@@ -3916,7 +4453,6 @@ export function AquariumCanvas({
       true,
       isPendingInventoryHandoff(),
     );
-    syncAnimalCarcasses(layers.animals, snapshot, animalCarcassDisplaysRef.current);
     const plantsKey = vallisneriaVisualKey(snapshot);
     if (lastPlantsDrawRef.current !== plantsKey) {
       drawAquaticPlants(layers.plantsBack, snapshot, 'back');
@@ -4028,7 +4564,7 @@ export function AquariumCanvas({
     const host = hostRef.current;
     if (!host?.clientWidth || !host.clientHeight) return;
     const zoom = Math.max(
-      fitTankZoom(host.clientWidth, host.clientHeight),
+      minimumTankZoom(host.clientWidth, host.clientHeight),
       Math.min(CAMERA_MAX_ZOOM, targetZoom),
     );
     const viewportPoint = clientToViewportPoint(clientX, clientY);

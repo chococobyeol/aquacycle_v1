@@ -377,6 +377,49 @@ describe('Vallisneria ramet life cycle', () => {
       .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   }, 60_000);
 
+  it('integrates light across exposed leaves instead of collapsing behind ordinary stone cover', () => {
+    const world = new SimulationWorld('mission-7');
+    for (const point of [
+      { x: 250, y: 300 },
+      { x: 600, y: 300 },
+      { x: 950, y: 300 },
+    ]) {
+      placeStructure(world, 'tall-stone', point);
+    }
+    placeStructure(world, 'flat-stone', { x: 250, y: 260 });
+
+    const structures = world.snapshot().structures;
+    for (const structure of structures) {
+      const faces = world.snapshot().cells
+        .filter((cell) =>
+          cell.ownerId === structure.id &&
+          cell.targetEligible
+        )
+        .sort((left, right) => left.y - right.y || left.x - right.x);
+      placeSeed(world, 'oedogonium', faces[Math.floor(faces.length * 0.25)]);
+      placeSeed(world, 'nitzschia', faces[Math.floor(faces.length * 0.65)]);
+    }
+
+    const substrate = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((left, right) => left.x - right.x);
+    for (const fraction of [0.24, 0.5, 0.76]) {
+      placeSeed(
+        world,
+        'vallisneria',
+        substrate[Math.round((substrate.length - 1) * fraction)],
+      );
+    }
+
+    world.handle({ type: 'start' });
+    advanceTo(world, 660);
+    const after = world.snapshot();
+
+    expect(after.plants.filter((plant) => plant.origin === 'supplied')).toHaveLength(3);
+    expect(after.totalBiomass.vallisneria).toBeGreaterThan(0.6);
+    expect(after.plants.every((plant) => plant.health > 0.25)).toBe(true);
+  }, 60_000);
+
   it('keeps structural leaves stable through one night while reserve biomass breathes', () => {
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');

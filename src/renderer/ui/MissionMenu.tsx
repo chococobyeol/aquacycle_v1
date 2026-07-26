@@ -113,16 +113,16 @@ const MISSION_CARDS: readonly MissionCardDefinition[] = [
     id: 'mission-7',
     stamp: '실험 7',
     className: 'mission-seven',
-    title: '먹고 먹히는 사이',
-    description: '송사리가 먹이를 찾고 수조에서 다음 세대를 남기도록 하세요.',
-    tags: '송사리 · 국소 포식 · 피난처 · 산란 · 치어',
-    illustrationClassName: 'ricefish-foodweb',
+    title: '초록 물결을 따라서',
+    description: '떠다니는 생산자와 물벼룩이 서로의 양을 바꾸며 세대를 잇도록 하세요.',
+    tags: '식물플랑크톤 · 큰물벼룩 · 여과섭식 · 세대 연결',
+    illustrationClassName: 'plankton-foodweb',
     illustration: (
       <>
-        <i className="mini-ricefish" />
-        <i className="mini-fry" />
-        <i className="mini-vallisneria" />
-        <i className="mini-shrimp-water" />
+        <i className="mini-green-water" />
+        <i className="mini-daphnia one" />
+        <i className="mini-daphnia two" />
+        <i className="mini-plankton-dots" />
       </>
     ),
   },

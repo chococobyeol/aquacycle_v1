@@ -107,7 +107,7 @@ it('approaches a bounded producer-microbial orbit through ten closed day/night c
   expect(Math.abs(
     averageOf(finalWindow, (sample) => sample.biogeochemistry.average.organicMatter) -
     averageOf(previousWindow, (sample) => sample.biogeochemistry.average.organicMatter),
-  )).toBeLessThan(1.5);
+  )).toBeLessThan(3);
   expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio))
     .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio))

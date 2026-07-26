@@ -746,6 +746,40 @@
   border-radius: 0 80% 80% 0;
   transform: rotate(8deg);
 }
+.ghost-ricefish {
+  position: relative;
+  display: block;
+  width: 70px;
+  height: 36px;
+}
+.ghost-ricefish::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  width: 45px;
+  height: 13px;
+  box-sizing: border-box;
+  border: 1.7px solid #354744;
+  border-radius: 54% 67% 55% 48%;
+  background:
+    radial-gradient(circle at 82% 32%, #26312f 0 1.6px, #d7bf6d 1.8px 3px, transparent 3.2px),
+    linear-gradient(180deg, rgba(151, 162, 124, 0.78), rgba(239, 230, 187, 0.72));
+  transform: rotate(-2deg);
+}
+.ghost-ricefish::after {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: 4px;
+  width: 17px;
+  height: 20px;
+  box-sizing: border-box;
+  border: 1.4px solid #46534e;
+  border-right: 0;
+  background: rgba(217, 210, 170, 0.48);
+  clip-path: polygon(100% 42%, 0 7%, 14% 50%, 0 93%, 100% 58%);
+}
 
 .animal-thumb {
   position: relative;
@@ -809,6 +843,76 @@
 .cherry-shrimp-thumb.carcass .shrimp-body { transform: translate(4px, 5px) rotate(18deg); }
 .cherry-shrimp-thumb.carcass .shrimp-tail { transform: translate(-5px, 8px) rotate(58deg); }
 .cherry-shrimp-thumb.carcass .shrimp-antenna { opacity: 0.45; }
+.daphnia-thumb .daphnia-shell {
+  position: absolute;
+  top: 15px;
+  left: 24px;
+  width: 25px;
+  height: 30px;
+  box-sizing: border-box;
+  border: 1.8px solid #4a4f4b;
+  border-radius: 52% 62% 56% 48%;
+  background:
+    radial-gradient(ellipse at 57% 56%, rgba(180, 92, 88, 0.26) 0 28%, transparent 30%),
+    linear-gradient(145deg, rgba(241, 192, 176, 0.72), rgba(205, 125, 121, 0.38));
+  box-shadow: inset 4px 1px rgba(255, 241, 218, 0.38);
+  transform: rotate(-7deg);
+}
+.daphnia-thumb .daphnia-eye {
+  position: absolute;
+  z-index: 2;
+  top: 19px;
+  left: 28px;
+  width: 4px;
+  height: 4px;
+  border: 1px solid #f2dfbd;
+  border-radius: 50%;
+  background: #263633;
+}
+.daphnia-thumb .daphnia-antennae::before,
+.daphnia-thumb .daphnia-antennae::after {
+  content: "";
+  position: absolute;
+  top: 11px;
+  left: 9px;
+  width: 27px;
+  height: 15px;
+  border-top: 1.5px solid #4a4f4b;
+  border-radius: 50%;
+  transform-origin: right bottom;
+}
+.daphnia-thumb .daphnia-antennae::before { transform: rotate(-18deg); }
+.daphnia-thumb .daphnia-antennae::after { top: 19px; transform: rotate(8deg); }
+.daphnia-thumb .daphnia-legs {
+  position: absolute;
+  top: 29px;
+  left: 30px;
+  width: 13px;
+  height: 9px;
+  border-bottom: 1px solid rgba(74, 79, 75, 0.72);
+  background: repeating-linear-gradient(
+    105deg,
+    transparent 0 3px,
+    rgba(74, 79, 75, 0.56) 3px 4px,
+    transparent 4px 6px
+  );
+  transform: rotate(-8deg);
+}
+.daphnia-thumb .daphnia-spine {
+  position: absolute;
+  top: 40px;
+  left: 45px;
+  width: 13px;
+  border-top: 1.7px solid #4a4f4b;
+  transform: rotate(17deg);
+  transform-origin: left center;
+}
+.daphnia-thumb.carcass {
+  filter: saturate(0.18) brightness(1.05);
+  transform: rotate(18deg);
+}
+.daphnia-thumb.carcass .daphnia-antennae,
+.daphnia-thumb.carcass .daphnia-legs { opacity: 0.4; }
 .ricefish-thumb .ricefish-body {
   position: absolute;
   top: 21px;
@@ -1964,6 +2068,8 @@
   border-radius: 10px 10px 0 0;
   background: #f7f0d9;
   box-shadow: 3px 4px 0 rgba(36, 53, 50, 0.14);
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
   overscroll-behavior: contain;
 }
 .floating-observation-scroll > * {
@@ -2547,6 +2653,64 @@
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+.history-graph-group {
+  display: grid;
+  overflow: hidden;
+  margin-top: 8px;
+  border: 1.5px solid rgba(49, 65, 63, 0.28);
+  border-radius: 10px 8px 11px 9px;
+  background: rgba(250, 245, 222, 0.6);
+}
+.history-graph-group-toggle {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: #354d48;
+  text-align: left;
+  cursor: pointer;
+}
+.history-graph-group-toggle:hover { background: rgba(174, 210, 194, 0.22); }
+.history-graph-group-toggle > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.history-graph-group-toggle strong { font-size: 13px; }
+.history-graph-group-toggle small {
+  overflow: hidden;
+  color: #6c7973;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-graph-group-toggle i {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-right: 2px solid #54726c;
+  border-bottom: 2px solid #54726c;
+  transform: rotate(45deg) translate(-2px, -2px);
+  transition: transform 120ms ease;
+}
+.history-graph-group.open .history-graph-group-toggle i {
+  transform: rotate(225deg) translate(-1px, -1px);
+}
+.history-graph-group-content {
+  display: grid;
+  gap: 8px;
+  padding: 0 8px 9px;
+  border-top: 1px dashed rgba(49, 65, 63, 0.22);
+}
+.history-graph-group-content > .ecology-history,
+.history-graph-group-content > .water-cycle-history,
+.history-graph-group-content > .animal-event-log {
+  margin-top: 8px;
+}
 .history-window-control + .ecology-history,
 .history-window-control + .water-cycle-history { margin-top: 0; }
 .ecology-history {
@@ -2730,6 +2894,8 @@
   margin: 0;
   padding: 0;
   overflow-y: auto;
+  overflow-anchor: none;
+  scrollbar-gutter: stable;
   list-style: none;
 }
 .animal-event-list li {
@@ -2768,7 +2934,7 @@
 }
 
 .water-cycle-history svg text {
-  font-size: 9px;
+  font-size: 10px;
   fill: #5d6965;
 }
 
@@ -2788,6 +2954,43 @@
 .water-cycle-history-value.decomposer { fill: #a96535; }
 .water-cycle-history-value.toxic { fill: #9e4e4e; }
 .water-cycle-history-value.nitrifier { fill: #347d77; }
+.water-cycle-history.plankton-history svg { height: 124px; }
+.plankton-history-kpis {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  margin: 6px 0 2px;
+}
+.plankton-history-kpis span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+  padding: 4px 5px;
+  border: 1px solid rgba(49, 65, 63, 0.18);
+  border-radius: 6px;
+  color: #68736e;
+  font-size: 10px;
+  line-height: 1.25;
+}
+.plankton-history-kpis b {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plankton-history-kpis .phytoplankton b,
+.plankton-axis.phytoplankton { color: #5d8147; fill: #5d8147; }
+.plankton-history-kpis .daphnia b,
+.plankton-axis.daphnia { color: #a75f58; fill: #a75f58; }
+.plankton-history-kpis .planktonic-decomposer b,
+.plankton-axis.planktonic-decomposer { color: #805f47; fill: #805f47; }
+.plankton-time-label { fill: #7a827d; font-variant-numeric: tabular-nums; }
+.water-cycle-history-line.phytoplankton { stroke: #6f9954; }
+.water-cycle-history-line.daphnia { stroke: #c4776d; }
+.water-cycle-history-line.planktonic-decomposer { stroke: #99775a; }
+.water-cycle-history-value.phytoplankton { fill: #5d8147; }
+.water-cycle-history-value.daphnia { fill: #a75f58; }
+.water-cycle-history-value.planktonic-decomposer { fill: #805f47; }
 .water-cycle-history.closed-cycle-history svg { height: 112px; }
 .water-cycle-history-line.mineral-nitrogen { stroke: #8a7348; }
 .water-cycle-history-line.nutrient { stroke: #718d4d; }
@@ -2953,7 +3156,10 @@
 .water-quality-channel span { display: flex; min-width: 0; align-items: center; gap: 5px; font-size: 11px; white-space: nowrap; }
 .water-quality-channel span i,
 .species-dot.decomposer,
-.species-dot.nitrifier {
+.species-dot.nitrifier,
+.species-dot.planktonic-decomposer,
+.species-dot.phytoplankton,
+.species-dot.daphnia {
   width: 8px;
   height: 8px;
   flex: 0 0 auto;
@@ -2978,6 +3184,9 @@
 .species-dot.decomposer { background: #8b7657; }
 .channel-nitrifier span i,
 .species-dot.nitrifier { background: #4f827d; }
+.species-dot.planktonic-decomposer { background: #98765b; }
+.species-dot.phytoplankton { background: #78a95a; }
+.species-dot.daphnia { background: #c88d7d; }
 
 .microbe-growth-readout {
   display: grid;
@@ -3402,4 +3611,124 @@
   bottom: 17px;
   left: 35px;
   transform: scale(0.72) rotate(-8deg);
+}
+
+.mission-illustration.plankton-foodweb {
+  right: 12px;
+  width: 170px;
+  overflow: hidden;
+}
+.plankton-foodweb .mini-green-water {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 11px;
+  height: 70px;
+  border: 2px solid rgba(55, 76, 68, 0.64);
+  border-radius: 46% 54% 18px 18px;
+  background:
+    radial-gradient(circle at 18% 32%, rgba(96, 148, 79, .62) 0 2px, transparent 2.5px),
+    radial-gradient(circle at 42% 58%, rgba(96, 148, 79, .52) 0 1.8px, transparent 2.3px),
+    radial-gradient(circle at 70% 34%, rgba(96, 148, 79, .56) 0 2px, transparent 2.5px),
+    rgba(99, 159, 143, .16);
+}
+.plankton-foodweb .mini-daphnia {
+  position: absolute;
+  width: 23px;
+  height: 31px;
+  border: 2px solid #665d55;
+  border-radius: 52% 48% 56% 44%;
+  background: rgba(221, 171, 150, .62);
+  transform: rotate(-12deg);
+}
+.plankton-foodweb .mini-daphnia::before {
+  content: "";
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  right: 5px;
+  top: 6px;
+  border-radius: 50%;
+  background: #35423f;
+}
+.plankton-foodweb .mini-daphnia::after {
+  content: "";
+  position: absolute;
+  width: 20px;
+  height: 12px;
+  right: -16px;
+  top: -7px;
+  border-top: 2px solid #665d55;
+  border-radius: 50%;
+  transform: rotate(-24deg);
+}
+.plankton-foodweb .mini-daphnia.one { left: 52px; bottom: 36px; }
+.plankton-foodweb .mini-daphnia.two {
+  left: 104px;
+  bottom: 24px;
+  transform: rotate(14deg) scale(.76);
+}
+.plankton-foodweb .mini-plankton-dots {
+  position: absolute;
+  left: 18px;
+  bottom: 25px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #6f9e55;
+  box-shadow:
+    13px -17px #78a95a,
+    25px 10px #6f9e55,
+    72px -18px #78a95a,
+    102px 13px #6f9e55,
+    124px -10px #78a95a;
+}
+
+.plankton-thumb,
+.ghost-plankton {
+  position: relative;
+  display: inline-block;
+  width: 58px;
+  height: 44px;
+  border-radius: 12px;
+  background: rgba(119, 169, 90, .1);
+  border: 1px solid rgba(66, 91, 78, .22);
+}
+.plankton-thumb i,
+.ghost-plankton i {
+  position: absolute;
+  border-radius: 50%;
+}
+.plankton-phytoplankton i {
+  width: 6px;
+  height: 6px;
+  background: #78a95a;
+  opacity: .78;
+}
+.plankton-phytoplankton i:nth-child(1) { left: 11px; top: 11px; }
+.plankton-phytoplankton i:nth-child(2) { left: 29px; top: 8px; transform: scale(.7); }
+.plankton-phytoplankton i:nth-child(3) { left: 39px; top: 25px; transform: scale(.85); }
+.plankton-phytoplankton i:nth-child(4) { left: 19px; top: 29px; transform: scale(.62); }
+.plankton-daphnia i:first-child {
+  width: 17px;
+  height: 24px;
+  left: 19px;
+  top: 9px;
+  border: 2px solid #765f58;
+  background: rgba(228, 183, 164, .65);
+}
+.plankton-daphnia i:nth-child(2) {
+  width: 4px;
+  height: 4px;
+  left: 29px;
+  top: 15px;
+  background: #35423f;
+}
+.plankton-daphnia i:nth-child(3) {
+  width: 17px;
+  height: 10px;
+  left: 32px;
+  top: 7px;
+  border-top: 1.5px solid #765f58;
+  border-radius: 50%;
 }

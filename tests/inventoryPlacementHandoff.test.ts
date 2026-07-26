@@ -12,6 +12,7 @@ import {
   isInventoryHandoffCaughtUp,
   isSecondaryPointerGesture,
 } from '../src/renderer/tank/AquariumCanvas';
+import { heldPlacementToolbarCopy } from '../src/renderer/ui/SimulationScreen';
 import type { HoldingSnapshot } from '../src/simulation/types';
 
 const heldStone = (x: number, y: number): HoldingSnapshot => ({
@@ -43,6 +44,49 @@ describe('inventory cursor handoff', () => {
 
   it('does not use the settled-motion fallback before the worker has sampled twice', () => {
     expect(isInventoryHandoffCaughtUp(heldStone(44, 110), { x: 5, y: 110 }, 80, false)).toBe(false);
+  });
+});
+
+describe('held item toolbar copy', () => {
+  it('presents every holding kind without routing plankton through surface species', () => {
+    const base = {
+      source: 'inventory' as const,
+      valid: true,
+      x: 400,
+      y: 260,
+    };
+    const holdings: HoldingSnapshot[] = [
+      { ...base, kind: 'structure', structureDefinitionId: 'flat-stone' },
+      { ...base, kind: 'seed', speciesId: 'oedogonium' },
+      { ...base, kind: 'animal', animalSpeciesId: 'cherry-shrimp' },
+      { ...base, kind: 'biofilm', microbeGuildId: 'decomposer' },
+      { ...base, kind: 'plankton', planktonKind: 'phytoplankton' },
+      { ...base, kind: 'plankton', planktonKind: 'daphnia' },
+    ];
+
+    expect(holdings.map((holding) => heldPlacementToolbarCopy(holding).label)).toEqual([
+      '넓적한 사암',
+      '붓뚜껑말',
+      '체리새우',
+      '분해균 필름',
+      '녹색 식물플랑크톤',
+      '큰물벼룩',
+    ]);
+    expect(heldPlacementToolbarCopy(holdings.at(-1)!).instruction)
+      .toBe('수면 아래 원하는 위치를 클릭해 방류');
+  });
+
+  it('uses safe fallback copy for a partially delivered worker snapshot', () => {
+    expect(heldPlacementToolbarCopy({
+      kind: 'plankton',
+      source: 'inventory',
+      valid: false,
+      x: 0,
+      y: 0,
+    })).toEqual({
+      label: '부유 생물',
+      instruction: '수면 아래 원하는 위치를 클릭해 접종',
+    });
   });
 });
 
@@ -157,6 +201,22 @@ describe('inventory preview rendering contract', () => {
     expect(completionBlock).toContain("setActiveTool(completedTool === 'move' ? 'move' : 'select');");
     expect(screenSource).toContain('onToolComplete={completeCanvasInteraction}');
     expect(canvasSource).toContain("onToolComplete('move');");
+  });
+
+  it('returns an in-progress placement before reopening the inventory', () => {
+    const inventoryToggleBlock = screenSource.slice(
+      screenSource.indexOf('const toggleInventoryPanel'),
+      screenSource.indexOf('const closeHudPanel'),
+    );
+    expect(inventoryToggleBlock).toContain("send({ type: 'cancel-held' });");
+    expect(inventoryToggleBlock).toContain('inventory: true');
+    expect(screenSource).toContain('onClick={toggleInventoryPanel}');
+  });
+
+  it('labels Daphnia as individuals and phytoplankton as inoculation attempts', () => {
+    expect(screenSource).toContain("kind === 'daphnia'");
+    expect(screenSource).toContain('`${remaining}마리 남음`');
+    expect(screenSource).toContain('planktonPlacementCountLabel(planktonKind, remaining)');
   });
 
   it('selects structures before showing separate move, rotate, and delete actions', () => {

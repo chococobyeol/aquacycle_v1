@@ -17,6 +17,7 @@ import {
   advanceAlgaeColonizationState,
   algaeCellVisualKey,
   algaeColonizationDetailSeed,
+  algaeDetailCount,
   algaeParticleAlpha,
   algaeParticleRadiusRatio,
   algaeVisualLevel,
@@ -81,6 +82,17 @@ describe('algae visual refresh decisions', () => {
     expect(combinedRadius).toBeGreaterThan(worstHorizontalCenterDistance);
     expect(algaeParticleAlpha(minimumVisibleLevel)).toBeGreaterThanOrEqual(0.25);
     expect(algaeParticleAlpha(24)).toBe(1);
+  });
+
+  it('removes crisp detail marks as a grazed colony loses biomass', () => {
+    expect(algaeDetailCount(ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL, 24))
+      .toBe(ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL);
+    expect(algaeDetailCount(ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL, 8))
+      .toBeLessThan(ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL);
+    expect(algaeDetailCount(ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL, 1))
+      .toBe(1);
+    expect(algaeDetailCount(ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL, 0))
+      .toBe(0);
   });
 
   it('uses one bounded, interpolated field instead of presenting ecology cells at native resolution', () => {

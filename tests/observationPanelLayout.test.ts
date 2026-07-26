@@ -86,6 +86,9 @@ describe('scalable observation panel layout', () => {
 
   it('scrolls only the content below the heading and scope tabs', () => {
     expect(screenSource).toContain('className="floating-observation-scroll"');
+    expect(screenSource).toContain('rememberObservationUserScroll(');
+    expect(screenSource).toContain('new ResizeObserver(scheduleObservationScrollRestore)');
+    expect(screenSource).toContain('snapshot?.elapsedSeconds');
     expect(styles).toContain('.floating-observation-scroll {');
     expect(styles).toMatch(/\.floating-observation-scroll \{[\s\S]*?overflow-y: auto;/);
     expect(styles).toMatch(/\.floating-observation-heading \{[\s\S]*?position: relative;/);

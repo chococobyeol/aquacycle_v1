@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { SimulationWorld } from "../src/simulation/SimulationWorld";
 import { BiogeochemistryLedger } from "../src/simulation/biogeochemistry";
+import {
+  continuousBodyMassFeedingScale,
+  WATER_CYCLE_RULES,
+} from "../src/simulation/config";
+import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from "../src/simulation/stoichiometry";
 import type {
   AnimalSpeciesId,
   SpeciesId,
@@ -82,6 +87,82 @@ const lifespanOf = (animal: WorldSnapshot["animals"][number]): number => {
 };
 
 describe("cherry shrimp lifecycle", () => {
+  it("uses a continuous body-mass feeding curve through maturation", () => {
+    const rules = WATER_CYCLE_RULES.shrimp;
+    const birthScale = continuousBodyMassFeedingScale(
+      rules.juvenileBirthBiomass,
+      rules.adultStructuralBiomass,
+      rules.feedingMassExponent,
+    );
+    const immediatelyBeforeMaturation = continuousBodyMassFeedingScale(
+      rules.adultStructuralBiomass - 1e-6,
+      rules.adultStructuralBiomass,
+      rules.feedingMassExponent,
+    );
+    const atMaturation = continuousBodyMassFeedingScale(
+      rules.adultStructuralBiomass,
+      rules.adultStructuralBiomass,
+      rules.feedingMassExponent,
+    );
+
+    expect(birthScale).toBeGreaterThan(0.24);
+    expect(birthScale).toBeLessThan(0.3);
+    expect(Math.abs(atMaturation - immediatelyBeforeMaturation))
+      .toBeLessThan(0.00001);
+  });
+
+  it("can consume trace algae and biofilm to zero without a hidden grazing floor", () => {
+    const world = new SimulationWorld("mission-7");
+    const cell = world.snapshot().cells
+      .filter((candidate) => candidate.surfaceKind === "substrate")
+      .sort((left, right) => Math.abs(left.x - 600) - Math.abs(right.x - 600))[0];
+    expect(cell).toBeDefined();
+    if (!cell) return;
+
+    placeShrimp(world, cell);
+    const save = world.exportSaveData();
+    const savedCell = save.substrateCells.find(
+      (candidate) => candidate.id === cell.id,
+    );
+    const shrimp = save.animals.find(
+      (animal) => animal.speciesId === SHRIMP,
+    );
+    expect(savedCell).toBeDefined();
+    expect(shrimp).toBeDefined();
+    if (!savedCell || !shrimp) return;
+
+    savedCell.biomass.nitzschia = 0.0004;
+    savedCell.biomass.oedogonium = 0.0004;
+    savedCell.biofilm.decomposer = 0.005;
+    savedCell.biofilm.nitrifier = 0.005;
+    shrimp.position = { x: cell.x, y: cell.y - 4 };
+    shrimp.behavior = "grazing";
+    shrimp.targetCellId = cell.id;
+    shrimp.behaviorTimer = 10;
+    world.loadSaveData(save);
+    world.handle({ type: "start" });
+    world.handle({ type: "set-speed", speed: 64 });
+    world.tick(0.1);
+
+    const afterCell = world.snapshot().cells.find(
+      (candidate) => candidate.id === cell.id,
+    );
+    expect(afterCell).toBeDefined();
+    if (!afterCell) return;
+    expect(afterCell.biomass.nitzschia).toBe(0);
+    expect(afterCell.biomass.oedogonium).toBe(0);
+    expect(afterCell.biofilm.decomposer).toBe(0);
+    expect(afterCell.biofilm.nitrifier).toBe(0);
+
+    const balance = world.snapshot().biogeochemistry.materialBalance;
+    expect(Math.abs(balance.nitrogenDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+    expect(Math.abs(balance.carbonDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+    expect(Math.abs(balance.oxygenEquivalentDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+  });
+
   it("assigns each supplied shrimp an individual compressed lifespan", () => {
     const world = new SimulationWorld("laboratory");
     for (const point of [
@@ -128,6 +209,38 @@ describe("cherry shrimp lifecycle", () => {
     world.tick(0.1);
     expect(world.snapshot().animals.some((animal) => animal.id === "animal-501")).toBe(true);
     expect(world.snapshot().animalPopulationEventTotals.deathsByCause["old-age"]).toBe(0);
+  });
+
+  it("reaches and grazes food on a substrate cell at the tank edge", () => {
+    const world = new SimulationWorld("laboratory");
+    const edgeCell = world
+      .snapshot()
+      .cells
+      .filter((cell) => cell.surfaceKind === "substrate")
+      .sort((left, right) => left.x - right.x)[0];
+    expect(edgeCell).toBeDefined();
+    if (!edgeCell) throw new Error("laboratory substrate must contain an edge cell");
+
+    // The cell centre lies outside the legal bounds for an animal's body
+    // centre. Movement and feeding still need to agree on the reachable
+    // contact point; otherwise the shrimp stops a few pixels short forever.
+    placeSeed(world, "nitzschia", edgeCell);
+    placeShrimp(world, edgeCell);
+    const shrimpId = world.snapshot().animals[0].id;
+    world.handle({ type: "start" });
+    world.handle({ type: "set-speed", speed: 16 });
+
+    let shrimp = world.snapshot().animals.find((animal) => animal.id === shrimpId);
+    while (
+      world.snapshot().elapsedSeconds < 30 &&
+      (shrimp?.consumedBiomass ?? 0) <= 0
+    ) {
+      shrimp = advanceOneTick(world).animals.find((animal) => animal.id === shrimpId);
+    }
+
+    expect(shrimp).toBeDefined();
+    expect(shrimp?.consumedBiomass ?? 0).toBeGreaterThan(0);
+    expect(shrimp?.secondsSinceFood ?? Number.POSITIVE_INFINITY).toBeLessThan(10);
   });
 
   it("lets a well-fed shrimp die of old age instead of living forever", () => {

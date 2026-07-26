@@ -3,6 +3,7 @@ import type {
   AnimalLifeStage,
   AnimalReproductiveState,
   AnimalSex,
+  AnimalSpeciesId,
   AnimalSnapshot,
   StructureSnapshot,
   WorkerMotionMessage,
@@ -17,12 +18,22 @@ const CONTROL_WORDS = 4;
 const HEADER_SAMPLED_AT_MS = 0;
 const HEADER_WORDS = 1;
 const STRUCTURE_WORDS = 7;
-const ANIMAL_WORDS = 18;
+const ANIMAL_WORDS = 20;
 
 export const SHARED_MOTION_MAX_STRUCTURES = 4_096;
 export const SHARED_MOTION_MAX_ANIMALS = 2_048;
 
-const LIFE_STAGES: readonly AnimalLifeStage[] = ['juvenile', 'adult'];
+const SPECIES: readonly AnimalSpeciesId[] = [
+  'cherry-shrimp',
+  'japanese-ricefish',
+  'daphnia',
+];
+const LIFE_STAGES: readonly AnimalLifeStage[] = [
+  'egg',
+  'fry',
+  'juvenile',
+  'adult',
+];
 const SEXES: readonly AnimalSex[] = ['female', 'male'];
 const BEHAVIORS: readonly AnimalBehavior[] = [
   'held',
@@ -31,8 +42,18 @@ const BEHAVIORS: readonly AnimalBehavior[] = [
   'grazing',
   'resting',
   'starving',
+  'hunting',
+  'courting',
+  'carrying-eggs',
+  'incubating',
 ];
-const REPRODUCTIVE_STATES: readonly AnimalReproductiveState[] = ['none', 'ready', 'berried'];
+const REPRODUCTIVE_STATES: readonly AnimalReproductiveState[] = [
+  'none',
+  'ready',
+  'berried',
+  'carrying-eggs',
+  'incubating',
+];
 
 const numericId = (id: string): number => {
   const separator = id.lastIndexOf('-');
@@ -109,6 +130,8 @@ export class SharedMotionWriter {
       this.payload[offset + 15] = enumIndex(REPRODUCTIVE_STATES, animal.reproductiveState);
       this.payload[offset + 16] = animal.recentIntake;
       this.payload[offset + 17] = animal.consumedBiomass;
+      this.payload[offset + 18] = enumIndex(SPECIES, animal.speciesId);
+      this.payload[offset + 19] = animal.secondsSinceFood;
       offset += ANIMAL_WORDS;
     }
 
@@ -156,6 +179,7 @@ const emptyAnimal = (): AnimalSnapshot => ({
   reproductiveState: 'none',
   recentIntake: 0,
   consumedBiomass: 0,
+  secondsSinceFood: Number.POSITIVE_INFINITY,
   temperature: 24,
   metabolicTemperatureFactor: 1,
   reproductionTemperatureFactor: 1,
@@ -261,6 +285,9 @@ export class SharedMotionReader {
       ] ?? 'none';
       animal.recentIntake = this.payload[offset + 16];
       animal.consumedBiomass = this.payload[offset + 17];
+      animal.speciesId = SPECIES[Math.trunc(this.payload[offset + 18])] ??
+        'cherry-shrimp';
+      animal.secondsSinceFood = this.payload[offset + 19];
       target.animals[index] = animal;
       offset += ANIMAL_WORDS;
     }

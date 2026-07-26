@@ -13,6 +13,7 @@ import {
   containTankScale,
   coverTankScale,
   fitTankZoom,
+  minimumTankZoom,
   isScreenDrag,
   isTankInteractionPoint,
   shouldStartCameraPan,
@@ -60,6 +61,14 @@ describe('aquarium camera interactions', () => {
   it('guards invalid viewport sizes when deriving the fit zoom', () => {
     expect(fitTankZoom(0, 0)).toBe(1);
     expect(fitTankZoom(Number.NaN, 720)).toBe(1);
+  });
+
+  it('allows a smaller panel-safe overview below the full-tank fit view', () => {
+    const fit = fitTankZoom(1920, 1080);
+    const minimum = minimumTankZoom(1920, 1080);
+    expect(minimum).toBeLessThan(fit);
+    expect(minimum).toBeCloseTo(fit * 0.72);
+    expect(minimum).toBeGreaterThanOrEqual(0.5);
   });
 
   it('allows controlled overscroll at fit zoom so every tank edge can clear a HUD panel', () => {

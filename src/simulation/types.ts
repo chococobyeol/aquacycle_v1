@@ -33,7 +33,7 @@ export type SimulationMode = 'challenge' | 'laboratory';
 export type SimulationPhase = 'setup' | 'running' | 'paused';
 export type MissionOutcome = 'pending' | 'success' | 'failure';
 export type SpeciesId = 'oedogonium' | 'nitzschia' | 'vallisneria';
-export type AnimalSpeciesId = 'cherry-shrimp' | 'japanese-ricefish';
+export type AnimalSpeciesId = 'cherry-shrimp' | 'japanese-ricefish' | 'daphnia';
 export type AnimalLifeStage = 'egg' | 'fry' | 'juvenile' | 'adult';
 export type AnimalSex = 'female' | 'male';
 export type AnimalBehavior =
@@ -69,6 +69,7 @@ export type AnimalPopulationEventKind =
   | 'death';
 export type StructureDefinitionId = 'flat-stone' | 'round-stone' | 'tall-stone';
 export type MicrobeGuildId = 'decomposer' | 'nitrifier';
+export type PlanktonKind = 'phytoplankton' | 'daphnia';
 export type WaterQualityVariable = 'organicMatter' | 'toxicWaste' | 'nutrients' | 'oxygen';
 export type InteractionTool =
   | 'select'
@@ -189,6 +190,8 @@ export interface AnimalSnapshot {
   reproductiveState: AnimalReproductiveState;
   recentIntake: number;
   consumedBiomass: number;
+  /** Simulated seconds since the last non-zero consumed ration. */
+  secondsSinceFood: number;
   recentFood?: string | null;
   attachmentLabel?: string | null;
   developmentProgress?: number | null;
@@ -198,6 +201,9 @@ export interface AnimalSnapshot {
   metabolicTemperatureFactor: number;
   reproductionTemperatureFactor: number;
   thermalHealthSuitability: number;
+  /** Supplied Daphnia founders are generation 0; their descendants increment it. */
+  generation?: number;
+  parentId?: string | null;
 }
 
 /**
@@ -276,7 +282,41 @@ export interface WaterQualityFieldSnapshot {
   nutrients: number[];
   oxygen: number[];
   dissolvedInorganicCarbon: number[];
+  /** Free-living heterotrophic decomposers carried by the water column. */
+  planktonicDecomposer: number[];
+  /** Suspended photosynthetic biomass, separate from attached algae. */
+  phytoplankton: number[];
+  daphniaJuveniles: number[];
+  daphniaAdults: number[];
   revision: number;
+}
+
+export interface PlanktonSnapshot {
+  phytoplanktonBiomass: number;
+  planktonicDecomposerBiomass: number;
+  daphniaJuvenileBiomass: number;
+  daphniaAdultBiomass: number;
+  daphniaFounderAdultBiomass: number;
+  daphniaBornAdultBiomass: number;
+  approximateDaphniaCount: number;
+  cumulativeFiltration: {
+    phytoplankton: number;
+    planktonicDecomposer: number;
+  };
+  cumulativeEvents: {
+    births: number;
+    maturations: number;
+    secondGenerationBirths: number;
+    deaths: number;
+  };
+  fluxes: {
+    phytoplanktonGrowthPerSecond: number;
+    phytoplanktonRespirationPerSecond: number;
+    phytoplanktonMortalityPerSecond: number;
+    daphniaFoodAssimilatedPerSecond: number;
+    daphniaRespirationPerSecond: number;
+    daphniaMortalityPerSecond: number;
+  };
 }
 
 export interface WaterTransportSnapshot {
@@ -305,6 +345,7 @@ export interface BiogeochemistrySnapshot {
   transport: WaterTransportSnapshot;
   average: WaterQualityValues;
   biofilmTotals: BiofilmBiomass;
+  plankton: PlanktonSnapshot;
   algaeFluxes: {
     grossProductionBiomassPerSecond: number;
     respirationBiomassPerSecond: number;
@@ -337,7 +378,7 @@ export interface BiogeochemistrySnapshot {
 }
 
 export interface HoldingSnapshot {
-  kind: 'structure' | 'seed' | 'animal' | 'biofilm';
+  kind: 'structure' | 'seed' | 'animal' | 'biofilm' | 'plankton';
   source: 'inventory' | 'existing';
   valid: boolean;
   x: number;
@@ -348,6 +389,7 @@ export interface HoldingSnapshot {
   animalId?: string;
   animalSpeciesId?: AnimalSpeciesId;
   microbeGuildId?: MicrobeGuildId;
+  planktonKind?: PlanktonKind;
 }
 
 export interface LightFieldSnapshot {
@@ -370,6 +412,12 @@ export interface ProbeSnapshot {
   water: WaterQualityValues;
   biofilm: BiofilmBiomass;
   microbeNetGrowth: Record<MicrobeGuildId, number>;
+  plankton: {
+    phytoplankton: number;
+    planktonicDecomposer: number;
+    daphniaJuveniles: number;
+    daphniaAdults: number;
+  };
 }
 
 export interface MeasurementSnapshot extends ProbeSnapshot {
@@ -455,6 +503,7 @@ export interface SimulationSnapshot {
   remainingSeeds: Record<SpeciesId, number | null>;
   remainingAnimals: Record<AnimalSpeciesId, number | null>;
   remainingMicrobes: Record<MicrobeGuildId, number | null>;
+  remainingPlankton: Record<PlanktonKind, number | null>;
   remainingStructures: Record<StructureDefinitionId, number | null>;
   totalBiomass: SpeciesBiomass;
   totalAlgaeConsumed: number;
@@ -476,6 +525,17 @@ export interface BiogeochemistrySaveState {
   oxygen: number[];
   dissolvedInorganicCarbon: number;
   dissolvedInorganicCarbonField?: number[];
+  planktonicDecomposer?: number[];
+  phytoplankton?: number[];
+  daphniaJuveniles?: number[];
+  daphniaFounderAdults?: number[];
+  daphniaBornAdults?: number[];
+  /** Optional, non-material behavioural field for version-1 save compatibility. */
+  daphniaCrowdingCue?: number[];
+  planktonCounters?: PlanktonSnapshot['cumulativeEvents'] & {
+    filteredPhytoplankton: number;
+    filteredPlanktonicDecomposer: number;
+  };
   headspaceCarbonDioxide: number;
   headspaceOxygen: number;
   cumulativeOxygenProduction: number;
@@ -552,8 +612,13 @@ export interface SavedAnimalState {
   growthProgress: number;
   reproductionCooldown: number;
   gestationRemaining: number | null;
+  /** Locked Daphnia clutch size; optional for older frozen aquariums. */
+  gestatingBroodSize?: number | null;
   matingAccumulator: number;
   randomSeed: number;
+  /** Optional so frozen aquariums created before individual Daphnia still load. */
+  generation?: number;
+  parentId?: string | null;
 }
 
 export interface SavedAnimalCarcassState {
@@ -625,6 +690,8 @@ export interface SimulationSaveData {
   animalInventoryUsed: Record<AnimalSpeciesId, number>;
   microbeInventoryUsed: Record<MicrobeGuildId, number>;
   suspendedBiofilm: BiofilmBiomass;
+  /** Optional so frozen aquariums from before mission 7 remain loadable. */
+  planktonInventoryUsed?: Record<PlanktonKind, number>;
   biofilmSettlementCursor: number;
   materialReference: {
     nitrogen: number;
@@ -649,6 +716,7 @@ export type SimulationCommand =
   | { type: 'pick-seed'; speciesId: SpeciesId; point?: Vec2 }
   | { type: 'pick-animal'; speciesId: AnimalSpeciesId; point?: Vec2 }
   | { type: 'pick-biofilm'; guildId: MicrobeGuildId; point?: Vec2 }
+  | { type: 'pick-plankton'; planktonKind: PlanktonKind; point?: Vec2 }
   | { type: 'pick-at'; point: Vec2 }
   | { type: 'hold-structure'; id: string; point?: Vec2 }
   | { type: 'rotate-structure'; id: string; radians: number }

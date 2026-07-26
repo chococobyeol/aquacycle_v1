@@ -33,6 +33,19 @@ export const fitTankZoom = (viewportWidth: number, viewportHeight: number): numb
   return Math.min(1, containScale / coverScale);
 };
 
+/**
+ * The fit view shows every tank edge, but floating notes still cover part of
+ * that image. Manual zoom-out therefore gets a second, lower bound so the
+ * player can leave a readable gutter for observation/inventory panels.
+ */
+export const minimumTankZoom = (
+  viewportWidth: number,
+  viewportHeight: number,
+): number => {
+  const fit = fitTankZoom(viewportWidth, viewportHeight);
+  return Math.min(fit, Math.max(0.5, fit * 0.72));
+};
+
 export interface TankCameraCenterBounds {
   minX: number;
   maxX: number;

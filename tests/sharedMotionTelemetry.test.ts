@@ -45,6 +45,7 @@ const motionMessage = (sequence: number, x: number): WorkerMotionMessage => ({
     reproductiveState: 'ready',
     recentIntake: 0.4,
     consumedBiomass: 14,
+    secondsSinceFood: 3.5,
     temperature: 24,
     metabolicTemperatureFactor: 1,
     reproductionTemperatureFactor: 1,
@@ -70,6 +71,7 @@ describe('shared binary motion telemetry', () => {
       facing: -1,
       behavior: 'traveling',
       reproductiveState: 'ready',
+      secondsSinceFood: 3.5,
     });
   });
 
@@ -90,5 +92,62 @@ describe('shared binary motion telemetry', () => {
     expect(third.animals[0].x).toBe(300);
     expect(second.animals[0].x).toBe(200);
     expect(reader.readLatest()).toBeNull();
+  });
+
+  it('preserves ricefish species, life stage, behavior, and reproductive state', () => {
+    const channel = createSharedMotionChannel();
+    const writer = new SharedMotionWriter(channel);
+    const reader = new SharedMotionReader(channel);
+    const message = motionMessage(4, 240);
+    message.animals[0] = {
+      ...message.animals[0],
+      speciesId: 'japanese-ricefish',
+      lifeStage: 'fry',
+      behavior: 'hunting',
+      reproductiveState: 'carrying-eggs',
+    };
+
+    expect(writer.publish(message)).toBe(true);
+    expect(reader.readLatest()?.animals[0]).toMatchObject({
+      speciesId: 'japanese-ricefish',
+      lifeStage: 'fry',
+      behavior: 'hunting',
+      reproductiveState: 'carrying-eggs',
+    });
+
+    message.sequence = 5;
+    message.animals[0] = {
+      ...message.animals[0],
+      lifeStage: 'egg',
+      behavior: 'incubating',
+      reproductiveState: 'incubating',
+    };
+    expect(writer.publish(message)).toBe(true);
+    expect(reader.readLatest()?.animals[0]).toMatchObject({
+      speciesId: 'japanese-ricefish',
+      lifeStage: 'egg',
+      behavior: 'incubating',
+      reproductiveState: 'incubating',
+    });
+  });
+
+  it('preserves Daphnia species instead of falling back to cherry shrimp', () => {
+    const channel = createSharedMotionChannel();
+    const writer = new SharedMotionWriter(channel);
+    const reader = new SharedMotionReader(channel);
+    const message = motionMessage(6, 320);
+    message.animals[0] = {
+      ...message.animals[0],
+      speciesId: 'daphnia',
+      bodyLength: 9,
+      behavior: 'grazing',
+    };
+
+    expect(writer.publish(message)).toBe(true);
+    expect(reader.readLatest()?.animals[0]).toMatchObject({
+      speciesId: 'daphnia',
+      bodyLength: 9,
+      behavior: 'grazing',
+    });
   });
 });

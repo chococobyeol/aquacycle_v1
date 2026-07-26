@@ -123,6 +123,21 @@ describe('active biogeochemistry', () => {
     expect(film.biofilm.nitrifier).toBeGreaterThan(0.35);
   });
 
+  it('turns an oxygenated nitrifier film from loss to growth inside the mission-5 ammonium band', () => {
+    const netGrowthAt = (toxicWaste: number): number => {
+      const ledger = new BiogeochemistryLedger({
+        effectsEnabled: true,
+        initial: { organicMatter: 0, toxicWaste, nutrients: 20, oxygen: 76 },
+      });
+      return ledger.microbeNetGrowthAt('nitrifier', point, 0.2);
+    };
+
+    expect(netGrowthAt(0.1)).toBeLessThan(0);
+    expect(netGrowthAt(0.5)).toBeLessThan(0);
+    expect(netGrowthAt(0.8)).toBeGreaterThan(0);
+    expect(netGrowthAt(1.5)).toBeGreaterThan(0);
+  });
+
   it('lets an organic pulse grow decomposers before resource depletion makes them decline', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,

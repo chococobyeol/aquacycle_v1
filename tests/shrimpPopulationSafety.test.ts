@@ -3,12 +3,22 @@ import {
   SHRIMP_TECHNICAL_POPULATION_LIMIT,
   SimulationWorld,
 } from '../src/simulation/SimulationWorld';
-import type { Vec2 } from '../src/simulation/types';
+import { BiogeochemistryLedger } from '../src/simulation/biogeochemistry';
+import {
+  GROUND_Y,
+  TANK_WIDTH,
+  WATER_TOP,
+  type Vec2,
+} from '../src/simulation/types';
 
 const SHRIMP = 'cherry-shrimp' as const;
 
 interface ReproductionAnimalState {
   position: Vec2;
+  targetCellId: string | null;
+  behavior: string;
+  behaviorTimer: number;
+  grazingSessionIntake: number;
   sex: 'female' | 'male';
   energy: number;
   recentIntake: number;
@@ -24,7 +34,27 @@ interface ReproductionAnimalState {
 interface ReproductionWorldInternals {
   animals: ReproductionAnimalState[];
   stepAnimalEcology(deltaSeconds: number): void;
-  chooseFoodTarget(animal: ReproductionAnimalState): { id: string } | null;
+  stepAnimalMotion(deltaSeconds: number): void;
+  chooseFoodTarget(animal: ReproductionAnimalState): TestSurfaceCell | null;
+  allCells(): TestSurfaceCell[];
+  shrimpSurfaceContactPoint(cell: TestSurfaceCell): Vec2;
+  biogeochemistry: BiogeochemistryLedger;
+}
+
+interface TestSurfaceCell {
+  id: string;
+  x: number;
+  y: number;
+  surfaceKind: 'substrate' | 'structure';
+  biomass: {
+    oedogonium: number;
+    nitzschia: number;
+    vallisneria: number;
+  };
+  biofilm: {
+    decomposer: number;
+    nitrifier: number;
+  };
 }
 
 type WorldSnapshot = ReturnType<SimulationWorld['snapshot']>;
@@ -96,6 +126,29 @@ const advanceTo = (
   return snapshot;
 };
 
+const waterFieldIndex = (point: Vec2): number => {
+  const column = Math.max(
+    0,
+    Math.min(35, Math.floor(point.x / TANK_WIDTH * 36)),
+  );
+  const row = Math.max(
+    0,
+    Math.min(
+      19,
+      Math.floor((point.y - WATER_TOP) / (GROUND_Y - WATER_TOP) * 20),
+    ),
+  );
+  return row * 36 + column;
+};
+
+const waterFields = (
+  world: SimulationWorld,
+): { oxygen: Float64Array; toxicWaste: Float64Array } =>
+  reproductionInternals(world).biogeochemistry as unknown as {
+    oxygen: Float64Array;
+    toxicWaste: Float64Array;
+  };
+
 describe('shrimp population safety contract', () => {
   it('derives condition from conserved body matter instead of killing on a stale hunger value', () => {
     const world = new SimulationWorld('laboratory');
@@ -153,6 +206,7 @@ describe('shrimp population safety contract', () => {
     const nourishedFemale = nourished.animals.find((animal) => animal.sex === 'female');
     if (!nourishedFemale) throw new Error('nourished fixture needs a female shrimp');
     nourishedFemale.storedBiomass = 0.5;
+    nourishedFemale.reproductiveBiomass = 0.5;
 
     for (let second = 0; second < 3; second += 1) {
       depleted.stepAnimalEcology(1);
@@ -163,13 +217,81 @@ describe('shrimp population safety contract', () => {
     expect(depletedWorld.snapshot().animalPopulation[SHRIMP].total).toBe(2);
     expect(nourishedFemale.gestationRemaining).not.toBeNull();
 
-    // Once the brood has been funded, a short gap since the last bite must not
+    // Once the brood has been funded, a gap since the last bite must not
     // freeze embryo development. Its material is already protected in reserve.
     nourishedFemale.secondsSinceFood = 120;
+    nourishedFemale.recentIntake = 0;
     nourishedFemale.gestationRemaining = 1;
     nourished.stepAnimalEcology(1);
 
     expect(nourishedWorld.snapshot().animalPopulation[SHRIMP].total).toBeGreaterThan(2);
+  });
+
+  it('does not allocate a new brood when recent assimilation falls below maintenance', () => {
+    const world = new SimulationWorld('laboratory');
+    const internals = configureReadyPair(world, true);
+    const female = internals.animals.find((animal) => animal.sex === 'female');
+    if (!female) throw new Error('surplus fixture needs a female shrimp');
+    female.storedBiomass = 0.5;
+    female.reproductiveBiomass = 0;
+    female.recentIntake = 0;
+
+    internals.stepAnimalEcology(1);
+
+    expect(female.reproductiveBiomass).toBe(0);
+    expect(female.matingAccumulator).toBe(0);
+  });
+
+  it('lets a funded pair mate and develop embryos across independent feeding gaps', () => {
+    const world = new SimulationWorld('laboratory');
+    const internals = configureReadyPair(world, true);
+    const female = internals.animals.find((animal) => animal.sex === 'female');
+    const male = internals.animals.find((animal) => animal.sex === 'male');
+    if (!female || !male) throw new Error('funded fixture needs both sexes');
+    female.storedBiomass = 0.5;
+    female.reproductiveBiomass = 0.5;
+    female.recentIntake = 0;
+    male.storedBiomass = 0.5;
+    male.recentIntake = 0;
+
+    for (let second = 0; second < 3; second += 1) {
+      internals.stepAnimalEcology(1);
+    }
+    expect(female.gestationRemaining).not.toBeNull();
+
+    female.gestationRemaining = 20;
+    internals.stepAnimalEcology(1);
+    expect(female.gestationRemaining).toBeLessThan(20);
+  });
+
+  it('allocates only the recent assimilation surplus to the brood reserve', () => {
+    const world = new SimulationWorld('laboratory');
+    const internals = configureReadyPair(world, true);
+    const female = internals.animals.find((animal) => animal.sex === 'female');
+    if (!female) throw new Error('allocation fixture needs a female shrimp');
+    female.storedBiomass = 0.5;
+    female.reproductiveBiomass = 0;
+
+    internals.stepAnimalEcology(1);
+
+    expect(female.reproductiveBiomass).toBeGreaterThan(0);
+    expect(female.reproductiveBiomass).toBeLessThan(0.05);
+  });
+
+  it('provisions the next conserved brood during cooldown without mating early', () => {
+    const world = new SimulationWorld('laboratory');
+    const internals = configureReadyPair(world, true);
+    const female = internals.animals.find((animal) => animal.sex === 'female');
+    if (!female) throw new Error('cooldown fixture needs a female shrimp');
+    female.storedBiomass = 0.5;
+    female.reproductiveBiomass = 0;
+    female.reproductionCooldown = 120;
+
+    internals.stepAnimalEcology(1);
+
+    expect(female.reproductiveBiomass).toBeGreaterThan(0);
+    expect(female.gestationRemaining).toBeNull();
+    expect(female.matingAccumulator).toBe(0);
   });
 
   it('does not detect a reproductive partner across the whole tank', () => {
@@ -210,6 +332,137 @@ describe('shrimp population safety contract', () => {
 
     shrimp.position = { x: farCell.x - 80, y: farCell.y };
     expect(internals.chooseFoodTarget(shrimp)).not.toBeNull();
+  });
+
+  it('prefers a locally sensed viable colony over a microscopic film underfoot', () => {
+    const world = new SimulationWorld('laboratory');
+    placeShrimp(world, { x: 600, y: 621 });
+    const internals = reproductionInternals(world);
+    const shrimp = internals.animals[0];
+    const substrate = internals.allCells()
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((left, right) => left.x - right.x);
+    const trace = substrate.reduce((best, cell) =>
+      Math.abs(cell.x - 600) < Math.abs(best.x - 600) ? cell : best
+    );
+    const colony = substrate.reduce((best, cell) =>
+      Math.abs(cell.x - (trace.x - 170)) <
+        Math.abs(best.x - (trace.x - 170))
+        ? cell
+        : best
+    );
+    trace.biofilm.decomposer = 0.00001;
+    colony.biomass.oedogonium = 0.5;
+    shrimp.position = internals.shrimpSurfaceContactPoint(trace);
+    shrimp.energy = 0.1;
+
+    expect(internals.chooseFoodTarget(shrimp)?.id).toBe(colony.id);
+  });
+
+  it('samples but leaves a trace film that cannot pay grazing metabolism', () => {
+    const world = new SimulationWorld('laboratory');
+    placeShrimp(world, { x: 600, y: 621 });
+    const internals = reproductionInternals(world);
+    const shrimp = internals.animals[0];
+    const trace = internals.allCells()
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((left, right) =>
+        Math.abs(left.x - 600) - Math.abs(right.x - 600))[0];
+    if (!trace) throw new Error('trace-film fixture needs a substrate cell');
+    trace.biofilm.decomposer = 0.00001;
+    shrimp.position = internals.shrimpSurfaceContactPoint(trace);
+    shrimp.targetCellId = trace.id;
+    shrimp.behavior = 'grazing';
+    shrimp.behaviorTimer = 0;
+    shrimp.grazingSessionIntake = 0;
+    shrimp.energy = 0.1;
+
+    internals.stepAnimalMotion(0.25);
+
+    expect(shrimp.behavior).not.toBe('grazing');
+    expect(shrimp.targetCellId).not.toBe(trace.id);
+  });
+
+  it('depletes a sparse edible film continuously instead of clipping it to zero', () => {
+    const world = new SimulationWorld('laboratory');
+    const internals = reproductionInternals(world);
+    const foodCell = internals.allCells()
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((left, right) =>
+        Math.abs(left.x - 600) - Math.abs(right.x - 600))[0];
+    if (!foodCell) throw new Error('continuous grazing fixture needs a substrate cell');
+    foodCell.biomass.oedogonium = 0.01;
+    const contact = internals.shrimpSurfaceContactPoint(foodCell);
+    for (let index = 0; index < 4; index += 1) {
+      placeShrimp(world, contact);
+      const shrimp = internals.animals.at(-1)!;
+      shrimp.position = { ...contact };
+      shrimp.targetCellId = foodCell.id;
+      shrimp.behavior = 'grazing';
+      shrimp.behaviorTimer = 2;
+      shrimp.energy = 0.1;
+    }
+
+    internals.stepAnimalEcology(1);
+
+    expect(foodCell.biomass.oedogonium).toBeGreaterThan(0);
+    expect(foodCell.biomass.oedogonium).toBeLessThan(0.01);
+  });
+
+  it('abandons a harmful local water pocket without sensing across the tank', () => {
+    const world = new SimulationWorld('mission-7');
+    const start = { x: 600, y: 400 };
+    placeShrimp(world, start);
+    const internals = reproductionInternals(world);
+    const fields = waterFields(world);
+    fields.oxygen.fill(78);
+    fields.toxicWaste.fill(1);
+    const startIndex = waterFieldIndex(start);
+    fields.oxygen[startIndex] = 8;
+    fields.toxicWaste[startIndex] = 24;
+
+    const beforeStress = internals.biogeochemistry.sampleAt(start);
+    internals.stepAnimalMotion(1);
+    const moved = internals.animals[0];
+    const afterStress = internals.biogeochemistry.sampleAt(moved.position);
+
+    expect(Math.hypot(
+      moved.position.x - start.x,
+      moved.position.y - start.y,
+    )).toBeGreaterThan(30);
+    expect(afterStress.oxygen).toBeGreaterThan(beforeStress.oxygen);
+    expect(afterStress.toxicWaste).toBeLessThan(beforeStress.toxicWaste);
+    expect(moved.targetCellId).toBeNull();
+  });
+
+  it('does not knowingly return to an unsafe food surface inside local cue range', () => {
+    const world = new SimulationWorld('mission-7');
+    const foodCell = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((left, right) =>
+        Math.abs(left.x - 600) - Math.abs(right.x - 600))[0];
+    if (!foodCell) throw new Error('water-cue fixture needs a substrate cell');
+    world.handle({ type: 'pick-seed', speciesId: 'nitzschia', point: foodCell });
+    world.handle({ type: 'drop-held', point: foodCell });
+    placeShrimp(world, foodCell);
+
+    const internals = reproductionInternals(world);
+    const shrimp = internals.animals[0];
+    expect(internals.chooseFoodTarget(shrimp)).not.toBeNull();
+
+    const fields = waterFields(world);
+    fields.toxicWaste[waterFieldIndex(foodCell)] = 24;
+    fields.oxygen[waterFieldIndex(foodCell)] = 8;
+
+    const saferTarget = internals.chooseFoodTarget(shrimp);
+    expect(saferTarget?.id ?? null).not.toBe(foodCell.id);
+    if (saferTarget) {
+      expect(
+        internals.biogeochemistry.sampleAt(
+          internals.shrimpSurfaceContactPoint(saferTarget),
+        ).oxygen,
+      ).toBeGreaterThan(8);
+    }
   });
 
   it('keeps persistent and snapshot arrays bounded with 64 live shrimp', () => {

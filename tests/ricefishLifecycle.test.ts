@@ -3,9 +3,7 @@ import { SCENARIOS } from '../src/simulation/config';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import type {
   AnimalSpeciesId,
-  MicrobeGuildId,
   SpeciesId,
-  SurfaceCellSnapshot,
   Vec2,
 } from '../src/simulation/types';
 
@@ -55,43 +53,17 @@ const placeSeed = (
   world.handle({ type: 'drop-held', point });
 };
 
-const placeFilm = (
-  world: SimulationWorld,
-  guildId: MicrobeGuildId,
-  point: Vec2,
-): void => {
-  world.handle({ type: 'pick-biofilm', guildId, point });
-  world.handle({ type: 'drop-held', point });
-};
-
-const nearestUnusedCell = (
-  cells: SurfaceCellSnapshot[],
-  targetX: number,
-  used: Set<string>,
-): SurfaceCellSnapshot => {
-  const cell = cells
-    .filter((candidate) => !used.has(candidate.id))
-    .sort((left, right) => Math.abs(left.x - targetX) - Math.abs(right.x - targetX))[0];
-  if (!cell) throw new Error('mission 7 fixture needs another substrate cell');
-  used.add(cell.id);
-  return cell;
-};
-
-describe('mission 7 ricefish lifecycle', () => {
-  it('uses a born fry rather than supplied adults as its public success target', () => {
-    const scenario = SCENARIOS['mission-7'];
-    expect(scenario.target).toMatchObject({
-      type: 'born-stage',
-      speciesId: RICEFISH,
-      lifeStage: 'fry',
-      count: 1,
+describe('ricefish lifecycle core', () => {
+  it('keeps ricefish in the laboratory while mission 7 validates plankton first', () => {
+    expect(SCENARIOS.laboratory.allowedAnimals).toContain(RICEFISH);
+    expect(SCENARIOS['mission-7'].allowedAnimals).not.toContain(RICEFISH);
+    expect(SCENARIOS['mission-7'].target).toMatchObject({
+      type: 'plankton-generation',
     });
-    expect(scenario.requiredStructures).toEqual({});
-    expect(scenario.allowedAnimals).toEqual(['cherry-shrimp', RICEFISH]);
   });
 
   it('supplies a reproducible 2F/1M trio without coupling age and lifespan to IDs', () => {
-    const world = new SimulationWorld('mission-7');
+    const world = new SimulationWorld('laboratory');
     placeAnimal(world, RICEFISH, { x: 500, y: 220 });
     placeAnimal(world, RICEFISH, { x: 550, y: 220 });
     placeAnimal(world, RICEFISH, { x: 600, y: 220 });
@@ -108,7 +80,7 @@ describe('mission 7 ricefish lifecycle', () => {
   });
 
   it('restores ricefish species, sex, life stage, age, and biomass from a frozen aquarium', () => {
-    const world = new SimulationWorld('mission-7');
+    const world = new SimulationWorld('laboratory');
     placeAnimal(world, RICEFISH, { x: 500, y: 220 });
     placeAnimal(world, RICEFISH, { x: 550, y: 220 });
     placeAnimal(world, RICEFISH, { x: 600, y: 220 });
@@ -142,7 +114,7 @@ describe('mission 7 ricefish lifecycle', () => {
   });
 
   it('removes a locally captured juvenile shrimp and records predation without a carcass', () => {
-    const world = new SimulationWorld('mission-7');
+    const world = new SimulationWorld('laboratory');
     placeAnimal(world, RICEFISH, { x: 600, y: 330 });
     placeAnimal(world, 'cherry-shrimp', { x: 610, y: 330 });
     const internals = world as unknown as WorldInternals;
@@ -176,7 +148,7 @@ describe('mission 7 ricefish lifecycle', () => {
   });
 
   it('attaches conserved eggs to habitat and hatches a born fry', () => {
-    const world = new SimulationWorld('mission-7');
+    const world = new SimulationWorld('laboratory');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
     const plantCell = substrate.sort((left, right) =>
       Math.abs(left.x - 620) - Math.abs(right.x - 620))[0]!;
@@ -225,74 +197,4 @@ describe('mission 7 ricefish lifecycle', () => {
     expect(snapshot.animals.find((animal) => animal.lifeStage === 'fry')?.attachmentLabel)
       .toBeNull();
   });
-
-  it('can complete through local feeding, courtship, attachment and hatching in two layouts', () => {
-    const layouts = [
-      {
-        algae: [120, 250, 380, 520, 680, 820, 950, 1_080],
-        plants: [280, 440, 600, 760, 920],
-        microbes: [150, 300, 450, 600, 750, 900, 1_050],
-        shrimp: [180, 300, 420, 540, 660, 780, 900, 1_020],
-        fish: [500, 600, 700],
-      },
-      {
-        algae: [340, 400, 460, 520, 600, 680, 760, 840],
-        plants: [400, 500, 600, 700, 800],
-        microbes: [360, 440, 520, 600, 680, 760, 840],
-        shrimp: [390, 450, 510, 570, 630, 690, 750, 810],
-        fish: [520, 600, 680],
-      },
-    ];
-
-    for (const layout of layouts) {
-      const world = new SimulationWorld('mission-7');
-      const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
-      const used = new Set<string>();
-
-      for (const x of layout.algae) {
-        placeSeed(world, 'nitzschia', nearestUnusedCell(substrate, x, used));
-        placeSeed(world, 'oedogonium', nearestUnusedCell(substrate, x + 20, used));
-      }
-      for (const x of layout.plants) {
-        placeSeed(world, 'vallisneria', nearestUnusedCell(substrate, x, used));
-      }
-      for (const x of layout.microbes) {
-        placeFilm(world, 'decomposer', nearestUnusedCell(substrate, x, used));
-        placeFilm(world, 'nitrifier', nearestUnusedCell(substrate, x + 12, used));
-      }
-      for (const x of layout.shrimp) {
-        placeAnimal(world, 'cherry-shrimp', { x, y: 560 });
-      }
-      for (const x of layout.fish) {
-        placeAnimal(world, RICEFISH, { x, y: 300 });
-      }
-
-      world.handle({ type: 'start' });
-      world.handle({ type: 'set-speed', speed: 64 });
-      let snapshot = world.snapshot();
-      let guard = 0;
-      let minimumShrimp = snapshot.animalPopulation['cherry-shrimp'].total;
-      while (
-        snapshot.elapsedSeconds < (snapshot.timeLimitSeconds ?? 1_500) &&
-        snapshot.outcome === 'pending' &&
-        guard < 1_000
-      ) {
-        world.tick(0.1);
-        snapshot = world.snapshot();
-        minimumShrimp = Math.min(
-          minimumShrimp,
-          snapshot.animalPopulation['cherry-shrimp'].total,
-        );
-        guard += 1;
-      }
-
-      expect(guard).toBeLessThan(1_000);
-      expect(snapshot.outcome).toBe('success');
-      expect(snapshot.animalPopulation[RICEFISH].fry).toBeGreaterThanOrEqual(1);
-      expect(snapshot.animalPopulationEventTotals.hatches).toBeGreaterThanOrEqual(1);
-      expect(snapshot.biogeochemistry.average.oxygen).toBeGreaterThan(18);
-      expect(snapshot.biogeochemistry.average.toxicWaste).toBeLessThan(14);
-      expect(minimumShrimp).toBeGreaterThan(0);
-    }
-  }, 15_000);
 });

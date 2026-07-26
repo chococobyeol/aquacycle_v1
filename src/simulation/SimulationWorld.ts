@@ -2,9 +2,13 @@ import Matter, { type Body as MatterBody } from 'matter-js';
 import {
   ALGAE_VISIBLE_BIOMASS,
   ANIMALS,
+  continuousBodyMassFeedingScale,
+  continuousBodyMassMaintenance,
+  daphniaSuspendedFoodResponse,
   initialWaterTemperatureForLight,
   MICROBE_ECOLOGY_RULES,
   MICROBES,
+  PLANKTON_ECOLOGY_RULES,
   RICEFISH_ECOLOGY_RULES,
   SCENARIOS,
   SHRIMP_ECOLOGY_RULES,
@@ -17,6 +21,10 @@ import {
   BiogeochemistryLedger,
   emptyBiofilm,
 } from './biogeochemistry';
+import {
+  animalCarcassVisualPoint,
+  animalVisualHitRadii,
+} from './animalPresentation';
 import { oxygenEquivalentInventory } from './stoichiometry';
 import { FIXED_LAMP_WIDTH, FIXED_LAMP_X, FIXED_LAMP_Y } from './lightGeometry';
 import { dayNightStateAt, type DayNightPhase, type DayNightState } from './dayNight';
@@ -79,6 +87,7 @@ import {
   type MissionProgressSnapshot,
   type PlantLifeStage,
   type PlantRametSnapshot,
+  type PlanktonKind,
   type ProbeSnapshot,
   type ScenarioId,
   type SelectionFilter,
@@ -232,8 +241,13 @@ interface AnimalState {
   growthProgress: number;
   reproductionCooldown: number;
   gestationRemaining: number | null;
+  /** Daphnia clutch size fixed when embryo development begins. */
+  gestatingBroodSize?: number | null;
   matingAccumulator: number;
   randomSeed: number;
+  /** Daphnia generations are tracked per individual; other animals default to 0. */
+  generation?: number;
+  parentId?: string | null;
 }
 
 interface AnimalCarcassState {
@@ -269,7 +283,20 @@ interface HeldBiofilmState {
   valid: boolean;
 }
 
-type HeldState = HeldStructureState | HeldSeedState | HeldAnimalState | HeldBiofilmState;
+interface HeldPlanktonState {
+  kind: 'plankton';
+  source: 'inventory';
+  planktonKind: PlanktonKind;
+  position: Vec2;
+  valid: boolean;
+}
+
+type HeldState =
+  | HeldStructureState
+  | HeldSeedState
+  | HeldAnimalState
+  | HeldBiofilmState
+  | HeldPlanktonState;
 
 const LIGHT_COLUMNS = 36;
 const LIGHT_ROWS = 20;
@@ -345,20 +372,22 @@ const VALLISNERIA_LOW_RESERVE_GRACE_SECONDS = 150;
 // daughter but cannot create biomass or drain the parent below its own reserve.
 const VALLISNERIA_CLONAL_SUPPORT_PER_SECOND = 0.00055;
 const VALLISNERIA_CLONAL_SUPPORT_TARGET = 0.22;
+// Rooted leaves turn over on the same scale as the explicit ramet life cycle.
+// Reusing the short-lived periphyton film loss here made healthy macrophytes
+// pay fast film turnover on top of respiration, stress and senescence.
+const VALLISNERIA_BACKGROUND_TURNOVER_PER_SECOND = 0.00018;
 // Five-percent structural steps are visually/ecologically smooth at the
 // 36×20 light-field resolution and avoid rebuilding the field for imperceptible
 // sub-pixel leaf growth during fast-forward.
 const VALLISNERIA_CANOPY_LIGHT_QUANTIZATION = 0.05;
 const BIOFILM_INOCULUM_BIOMASS = 0.18;
 const PICK_SEED_DISTANCE = 18;
-const PICK_ANIMAL_DISTANCE = 28;
 const SHRIMP_ADULT_LENGTH = 36;
 const SHRIMP_JUVENILE_LENGTH = 14;
 const SHRIMP_MATURITY_SECONDS = SHRIMP_ECOLOGY_RULES.maturationSeconds;
 // Two real-world months are compressed to the 180-second maturation period.
-// Keeping the same scale maps the observed 10–15 month life span to 15–22.5
-// simulation minutes. A deterministic per-animal value prevents cohort-wide
-// deaths while keeping replay results reproducible.
+// The configured 15–30 minute range represents broad individual variation and
+// prevents cohort-wide deaths while keeping replay results reproducible.
 const SHRIMP_MIN_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds;
 const SHRIMP_MAX_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds;
 const SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS =
@@ -378,27 +407,49 @@ const SHRIMP_FORAGE_STOP_ENERGY = 0.7;
 // survival is now determined by the conserved reserve/structure budget.
 const SHRIMP_BITE_RATE = SHRIMP_ECOLOGY_RULES.maximumBiteBiomassPerSecond;
 const SHRIMP_GRAZE_DISTANCE = 15;
-// Target detection and ingestion are deliberately separate. Shrimp seek a
-// visibly established patch instead of being distracted by every microscopic
-// speck, while a shrimp already on a patch can keep grazing it continuously.
-const SHRIMP_FOOD_TARGET_BIOMASS = 0.04;
-// Ecology keeps trace film continuous instead of declaring an otherwise edible
-// cell empty at 0.04 biomass. The existing half-saturation curve makes intake
-// smoothly approach zero; this much smaller cutoff is only the point where the
-// remaining film is mineralised into detritus rather than numerically stranded.
-const SHRIMP_TRACE_GRAZABLE_BIOMASS = 0.0005;
-const SHRIMP_GRAZING_HALF_SATURATION = 0.02;
+// Target choice and intake both use the real remaining biomass. Density
+// response below makes a trace patch unattractive without reserving an
+// uneatable floor.
+// Surface-cell biomass is bounded to 1. A half-saturation of 0.02 made the
+// low-density slope Vmax/K = 18.75/s: at the one-second fast-forward ecology
+// step a single shrimp could numerically erase every last propagule in one
+// update. Keeping the response unsaturated through most of a cell makes
+// scraping pressure fall with the actually visible film while preserving the
+// same high-density maximum bite.
+const SHRIMP_GRAZING_HALF_SATURATION = 0.8;
+const SHRIMP_DECOMPOSER_FOOD_WEIGHT = 0.45;
+const SHRIMP_NITRIFIER_FOOD_WEIGHT = 0.22;
 const SHRIMP_LOCAL_FOOD_RADIUS = 64;
 // A hungry shrimp samples a somewhat wider nearby area, never the whole tank.
 // Longer-range discovery happens only through ordinary exploratory movement.
-const SHRIMP_EMERGENCY_FOOD_RADIUS = 180;
+const SHRIMP_EMERGENCY_FOOD_RADIUS = 240;
 const SHRIMP_EMERGENCY_SEARCH_ENERGY = 0.35;
+// Cherry shrimp detect deteriorating water with short-range chemical and
+// oxygen cues. The probe radius is deliberately about one-and-a-half adult
+// body lengths: it lets an animal follow a local gradient away from a waste
+// pocket without revealing safe water elsewhere in the tank.
+const SHRIMP_LOCAL_WATER_SENSE_RADIUS = 54;
+const SHRIMP_WATER_ESCAPE_SPEED = 68;
+// Daphnia react to oxygen and dissolved-waste cues over only a few body
+// lengths. This is local avoidance of an immediately harmful pocket, not
+// knowledge of water conditions across the tank.
+const DAPHNIA_LOCAL_WATER_SENSE_RADIUS = 42;
+const DAPHNIA_WATER_ESCAPE_SPEED = 34;
 const SHRIMP_GRAZING_BOUT_BIOMASS = 1.4;
+// A shrimp samples a newly encountered film for at least this long. If the
+// assimilable ration gathered during that sample cannot even fund the same
+// interval of grazing metabolism, it leaves instead of remaining attached to
+// a perpetually regenerating trace film until its body is exhausted.
+const SHRIMP_GRAZING_PROFIT_SAMPLE_SECONDS = 3;
 // After a feeding bout, shrimp visibly leave the feeding surface before they
 // are allowed to seek food again. Reusing behaviorTimer keeps this a simple
 // graze -> roam -> forage state transition rather than a per-cell memory model.
 const SHRIMP_POST_GRAZE_ROAM_MIN_SECONDS = 2.5;
 const SHRIMP_POST_GRAZE_ROAM_VARIANCE_SECONDS = 1.5;
+// `recentIntake` is an exponentially decaying eight-second integral of real
+// consumed biomass. Converting that window to retained biomass per second lets
+// reproduction compare the same material units as maintenance respiration.
+const SHRIMP_RECENT_INTAKE_WINDOW_SECONDS = 8;
 // In a healthy tank adults settle near 0.5 energy. Reproduction is therefore
 // gated by current reserve and recent access to food rather than a hidden
 // population-capacity formula.
@@ -427,15 +478,29 @@ const SHRIMP_MAXIMUM_BROOD_BIOMASS =
 // Adult females gradually allocate feeding surplus to eggs instead of needing
 // the complete clutch to appear in ordinary reserve at a single instant.
 const SHRIMP_REPRODUCTIVE_SOMATIC_RESERVE_FLOOR = 0.16;
+// Juvenile growth is paid continuously from conserved reserve after
+// maintenance. Keeping a small reserve prevents one growth step from turning a
+// fed juvenile into an immediately starving one, without using the old
+// all-or-nothing "ate within 12 seconds" gate.
+const SHRIMP_JUVENILE_GROWTH_RESERVE_FLOOR = 0.04;
 // Mating is a local encounter, not a tank-wide lookup. The radius is wider
 // than the grazing contact distance to stand in for short-range chemical and
 // tactile cues without revealing animals elsewhere in the aquarium.
-const SHRIMP_MATING_ENCOUNTER_RADIUS = 140;
+const SHRIMP_MATING_ENCOUNTER_RADIUS = 300;
+// A ready female can follow a short-range dissolved/tactile cue toward a mate.
+// This is deliberately much smaller than the 1,200-wide tank and is unrelated
+// to food discovery, so sparse adults can meet without gaining a tank radar.
+const SHRIMP_MATING_ATTRACTION_RADIUS = 420;
 const SHRIMP_MATING_SECONDS = 3;
 const SHRIMP_GESTATION_SECONDS = 75;
-const SHRIMP_POST_BROOD_COOLDOWN = 160;
+// A completed brood does not consume a third of the animal's compressed
+// lifetime. Keeping the interval near the real clutch-to-lifespan proportion
+// lets parent and offspring cohorts overlap without guaranteeing survival or
+// adding a population floor.
+const SHRIMP_POST_BROOD_COOLDOWN = 360;
 const SHRIMP_MALE_POST_MATING_COOLDOWN = 45;
 const SHRIMP_CARCASS_LIFETIME_SECONDS = 55;
+const DAPHNIA_CARCASS_LIFETIME_SECONDS = 140;
 const RICEFISH_CARCASS_LIFETIME_SECONDS = 70;
 const MAX_ANIMAL_POPULATION_EVENTS = 240;
 // This is not an ecological carrying capacity. It is only a last-resort guard
@@ -544,10 +609,15 @@ export class SimulationWorld {
   private animalInventoryUsed: Record<AnimalSpeciesId, number> = {
     'cherry-shrimp': 0,
     'japanese-ricefish': 0,
+    daphnia: 0,
   };
   private microbeInventoryUsed: Record<MicrobeGuildId, number> = {
     decomposer: 0,
     nitrifier: 0,
+  };
+  private planktonInventoryUsed: Record<PlanktonKind, number> = {
+    phytoplankton: 0,
+    daphnia: 0,
   };
   private suspendedBiofilm: BiofilmBiomass = emptyBiofilm();
   private biofilmSettlementCursor = 0;
@@ -623,8 +693,13 @@ export class SimulationWorld {
     this.animalPopulationEventTotals = emptyAnimalPopulationEventTotals();
     this.animalPopulationEventSequence = 0;
     this.totalAlgaeConsumed = 0;
-    this.animalInventoryUsed = { 'cherry-shrimp': 0, 'japanese-ricefish': 0 };
+    this.animalInventoryUsed = {
+      'cherry-shrimp': 0,
+      'japanese-ricefish': 0,
+      daphnia: 0,
+    };
     this.microbeInventoryUsed = { decomposer: 0, nitrifier: 0 };
+    this.planktonInventoryUsed = { phytoplankton: 0, daphnia: 0 };
     this.suspendedBiofilm = emptyBiofilm();
     this.biofilmSettlementCursor = 0;
     this.materialReference = null;
@@ -727,6 +802,10 @@ export class SimulationWorld {
       case 'pick-biofilm':
         if (command.point) this.pointer = this.clampPointer(command.point);
         this.pickBiofilmFromInventory(command.guildId);
+        break;
+      case 'pick-plankton':
+        if (command.point) this.pointer = this.clampPointer(command.point);
+        this.pickPlanktonFromInventory(command.planktonKind);
         break;
       case 'pick-at':
         this.pickExistingAt(command.point);
@@ -1026,10 +1105,15 @@ export class SimulationWorld {
       remainingAnimals: {
         'cherry-shrimp': this.remainingAnimals('cherry-shrimp'),
         'japanese-ricefish': this.remainingAnimals('japanese-ricefish'),
+        daphnia: this.remainingAnimals('daphnia'),
       },
       remainingMicrobes: {
         decomposer: this.remainingMicrobes('decomposer'),
         nitrifier: this.remainingMicrobes('nitrifier'),
+      },
+      remainingPlankton: {
+        phytoplankton: this.remainingPlankton('phytoplankton'),
+        daphnia: this.remainingPlankton('daphnia'),
       },
       remainingStructures: {
         'flat-stone': this.remainingStructures('flat-stone'),
@@ -1041,6 +1125,7 @@ export class SimulationWorld {
       animalPopulation: {
         'cherry-shrimp': this.animalPopulation('cherry-shrimp'),
         'japanese-ricefish': this.animalPopulation('japanese-ricefish'),
+        daphnia: this.animalPopulation('daphnia'),
       },
       animalPopulationEvents: this.animalPopulationEvents.map((event) => ({
         ...event,
@@ -1169,6 +1254,7 @@ export class SimulationWorld {
       animalInventoryUsed: { ...this.animalInventoryUsed },
       microbeInventoryUsed: { ...this.microbeInventoryUsed },
       suspendedBiofilm: { ...this.suspendedBiofilm },
+      planktonInventoryUsed: { ...this.planktonInventoryUsed },
       biofilmSettlementCursor: this.biofilmSettlementCursor,
       materialReference: this.materialReference ? { ...this.materialReference } : null,
       biogeochemistry: this.biogeochemistry.exportSaveState(),
@@ -1253,10 +1339,13 @@ export class SimulationWorld {
     this.animals = data.animals.map((animal) => cloneAnimalState({
       ...animal,
       reproductiveBiomass: animal.reproductiveBiomass ?? 0,
+      generation: animal.generation ?? 0,
+      parentId: animal.parentId ?? null,
       targetAnimalId: animal.targetAnimalId ?? null,
       attachmentCellId: animal.attachmentCellId ?? null,
       incubationRemaining: animal.incubationRemaining ?? null,
       recentFood: animal.recentFood ?? null,
+      gestatingBroodSize: animal.gestatingBroodSize ?? null,
     }));
     this.carcasses = data.carcasses.map((carcass) => ({
       ...carcass,
@@ -1287,11 +1376,70 @@ export class SimulationWorld {
     this.animalInventoryUsed = {
       'cherry-shrimp': data.animalInventoryUsed['cherry-shrimp'] ?? 0,
       'japanese-ricefish': data.animalInventoryUsed['japanese-ricefish'] ?? 0,
+      daphnia: data.animalInventoryUsed.daphnia ?? 0,
     };
     this.microbeInventoryUsed = { ...data.microbeInventoryUsed };
+    this.planktonInventoryUsed = {
+      phytoplankton: data.planktonInventoryUsed?.phytoplankton ?? 0,
+      daphnia: data.planktonInventoryUsed?.daphnia ?? 0,
+    };
     this.suspendedBiofilm = { ...data.suspendedBiofilm };
     this.biofilmSettlementCursor = data.biofilmSettlementCursor;
     this.biogeochemistry.restoreSaveState(data.biogeochemistry, data.waterTemperature);
+    if (
+      !data.biogeochemistry.planktonicDecomposer &&
+      this.suspendedBiofilm.decomposer > 0
+    ) {
+      this.biogeochemistry.addPlanktonicDecomposer(
+        { x: TANK_WIDTH / 2, y: (WATER_TOP + GROUND_Y) / 2 },
+        this.suspendedBiofilm.decomposer,
+      );
+    }
+    this.suspendedBiofilm.decomposer = 0;
+    const restoredPlankton = this.biogeochemistry.planktonState();
+    if (
+      !this.animals.some((animal) => animal.speciesId === 'daphnia') &&
+      restoredPlankton.daphniaJuvenileBiomass +
+        restoredPlankton.daphniaAdultBiomass > 1e-9
+    ) {
+      const totalBiomass = restoredPlankton.daphniaJuvenileBiomass +
+        restoredPlankton.daphniaAdultBiomass;
+      const count = Math.max(1, restoredPlankton.approximateDaphniaCount);
+      for (let index = 0; index < count; index += 1) {
+        const angle = index / count * Math.PI * 2;
+        const animal = this.createAdultDaphniaState(
+          `animal-${++this.animalCounter}`,
+          {
+            x: TANK_WIDTH / 2 + Math.cos(angle) * Math.min(120, 12 * count),
+            y: (WATER_TOP + GROUND_Y) / 2 + Math.sin(angle) * 36,
+          },
+          index < Math.max(1, Math.round(
+            count * restoredPlankton.daphniaFounderAdultBiomass /
+              Math.max(1e-9, restoredPlankton.daphniaAdultBiomass),
+          ))
+            ? 'supplied'
+            : 'born',
+          index < Math.max(1, Math.round(
+            count * restoredPlankton.daphniaFounderAdultBiomass /
+              Math.max(1e-9, restoredPlankton.daphniaAdultBiomass),
+          ))
+            ? 0
+            : 1,
+          null,
+        );
+        const individualMass = totalBiomass / count;
+        animal.structuralBiomass = Math.min(
+          PLANKTON_ECOLOGY_RULES.daphnia.adultStructuralBiomass,
+          individualMass * 0.72,
+        );
+        animal.storedBiomass = Math.max(
+          0,
+          individualMass - animal.structuralBiomass,
+        );
+        this.animals.push(animal);
+      }
+    }
+    this.syncDaphniaIndividuals();
     const restoredTotals = this.computeMaterialTotals();
     this.materialReference = data.materialReference
       ? {
@@ -1345,9 +1493,10 @@ export class SimulationWorld {
         animal.storedBiomass + animal.reproductiveBiomass,
       0,
     );
-    const suspended = this.suspendedBiofilm.decomposer + this.suspendedBiofilm.nitrifier;
+    const suspended = this.suspendedBiofilm.nitrifier;
     const biologicalMatter = water.organicMatter + water.detritus +
-      surfaceBiomass + animalBiomass + suspended;
+      surfaceBiomass + animalBiomass + suspended +
+      water.planktonicDecomposer + water.phytoplankton + water.daphnia;
     const organicCarbon = biologicalMatter * WATER_CYCLE_RULES.biomassCarbon;
     return {
       nitrogen: water.toxicWaste + water.nutrients +
@@ -1365,6 +1514,12 @@ export class SimulationWorld {
   private createSubstrateCells(): SurfaceCellState[] {
     const sampled = sampleSubstrate();
     const ids = sampled.map((_, index) => `substrate:cell-${index}`);
+    const exposedRow = sampled.reduce(
+      (topRow, cell) => Math.max(topRow, cell.row),
+      Number.NEGATIVE_INFINITY,
+    );
+    const exposedCellCount = sampled.filter((cell) => cell.row === exposedRow).length;
+    const initialBiofilm = this.scenario.waterCycle?.initialBiofilm;
     return sampled.map((cell, index) => ({
       ...cell,
       id: ids[index],
@@ -1374,7 +1529,12 @@ export class SimulationWorld {
       index,
       light: 0,
       biomass: emptyBiomass(),
-      biofilm: emptyBiofilm(),
+      biofilm: initialBiofilm && cell.row === exposedRow && exposedCellCount > 0
+        ? {
+          decomposer: initialBiofilm.decomposer / exposedCellCount,
+          nitrifier: initialBiofilm.nitrifier / exposedCellCount,
+        }
+        : emptyBiofilm(),
       localNeighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
       neighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
     }));
@@ -1543,6 +1703,33 @@ export class SimulationWorld {
     this.snapshotDirty = true;
   }
 
+  private pickPlanktonFromInventory(planktonKind: PlanktonKind): void {
+    if (
+      !this.canEdit() ||
+      this.held ||
+      !this.scenario.allowedPlankton.includes(planktonKind)
+    ) return;
+    const remaining = this.remainingPlankton(planktonKind);
+    if (remaining !== null && remaining <= 0) {
+      this.message = '이 부유 생물 접종체는 모두 사용했습니다.';
+      return;
+    }
+    const position = this.clampAnimalPoint(this.pointer);
+    this.held = {
+      kind: 'plankton',
+      source: 'inventory',
+      planktonKind,
+      position,
+      valid: this.isAnimalPlacementPoint(position),
+    };
+    this.pointer = position;
+    this.selection = null;
+    this.message = planktonKind === 'phytoplankton'
+      ? '식물플랑크톤 접종체가 커서에 붙었습니다. 수중에 방류하세요.'
+      : '큰물벼룩 성체 한 마리가 커서에 붙었습니다. 수중에 놓으세요.';
+    this.snapshotDirty = true;
+  }
+
   private pickExistingAt(point: Vec2): void {
     if (!this.canEdit() || this.held) return;
     this.pointer = this.clampPointer(point);
@@ -1598,9 +1785,9 @@ export class SimulationWorld {
       }
     }
 
-    const nearestAnimal = this.nearestAnimal(this.pointer);
-    if (nearestAnimal && nearestAnimal.distance <= PICK_ANIMAL_DISTANCE) {
-      const animal = nearestAnimal.animal;
+    const animalHit = this.nearestAnimalHit(this.pointer);
+    if (animalHit) {
+      const animal = animalHit.animal;
       this.animals = this.animals.filter((candidate) => candidate.id !== animal.id);
       this.held = {
         kind: 'animal',
@@ -1700,17 +1887,9 @@ export class SimulationWorld {
     }
 
     if (filter === 'organism' || filter === 'all') {
-      const nearestAnimal = this.nearestAnimal(exact);
-      const nearestCarcass = this.nearestCarcass(exact);
-      const animalHit = nearestAnimal &&
-        nearestAnimal.distance <= this.animalHitRadius(nearestAnimal.animal)
-        ? nearestAnimal
-        : null;
-      const carcassHit = nearestCarcass &&
-        nearestCarcass.distance <= this.carcassHitRadius(nearestCarcass.carcass)
-        ? nearestCarcass
-        : null;
-      if (animalHit && (!carcassHit || animalHit.distance <= carcassHit.distance)) {
+      const animalHit = this.nearestAnimalHit(exact);
+      const carcassHit = this.nearestCarcassHit(exact);
+      if (animalHit && (!carcassHit || animalHit.score <= carcassHit.score)) {
         const animal = animalHit.animal;
         this.selection = {
           kind: 'animal',
@@ -1722,10 +1901,10 @@ export class SimulationWorld {
         return;
       }
       if (carcassHit) {
-        const carcass = carcassHit.carcass;
+        const { carcass, visualPoint } = carcassHit;
         this.selection = {
           kind: 'carcass',
-          ...carcass.position,
+          ...visualPoint,
           ownerLabel: `${ANIMALS[carcass.speciesId].displayName} · 죽은 개체`,
           carcassId: carcass.id,
         };
@@ -1998,6 +2177,9 @@ export class SimulationWorld {
       this.updateHeldSeedCandidate(this.pointer);
     } else if (this.held.kind === 'biofilm') {
       this.updateHeldBiofilmCandidate(this.pointer);
+    } else if (this.held.kind === 'animal') {
+      this.held.position = this.clampAnimalPoint(this.pointer);
+      this.held.valid = this.isAnimalPlacementPoint(this.held.position);
     } else {
       this.held.position = this.clampAnimalPoint(this.pointer);
       this.held.valid = this.isAnimalPlacementPoint(this.held.position);
@@ -2020,6 +2202,8 @@ export class SimulationWorld {
           ? '체리새우는 수면 아래와 바닥 위의 수중에 놓아야 합니다.'
         : held.kind === 'biofilm'
           ? '균 필름은 돌의 보이는 앞면이나 바닥재 표면에 접종해야 합니다.'
+        : held.kind === 'plankton'
+          ? '부유 생물은 수면 아래와 바닥 위의 물속에 방류해야 합니다.'
         : duplicateSeed
           ? '이 표면에는 같은 조류가 이미 접종되어 있습니다. 다른 지점을 선택하세요.'
           : '접종체는 돌의 보이는 앞면이나 바닥재 표면에 놓아야 합니다.';
@@ -2091,6 +2275,66 @@ export class SimulationWorld {
       this.microbeInventoryUsed[heldBiofilm.guildId] += 1;
       this.held = null;
       this.message = `${MICROBES[heldBiofilm.guildId].displayName}을 접종했습니다.`;
+      this.snapshotDirty = true;
+      return;
+    }
+
+    if (this.held.kind === 'plankton') {
+      const heldPlankton = this.held;
+      let added = 0;
+      if (heldPlankton.planktonKind === 'daphnia') {
+        const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+        const founders: AnimalState[] = [];
+        for (let index = 0; index < rules.foundersPerInoculum; index += 1) {
+          const angle = index / rules.foundersPerInoculum * Math.PI * 2;
+          const radius = rules.foundersPerInoculum === 1
+            ? 0
+            : 8 + index % 3 * 5;
+          const founder = this.createAdultDaphniaState(
+            `animal-${++this.animalCounter}`,
+            this.clampDaphniaPoint({
+              x: heldPlankton.position.x + Math.cos(angle) * radius,
+              y: heldPlankton.position.y + Math.sin(angle) * radius,
+            }),
+            'supplied',
+            0,
+            null,
+          );
+          founders.push(founder);
+          added += founder.structuralBiomass + founder.storedBiomass;
+        }
+        this.animals.push(...founders);
+        for (const founder of founders) {
+          if (this.hasStarted) this.recordAnimalPopulationEvent('introduced', founder);
+        }
+        this.syncDaphniaIndividuals();
+      } else {
+        added = this.biogeochemistry.addPlankton(
+          heldPlankton.position,
+          'phytoplankton',
+          PLANKTON_ECOLOGY_RULES.inoculum.phytoplanktonBiomass,
+        );
+      }
+      if (added <= 0) {
+        this.message = '이 위치에는 접종체가 퍼질 물 공간이 부족합니다.';
+        return;
+      }
+      this.planktonInventoryUsed[heldPlankton.planktonKind] += 1;
+      if (
+        this.hasStarted &&
+        this.scenario.mode === 'challenge' &&
+        this.materialReference
+      ) {
+        this.materialReference.nitrogen += added * WATER_CYCLE_RULES.biomassNitrogen;
+        this.materialReference.carbon += added * WATER_CYCLE_RULES.biomassCarbon;
+        this.materialReference.oxygenEquivalent -=
+          added * WATER_CYCLE_RULES.biomassCarbon *
+          WATER_CYCLE_RULES.oxygenPerOrganicCarbon;
+      }
+      this.held = null;
+      this.message = heldPlankton.planktonKind === 'phytoplankton'
+        ? '식물플랑크톤을 물기둥에 접종했습니다.'
+        : '큰물벼룩 한 마리를 물기둥에 방류했습니다.';
       this.snapshotDirty = true;
       return;
     }
@@ -2619,6 +2863,19 @@ export class SimulationWorld {
     return Math.max(0, budget - this.microbeInventoryUsed[guildId] - held);
   }
 
+  private remainingPlankton(planktonKind: PlanktonKind): number | null {
+    const budget = this.scenario.planktonBudget[planktonKind];
+    if (budget === null) return null;
+    const held = this.held?.kind === 'plankton' &&
+      this.held.planktonKind === planktonKind
+      ? 1
+      : 0;
+    return Math.max(
+      0,
+      budget - this.planktonInventoryUsed[planktonKind] - held,
+    );
+  }
+
   private remainingStructures(definitionId: StructureDefinitionId): number | null {
     const budget = this.scenario.structureBudget[definitionId];
     if (budget === null) return null;
@@ -2671,6 +2928,7 @@ export class SimulationWorld {
           occupiedBiofilm,
         ),
       },
+      plankton: this.biogeochemistry.planktonAt(measuredPoint),
     };
   }
 
@@ -3187,10 +3445,94 @@ export class SimulationWorld {
         this.stepRicefishMotion(animal, deltaSeconds);
         continue;
       }
+      if (animal.speciesId === 'daphnia') {
+        this.stepDaphniaMotion(animal, deltaSeconds);
+        continue;
+      }
+      const waterEscape = this.shrimpLocalWaterEscape(animal);
+      if (waterEscape) {
+        // Unsafe water takes priority over courtship and feeding. A shrimp
+        // abandons the current surface, samples only its immediate
+        // neighbourhood, and swims down the locally improving gradient.
+        animal.targetCellId = null;
+        animal.targetAnimalId = null;
+        animal.behavior = 'traveling';
+        animal.behaviorTimer = 0;
+        animal.nextTargetEvaluation = 0;
+        animal.grazingSessionIntake = 0;
+        const desiredSpeed = SHRIMP_WATER_ESCAPE_SPEED *
+          (0.8 + waterEscape.stress * 0.45);
+        const response = 1 - Math.exp(-deltaSeconds * 5.4);
+        animal.velocity.x +=
+          (waterEscape.x * desiredSpeed - animal.velocity.x) * response;
+        animal.velocity.y +=
+          (waterEscape.y * desiredSpeed - animal.velocity.y) * response;
+        animal.position.x += animal.velocity.x * deltaSeconds;
+        animal.position.y += animal.velocity.y * deltaSeconds;
+        animal.position = this.clampAnimalPoint(animal.position);
+        if (Math.abs(animal.velocity.x) > 2.5) {
+          animal.facing = animal.velocity.x < 0 ? -1 : 1;
+        }
+        animal.poseAngle = clamp(
+          Math.atan2(animal.velocity.y, Math.max(5, Math.abs(animal.velocity.x))),
+          -0.34,
+          0.34,
+        );
+        continue;
+      }
+      const readyToMate = animal.lifeStage === 'adult' &&
+        animal.sex === 'female' &&
+        animal.gestationRemaining === null &&
+        animal.reproductionCooldown <= 0 &&
+        animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
+        animal.energy >= SHRIMP_REPRODUCTION_ENERGY;
+      const nearbyMate = readyToMate
+        ? this.animals
+          .filter((candidate) =>
+            candidate.id !== animal.id &&
+            candidate.speciesId === 'cherry-shrimp' &&
+            candidate.lifeStage === 'adult' &&
+            candidate.sex === 'male' &&
+            candidate.energy >= SHRIMP_ECOLOGY_RULES.maleReproductionEnergy &&
+            candidate.reproductionCooldown <= 0 &&
+            distanceSquared(candidate.position, animal.position) <=
+              SHRIMP_MATING_ATTRACTION_RADIUS * SHRIMP_MATING_ATTRACTION_RADIUS)
+          .sort((left, right) =>
+            distanceSquared(animal.position, left.position) -
+            distanceSquared(animal.position, right.position))[0]
+        : undefined;
+      if (nearbyMate) {
+        const dx = nearbyMate.position.x - animal.position.x;
+        const dy = nearbyMate.position.y - animal.position.y;
+        const distance = Math.max(0.001, Math.hypot(dx, dy));
+        const desiredSpeed = distance > SHRIMP_MATING_ENCOUNTER_RADIUS ? 46 : 22;
+        const desiredX = dx / distance * desiredSpeed;
+        const desiredY = dy / distance * desiredSpeed;
+        const response = 1 - Math.exp(-deltaSeconds * 4.2);
+        animal.velocity.x += (desiredX - animal.velocity.x) * response;
+        animal.velocity.y += (desiredY - animal.velocity.y) * response;
+        animal.position.x += animal.velocity.x * deltaSeconds;
+        animal.position.y += animal.velocity.y * deltaSeconds;
+        animal.position = this.clampAnimalPoint(animal.position);
+        animal.targetCellId = null;
+        animal.behavior = 'courting';
+        if (Math.abs(animal.velocity.x) > 2.5) {
+          animal.facing = animal.velocity.x < 0 ? -1 : 1;
+        }
+        animal.poseAngle = clamp(
+          Math.atan2(animal.velocity.y, Math.max(5, Math.abs(animal.velocity.x))),
+          -0.34,
+          0.34,
+        );
+        continue;
+      }
       let currentTarget = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
       let targetFood = currentTarget ? this.edibleBiomass(currentTarget) : 0;
       let currentTargetDistance = currentTarget
-        ? Math.sqrt(distanceSquared(animal.position, this.cellWorldPoint(currentTarget)))
+        ? Math.sqrt(distanceSquared(
+          animal.position,
+          this.shrimpSurfaceContactPoint(currentTarget),
+        ))
         : Number.POSITIVE_INFINITY;
       const wasForaging = animal.behavior === 'traveling' ||
         animal.behavior === 'grazing' || animal.behavior === 'starving' ||
@@ -3206,14 +3548,28 @@ export class SimulationWorld {
 
       // A fed shrimp releases the colony after a short grazing bout, then must
       // spend a visible interval roaming before food targeting can resume.
+      // A hungry shrimp also releases a trace film after sampling it when the
+      // realised ration cannot pay its grazing metabolism. Trace biomass is
+      // still consumed; it simply cannot pin the animal in place forever.
+      const grazingSampleWasUnprofitable =
+        animal.behavior === 'grazing' &&
+        animal.behaviorTimer <= 0 &&
+        animal.grazingSessionIntake <
+          this.shrimpMinimumProfitableGrazingIntake(animal);
       if (
         animal.behavior === 'grazing' &&
-        animal.energy >= SHRIMP_FORAGE_START_ENERGY &&
-        (((animal.behaviorTimer <= 0 ||
-          animal.grazingSessionIntake >= SHRIMP_GRAZING_BOUT_BIOMASS) &&
-          animal.energy >= SHRIMP_FORAGE_START_ENERGY) ||
-          animal.energy >= SHRIMP_FORAGE_STOP_ENERGY ||
-          targetFood < SHRIMP_FOOD_TARGET_BIOMASS)
+        (
+          grazingSampleWasUnprofitable ||
+          (
+            animal.energy >= SHRIMP_FORAGE_START_ENERGY &&
+            (
+              animal.behaviorTimer <= 0 ||
+              animal.grazingSessionIntake >= SHRIMP_GRAZING_BOUT_BIOMASS ||
+              animal.energy >= SHRIMP_FORAGE_STOP_ENERGY ||
+              targetFood <= 0
+            )
+          )
+        )
       ) {
         animal.targetCellId = null;
         animal.behavior = 'exploring';
@@ -3255,7 +3611,10 @@ export class SimulationWorld {
       currentTarget = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
       targetFood = currentTarget ? this.edibleBiomass(currentTarget) : 0;
       currentTargetDistance = currentTarget
-        ? Math.sqrt(distanceSquared(animal.position, this.cellWorldPoint(currentTarget)))
+        ? Math.sqrt(distanceSquared(
+          animal.position,
+          this.shrimpSurfaceContactPoint(currentTarget),
+        ))
         : Number.POSITIVE_INFINITY;
 
       if (
@@ -3278,12 +3637,12 @@ export class SimulationWorld {
       if (
         animal.nextTargetEvaluation <= 0 ||
         (!currentTarget && animal.behavior !== 'resting') ||
-        (seeking && targetFood < SHRIMP_FOOD_TARGET_BIOMASS && currentTargetDistance <= 24)
+        (seeking && targetFood <= 0 && currentTargetDistance <= 24)
       ) {
         const foodTarget = seeking ? this.chooseFoodTarget(animal) : null;
         const retainExplorationTarget = Boolean(
           seeking && currentTarget &&
-          targetFood < SHRIMP_FOOD_TARGET_BIOMASS && currentTargetDistance > 24,
+          targetFood <= 0 && currentTargetDistance > 24,
         );
         animal.targetCellId = foodTarget?.id ??
           (retainExplorationTarget ? currentTarget!.id : this.chooseExplorationTarget(animal)?.id ?? null);
@@ -3303,11 +3662,11 @@ export class SimulationWorld {
         continue;
       }
 
-      const targetPoint = this.cellWorldPoint(target);
+      const targetPoint = this.shrimpSurfaceContactPoint(target);
       const dx = targetPoint.x - animal.position.x;
       const dy = targetPoint.y - animal.position.y;
       const distance = Math.max(0.001, Math.hypot(dx, dy));
-      const hasFood = this.edibleBiomass(target) >= SHRIMP_TRACE_GRAZABLE_BIOMASS;
+      const hasFood = this.edibleBiomass(target) > 0;
       const grazing = seeking && hasFood &&
         distance <= Math.max(SHRIMP_GRAZE_DISTANCE, target.cellSize * 1.4);
       if (grazing) {
@@ -3362,6 +3721,139 @@ export class SimulationWorld {
     }
   }
 
+  private stepDaphniaMotion(animal: AnimalState, deltaSeconds: number): void {
+    const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+    const localFood = this.biogeochemistry.planktonAt(animal.position);
+    const centerFood = localFood.phytoplankton +
+      localFood.planktonicDecomposer * rules.maximumBacteriaDietFraction;
+    const hungry = centerFood < rules.phytoplanktonHalfSaturation ||
+      animal.energy < 0.38;
+
+    // Daphnia filter the water they happen to occupy; they do not sample
+    // distant cells and steer toward the richest one. A correlated random walk
+    // plus current and boundary response still lets them cross the tank
+    // without granting an invisible food-direction sensor.
+    const roamingTime = animal.ageSeconds / rules.roamingDirectionSeconds;
+    const roamingSegment = Math.floor(roamingTime);
+    const roamingBlend = roamingTime - roamingSegment;
+    const headingAt = (segment: number): number =>
+      deterministicNoise(animal.randomSeed * 0.071 + segment * 7.193 + 3.17) *
+      Math.PI * 2;
+    const firstHeading = headingAt(roamingSegment);
+    const nextHeading = headingAt(roamingSegment + 1);
+    const firstX = Math.cos(firstHeading);
+    const firstY = Math.sin(firstHeading);
+    const nextX = Math.cos(nextHeading);
+    const nextY = Math.sin(nextHeading);
+    const smoothBlend = roamingBlend * roamingBlend * (3 - 2 * roamingBlend);
+    const wanderX = firstX + (nextX - firstX) * smoothBlend;
+    const wanderY = (firstY + (nextY - firstY) * smoothBlend) * 0.72;
+
+    // A power stroke followed by passive sinking produces the characteristic
+    // hop, but subtracting its cycle mean prevents the old permanent upward
+    // drift that pinned the whole population to the surface.
+    const phase = animal.ageSeconds * 3.4 + animal.randomSeed * 11.7;
+    const hop = Math.max(0, Math.sin(phase));
+    const balancedHop = -(hop - 1 / Math.PI) * 0.34;
+    const localFoodResponse = centerFood <= 0
+      ? 0
+      : centerFood / (rules.phytoplanktonHalfSaturation + centerFood);
+    // Animals increase search activity in poor water but keep the same
+    // stochastic heading. In food-rich water the slower walk lengthens local
+    // residence without revealing the direction of another patch.
+    const roamingWeight = hungry
+      ? 1.08
+      : 0.78 + (1 - localFoodResponse) * 0.18;
+    const current = this.biogeochemistry.velocityAt(animal.position);
+    // A hard positional clamp leaves outward velocity intact and can pin a
+    // Daphnia to the glass while only its appendages animate. Steer away
+    // before contact, then reflect any remaining outward velocity.
+    const horizontalMargin = 72;
+    const verticalMargin = 58;
+    const waterTop = WATER_TOP + 12;
+    const waterBottom = GROUND_Y - 14;
+    const waterColumnMiddle = (waterTop + waterBottom) / 2;
+    const verticalBalance = clamp(
+      (waterColumnMiddle - animal.position.y) /
+        ((waterBottom - waterTop) * 0.42),
+      -1,
+      1,
+    ) * 0.22;
+    const boundaryX = clamp(
+      (horizontalMargin - animal.position.x) / horizontalMargin,
+      0,
+      1,
+    ) - clamp(
+      (animal.position.x - (TANK_WIDTH - horizontalMargin)) / horizontalMargin,
+      0,
+      1,
+    );
+    const boundaryY = clamp(
+      (waterTop + verticalMargin - animal.position.y) / verticalMargin,
+      0,
+      1,
+    ) - clamp(
+      (animal.position.y - (waterBottom - verticalMargin)) / verticalMargin,
+      0,
+      1,
+    );
+    const activityScale = animal.behavior === 'starving'
+      ? 0.52
+      : 0.72 + animal.energy * 0.28;
+    let desiredX = (
+      wanderX * roamingWeight + boundaryX * 1.35
+    ) * rules.swimmingSpeed * activityScale +
+      current.x * rules.currentVelocityScale;
+    let desiredY = (
+      wanderY * roamingWeight + balancedHop +
+        // Daphnia are slightly denser than water between power strokes. A
+        // small settling term plus a weak return toward the water column keeps
+        // an unfed cohort suspended instead of accumulating at the surface.
+        0.08 + verticalBalance +
+        boundaryY * 1.2
+    ) * rules.swimmingSpeed * activityScale +
+      current.y * rules.currentVelocityScale;
+    const waterEscape = this.daphniaLocalWaterEscape(animal);
+    if (waterEscape) {
+      const escapeSpeed = DAPHNIA_WATER_ESCAPE_SPEED *
+        (0.82 + waterEscape.stress * 0.5);
+      desiredX = waterEscape.x * escapeSpeed +
+        current.x * rules.currentVelocityScale;
+      desiredY = waterEscape.y * escapeSpeed +
+        current.y * rules.currentVelocityScale;
+    }
+    const response = 1 - Math.exp(-deltaSeconds * (hop > 0 ? 7 : 2.8));
+    animal.velocity.x += (desiredX - animal.velocity.x) * response;
+    animal.velocity.y += (desiredY - animal.velocity.y) * response;
+    const proposed = {
+      x: animal.position.x + animal.velocity.x * deltaSeconds,
+      y: animal.position.y + animal.velocity.y * deltaSeconds,
+    };
+    const clamped = this.clampDaphniaPoint(proposed);
+    if (clamped.x !== proposed.x) {
+      animal.velocity.x = clamped.x <= 10
+        ? Math.abs(animal.velocity.x) * 0.62
+        : -Math.abs(animal.velocity.x) * 0.62;
+    }
+    if (clamped.y !== proposed.y) {
+      animal.velocity.y = clamped.y <= waterTop
+        ? Math.abs(animal.velocity.y) * 0.58
+        : -Math.abs(animal.velocity.y) * 0.58;
+    }
+    animal.position = clamped;
+    if (Math.abs(animal.velocity.x) > 0.8) animal.facing = animal.velocity.x < 0 ? -1 : 1;
+    animal.poseAngle = clamp(
+      Math.atan2(animal.velocity.y, Math.max(3, Math.abs(animal.velocity.x))),
+      -0.55,
+      0.55,
+    );
+    animal.behavior = animal.secondsSinceFood > 30 && animal.energy < 0.18
+      ? 'starving'
+      : animal.secondsSinceFood <= 2
+        ? 'grazing'
+        : 'exploring';
+  }
+
   private stepRicefishMotion(animal: AnimalState, deltaSeconds: number): void {
     if (animal.lifeStage === 'egg') {
       const attachment = animal.attachmentCellId
@@ -3396,8 +3888,7 @@ export class SimulationWorld {
       animal.reproductiveBiomass >=
         rules.eggClutchMinimum * WATER_CYCLE_RULES.ricefish.eggBiomass &&
       animal.health > 0.72 &&
-      animal.energy >= 0.35 &&
-      animal.recentFood !== null;
+      animal.energy >= rules.matingEnergy;
     const mate = matingReady
       ? this.animals
         .filter((candidate) =>
@@ -3651,24 +4142,38 @@ export class SimulationWorld {
           (1 - Math.exp(-kinetics.waterborneExportRate * deltaSeconds));
         if (detached <= 0) continue;
         cell.biofilm[guildId] = Math.max(0, cell.biofilm[guildId] - detached);
-        this.suspendedBiofilm[guildId] += detached;
+        if (guildId === 'decomposer') {
+          this.biogeochemistry.addPlanktonicDecomposer(
+            this.cellWorldPoint(cell),
+            detached,
+          );
+        } else {
+          this.suspendedBiofilm.nitrifier += detached;
+        }
       }
     }
 
     for (const guildId of ['decomposer', 'nitrifier'] as const) {
       const kinetics = MICROBE_ECOLOGY_RULES[guildId];
-      const suspendedBeforeDecay = this.suspendedBiofilm[guildId];
-      this.suspendedBiofilm[guildId] *= Math.exp(-kinetics.suspendedDecayRate * deltaSeconds);
-      this.biogeochemistry.recordSuspendedBiomassDeath(
-        { x: TANK_WIDTH / 2, y: (WATER_TOP + GROUND_Y) / 2 },
-        suspendedBeforeDecay - this.suspendedBiofilm[guildId],
-      );
+      if (guildId === 'nitrifier') {
+        const suspendedBeforeDecay = this.suspendedBiofilm.nitrifier;
+        this.suspendedBiofilm.nitrifier *= Math.exp(
+          -kinetics.suspendedDecayRate * deltaSeconds,
+        );
+        this.biogeochemistry.recordSuspendedBiomassDeath(
+          { x: TANK_WIDTH / 2, y: (WATER_TOP + GROUND_Y) / 2 },
+          suspendedBeforeDecay - this.suspendedBiofilm.nitrifier,
+        );
+      }
       const attempts = Math.max(
         1,
         Math.round(MICROBE_ECOLOGY_RULES.settlementAttemptsPerSecond * deltaSeconds),
       );
       for (let attempt = 0; attempt < attempts; attempt += 1) {
-        if (this.suspendedBiofilm[guildId] <= 1e-8 || cells.length === 0) break;
+        const suspendedAvailable = guildId === 'decomposer'
+          ? this.biogeochemistry.planktonicDecomposerMass()
+          : this.suspendedBiofilm.nitrifier;
+        if (suspendedAvailable <= 1e-8 || cells.length === 0) break;
         this.biofilmSettlementCursor += 1;
         const guildOffset = guildId === 'decomposer' ? 17.3 : 71.9;
         const candidateIndex = Math.min(
@@ -3691,17 +4196,23 @@ export class SimulationWorld {
         const retention = clamp(0.12 + netGrowth * 38, 0.04, 1);
         const offered = Math.max(
           MICROBE_ECOLOGY_RULES.minimumSettlement,
-          this.suspendedBiofilm[guildId] *
+          suspendedAvailable *
             MICROBE_ECOLOGY_RULES.settlementFractionPerAttempt,
         );
         const amount = Math.min(
           available,
-          this.suspendedBiofilm[guildId],
+          suspendedAvailable,
           offered * retention,
         );
         if (amount <= 0) continue;
-        receiver.biofilm[guildId] += amount;
-        this.suspendedBiofilm[guildId] -= amount;
+        const settled = guildId === 'decomposer'
+          ? this.biogeochemistry.removePlanktonicDecomposer(
+            this.cellWorldPoint(receiver),
+            amount,
+          )
+          : amount;
+        receiver.biofilm[guildId] += settled;
+        if (guildId === 'nitrifier') this.suspendedBiofilm.nitrifier -= settled;
       }
     }
   }
@@ -3713,6 +4224,8 @@ export class SimulationWorld {
         .filter((carcass) => carcass.ageSeconds < (
           carcass.speciesId === 'japanese-ricefish'
             ? RICEFISH_CARCASS_LIFETIME_SECONDS
+            : carcass.speciesId === 'daphnia'
+              ? DAPHNIA_CARCASS_LIFETIME_SECONDS
             : SHRIMP_CARCASS_LIFETIME_SECONDS
         ));
       if (
@@ -3723,6 +4236,7 @@ export class SimulationWorld {
       }
       this.snapshotDirty = true;
     }
+    this.stepDaphniaEcology(deltaSeconds);
     this.stepRicefishEcology(deltaSeconds);
     if (!this.animals.length) return;
     const shrimpAnimals = this.animals.filter((animal) =>
@@ -3733,11 +4247,13 @@ export class SimulationWorld {
       cell: SurfaceCellState;
       nitzschia: number;
       oedogonium: number;
+      decomposer: number;
+      nitrifier: number;
     }
     const requestsByCell = new Map<string, GrazingRequest[]>();
     const environmentalDeathCauses = new Map<
       string,
-      'hypoxia' | 'toxicity' | 'temperature'
+      'hypoxia' | 'toxicity' | 'temperature' | 'starvation'
     >();
     const maintenanceRequests = new Map<string, number>();
 
@@ -3767,7 +4283,11 @@ export class SimulationWorld {
       animal.recentIntake *= Math.exp(-deltaSeconds / 8);
       animal.secondsSinceFood += deltaSeconds;
 
-      const stageScale = animal.lifeStage === 'adult' ? 1 : 0.58;
+      const stageScale = continuousBodyMassFeedingScale(
+        animal.structuralBiomass,
+        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
+        WATER_CYCLE_RULES.shrimp.feedingMassExponent,
+      );
       const activityCost = animal.behavior === 'traveling'
         ? SHRIMP_ECOLOGY_RULES.travelingActivityCostPerSecond
         : animal.behavior === 'grazing' || animal.behavior === 'exploring'
@@ -3806,53 +4326,116 @@ export class SimulationWorld {
         )
         : 0;
       const thermalStress = clamp(1 - thermalHealthSuitability, 0, 1);
+      const unfedAcclimation = clamp(
+        1 -
+          animal.consumedBiomass /
+            SHRIMP_ECOLOGY_RULES.starvationAcclimationFoodBiomass,
+        0,
+        1,
+      );
+      const starvationStress = clamp(
+        (
+          animal.secondsSinceFood -
+          SHRIMP_ECOLOGY_RULES.starvationGraceSeconds
+        ) / (
+          SHRIMP_ECOLOGY_RULES.starvationFullStressSeconds -
+          SHRIMP_ECOLOGY_RULES.starvationGraceSeconds
+        ),
+        0,
+        1,
+      ) * unfedAcclimation;
       const damageRate =
         Math.pow(oxygenStress, 1.35) *
           SHRIMP_ECOLOGY_RULES.oxygenMaximumDamagePerSecond +
         Math.pow(toxicStress, 1.25) *
           SHRIMP_ECOLOGY_RULES.toxicMaximumDamagePerSecond +
         Math.pow(thermalStress, 1.35) *
-          temperatureProfile.maximumThermalDamagePerSecond;
+          temperatureProfile.maximumThermalDamagePerSecond +
+        starvationStress *
+          SHRIMP_ECOLOGY_RULES.starvationMaximumDamagePerSecond;
       const recoveryRate = Math.max(
         0,
-        1 - Math.max(oxygenStress, toxicStress, thermalStress),
+        1 - Math.max(
+          oxygenStress,
+          toxicStress,
+          thermalStress,
+          starvationStress,
+        ),
       ) * SHRIMP_WATER_RECOVERY_RATE;
       animal.health = clamp01(
         animal.health + (recoveryRate - damageRate) * deltaSeconds,
       );
       if (animal.health <= 0) {
-        const highestStress = Math.max(oxygenStress, toxicStress, thermalStress);
+        const highestStress = Math.max(
+          oxygenStress,
+          toxicStress,
+          thermalStress,
+          starvationStress,
+        );
         environmentalDeathCauses.set(
           animal.id,
           highestStress === thermalStress
             ? 'temperature'
             : highestStress === oxygenStress
               ? 'hypoxia'
-              : 'toxicity',
+              : highestStress === toxicStress
+                ? 'toxicity'
+                : 'starvation',
         );
       }
 
       const target = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
       if (target && animal.behavior === 'grazing') {
-        const targetPoint = this.cellWorldPoint(target);
+        const targetPoint = this.shrimpSurfaceContactPoint(target);
         const distance = Math.sqrt(distanceSquared(animal.position, targetPoint));
         const food = this.edibleBiomass(target);
         if (
-          food >= SHRIMP_TRACE_GRAZABLE_BIOMASS &&
+          food > 0 &&
           distance <= Math.max(SHRIMP_GRAZE_DISTANCE, target.cellSize * 1.4)
         ) {
           const requested = SHRIMP_BITE_RATE *
             (food / (food + SHRIMP_GRAZING_HALF_SATURATION)) *
             deltaSeconds * stageScale;
-          const nitzschiaWeight = target.biomass.nitzschia;
-          const oedogoniumWeight = target.biomass.oedogonium * 0.72;
-          const totalWeight = nitzschiaWeight + oedogoniumWeight;
+          const nitzschiaWeight = Math.max(0, target.biomass.nitzschia);
+          const oedogoniumWeight =
+            Math.max(0, target.biomass.oedogonium) * 0.72;
+          const decomposerWeight =
+            Math.max(0, target.biofilm.decomposer) *
+            SHRIMP_DECOMPOSER_FOOD_WEIGHT;
+          const nitrifierWeight =
+            Math.max(0, target.biofilm.nitrifier) *
+            SHRIMP_NITRIFIER_FOOD_WEIGHT;
+          const algaeWeight = nitzschiaWeight + oedogoniumWeight;
+          const biofilmWeight = decomposerWeight + nitrifierWeight;
+          const totalWeight = algaeWeight + biofilmWeight;
           if (totalWeight > 0) {
+            // Food weights already express preference and nutritional
+            // accessibility. A fixed minimum algae share made a shrimp spend
+            // most of every bite on a trace algal remnant even when edible
+            // biofilm was abundant, causing starvation beside visible food.
+            const algaeShare = algaeWeight <= 0
+              ? 0
+              : biofilmWeight <= 0
+                ? 1
+                : algaeWeight / totalWeight;
+            const biofilmShare = 1 - algaeShare;
             const request: GrazingRequest = {
               animal,
               cell: target,
-              nitzschia: requested * (nitzschiaWeight / totalWeight),
-              oedogonium: requested * (oedogoniumWeight / totalWeight),
+              nitzschia: algaeWeight > 0
+                ? requested * algaeShare * (nitzschiaWeight / algaeWeight)
+                : 0,
+              oedogonium: algaeWeight > 0
+                ? requested * algaeShare * (oedogoniumWeight / algaeWeight)
+                : 0,
+              decomposer: biofilmWeight > 0
+                ? requested * biofilmShare *
+                  (decomposerWeight / biofilmWeight)
+                : 0,
+              nitrifier: biofilmWeight > 0
+                ? requested * biofilmShare *
+                  (nitrifierWeight / biofilmWeight)
+                : 0,
             };
             const requests = requestsByCell.get(target.id) ?? [];
             requests.push(request);
@@ -3866,25 +4449,73 @@ export class SimulationWorld {
       const cell = requests[0].cell;
       const totalNitzschia = requests.reduce((sum, request) => sum + request.nitzschia, 0);
       const totalOedogonium = requests.reduce((sum, request) => sum + request.oedogonium, 0);
+      const totalDecomposer = requests.reduce((sum, request) => sum + request.decomposer, 0);
+      const totalNitrifier = requests.reduce((sum, request) => sum + request.nitrifier, 0);
+      // Integrate simultaneous grazing as continuous depletion over the step.
+      // `min(available, requested)` is an explicit-Euler clip: once several
+      // consumers request more than a sparse patch contains it snaps the
+      // producer to exact zero. B * (1 - exp(-R/B)) preserves the same demand
+      // at small R, shares it proportionally, and lets density approach zero
+      // continuously without inventing an inaccessible biomass refuge.
+      const continuousDepletionScale = (
+        available: number,
+        requested: number,
+      ): number => {
+        if (available <= 0 || requested <= 0) return 0;
+        const removed = available * -Math.expm1(-requested / available);
+        return removed / requested;
+      };
       const nitzschiaScale = totalNitzschia > 0
-        ? Math.min(1, cell.biomass.nitzschia / totalNitzschia)
+        ? continuousDepletionScale(
+          Math.max(0, cell.biomass.nitzschia),
+          totalNitzschia,
+        )
         : 0;
       const oedogoniumScale = totalOedogonium > 0
-        ? Math.min(1, cell.biomass.oedogonium / totalOedogonium)
+        ? continuousDepletionScale(
+          Math.max(0, cell.biomass.oedogonium),
+          totalOedogonium,
+        )
+        : 0;
+      const decomposerScale = totalDecomposer > 0
+        ? continuousDepletionScale(
+          Math.max(0, cell.biofilm.decomposer),
+          totalDecomposer,
+        )
+        : 0;
+      const nitrifierScale = totalNitrifier > 0
+        ? continuousDepletionScale(
+          Math.max(0, cell.biofilm.nitrifier),
+          totalNitrifier,
+        )
         : 0;
       let consumedNitzschia = 0;
       let consumedOedogonium = 0;
+      let consumedDecomposer = 0;
+      let consumedNitrifier = 0;
       for (const request of requests) {
         const actualNitzschia = request.nitzschia * nitzschiaScale;
         const actualOedogonium = request.oedogonium * oedogoniumScale;
-        const consumed = actualNitzschia + actualOedogonium;
+        const actualDecomposer = request.decomposer * decomposerScale;
+        const actualNitrifier = request.nitrifier * nitrifierScale;
+        const consumed = actualNitzschia + actualOedogonium +
+          actualDecomposer + actualNitrifier;
         consumedNitzschia += actualNitzschia;
         consumedOedogonium += actualOedogonium;
+        consumedDecomposer += actualDecomposer;
+        consumedNitrifier += actualNitrifier;
         request.animal.recentIntake += consumed;
         request.animal.consumedBiomass += consumed;
         request.animal.grazingSessionIntake += consumed;
-        this.totalAlgaeConsumed += consumed;
+        this.totalAlgaeConsumed += actualNitzschia + actualOedogonium;
         request.animal.secondsSinceFood = 0;
+        request.animal.recentFood =
+          actualNitzschia + actualOedogonium >=
+            actualDecomposer + actualNitrifier
+            ? actualNitzschia >= actualOedogonium
+              ? '표면 규조류'
+              : '붓뚜껑말'
+            : '생물막';
         const assimilated = this.biogeochemistry.recordAnimalFeeding(
           request.animal.position,
           consumed,
@@ -3904,31 +4535,29 @@ export class SimulationWorld {
       }
       cell.biomass.nitzschia = Math.max(0, cell.biomass.nitzschia - consumedNitzschia);
       cell.biomass.oedogonium = Math.max(0, cell.biomass.oedogonium - consumedOedogonium);
-      let traceTurnover = 0;
-      if (
-        cell.biomass.nitzschia > 0 &&
-        cell.biomass.nitzschia < SHRIMP_TRACE_GRAZABLE_BIOMASS
-      ) {
-        traceTurnover += cell.biomass.nitzschia;
-        cell.biomass.nitzschia = 0;
-      }
-      if (
-        cell.biomass.oedogonium > 0 &&
-        cell.biomass.oedogonium < SHRIMP_TRACE_GRAZABLE_BIOMASS
-      ) {
-        traceTurnover += cell.biomass.oedogonium;
-        cell.biomass.oedogonium = 0;
-      }
-      if (traceTurnover > 0) {
-        this.biogeochemistry.recordAlgaeTurnover(
-          this.cellWorldPoint(cell),
-          traceTurnover,
-        );
-      }
+      cell.biofilm.decomposer = Math.max(
+        0,
+        cell.biofilm.decomposer - consumedDecomposer,
+      );
+      cell.biofilm.nitrifier = Math.max(
+        0,
+        cell.biofilm.nitrifier - consumedNitrifier,
+      );
     }
 
     const newborns: AnimalState[] = [];
     const living: AnimalState[] = [];
+    const recentNetAssimilationSurplusRate = (animal: AnimalState): number => {
+      const maintenanceRequest = maintenanceRequests.get(animal.id) ?? 0;
+      const recentAssimilationRate =
+        animal.recentIntake *
+        WATER_CYCLE_RULES.shrimp.assimilationFraction /
+        SHRIMP_RECENT_INTAKE_WINDOW_SECONDS;
+      const maintenanceRate = deltaSeconds > 0
+        ? maintenanceRequest / deltaSeconds
+        : 0;
+      return Math.max(0, recentAssimilationRate - maintenanceRate);
+    };
     for (const animal of shrimpAnimals) {
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
@@ -3965,27 +4594,24 @@ export class SimulationWorld {
       }
 
       if (animal.lifeStage === 'juvenile') {
-        if (animal.energy >= 0.44 && animal.secondsSinceFood < 12) {
-          const desiredProgress = Math.min(
-            1,
-            animal.growthProgress +
-              deltaSeconds * reproductionTemperatureFactor / SHRIMP_MATURITY_SECONDS,
-          );
-          const birthBiomass = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
-          const adultBiomass = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
-          const desiredStructuralBiomass = birthBiomass +
-            (adultBiomass - birthBiomass) * desiredProgress;
-          const materialNeeded = Math.max(
+        const birthBiomass = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
+        const adultBiomass = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+        const maximumGrowth = (
+          adultBiomass - birthBiomass
+        ) * deltaSeconds * reproductionTemperatureFactor / SHRIMP_MATURITY_SECONDS;
+        const materialUsed = Math.min(
+          Math.max(0, adultBiomass - animal.structuralBiomass),
+          maximumGrowth,
+          Math.max(
             0,
-            desiredStructuralBiomass - animal.structuralBiomass,
-          );
-          const materialUsed = Math.min(animal.storedBiomass, materialNeeded);
-          animal.storedBiomass -= materialUsed;
-          animal.structuralBiomass += materialUsed;
-          animal.growthProgress = clamp01(
-            (animal.structuralBiomass - birthBiomass) / (adultBiomass - birthBiomass),
-          );
-        }
+            animal.storedBiomass - SHRIMP_JUVENILE_GROWTH_RESERVE_FLOOR,
+          ),
+        );
+        animal.storedBiomass -= materialUsed;
+        animal.structuralBiomass += materialUsed;
+        animal.growthProgress = clamp01(
+          (animal.structuralBiomass - birthBiomass) / (adultBiomass - birthBiomass),
+        );
         animal.bodyLength = SHRIMP_JUVENILE_LENGTH +
           (SHRIMP_ADULT_LENGTH - SHRIMP_JUVENILE_LENGTH) * animal.growthProgress;
         if (animal.ageSeconds >= SHRIMP_MATURITY_SECONDS && animal.growthProgress >= 1) {
@@ -4009,10 +4635,17 @@ export class SimulationWorld {
       }
 
       if (animal.lifeStage === 'adult' && animal.sex === 'female') {
+        const reproductiveSurplusRate =
+          recentNetAssimilationSurplusRate(animal);
+        const hasReproductiveSurplus = reproductiveSurplusRate > 1e-9;
+        // Cooldown delays the next mating/brood; it does not switch ovarian
+        // provisioning off. Letting a well-fed female bank conserved egg
+        // matter during that interval prevents every generation from waiting
+        // until its mate is already near the end of its lifespan.
         if (
           animal.gestationRemaining === null &&
-          animal.reproductionCooldown <= 0 &&
           animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
+          hasReproductiveSurplus &&
           animal.reproductiveBiomass < SHRIMP_MAXIMUM_BROOD_BIOMASS
         ) {
           const allocation = Math.min(
@@ -4020,6 +4653,9 @@ export class SimulationWorld {
               0,
               animal.storedBiomass - SHRIMP_REPRODUCTIVE_SOMATIC_RESERVE_FLOOR,
             ),
+            reproductiveSurplusRate *
+              SHRIMP_ECOLOGY_RULES.reproductionSurplusAllocationFraction *
+              deltaSeconds,
             SHRIMP_MAXIMUM_BROOD_BIOMASS - animal.reproductiveBiomass,
           );
           animal.storedBiomass -= allocation;
@@ -4029,8 +4665,9 @@ export class SimulationWorld {
         if (animal.gestationRemaining !== null) {
           // Embryos were funded from the mother's conserved reserve when
           // mating completed. Development therefore follows temperature and
-          // maternal health instead of stopping merely because the last bite
-          // was more than a few seconds ago.
+          // maternal health instead of stopping merely because the parents'
+          // independent grazing bouts did not overlap inside one short recent-
+          // intake window.
           const gestationCanAdvance =
             animal.energy >= SHRIMP_ECOLOGY_RULES.gestationEnergy &&
             animal.health > 0.5 &&
@@ -4132,6 +4769,489 @@ export class SimulationWorld {
     this.snapshotDirty = true;
   }
 
+  private stepDaphniaEcology(deltaSeconds: number): void {
+    const daphnia = this.animals.filter((animal) => animal.speciesId === 'daphnia');
+    if (!daphnia.length) {
+      this.syncDaphniaIndividuals();
+      return;
+    }
+    const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+    const living: AnimalState[] = [];
+    const newborns: AnimalState[] = [];
+    for (const animal of daphnia) {
+      animal.ageSeconds += deltaSeconds;
+      animal.reproductionCooldown = Math.max(
+        0,
+        animal.reproductionCooldown - deltaSeconds,
+      );
+      animal.recentIntake *= Math.exp(-deltaSeconds / 6);
+      animal.secondsSinceFood += deltaSeconds;
+      const local = this.biogeochemistry.planktonAt(animal.position);
+      // Suspended-food intake follows ordinary type-II saturation. At trace
+      // concentrations intake becomes proportionally tiny but no hidden
+      // uneatable food floor remains.
+      const {
+        phytoplanktonPotential: phytoResponse,
+        combinedResponse,
+        bacteriaShare,
+      } = daphniaSuspendedFoodResponse(
+        local.phytoplankton,
+        local.planktonicDecomposer,
+      );
+      const bodyMass = Math.max(
+        0,
+        animal.structuralBiomass + animal.storedBiomass +
+          animal.reproductiveBiomass,
+      );
+      // Apply one continuous allometric curve across the juvenile/adult
+      // boundary. The former stage switch changed from M^b to M at
+      // maturation, so the same body could abruptly lose filtration capacity
+      // merely because its label changed. A continuous curve gives neonates
+      // lower absolute but higher mass-specific clearance and leaves no
+      // artificial maturation discontinuity.
+      const filtrationBodyMass = animal.structuralBiomass <= 0
+        ? 0
+        : rules.representativeAdultBiomass *
+          continuousBodyMassFeedingScale(
+          animal.structuralBiomass,
+          rules.adultStructuralBiomass,
+          rules.filtrationMassExponent,
+        );
+      // Filtering limbs do not remain at full activity after the animal has
+      // exhausted most of its transient reserve.  This is an individual
+      // condition response: no population count, protected food floor or
+      // tank-wide crowding signal is involved.
+      const filtrationCondition = animal.energy >= rules.fullFiltrationEnergy
+        ? 1
+        : rules.minimumStarvedFiltrationFraction +
+          (1 - rules.minimumStarvedFiltrationFraction) *
+          Math.pow(
+            clamp(
+              animal.energy / Math.max(1e-9, rules.fullFiltrationEnergy),
+              0,
+              1,
+            ),
+            rules.filtrationConditionExponent,
+          );
+      const requestedFood = filtrationBodyMass *
+        rules.maximumFiltrationPerBiomassSecond *
+        combinedResponse * filtrationCondition * deltaSeconds;
+      const consumed = this.biogeochemistry.consumeDaphniaFood(
+        animal.position,
+        requestedFood * (1 - bacteriaShare),
+        requestedFood * bacteriaShare,
+      );
+      const assimilated = this.biogeochemistry.recordDaphniaFeeding(
+        animal.position,
+        consumed.phytoplankton,
+        consumed.planktonicDecomposer,
+      );
+      // Reproduction must be funded by the food this individual actually
+      // retained, not merely by a high ambient concentration sampled before
+      // neighbouring animals had filtered the same patch. The distinction is
+      // what lets ordinary local food competition reduce brood production
+      // before a whole cohort strips the producer and crashes together.
+      const currentPhytoplanktonAssimilation =
+        consumed.phytoplankton * rules.phytoplanktonAssimilation;
+      const currentBacterioplanktonAssimilation =
+        consumed.planktonicDecomposer * rules.bacterioplanktonAssimilation;
+      if (assimilated > 0) {
+        // Assimilation enters a transient reserve first. Maintenance, somatic
+        // growth and egg provisioning all draw from it below; only the amount
+        // still above the final reserve capacity is egested afterward. The old
+        // order overflowed a full reserve before paying this tick's costs,
+        // turning usable food straight into detritus.
+        animal.storedBiomass += assimilated;
+        animal.recentIntake += consumed.phytoplankton +
+          consumed.planktonicDecomposer;
+        animal.consumedBiomass += consumed.phytoplankton +
+          consumed.planktonicDecomposer;
+        animal.secondsSinceFood = 0;
+        animal.recentFood = consumed.phytoplankton >=
+          consumed.planktonicDecomposer
+          ? '식물플랑크톤'
+          : '부유 분해균';
+      }
+
+      const temperature = this.biogeochemistry.temperatureAt(animal.position);
+      const temperatureProfile = ANIMALS.daphnia.temperature;
+      const metabolicTemperatureFactor = thetaTemperatureFactor(
+        temperature,
+        temperatureProfile.referenceTemperature,
+        temperatureProfile.metabolicTheta,
+        temperatureProfile.minimumMetabolicFactor,
+        temperatureProfile.maximumMetabolicFactor,
+      );
+      const maintenanceRequest = continuousBodyMassMaintenance(
+        bodyMass,
+        rules.representativeAdultBiomass,
+        rules.adultMaintenancePerSecond,
+        rules.maintenanceMassExponent,
+      ) *
+        metabolicTemperatureFactor * deltaSeconds;
+      const minimumStructure = animal.lifeStage === 'juvenile'
+        ? rules.juvenileMinimumStructure
+        : rules.adultMinimumStructure;
+      const availableForMaintenance = animal.storedBiomass +
+        Math.max(0, animal.structuralBiomass - minimumStructure);
+      const requestedRespiration = Math.min(
+        maintenanceRequest,
+        availableForMaintenance,
+      );
+      const respired = this.biogeochemistry.recordDaphniaRespiration(
+        animal.position,
+        requestedRespiration,
+      );
+      const maintenanceShortfall = Math.max(
+        0,
+        maintenanceRequest - respired,
+      );
+      const fromReserve = Math.min(animal.storedBiomass, respired);
+      animal.storedBiomass -= fromReserve;
+      animal.structuralBiomass = Math.max(
+        0,
+        animal.structuralBiomass - (respired - fromReserve),
+      );
+      const currentSomaticSurplus = Math.max(
+        0,
+        assimilated - maintenanceRequest,
+      );
+
+      if (animal.lifeStage === 'juvenile') {
+        // A neonate must keep a small metabolic reserve. Converting the entire
+        // birth reserve into structure in the first few seconds made its energy
+        // read zero and killed it before local filtration could fund growth.
+        const juvenileMetabolicReserve = Math.min(
+          rules.juvenileBirthBiomass * 0.3,
+          rules.juvenileReserveCapacity *
+            rules.juvenileProtectedReserveFraction,
+        );
+        const growth = Math.min(
+          Math.max(0, animal.storedBiomass - juvenileMetabolicReserve),
+          Math.max(0, rules.adultStructuralBiomass - animal.structuralBiomass),
+          rules.juvenileGrowthPerSecond * deltaSeconds,
+        );
+        animal.storedBiomass -= growth;
+        animal.structuralBiomass += growth;
+        animal.growthProgress = clamp(
+          animal.structuralBiomass / rules.adultStructuralBiomass,
+          0,
+          1,
+        );
+        animal.bodyLength = 4.6 + animal.growthProgress * 4.4;
+        if (
+          animal.ageSeconds >= rules.maturationSeconds &&
+          animal.structuralBiomass >= rules.maturationStructuralBiomass
+        ) {
+          animal.lifeStage = 'adult';
+          // Maturation is a label change at the animal's current conserved
+          // structure, not a free jump to full adult size. Daphnia continue
+          // indeterminate somatic growth after their first reproductive stage.
+          animal.reproductionCooldown = 0;
+          this.biogeochemistry.recordDaphniaMaturation();
+          this.recordAnimalPopulationEvent('matured', animal);
+        }
+      } else {
+        // A newly mature Daphnia is reproductive before reaching final adult
+        // structure. Somatic growth and egg provisioning compete for the same
+        // genuinely assimilated reserve; this transfer cannot create matter.
+        const somaticReserveFloor =
+          rules.reproductiveReserveFloor *
+          clamp(
+            animal.structuralBiomass / rules.adultStructuralBiomass,
+            0.25,
+            1,
+          );
+        const adultSomaticGrowth = Math.min(
+          Math.max(0, animal.storedBiomass - somaticReserveFloor),
+          Math.max(
+            0,
+            rules.adultStructuralBiomass - animal.structuralBiomass,
+          ),
+          rules.adultSomaticGrowthPerSecond * deltaSeconds,
+          currentSomaticSurplus *
+            rules.adultSomaticGrowthAllocationFraction,
+        );
+        animal.storedBiomass -= adultSomaticGrowth;
+        animal.structuralBiomass += adultSomaticGrowth;
+        animal.growthProgress = clamp(
+          animal.structuralBiomass / rules.adultStructuralBiomass,
+          0,
+          1,
+        );
+        animal.bodyLength = 4.6 + animal.growthProgress * 4.4;
+
+        const adultSizeScale = clamp(
+          animal.structuralBiomass / rules.adultStructuralBiomass,
+          0.25,
+          1,
+        );
+        const adultReserveCapacity =
+          rules.adultReserveCapacity * adultSizeScale;
+        const maternalReserveRatio = clamp(
+          animal.storedBiomass / Math.max(1e-9, adultReserveCapacity),
+          0,
+          1,
+        );
+        // Food concentration alone is not enough to fund eggs: low-ration
+        // females first lose somatic reserve and then provision progressively
+        // fewer eggs. This is an individual condition response, not a
+        // population-count limiter.
+        const maternalCondition = clamp(
+          (
+            maternalReserveRatio -
+            rules.reproductionStartEnergy
+          ) /
+            Math.max(1e-6, 1 - rules.reproductionStartEnergy),
+          0,
+          1,
+        );
+        const reserveAboveFloor = Math.max(
+          0,
+          animal.storedBiomass -
+            Math.max(
+              rules.reproductiveReserveFloor * adultSizeScale,
+              adultReserveCapacity * rules.reproductionStartEnergy,
+            ),
+        );
+        // Bacterial food can cover part of maintenance, but it must not turn a
+        // stored reserve into several delayed broods after phytoplankton has
+        // already collapsed. Reproductive allocation follows the current
+        // high-quality food response.
+        const reproductiveFoodFactor = Math.pow(
+          clamp(
+            (
+              phytoResponse -
+              rules.minimumFoodQualityForReproduction
+            ) /
+              Math.max(
+                1e-6,
+                rules.highFoodBroodResponseThreshold -
+                  rules.minimumFoodQualityForReproduction,
+              ),
+            0,
+            1,
+          ),
+          rules.reproductionFoodResponseExponent,
+        );
+        const broodReserveCapacity = rules.maximumBroodSize *
+          rules.juvenileBirthBiomass;
+        // Low-quality bacterioplankton can pay part of somatic maintenance,
+        // leaving genuinely assimilated phytoplankton available for eggs. It
+        // still cannot create a brood on its own: the eligible surplus is
+        // capped by this tick's phytoplankton assimilation. The former formula
+        // subtracted the whole maintenance request from phytoplankton even
+        // after bacterial food had already paid that cost, producing an
+        // artificial reproductive cliff in mixed-food water.
+        const maintenanceNotCoveredByBacteria = Math.max(
+          0,
+          maintenanceRequest - currentBacterioplanktonAssimilation,
+        );
+        const currentReproductiveSurplus = Math.max(
+          0,
+          currentPhytoplanktonAssimilation -
+            maintenanceNotCoveredByBacteria,
+        );
+        // Once embryo development begins the clutch is closed. Continuing to
+        // provision another egg behind it created a food-independent backlog
+        // that could hatch after the producer had already collapsed.
+        const allocation = animal.gestationRemaining === null
+          ? Math.min(
+            reserveAboveFloor,
+            Math.max(0, broodReserveCapacity - animal.reproductiveBiomass),
+            rules.reproductionAllocationPerSecondIndividual *
+              reproductiveFoodFactor *
+              maternalCondition * deltaSeconds,
+            currentReproductiveSurplus *
+              (1 - rules.adultSomaticGrowthAllocationFraction),
+          )
+          : 0;
+        animal.storedBiomass -= allocation;
+        animal.reproductiveBiomass += allocation;
+        if (
+          animal.gestationRemaining === null &&
+          animal.reproductionCooldown <= 0 &&
+          animal.health >= 0.3 &&
+          animal.reproductiveBiomass >=
+            rules.minimumBroodSize * rules.juvenileBirthBiomass
+        ) {
+          // Egg biomass was funded only while both current food and maternal
+          // condition passed their gates. Lock the affordable clutch now:
+          // embryo development may finish through a short trough, but neither
+          // spare egg biomass nor later filtering can queue a hidden brood.
+          const affordableBrood = Math.floor(
+            animal.reproductiveBiomass / rules.juvenileBirthBiomass,
+          );
+          const highFoodBrood = phytoResponse >=
+              rules.highFoodBroodResponseThreshold
+            ? rules.maximumBroodSize
+            : rules.minimumBroodSize;
+          animal.gestatingBroodSize = Math.min(
+            highFoodBrood,
+            affordableBrood,
+          );
+          const lockedClutchBiomass =
+            animal.gestatingBroodSize * rules.juvenileBirthBiomass;
+          const excessEggBiomass = Math.max(
+            0,
+            animal.reproductiveBiomass - lockedClutchBiomass,
+          );
+          if (excessEggBiomass > 0) {
+            const returnedToReserve = Math.min(
+              excessEggBiomass,
+              Math.max(0, adultReserveCapacity - animal.storedBiomass),
+            );
+            animal.storedBiomass += returnedToReserve;
+            animal.reproductiveBiomass -= excessEggBiomass;
+            this.biogeochemistry.recordAnimalAssimilationOverflow(
+              animal.position,
+              excessEggBiomass - returnedToReserve,
+            );
+          }
+          animal.gestationRemaining = rules.broodDevelopmentSeconds;
+        }
+        if (animal.gestationRemaining !== null) {
+          animal.gestationRemaining = Math.max(
+            0,
+            animal.gestationRemaining - deltaSeconds,
+          );
+          if (animal.gestationRemaining <= 0) {
+            const desiredBrood =
+              animal.gestatingBroodSize ?? rules.minimumBroodSize;
+            const affordableBrood = Math.floor(
+              animal.reproductiveBiomass / rules.juvenileBirthBiomass,
+            );
+            const broodSize = Math.min(
+              desiredBrood,
+              affordableBrood,
+            );
+            for (let index = 0; index < broodSize; index += 1) {
+              const newborn = this.createJuvenileDaphniaState(animal, index);
+              newborns.push(newborn);
+              animal.reproductiveBiomass -= rules.juvenileBirthBiomass;
+              this.biogeochemistry.recordDaphniaBirth(
+                (animal.generation ?? 0) >= 1,
+                rules.juvenileBirthBiomass,
+              );
+              this.recordAnimalPopulationEvent('birth', newborn, {
+                parentId: animal.id,
+              });
+            }
+            animal.gestationRemaining = null;
+            animal.gestatingBroodSize = null;
+            animal.reproductionCooldown = rules.broodCooldownSeconds * (
+              0.78 + deterministicNoise(
+                animal.randomSeed + animal.ageSeconds * 0.023,
+              ) * 0.44
+            );
+          }
+        }
+      }
+
+      const finalAdultSizeScale = clamp(
+        animal.structuralBiomass / rules.adultStructuralBiomass,
+        0.25,
+        1,
+      );
+      const finalReserveCapacity = animal.lifeStage === 'juvenile'
+        ? rules.juvenileReserveCapacity
+        : rules.adultReserveCapacity * finalAdultSizeScale;
+      const assimilationOverflow = Math.max(
+        0,
+        animal.storedBiomass - finalReserveCapacity,
+      );
+      if (assimilationOverflow > 0) {
+        animal.storedBiomass -= assimilationOverflow;
+        this.biogeochemistry.recordAnimalAssimilationOverflow(
+          animal.position,
+          assimilationOverflow,
+        );
+      }
+
+      const quality = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.sampleAt(animal.position)
+        : null;
+      const oxygenStress = quality
+        ? clamp((rules.oxygenStressStart - quality.oxygen) /
+          rules.oxygenStressStart, 0, 1)
+        : 0;
+      const toxicityStress = quality
+        ? clamp((quality.toxicWaste - rules.toxicWasteStressStart) /
+          Math.max(1, 24 - rules.toxicWasteStressStart), 0, 1)
+        : 0;
+      const thermalSuitability = interpolateTemperatureResponse(
+        temperatureProfile.healthCurve,
+        temperature,
+      );
+      const adultSizeScale = clamp(
+        animal.structuralBiomass / rules.adultStructuralBiomass,
+        0.25,
+        1,
+      );
+      const reserveCapacity = animal.lifeStage === 'juvenile'
+        ? rules.juvenileReserveCapacity
+        : rules.adultReserveCapacity * adultSizeScale;
+      animal.energy = clamp(animal.storedBiomass / reserveCapacity, 0, 1);
+      const reserveStress = clamp((0.18 - animal.energy) / 0.18, 0, 1);
+      const feedingGapStress = clamp(
+        (animal.secondsSinceFood - 30) / 150,
+        0,
+        1,
+      );
+      // A trace particle can reset secondsSinceFood without replacing the
+      // animal's depleted reserve. Requiring both a long feeding gap and low
+      // reserve therefore let a crowded cohort survive on negligible bites
+      // until every member died of old age, continuing to suppress its food
+      // throughout the whole interval. Reserve depletion is itself chronic
+      // starvation; the feeding gap only makes that stress more acute.
+      const starvationStress = reserveStress * (
+        0.7 + feedingGapStress * 0.3
+      );
+      const damage = (
+        oxygenStress * oxygenStress * rules.oxygenMaximumDamagePerSecond +
+        toxicityStress * toxicityStress * rules.toxicMaximumDamagePerSecond +
+        (1 - thermalSuitability) * 0.012 +
+        starvationStress * rules.starvationMortalityPerSecond
+      ) * deltaSeconds;
+      const recovery = (
+        oxygenStress <= 0 &&
+        toxicityStress <= 0 &&
+        thermalSuitability >= 0.75 &&
+        animal.energy >= 0.18
+      ) ? rules.healthyWaterRecoveryPerSecond * deltaSeconds : 0;
+      animal.health = clamp(animal.health - damage + recovery, 0, 1);
+
+      let deathCause: AnimalCarcassSnapshot['cause'] | null = null;
+      const terminalStarvation =
+        maintenanceShortfall > 1e-12 &&
+        animal.storedBiomass <= 1e-9 &&
+        animal.structuralBiomass <= minimumStructure + 1e-9;
+      if (terminalStarvation) deathCause = 'starvation';
+      else if (animal.ageSeconds >= animal.lifespanSeconds) deathCause = 'old-age';
+      else if (animal.health <= 0) {
+        deathCause = oxygenStress >= toxicityStress && oxygenStress > 0.35
+          ? 'hypoxia'
+          : toxicityStress > 0.35
+            ? 'toxicity'
+            : thermalSuitability < 0.3
+              ? 'temperature'
+              : 'starvation';
+      }
+      if (deathCause) {
+        this.killAnimal(animal, deathCause);
+      } else {
+        living.push(animal);
+      }
+    }
+    this.animals = [
+      ...this.animals.filter((animal) => animal.speciesId !== 'daphnia'),
+      ...living,
+      ...newborns,
+    ];
+    this.syncDaphniaIndividuals();
+    this.snapshotDirty = true;
+  }
+
   private stepRicefishEcology(deltaSeconds: number): void {
     const ricefish = this.animals.filter((animal) =>
       animal.speciesId === 'japanese-ricefish');
@@ -4208,20 +5328,28 @@ export class SimulationWorld {
         continue;
       }
 
+      const somaticMetabolicScale = fish.lifeStage === 'egg'
+        ? 0
+        : Math.pow(
+          clamp(
+            fish.structuralBiomass /
+              WATER_CYCLE_RULES.ricefish.adultStructuralBiomass,
+            0.015,
+            1,
+          ),
+          rules.metabolicMassExponent,
+        );
       const baseMetabolism = fish.lifeStage === 'egg'
         ? rules.eggBaseMetabolismPerSecond
-        : fish.lifeStage === 'fry'
-          ? rules.fryBaseMetabolismPerSecond
-          : fish.lifeStage === 'juvenile'
-            ? rules.juvenileBaseMetabolismPerSecond
-            : rules.adultBaseMetabolismPerSecond;
+        : rules.adultBaseMetabolismPerSecond * somaticMetabolicScale;
       const activity = fish.lifeStage === 'egg' || fish.behavior === 'resting'
         ? rules.restingActivityCostPerSecond
         : fish.behavior === 'hunting'
           ? rules.huntingActivityCostPerSecond
           : rules.swimmingActivityCostPerSecond;
       const requestedRespiration = (
-        baseMetabolism + (fish.lifeStage === 'egg' ? 0 : activity)
+        baseMetabolism +
+          (fish.lifeStage === 'egg' ? 0 : activity * somaticMetabolicScale)
       ) * metabolicTemperatureFactor * deltaSeconds;
       const minimumStructure = this.ricefishMinimumViableStructure(fish);
       const availableForRespiration = fish.storedBiomass +
@@ -4248,13 +5376,24 @@ export class SimulationWorld {
         );
         fish.energy = clamp01(fish.health);
         if (fish.incubationRemaining <= 0) {
+          const remainingEggMatter =
+            fish.structuralBiomass + fish.storedBiomass;
+          const minimumFryStructure =
+            WATER_CYCLE_RULES.ricefish.fryBirthBiomass * 0.24;
+          const yolkReserve = Math.min(
+            remainingEggMatter * rules.hatchYolkReserveFraction,
+            Math.max(0, remainingEggMatter - minimumFryStructure),
+          );
           fish.lifeStage = 'fry';
           fish.behavior = 'resting';
           fish.bodyLength = rules.fryLength;
+          fish.structuralBiomass = remainingEggMatter - yolkReserve;
+          fish.storedBiomass = yolkReserve;
           fish.attachmentCellId = null;
           fish.incubationRemaining = null;
           fish.velocity = { x: 0, y: 0 };
           fish.secondsSinceFood = 0;
+          this.synchroniseRicefishEnergy(fish);
           this.recordAnimalPopulationEvent('hatched', fish);
         }
         livingFish.push(fish);
@@ -4275,7 +5414,7 @@ export class SimulationWorld {
           rules.strikeDistance * rules.strikeDistance &&
         this.ricefishHasLineOfSight(fish.position, targetPrey.position)
       ) {
-        const shelter = this.ricefishShelterAt(targetPrey.position);
+        const shelter = this.ricefishPreyShelter(targetPrey);
         const approach = clamp(
           1 - Math.sqrt(distanceSquared(fish.position, targetPrey.position)) /
             rules.strikeDistance,
@@ -4283,8 +5422,8 @@ export class SimulationWorld {
           1,
         );
         const captureProbability = clamp(
-          0.42 + approach * 0.42 - shelter * 0.62,
-          0.06,
+          (0.42 + approach * 0.42) * Math.pow(1 - shelter, 1.8),
+          0.01,
           0.9,
         );
         const attempt = Math.floor(fish.ageSeconds / Math.max(deltaSeconds, 0.01));
@@ -4314,27 +5453,74 @@ export class SimulationWorld {
       if (algaeTarget && fish.behavior === 'grazing') {
         const point = this.cellWorldPoint(algaeTarget);
         if (distanceSquared(fish.position, point) <= 24 * 24) {
-          const nitzschiaWeight = algaeTarget.biomass.nitzschia;
-          const oedogoniumWeight = algaeTarget.biomass.oedogonium * 0.45;
-          const weighted = nitzschiaWeight + oedogoniumWeight;
+          const nitzschiaWeight =
+            Math.max(0, algaeTarget.biomass.nitzschia);
+          const oedogoniumWeight =
+            Math.max(0, algaeTarget.biomass.oedogonium) * 0.45;
+          const biofilmFoodMultiplier = fish.lifeStage === 'fry'
+            ? rules.fryBiofilmMicrofaunaMultiplier
+            : fish.lifeStage === 'juvenile'
+              ? rules.juvenileBiofilmMicrofaunaMultiplier
+              : rules.adultBiofilmMicrofaunaMultiplier;
+          const decomposerWeight =
+            Math.max(0, algaeTarget.biofilm.decomposer) *
+            biofilmFoodMultiplier;
+          const nitrifierWeight =
+            Math.max(0, algaeTarget.biofilm.nitrifier) *
+            biofilmFoodMultiplier * 0.45;
+          const weighted = nitzschiaWeight + oedogoniumWeight +
+            decomposerWeight + nitrifierWeight;
           if (weighted > 0) {
             const bite = Math.min(
               weighted,
-              rules.maximumAlgaeBiteBiomassPerSecond * deltaSeconds,
+              rules.maximumAlgaeBiteBiomassPerSecond *
+                (weighted /
+                  (weighted + rules.periphytonGrazingHalfSaturation)) *
+                (
+                  fish.lifeStage === 'fry'
+                    ? rules.fryAlgaeBiteScale
+                    : fish.lifeStage === 'juvenile'
+                      ? rules.juvenileAlgaeBiteScale
+                      : rules.adultAlgaeBiteScale
+                ) *
+                deltaSeconds,
             );
             const eatenNitzschia = Math.min(
-              algaeTarget.biomass.nitzschia,
+              Math.max(0, algaeTarget.biomass.nitzschia),
               bite * nitzschiaWeight / weighted,
             );
             const eatenOedogonium = Math.min(
-              algaeTarget.biomass.oedogonium,
+              Math.max(0, algaeTarget.biomass.oedogonium),
               bite * oedogoniumWeight / weighted,
+            );
+            const eatenDecomposer = Math.min(
+              Math.max(0, algaeTarget.biofilm.decomposer),
+              bite * decomposerWeight / weighted,
+            );
+            const eatenNitrifier = Math.min(
+              Math.max(0, algaeTarget.biofilm.nitrifier),
+              bite * nitrifierWeight / weighted,
             );
             algaeTarget.biomass.nitzschia -= eatenNitzschia;
             algaeTarget.biomass.oedogonium -= eatenOedogonium;
-            const actual = eatenNitzschia + eatenOedogonium;
-            const digestible = eatenNitzschia * rules.diatomAssimilationMultiplier +
-              eatenOedogonium * rules.oedogoniumAssimilationMultiplier;
+            algaeTarget.biofilm.decomposer -= eatenDecomposer;
+            algaeTarget.biofilm.nitrifier -= eatenNitrifier;
+            const algaeConsumed = eatenNitzschia + eatenOedogonium;
+            const biofilmMicrofaunaConsumed = eatenDecomposer + eatenNitrifier;
+            const actual = algaeConsumed + biofilmMicrofaunaConsumed;
+            const diatomDigestibility = fish.lifeStage === 'fry'
+              ? rules.fryDiatomAssimilationMultiplier
+              : fish.lifeStage === 'juvenile'
+                ? rules.juvenileDiatomAssimilationMultiplier
+                : rules.diatomAssimilationMultiplier;
+            const oedogoniumDigestibility = fish.lifeStage === 'fry'
+              ? rules.fryOedogoniumAssimilationMultiplier
+              : fish.lifeStage === 'juvenile'
+                ? rules.juvenileOedogoniumAssimilationMultiplier
+                : rules.oedogoniumAssimilationMultiplier;
+            const digestible = eatenNitzschia * diatomDigestibility +
+              eatenOedogonium * oedogoniumDigestibility +
+              biofilmMicrofaunaConsumed;
             const indigestible = Math.max(0, actual - digestible);
             const assimilated = this.biogeochemistry.recordAnimalFeeding(
               fish.position,
@@ -4350,11 +5536,14 @@ export class SimulationWorld {
             this.addRicefishReserve(fish, assimilated);
             fish.recentIntake += actual;
             fish.consumedBiomass += actual;
-            fish.recentFood = eatenNitzschia >= eatenOedogonium
-              ? '표면 규조류'
-              : '붓뚜껑말 끝부분';
+            fish.recentFood = biofilmMicrofaunaConsumed >=
+                Math.max(eatenNitzschia, eatenOedogonium)
+              ? '생물막의 미소동물'
+              : eatenNitzschia >= eatenOedogonium
+                ? '표면 규조류'
+                : '붓뚜껑말 끝부분';
             fish.secondsSinceFood = 0;
-            this.totalAlgaeConsumed += actual;
+            this.totalAlgaeConsumed += algaeConsumed;
           }
         }
       }
@@ -4365,22 +5554,6 @@ export class SimulationWorld {
       if (fish.lifeStage === 'adult' && fish.sex === 'female') {
         const minimumEggMatter = rules.eggClutchMinimum *
           WATER_CYCLE_RULES.ricefish.eggBiomass;
-        const maximumEggMatter = rules.eggClutchMaximum *
-          WATER_CYCLE_RULES.ricefish.eggBiomass;
-        if (
-          fish.gestationRemaining === null &&
-          fish.reproductionCooldown <= 0 &&
-          fish.energy >= rules.reproductionEnergy &&
-          fish.reproductiveBiomass < maximumEggMatter
-        ) {
-          const allocation = Math.min(
-            Math.max(0, fish.storedBiomass - rules.reproductionReserveFloor),
-            maximumEggMatter - fish.reproductiveBiomass,
-          );
-          fish.storedBiomass -= allocation;
-          fish.reproductiveBiomass += allocation;
-          this.synchroniseRicefishEnergy(fish);
-        }
         if (fish.gestationRemaining !== null) {
           fish.behavior = 'carrying-eggs';
           fish.gestationRemaining -= deltaSeconds * reproductionTemperatureFactor;
@@ -4416,8 +5589,7 @@ export class SimulationWorld {
           fish.reproductionCooldown <= 0 &&
           fish.reproductiveBiomass >= minimumEggMatter &&
           fish.health > 0.72 &&
-          fish.energy >= 0.35 &&
-          fish.recentFood !== null
+          fish.energy >= rules.matingEnergy
         ) {
           const male = ricefish.find((candidate) =>
             candidate.id !== fish.id &&
@@ -4494,25 +5666,36 @@ export class SimulationWorld {
       temperatureAtDeath,
       ageSeconds: 0,
     });
-    this.biogeochemistry.recordDeath(
-      animal.position,
-      this.biogeochemistry.effectsEnabled
-        ? animal.structuralBiomass + animal.storedBiomass +
-          animal.reproductiveBiomass
-        : animal.speciesId === 'japanese-ricefish'
-          ? animal.structuralBiomass + animal.storedBiomass +
-            animal.reproductiveBiomass
+    const conservedBodyMass = animal.structuralBiomass +
+      animal.storedBiomass + animal.reproductiveBiomass;
+    if (animal.speciesId === 'daphnia') {
+      this.biogeochemistry.recordDaphniaDeath(
+        animal.position,
+        conservedBodyMass,
+      );
+    } else {
+      this.biogeochemistry.recordDeath(
+        animal.position,
+        this.biogeochemistry.effectsEnabled ||
+          animal.speciesId === 'japanese-ricefish'
+          ? conservedBodyMass
           : animal.lifeStage === 'adult'
             ? WATER_CYCLE_RULES.shrimp.adultStructuralBiomass
             : WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
-    );
+      );
+    }
     if (this.selection?.kind === 'animal' && this.selection.animalId === animal.id) {
       this.selection = null;
     }
   }
 
   private edibleBiomass(cell: SurfaceCellState): number {
-    return cell.biomass.nitzschia + cell.biomass.oedogonium * 0.72;
+    return Math.max(0, cell.biomass.nitzschia) +
+      Math.max(0, cell.biomass.oedogonium) * 0.72 +
+      Math.max(0, cell.biofilm.decomposer) *
+        SHRIMP_DECOMPOSER_FOOD_WEIGHT +
+      Math.max(0, cell.biofilm.nitrifier) *
+        SHRIMP_NITRIFIER_FOOD_WEIGHT;
   }
 
   private isRicefishAnimalPrey(predator: AnimalState, candidate: AnimalState): boolean {
@@ -4563,8 +5746,31 @@ export class SimulationWorld {
     return clamp(1 - Math.exp(-opticalDepth), 0, 0.86);
   }
 
+  private ricefishPreyShelter(prey: AnimalState): number {
+    return clamp(this.ricefishShelterAt(prey.position), 0, 0.92);
+  }
+
   private chooseRicefishPrey(predator: AnimalState): AnimalState | null {
     const rules = RICEFISH_ECOLOGY_RULES;
+    const candidates = this.animals.filter((candidate) => {
+      if (!this.isRicefishAnimalPrey(predator, candidate)) return false;
+      if (
+        distanceSquared(predator.position, candidate.position) >
+          rules.animalPreyDetectionRadius * rules.animalPreyDetectionRadius
+      ) return false;
+      return this.ricefishHasLineOfSight(predator.position, candidate.position);
+    });
+    // A fish does not query every juvenile in the tank like a radar. The
+    // chance of an encounter follows a saturating functional response to the
+    // *locally exposed* prey density. Sparse or well-sheltered juveniles are
+    // therefore encountered rarely, while an exposed concentration remains
+    // attractive and can still support visible predation.
+    const exposedPreyDensity = candidates.reduce(
+      (total, candidate) =>
+        total + Math.pow(1 - this.ricefishPreyShelter(candidate), 1.5),
+      0,
+    );
+    const encounterChance = exposedPreyDensity / (exposedPreyDensity + 2);
     const reserved = new Set(
       this.animals
         .filter((animal) =>
@@ -4574,13 +5780,14 @@ export class SimulationWorld {
         .map((animal) => animal.targetAnimalId as string),
     );
     let best: { prey: AnimalState; score: number } | null = null;
-    for (const candidate of this.animals) {
-      if (!this.isRicefishAnimalPrey(predator, candidate)) continue;
+    for (const candidate of candidates) {
       const distance = Math.sqrt(distanceSquared(predator.position, candidate.position));
-      if (distance > rules.animalPreyDetectionRadius) continue;
-      if (!this.ricefishHasLineOfSight(predator.position, candidate.position)) continue;
-      const shelter = this.ricefishShelterAt(candidate.position);
-      const detectionChance = clamp(1 - shelter * 0.76, 0.16, 1);
+      const shelter = this.ricefishPreyShelter(candidate);
+      // Dense ribbon-leaf cover is a real refuge, not just a small delay
+      // before an inevitable capture. Detection and the later strike both
+      // fall non-linearly with canopy density, while shrimp in open water
+      // remain fully available to the predator.
+      const detectionChance = Math.pow(1 - shelter, 2.2) * encounterChance;
       const epoch = Math.floor(predator.ageSeconds / 0.7);
       if (
         deterministicNoise(
@@ -4598,12 +5805,28 @@ export class SimulationWorld {
   private chooseRicefishAlgaeTarget(fish: AnimalState): SurfaceCellState | null {
     let best: { cell: SurfaceCellState; score: number } | null = null;
     for (const cell of this.allCells()) {
-      const food = cell.biomass.nitzschia +
-        cell.biomass.oedogonium * RICEFISH_ECOLOGY_RULES.oedogoniumAssimilationMultiplier;
-      if (food < RICEFISH_ECOLOGY_RULES.minimumVisibleAlgaeFood) continue;
+      const biofilmFoodMultiplier = fish.lifeStage === 'fry'
+        ? RICEFISH_ECOLOGY_RULES.fryBiofilmMicrofaunaMultiplier
+        : fish.lifeStage === 'juvenile'
+          ? RICEFISH_ECOLOGY_RULES.juvenileBiofilmMicrofaunaMultiplier
+          : RICEFISH_ECOLOGY_RULES.adultBiofilmMicrofaunaMultiplier;
+      const food =
+        Math.max(0, cell.biomass.nitzschia) +
+        Math.max(0, cell.biomass.oedogonium) *
+          RICEFISH_ECOLOGY_RULES.oedogoniumAssimilationMultiplier +
+        Math.max(0, cell.biofilm.decomposer) *
+          biofilmFoodMultiplier +
+        Math.max(0, cell.biofilm.nitrifier) *
+          biofilmFoodMultiplier * 0.45;
+      if (food <= 0) continue;
       const point = this.cellWorldPoint(cell);
       const distance = Math.sqrt(distanceSquared(fish.position, point));
-      if (distance > RICEFISH_ECOLOGY_RULES.algaeDetectionRadius) continue;
+      const detectionRadius = fish.lifeStage === 'fry'
+        ? RICEFISH_ECOLOGY_RULES.fryAlgaeDetectionRadius
+        : fish.lifeStage === 'juvenile'
+          ? RICEFISH_ECOLOGY_RULES.juvenileAlgaeDetectionRadius
+          : RICEFISH_ECOLOGY_RULES.algaeDetectionRadius;
+      if (distance > detectionRadius) continue;
       if (!this.ricefishHasLineOfSight(fish.position, point)) continue;
       const score = -distance + Math.min(20, food * 12) +
         deterministicNoise(fish.randomSeed + cell.index * 3.7) * 4;
@@ -4645,10 +5868,10 @@ export class SimulationWorld {
               RICEFISH_ECOLOGY_RULES.fryStageSeconds,
           ),
       );
-      return WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass +
+      return WATER_CYCLE_RULES.ricefish.fryBirthBiomass +
         (
           WATER_CYCLE_RULES.ricefish.adultStructuralBiomass -
-          WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass
+          WATER_CYCLE_RULES.ricefish.fryBirthBiomass
         ) * progress;
     }
     return WATER_CYCLE_RULES.ricefish.adultStructuralBiomass;
@@ -4663,7 +5886,10 @@ export class SimulationWorld {
   }
 
   private ricefishMinimumViableStructure(fish: AnimalState): number {
-    return this.ricefishTargetStructuralBiomass(fish) * 0.24;
+    const establishedStageStructure = fish.lifeStage === 'adult'
+      ? WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass
+      : WATER_CYCLE_RULES.ricefish.fryBirthBiomass;
+    return establishedStageStructure * 0.24;
   }
 
   private synchroniseRicefishEnergy(fish: AnimalState): void {
@@ -4698,15 +5924,41 @@ export class SimulationWorld {
     deltaSeconds: number,
     temperatureFactor: number,
   ): void {
-    if (fish.lifeStage === 'adult' || fish.lifeStage === 'egg') return;
-    const nextTarget = fish.lifeStage === 'fry'
-      ? WATER_CYCLE_RULES.ricefish.juvenileStructuralBiomass
-      : this.ricefishTargetStructuralBiomass(fish);
-    if (fish.energy >= 0.42 && fish.secondsSinceFood < 18) {
+    if (fish.lifeStage === 'egg') return;
+    this.synchroniseRicefishEnergy(fish);
+    if (
+      fish.lifeStage === 'adult' &&
+      fish.sex === 'female' &&
+      fish.gestationRemaining === null
+    ) {
+      const maximumEggMatter =
+        RICEFISH_ECOLOGY_RULES.eggClutchMaximum *
+        WATER_CYCLE_RULES.ricefish.eggBiomass;
+      const surplus = Math.max(
+        0,
+        fish.storedBiomass -
+          RICEFISH_ECOLOGY_RULES.reproductionReserveFloor,
+      );
+      const allocation = Math.min(
+        surplus * RICEFISH_ECOLOGY_RULES.reproductionAllocationFraction,
+        maximumEggMatter - fish.reproductiveBiomass,
+      );
+      fish.storedBiomass -= Math.max(0, allocation);
+      fish.reproductiveBiomass += Math.max(0, allocation);
+    }
+    const nextTarget = this.ricefishTargetStructuralBiomass(fish);
+    // Maintenance has already been paid from reserve above. Any remaining
+    // reserve may be mobilised for growth. Mature females split repeated
+    // surplus pulses between soma and the reproductive buffer, instead of
+    // finishing all adult growth before the first egg receives any matter.
+    if (fish.storedBiomass > 0) {
+      const growthReserveFloor = fish.lifeStage === 'adult'
+        ? RICEFISH_ECOLOGY_RULES.reproductionReserveFloor
+        : 0;
       const desired = Math.min(
         nextTarget - fish.structuralBiomass,
         deltaSeconds * temperatureFactor * 0.005,
-        fish.storedBiomass,
+        Math.max(0, fish.storedBiomass - growthReserveFloor),
       );
       fish.structuralBiomass += Math.max(0, desired);
       fish.storedBiomass -= Math.max(0, desired);
@@ -4781,7 +6033,8 @@ export class SimulationWorld {
   }
 
   private chooseFoodTarget(animal: AnimalState): SurfaceCellState | null {
-    const detectionRadius = animal.energy <= SHRIMP_EMERGENCY_SEARCH_ENERGY
+    const emergencySearch = animal.energy <= SHRIMP_EMERGENCY_SEARCH_ENERGY;
+    const detectionRadius = emergencySearch
       ? SHRIMP_EMERGENCY_FOOD_RADIUS
       : SHRIMP_LOCAL_FOOD_RADIUS;
     const reservations = new Map<string, number>();
@@ -4792,10 +6045,17 @@ export class SimulationWorld {
     let best: { cell: SurfaceCellState; score: number } | null = null;
     for (const cell of this.allCells()) {
       const food = this.edibleBiomass(cell);
-      if (food < SHRIMP_FOOD_TARGET_BIOMASS) continue;
-      const point = this.cellWorldPoint(cell);
+      if (food <= 0) continue;
+      const point = this.shrimpSurfaceContactPoint(cell);
       const distance = Math.sqrt(distanceSquared(animal.position, point));
       if (distance > detectionRadius) continue;
+      // Water quality is sensed only once the surface is inside the ordinary
+      // local cue radius. Emergency food search may notice a distant colony,
+      // but it does not grant knowledge of chemistry across the tank.
+      if (
+        distance <= SHRIMP_LOCAL_WATER_SENSE_RADIUS &&
+        this.shrimpWaterStressAt(point) > 0
+      ) continue;
       const congestion = reservations.get(cell.id) ?? 0;
       // Preserve a target only while traveling toward it, so movement does not
       // jitter between neighboring cells. A completed grazing target is cleared
@@ -4804,12 +6064,227 @@ export class SimulationWorld {
       const noise = deterministicNoise(
         animal.randomSeed + cell.index * 1.7 + point.x * 0.01,
       ) * 3;
+      const profitability = this.shrimpFoodProfitability(animal, cell);
+      // Compare a sensed patch's potential assimilation with the metabolic
+      // cost of grazing there. Scaling by the *local* detection radius keeps
+      // this a nearby cue, while allowing a starving animal to cross that
+      // radius for a viable colony instead of selecting a microscopic film
+      // merely because it is underfoot.
+      const foodUtility =
+        Math.min(2.5, profitability) * detectionRadius * 0.55;
       // Food search is an encounter, not omniscience: choose a nearby edible
-      // surface instead of steering toward the globally densest colony.
-      const score = -distance - congestion * 20 + targetCommitment + noise;
+      // surface. Within that sensed neighbourhood, a dense patch is worth a
+      // somewhat longer trip than a trace film, avoiding repeated starvation
+      // trips to the nearest nearly-empty cell.
+      const score =
+        -distance + foodUtility - congestion * 20 + targetCommitment + noise;
       if (!best || score > best.score) best = { cell, score };
     }
     return best?.cell ?? null;
+  }
+
+  private shrimpFoodProfitability(
+    animal: AnimalState,
+    cell: SurfaceCellState,
+  ): number {
+    const food = this.edibleBiomass(cell);
+    if (food <= 0) return 0;
+    const feedingScale = continuousBodyMassFeedingScale(
+      animal.structuralBiomass,
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
+      WATER_CYCLE_RULES.shrimp.feedingMassExponent,
+    );
+    const potentialAssimilationPerSecond =
+      SHRIMP_BITE_RATE *
+      (food / (food + SHRIMP_GRAZING_HALF_SATURATION)) *
+      feedingScale *
+      WATER_CYCLE_RULES.shrimp.assimilationFraction;
+    const maintenancePerSecond =
+      this.shrimpGrazingMaintenancePerSecond(animal);
+    return potentialAssimilationPerSecond /
+      Math.max(1e-9, maintenancePerSecond);
+  }
+
+  private shrimpGrazingMaintenancePerSecond(animal: AnimalState): number {
+    const baseCost = animal.lifeStage === 'adult'
+      ? SHRIMP_BASE_METABOLISM
+      : SHRIMP_ECOLOGY_RULES.juvenileBaseMetabolismPerSecond;
+    const temperature = this.biogeochemistry.temperatureAt(animal.position);
+    const temperatureProfile = ANIMALS[animal.speciesId].temperature;
+    const metabolicTemperatureFactor = thetaTemperatureFactor(
+      temperature,
+      temperatureProfile.referenceTemperature,
+      temperatureProfile.metabolicTheta,
+      temperatureProfile.minimumMetabolicFactor,
+      temperatureProfile.maximumMetabolicFactor,
+    );
+    return (
+      baseCost + SHRIMP_ECOLOGY_RULES.grazingActivityCostPerSecond
+    ) * this.animalEnergyCapacity(animal) * metabolicTemperatureFactor;
+  }
+
+  private shrimpMinimumProfitableGrazingIntake(
+    animal: AnimalState,
+  ): number {
+    return (
+      this.shrimpGrazingMaintenancePerSecond(animal) *
+      SHRIMP_GRAZING_PROFIT_SAMPLE_SECONDS /
+      WATER_CYCLE_RULES.shrimp.assimilationFraction
+    );
+  }
+
+  private daphniaWaterStressAt(point: Vec2): number {
+    if (!this.biogeochemistry.effectsEnabled) return 0;
+    const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+    const water = this.biogeochemistry.sampleAt(point);
+    const oxygenStress = clamp(
+      (rules.oxygenStressStart - water.oxygen) /
+        rules.oxygenStressStart,
+      0,
+      1,
+    );
+    const toxicStress = clamp(
+      (water.toxicWaste - rules.toxicWasteStressStart) /
+        Math.max(
+          1,
+          rules.toxicWasteFullStress - rules.toxicWasteStressStart,
+        ),
+      0,
+      1,
+    );
+    return Math.max(oxygenStress, toxicStress);
+  }
+
+  /**
+   * Compare only the current chemistry cell and its immediate neighbours.
+   * Daphnia can alter swimming when their appendages encounter low oxygen or
+   * dissolved waste, but they are never told where a remote safe cell lies.
+   */
+  private daphniaLocalWaterEscape(
+    animal: AnimalState,
+  ): { x: number; y: number; stress: number } | null {
+    const currentStress = this.daphniaWaterStressAt(animal.position);
+    if (currentStress <= 0) return null;
+
+    const diagonal = Math.SQRT1_2;
+    const directions: readonly Vec2[] = [
+      { x: 1, y: 0 },
+      { x: diagonal, y: diagonal },
+      { x: 0, y: 1 },
+      { x: -diagonal, y: diagonal },
+      { x: -1, y: 0 },
+      { x: -diagonal, y: -diagonal },
+      { x: 0, y: -1 },
+      { x: diagonal, y: -diagonal },
+    ];
+    let bestDirection: Vec2 | null = null;
+    let bestStress = currentStress;
+    for (const direction of directions) {
+      const candidate = this.clampDaphniaPoint({
+        x: animal.position.x +
+          direction.x * DAPHNIA_LOCAL_WATER_SENSE_RADIUS,
+        y: animal.position.y +
+          direction.y * DAPHNIA_LOCAL_WATER_SENSE_RADIUS,
+      });
+      if (distanceSquared(candidate, animal.position) < 1) continue;
+      const stress = this.daphniaWaterStressAt(candidate);
+      if (stress < bestStress - 1e-4) {
+        bestStress = stress;
+        bestDirection = direction;
+      }
+    }
+    if (bestDirection) {
+      return { ...bestDirection, stress: currentStress };
+    }
+
+    // In the flat centre of a plume, retain one local escape heading for a
+    // few seconds rather than jittering in place. This is ordinary correlated
+    // motion and contains no sample from outside the local cue radius.
+    const phase = Math.floor(animal.ageSeconds / 5);
+    const angle = deterministicNoise(
+      animal.randomSeed * 2.17 + phase * 13.9,
+    ) * Math.PI * 2;
+    return {
+      x: Math.cos(angle),
+      y: Math.sin(angle),
+      stress: currentStress,
+    };
+  }
+
+  private shrimpWaterStressAt(point: Vec2): number {
+    if (!this.biogeochemistry.effectsEnabled) return 0;
+    const water = this.biogeochemistry.sampleAt(point);
+    const oxygenStress = clamp(
+      (SHRIMP_OXYGEN_STRESS_START - water.oxygen) /
+        SHRIMP_OXYGEN_STRESS_START,
+      0,
+      1,
+    );
+    const toxicStress = clamp(
+      (water.toxicWaste - SHRIMP_TOXIC_STRESS_START) /
+        (SHRIMP_TOXIC_STRESS_FULL - SHRIMP_TOXIC_STRESS_START),
+      0,
+      1,
+    );
+    return Math.max(oxygenStress, toxicStress);
+  }
+
+  /**
+   * Return a unit vector away from the current harmful pocket. This is a
+   * chemotactic local comparison, not a search for the tank-wide safest cell.
+   * When all nearby samples are equally poor, one stable individual heading
+   * prevents the animal from freezing in the centre of a broad flat hotspot.
+   */
+  private shrimpLocalWaterEscape(
+    animal: AnimalState,
+  ): { x: number; y: number; stress: number } | null {
+    const currentStress = this.shrimpWaterStressAt(animal.position);
+    if (currentStress <= 0) return null;
+
+    const diagonal = Math.SQRT1_2;
+    const directions: readonly Vec2[] = [
+      { x: 1, y: 0 },
+      { x: diagonal, y: diagonal },
+      { x: 0, y: 1 },
+      { x: -diagonal, y: diagonal },
+      { x: -1, y: 0 },
+      { x: -diagonal, y: -diagonal },
+      { x: 0, y: -1 },
+      { x: diagonal, y: -diagonal },
+    ];
+    let bestDirection: Vec2 | null = null;
+    let bestStress = currentStress;
+    for (const direction of directions) {
+      const candidate = this.clampAnimalPoint({
+        x: animal.position.x +
+          direction.x * SHRIMP_LOCAL_WATER_SENSE_RADIUS,
+        y: animal.position.y +
+          direction.y * SHRIMP_LOCAL_WATER_SENSE_RADIUS,
+      });
+      if (distanceSquared(candidate, animal.position) < 1) continue;
+      const stress = this.shrimpWaterStressAt(candidate);
+      if (stress < bestStress - 1e-4) {
+        bestStress = stress;
+        bestDirection = direction;
+      }
+    }
+
+    if (bestDirection) {
+      return { ...bestDirection, stress: currentStress };
+    }
+
+    // A deterministic six-second heading is local random motion, not hidden
+    // knowledge. Keeping it stable long enough to cross several chemistry
+    // cells lets a shrimp escape the flat centre of a freshly formed plume.
+    const phase = Math.floor(animal.ageSeconds / 6);
+    const angle = deterministicNoise(
+      animal.randomSeed * 1.91 + phase * 17.3,
+    ) * Math.PI * 2;
+    return {
+      x: Math.cos(angle),
+      y: Math.sin(angle),
+      stress: currentStress,
+    };
   }
 
   private chooseExplorationTarget(animal: AnimalState): SurfaceCellState | null {
@@ -4830,7 +6305,7 @@ export class SimulationWorld {
         animal.randomSeed + phase * 19 + index * 7.3,
       ) * cells.length);
       const cell = cells[sampleIndex];
-      const point = this.cellWorldPoint(cell);
+      const point = this.shrimpSurfaceContactPoint(cell);
       // Roaming has no hidden knowledge of food outside the local sensing
       // radius. A time-varying individual heading defines a local random walk,
       // and the closest reachable surface is chosen from geometry alone;
@@ -4876,6 +6351,114 @@ export class SimulationWorld {
       x: anchor.x,
       y: Math.max(WATER_TOP + 16, canopy.minY + 5),
     };
+  }
+
+  /**
+   * A rooted macrophyte photosynthesizes across its leaf blades. Sampling one
+   * point above the root made an otherwise exposed rosette behave as though
+   * its whole canopy were hidden whenever that point happened to sit behind a
+   * stone. Average several positions along every painted leaf so partial shade
+   * reduces production without creating a single-point collapse loop.
+   */
+  private vallisneriaCanopySamplePoints(cell: SurfaceCellState): Vec2[] {
+    const ramet = this.seedPlacements.find((placement) =>
+      placement.speciesId === 'vallisneria' && placement.cellId === cell.id
+    );
+    const anchor = ramet
+      ? this.vallisneriaRootPosition(ramet, cell)
+      : this.cellWorldPoint(cell);
+    const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
+    return vallisneriaLeaves(cell.index, anchor, structuralScale)
+      .flatMap((leaf) => [0.25, 0.5, 0.75, 1].map((position) =>
+        vallisneriaLeafPoint(leaf, position)
+      ));
+  }
+
+  private vallisneriaCanopyLightSamples(cell: SurfaceCellState): number[] {
+    return this.vallisneriaCanopySamplePoints(cell).map((point) =>
+      this.sampleLightField(point)
+    );
+  }
+
+  /**
+   * Vallisneria can take mineral nutrients through its roots and dissolved
+   * carbon/nutrients across submerged leaves. Select the best point that the
+   * painted plant physically reaches, while commitAlgaeProduction still
+   * withdraws every unit from that finite local ledger.
+   */
+  private vallisneriaUptakePoint(cell: SurfaceCellState): Vec2 {
+    const ramet = this.seedPlacements.find((placement) =>
+      placement.speciesId === 'vallisneria' && placement.cellId === cell.id
+    );
+    const root = ramet
+      ? this.vallisneriaRootPosition(ramet, cell)
+      : this.cellWorldPoint(cell);
+    const candidates = [root, ...this.vallisneriaCanopySamplePoints(cell)];
+    return candidates.reduce((best, candidate) =>
+      this.biogeochemistry.algaeResourceFactor(candidate) >
+        this.biogeochemistry.algaeResourceFactor(best)
+        ? candidate
+        : best
+    );
+  }
+
+  private vallisneriaCanopyLight(cell: SurfaceCellState): number {
+    const samples = this.vallisneriaCanopyLightSamples(cell);
+    if (samples.length === 0) {
+      return this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria'));
+    }
+    return samples.reduce((sum, light) => sum + light, 0) / samples.length;
+  }
+
+  private vallisneriaCanopyPhysiology(
+    cell: SurfaceCellState,
+    temperature: number,
+  ): ReturnType<typeof algaePhysiology> {
+    const samples = this.vallisneriaCanopyLightSamples(cell);
+    if (samples.length === 0) {
+      return algaePhysiology(
+        'vallisneria',
+        this.vallisneriaCanopyLight(cell),
+        temperature,
+      );
+    }
+    const total = samples.reduce((rates, light) => {
+      const sample = algaePhysiology('vallisneria', light, temperature);
+      rates.grossPhotosynthesis += sample.grossPhotosynthesis;
+      rates.respiration += sample.respiration;
+      rates.lightStressTurnover += sample.lightStressTurnover;
+      rates.netGrowth += sample.netGrowth;
+      return rates;
+    }, {
+      grossPhotosynthesis: 0,
+      respiration: 0,
+      lightStressTurnover: 0,
+      netGrowth: 0,
+    });
+    const divisor = samples.length;
+    return {
+      grossPhotosynthesis: total.grossPhotosynthesis / divisor,
+      respiration: total.respiration / divisor,
+      lightStressTurnover: total.lightStressTurnover / divisor,
+      netGrowth: total.netGrowth / divisor,
+    };
+  }
+
+  private vallisneriaCanopySuitability(
+    cell: SurfaceCellState,
+    temperature: number,
+  ): number {
+    const samples = this.vallisneriaCanopyLightSamples(cell);
+    if (samples.length === 0) {
+      return habitatSuitability(
+        'vallisneria',
+        this.vallisneriaCanopyLight(cell),
+        temperature,
+      );
+    }
+    return samples.reduce((sum, light) =>
+      sum + habitatSuitability('vallisneria', light, temperature), 0
+    ) / samples.length;
   }
 
   private createSeedPlacement(
@@ -4954,8 +6537,14 @@ export class SimulationWorld {
         : 0,
       lifespanSeconds,
       structuralScale: origin === 'supplied'
-        ? 0.48 + deterministicNoise(seed * 0.0319) * 0.1
-        : 0.18,
+        // Inventory stock is an established rooted rosette, not a newly
+        // detached runner. Its leaves must begin tall enough to sample the
+        // water above ordinary hardscape instead of shrinking forever inside
+        // one stone's shadow.
+        ? 0.62 + deterministicNoise(seed * 0.0319) * 0.08
+        // A runner plantlet remains visibly smaller, but retains enough leaf
+        // area to use the support it receives from its connected parent.
+        : 0.24,
       runnerProgress: origin === 'supplied'
         ? deterministicNoise(seed * 0.0473) * 0.12
         : 0,
@@ -4990,13 +6579,11 @@ export class SimulationWorld {
     const parentSeed = deterministicStringSeed(parent.id) + (parent.plant?.reproductionCount ?? 0) * 97;
     const sourceTotal = source.biomass.oedogonium +
       source.biomass.nitzschia + source.biomass.vallisneria;
-    const sourceLight = this.sampleLightField(this.producerActivityPoint(source, 'vallisneria'));
     const sourceTemperature = this.biogeochemistry.temperatureAt(
       this.producerActivityPoint(source, 'vallisneria'),
     );
-    const sourceSuitability = habitatSuitability(
-      'vallisneria',
-      sourceLight,
+    const sourceSuitability = this.vallisneriaCanopySuitability(
+      source,
       sourceTemperature,
     );
     // Ramets in a poor or crowded patch tend to explore farther before
@@ -5013,16 +6600,19 @@ export class SimulationWorld {
         distance > VALLISNERIA_RUNNER_MAX_DISTANCE
       ) return [];
       const targetPoint = this.producerActivityPoint(cell, 'vallisneria');
-      const targetSuitability = habitatSuitability(
-        'vallisneria',
-        this.sampleLightField(targetPoint),
+      const targetSuitability = this.vallisneriaCanopySuitability(
+        cell,
         this.biogeochemistry.temperatureAt(targetPoint),
+      );
+      const targetResourceSuitability = this.biogeochemistry.algaeResourceFactor(
+        this.vallisneriaUptakePoint(cell),
       );
       // Clonal foraging is a bias, not omniscience: habitat and competition
       // matter, while deterministic noise still produces varied directions.
       const competition = clamp01(total);
       const score = Math.abs(distance - preferredDistance) +
         (1 - targetSuitability) * 68 +
+        (1 - targetResourceSuitability) * 42 +
         competition * 54 +
         deterministicNoise(parentSeed + cell.index * 1.71) * 24;
       return [{ cell, score }];
@@ -5136,9 +6726,8 @@ export class SimulationWorld {
         life.runnerProgress = Math.max(0, life.runnerProgress - deltaSeconds / 1_800);
         continue;
       }
-      const canopyLight = this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria'));
       const temperature = this.biogeochemistry.temperatureAt(this.producerActivityPoint(cell, 'vallisneria'));
-      const suitability = habitatSuitability('vallisneria', canopyLight, temperature);
+      const suitability = this.vallisneriaCanopySuitability(cell, temperature);
       life.runnerProgress += deltaSeconds / VALLISNERIA_RUNNER_INTERVAL_SECONDS *
         clamp(health * suitability * (biomass / 0.5), 0, 1.35);
       if (life.runnerProgress < 1) continue;
@@ -5197,16 +6786,20 @@ export class SimulationWorld {
       const rates = emptyBiomass();
       const physiology = new Map<SpeciesId, ReturnType<typeof algaePhysiology>>();
       const resourceFactors = new Map<SpeciesId, number>();
+      const activityPoints = new Map<SpeciesId, Vec2>();
       for (const speciesId of this.scenario.allowedSpecies) {
-        const activityPoint = this.producerActivityPoint(cell, speciesId);
-        const activityLight = speciesId === 'vallisneria'
-          ? this.sampleLightField(activityPoint)
-          : cell.light;
-        const localTemperature = this.biogeochemistry.temperatureAt(activityPoint);
-        const response = algaePhysiology(speciesId, activityLight, localTemperature);
+        const physiologyPoint = this.producerActivityPoint(cell, speciesId);
+        const activityPoint = speciesId === 'vallisneria'
+          ? this.vallisneriaUptakePoint(cell)
+          : physiologyPoint;
+        const localTemperature = this.biogeochemistry.temperatureAt(physiologyPoint);
+        const response = speciesId === 'vallisneria'
+          ? this.vallisneriaCanopyPhysiology(cell, localTemperature)
+          : algaePhysiology(speciesId, cell.light, localTemperature);
         const resourceFactor =
           this.biogeochemistry.algaeResourceFactor(activityPoint) *
           backgroundNutrientFactor;
+        activityPoints.set(speciesId, activityPoint);
         physiology.set(speciesId, response);
         resourceFactors.set(speciesId, resourceFactor);
         rates[speciesId] = response.netGrowth > 0
@@ -5227,7 +6820,8 @@ export class SimulationWorld {
         const amount = current[speciesId];
         if (amount <= 0) continue;
         const response = physiology.get(speciesId)!;
-        const activityPoint = this.producerActivityPoint(cell, speciesId);
+        const activityPoint = activityPoints.get(speciesId) ??
+          this.producerActivityPoint(cell, speciesId);
         const resourceFactor = resourceFactors.get(speciesId) ?? 1;
         const rate = rates[speciesId];
         // Density-dependent limitation throttles only the photosynthesis left
@@ -5257,7 +6851,11 @@ export class SimulationWorld {
         const replacement = total > 0.04
           ? amount * (rate - weightedAverage) * total * 1.35 * deltaSeconds
           : 0;
-        const naturalTurnover = amount * 0.0018 * deltaSeconds;
+        const naturalTurnover = amount * (
+          speciesId === 'vallisneria'
+            ? VALLISNERIA_BACKGROUND_TURNOVER_PER_SECOND
+            : 0.0018
+        ) * deltaSeconds;
         result[speciesId] = Math.max(
           0,
           amount + production - respiration - stressTurnover + replacement - naturalTurnover,
@@ -5501,6 +7099,37 @@ export class SimulationWorld {
         holdTarget: target.holdSeconds,
       };
     }
+    if (target.type === 'plankton-generation') {
+      const plankton = this.biogeochemistry.planktonState();
+      // Supplied founders cannot satisfy the hold condition on behalf of a
+      // failed lineage. Only animals descended from the inoculated adults
+      // contribute to the living reserve that must cross the next day/night.
+      const bornLineageBiomass = this.animals
+        .filter((animal) =>
+          animal.speciesId === 'daphnia' &&
+          (animal.generation ?? 0) >= 1)
+        .reduce(
+          (total, animal) =>
+            total +
+            animal.structuralBiomass +
+            animal.storedBiomass +
+            animal.reproductiveBiomass,
+          0,
+        );
+      const current =
+        bornLineageBiomass >= target.minimumBornLineageBiomass
+        ? plankton.cumulativeEvents.secondGenerationBirths
+        : 0;
+      return {
+        current,
+        target: target.secondGenerationBirthBiomass,
+        unit: 'biomass',
+        label: target.label,
+        ratio: current / target.secondGenerationBirthBiomass,
+        holdCurrent: this.successHoldAccumulator,
+        holdTarget: target.holdSeconds,
+      };
+    }
     return {
       current: coverageRatio,
       target: target.ratio,
@@ -5591,6 +7220,15 @@ export class SimulationWorld {
                 WATER_CYCLE_RULES.ricefish.eggBiomass
               ? 'ready'
               : 'none'
+        : animal.speciesId === 'daphnia'
+          ? animal.gestationRemaining !== null
+            ? 'carrying-eggs'
+            : animal.lifeStage === 'adult' &&
+              animal.reproductionCooldown <= 0 &&
+              animal.energy >=
+                PLANKTON_ECOLOGY_RULES.daphnia.reproductionStartEnergy
+              ? 'ready'
+              : 'none'
         : animal.gestationRemaining !== null
           ? 'berried'
           : animal.lifeStage === 'adult' &&
@@ -5602,7 +7240,10 @@ export class SimulationWorld {
             : 'none';
       snapshot.recentIntake = animal.recentIntake;
       snapshot.consumedBiomass = animal.consumedBiomass;
+      snapshot.secondsSinceFood = animal.secondsSinceFood;
       snapshot.recentFood = animal.recentFood;
+      snapshot.generation = animal.generation ?? 0;
+      snapshot.parentId = animal.parentId ?? null;
       snapshot.attachmentLabel = animal.attachmentCellId
         ? this.cellById(animal.attachmentCellId)?.ownerLabel ?? null
         : null;
@@ -5641,6 +7282,21 @@ export class SimulationWorld {
   }
 
   private carcassSnapshots(): AnimalCarcassSnapshot[] {
+    if (this.selection?.kind === 'carcass' && this.selection.carcassId) {
+      const selected = this.carcasses.find(
+        (carcass) => carcass.id === this.selection?.carcassId,
+      );
+      if (selected) {
+        const visualPoint = animalCarcassVisualPoint({
+          speciesId: selected.speciesId,
+          x: selected.position.x,
+          y: selected.position.y,
+          ageSeconds: selected.ageSeconds,
+        });
+        this.selection.x = visualPoint.x;
+        this.selection.y = visualPoint.y;
+      }
+    }
     return this.carcasses.map((carcass) => ({
       id: carcass.id,
       sourceAnimalId: carcass.sourceAnimalId,
@@ -5657,10 +7313,14 @@ export class SimulationWorld {
       ageSeconds: carcass.ageSeconds,
       lifetimeSeconds: carcass.speciesId === 'japanese-ricefish'
         ? RICEFISH_CARCASS_LIFETIME_SECONDS
+        : carcass.speciesId === 'daphnia'
+          ? DAPHNIA_CARCASS_LIFETIME_SECONDS
         : SHRIMP_CARCASS_LIFETIME_SECONDS,
       progress: clamp01(carcass.ageSeconds / (
         carcass.speciesId === 'japanese-ricefish'
           ? RICEFISH_CARCASS_LIFETIME_SECONDS
+          : carcass.speciesId === 'daphnia'
+            ? DAPHNIA_CARCASS_LIFETIME_SECONDS
           : SHRIMP_CARCASS_LIFETIME_SECONDS
       )),
     }));
@@ -5769,7 +7429,7 @@ export class SimulationWorld {
         cellSize: cell.cellSize,
         light: cell.light,
         plantCanopyLight: cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS
-          ? this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria'))
+          ? this.vallisneriaCanopyLight(cell)
           : null,
         biomass: cloneBiomass(cell.biomass),
         biofilm: { ...cell.biofilm },
@@ -5864,6 +7524,16 @@ export class SimulationWorld {
         microbeGuildId: this.held.guildId,
       };
     }
+    if (this.held.kind === 'plankton') {
+      return {
+        kind: 'plankton',
+        source: 'inventory',
+        valid: this.held.valid,
+        x: this.held.position.x,
+        y: this.held.position.y,
+        planktonKind: this.held.planktonKind,
+      };
+    }
     const candidate = this.held.candidateCellId ? this.cellById(this.held.candidateCellId) : undefined;
     const point = this.held.speciesId === 'vallisneria' && this.held.candidateRootPosition
       ? this.held.candidateRootPosition
@@ -5889,31 +7559,43 @@ export class SimulationWorld {
     if (speciesId === 'japanese-ricefish') {
       return this.createAdultRicefishState(id, point, origin);
     }
-    const numericId = Number.parseInt(id.split('-').at(-1) ?? '1', 10) || 1;
+    if (speciesId === 'daphnia') {
+      return this.createAdultDaphniaState(id, point, origin, 0, null);
+    }
+    const characteristicSeed = deterministicStringSeed(`${id}:shrimp`);
+    const suppliedIndex = this.animals.filter((animal) =>
+      animal.speciesId === 'cherry-shrimp' && animal.origin === 'supplied').length;
+    const lifespanNoise = deterministicNoise(characteristicSeed * 0.019 + 13.7);
+    const motionNoise = deterministicNoise(characteristicSeed * 0.031 + 31.1);
     return {
       id,
       speciesId,
       origin,
       position: this.clampAnimalPoint(point),
       velocity: { x: 0, y: 0 },
-      facing: numericId % 2 === 0 ? -1 : 1,
+      facing: motionNoise < 0.5 ? -1 : 1,
       poseAngle: 0,
-      bodyLength: SHRIMP_ADULT_LENGTH * (0.94 + deterministicNoise(numericId * 5.1) * 0.12),
+      bodyLength: SHRIMP_ADULT_LENGTH *
+        (0.94 + deterministicNoise(characteristicSeed * 0.037) * 0.12),
       lifeStage: 'adult',
-      sex: numericId % 2 === 1 ? 'female' : 'male',
+      sex: suppliedIndex % 2 === 0 ? 'female' : 'male',
       ageSeconds: SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS +
-        (numericId * 7) %
+        deterministicNoise(characteristicSeed * 0.013 + 7.1) *
         (SHRIMP_SUPPLIED_ADULT_MAX_AGE_SECONDS - SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS),
       lifespanSeconds: SHRIMP_MIN_LIFESPAN_SECONDS +
-        deterministicNoise(numericId * 29.73) *
+        lifespanNoise *
         (SHRIMP_MAX_LIFESPAN_SECONDS - SHRIMP_MIN_LIFESPAN_SECONDS),
-      energy: 0.52 + ((numericId - 1) % 4) * 0.01,
+      energy: 0.52 + (suppliedIndex % 4) * 0.01,
       structuralBiomass: WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
       storedBiomass: WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass,
-      reproductiveBiomass: 0,
+      reproductiveBiomass:
+        suppliedIndex % 2 === 0 && origin === 'supplied'
+          ? SHRIMP_MINIMUM_BROOD_BIOMASS *
+            SHRIMP_ECOLOGY_RULES.suppliedFemaleBroodReserveFraction
+          : 0,
       health: 1,
       behavior: 'resting',
-      behaviorTimer: 1 + deterministicNoise(numericId * 2.7) * 2,
+      behaviorTimer: 1 + deterministicNoise(characteristicSeed * 0.043) * 2,
       targetCellId: null,
       targetAnimalId: null,
       attachmentCellId: null,
@@ -5923,23 +7605,150 @@ export class SimulationWorld {
       recentIntake: 0,
       consumedBiomass: 0,
       grazingSessionIntake: 0,
-      secondsSinceFood: Number.POSITIVE_INFINITY,
+      secondsSinceFood: 0,
       growthProgress: 1,
       reproductionCooldown:
         SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMin +
-        deterministicNoise(numericId * 11.3) * (
+        deterministicNoise(characteristicSeed * 0.047) * (
           SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMax -
           SHRIMP_ECOLOGY_RULES.suppliedAdultReproductionCooldownMin
         ),
       gestationRemaining: null,
       matingAccumulator: 0,
-      randomSeed: numericId * 17.17,
+      randomSeed: characteristicSeed * 0.001,
     };
+  }
+
+  private createAdultDaphniaState(
+    id: string,
+    point: Vec2,
+    origin: 'supplied' | 'born',
+    generation: number,
+    parentId: string | null,
+  ): AnimalState {
+    const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+    const seed = deterministicStringSeed(`${id}:daphnia`);
+    const lifespanNoise = deterministicNoise(seed * 0.019 + 13.7);
+    return {
+      id,
+      speciesId: 'daphnia',
+      origin,
+      position: this.clampDaphniaPoint(point),
+      velocity: { x: 0, y: 0 },
+      facing: deterministicNoise(seed * 0.031) < 0.5 ? -1 : 1,
+      poseAngle: 0,
+      bodyLength: 8.2 + deterministicNoise(seed * 0.037) * 1.6,
+      lifeStage: 'adult',
+      sex: 'female',
+      ageSeconds: origin === 'supplied'
+        ? rules.suppliedAdultAgeMinimumSeconds +
+          deterministicNoise(seed * 0.013) * (
+            rules.suppliedAdultAgeMaximumSeconds -
+            rules.suppliedAdultAgeMinimumSeconds
+          )
+        : rules.maturationSeconds,
+      lifespanSeconds: rules.minimumLifespanSeconds + lifespanNoise *
+        (rules.maximumLifespanSeconds - rules.minimumLifespanSeconds),
+      energy: rules.suppliedAdultReserveBiomass / rules.adultReserveCapacity,
+      structuralBiomass: rules.adultStructuralBiomass,
+      storedBiomass: rules.suppliedAdultReserveBiomass,
+      reproductiveBiomass: 0,
+      health: 1,
+      behavior: 'exploring',
+      behaviorTimer: 0,
+      targetCellId: null,
+      targetAnimalId: null,
+      attachmentCellId: null,
+      incubationRemaining: null,
+      recentFood: null,
+      nextTargetEvaluation: 0,
+      recentIntake: 0,
+      consumedBiomass: 0,
+      grazingSessionIntake: 0,
+      secondsSinceFood: 0,
+      growthProgress: 1,
+      reproductionCooldown: rules.broodCooldownSeconds *
+        (0.55 + deterministicNoise(seed * 0.043) * 0.65),
+      gestationRemaining: null,
+      matingAccumulator: 0,
+      randomSeed: seed * 0.001,
+      generation,
+      parentId,
+    };
+  }
+
+  private createJuvenileDaphniaState(
+    parent: AnimalState,
+    broodIndex: number,
+  ): AnimalState {
+    const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+    const id = `animal-${++this.animalCounter}`;
+    const seed = deterministicStringSeed(`${id}:daphnia`);
+    const angle = deterministicNoise(parent.randomSeed + broodIndex * 7.31) *
+      Math.PI * 2;
+    const distance = 4 + deterministicNoise(parent.randomSeed + broodIndex * 3.17) * 7;
+    const initialStructure = rules.juvenileMinimumStructure;
+    return {
+      id,
+      speciesId: 'daphnia',
+      origin: 'born',
+      position: this.clampDaphniaPoint({
+        x: parent.position.x + Math.cos(angle) * distance,
+        y: parent.position.y + Math.sin(angle) * distance,
+      }),
+      velocity: {
+        x: Math.cos(angle) * 3,
+        y: Math.sin(angle) * 3,
+      },
+      facing: Math.cos(angle) < 0 ? -1 : 1,
+      poseAngle: 0,
+      bodyLength: 4.6,
+      lifeStage: 'juvenile',
+      sex: 'female',
+      ageSeconds: 0,
+      lifespanSeconds: rules.minimumLifespanSeconds +
+        deterministicNoise(seed * 0.019 + 13.7) *
+        (rules.maximumLifespanSeconds - rules.minimumLifespanSeconds),
+      energy: (
+        rules.juvenileBirthBiomass - initialStructure
+      ) / rules.juvenileReserveCapacity,
+      structuralBiomass: initialStructure,
+      storedBiomass: rules.juvenileBirthBiomass - initialStructure,
+      reproductiveBiomass: 0,
+      health: 1,
+      behavior: 'exploring',
+      behaviorTimer: 0,
+      targetCellId: null,
+      targetAnimalId: null,
+      attachmentCellId: null,
+      incubationRemaining: null,
+      recentFood: null,
+      nextTargetEvaluation: 0,
+      recentIntake: 0,
+      consumedBiomass: 0,
+      grazingSessionIntake: 0,
+      secondsSinceFood: 0,
+      growthProgress: initialStructure / rules.adultStructuralBiomass,
+      reproductionCooldown: 0,
+      gestationRemaining: null,
+      matingAccumulator: 0,
+      randomSeed: seed * 0.001,
+      generation: (parent.generation ?? 0) + 1,
+      parentId: parent.id,
+    };
+  }
+
+  private syncDaphniaIndividuals(): void {
+    this.biogeochemistry.setDaphniaIndividuals(
+      this.animals.filter((animal) => animal.speciesId === 'daphnia'),
+    );
   }
 
   private createJuvenileAnimalState(parent: AnimalState, clutchIndex: number): AnimalState {
     const id = `animal-${++this.animalCounter}`;
-    const numericId = this.animalCounter;
+    const characteristicSeed = deterministicStringSeed(`${id}:shrimp`);
+    const cohortSexOffset =
+      deterministicNoise(parent.randomSeed + parent.ageSeconds * 0.017) < 0.5 ? 0 : 1;
     const angle = deterministicNoise(parent.randomSeed + clutchIndex * 3.7) * Math.PI * 2;
     const distance = 7 + deterministicNoise(parent.randomSeed + clutchIndex * 8.9) * 12;
     return {
@@ -5955,10 +7764,10 @@ export class SimulationWorld {
       poseAngle: 0,
       bodyLength: SHRIMP_JUVENILE_LENGTH,
       lifeStage: 'juvenile',
-      sex: numericId % 2 === 1 ? 'female' : 'male',
+      sex: (clutchIndex + cohortSexOffset) % 2 === 0 ? 'female' : 'male',
       ageSeconds: 0,
       lifespanSeconds: SHRIMP_MIN_LIFESPAN_SECONDS +
-        deterministicNoise(numericId * 29.73) *
+        deterministicNoise(characteristicSeed * 0.019 + 13.7) *
         (SHRIMP_MAX_LIFESPAN_SECONDS - SHRIMP_MIN_LIFESPAN_SECONDS),
       energy: 0.46,
       structuralBiomass: WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
@@ -5966,13 +7775,13 @@ export class SimulationWorld {
       reproductiveBiomass: 0,
       health: 1,
       behavior: 'resting',
-      behaviorTimer: deterministicNoise(numericId * 4.1),
+      behaviorTimer: deterministicNoise(characteristicSeed * 0.043),
       targetCellId: parent.targetCellId,
       targetAnimalId: null,
       attachmentCellId: null,
       incubationRemaining: null,
       recentFood: null,
-      nextTargetEvaluation: deterministicNoise(numericId * 2.3) * 0.5,
+      nextTargetEvaluation: deterministicNoise(characteristicSeed * 0.047) * 0.5,
       recentIntake: 0,
       consumedBiomass: 0,
       grazingSessionIntake: 0,
@@ -5981,7 +7790,7 @@ export class SimulationWorld {
       reproductionCooldown: 0,
       gestationRemaining: null,
       matingAccumulator: 0,
-      randomSeed: numericId * 17.17,
+      randomSeed: characteristicSeed * 0.001,
     };
   }
 
@@ -6063,6 +7872,8 @@ export class SimulationWorld {
     const point = this.cellWorldPoint(cell);
     const angle = deterministicNoise(seed * 0.017 + clutchIndex) * Math.PI * 2;
     const radius = 3 + deterministicNoise(seed * 0.023 + clutchIndex * 2.1) * 6;
+    const cohortSexOffset =
+      deterministicNoise(parent.randomSeed + parent.ageSeconds * 0.019) < 0.5 ? 0 : 1;
     return {
       id,
       speciesId: 'japanese-ricefish',
@@ -6076,7 +7887,7 @@ export class SimulationWorld {
       poseAngle: 0,
       bodyLength: 6,
       lifeStage: 'egg',
-      sex: deterministicNoise(seed * 0.031) < 0.5 ? 'female' : 'male',
+      sex: (clutchIndex + cohortSexOffset) % 2 === 0 ? 'female' : 'male',
       ageSeconds: 0,
       lifespanSeconds: RICEFISH_ECOLOGY_RULES.minimumLifespanSeconds +
         deterministicNoise(seed * 0.037) * (
@@ -6108,30 +7919,101 @@ export class SimulationWorld {
     };
   }
 
-  private nearestAnimal(point: Vec2): { animal: AnimalState; distance: number } | null {
-    let nearest: { animal: AnimalState; distance: number } | null = null;
+  private animalHitScore(point: Vec2, animal: AnimalState): number | null {
+    const radii = animalVisualHitRadii(animal.speciesId, animal.bodyLength);
+    const facingSign = animal.facing < 0 ? -1 : 1;
+    const rotation = animal.poseAngle * facingSign;
+    const dx = point.x - animal.position.x;
+    const dy = point.y - animal.position.y;
+    const cosine = Math.cos(rotation);
+    const sine = Math.sin(rotation);
+    const localX = dx * cosine + dy * sine;
+    const localY = -dx * sine + dy * cosine;
+    const score = Math.sqrt(
+      (localX * localX) / (radii.x * radii.x) +
+      (localY * localY) / (radii.y * radii.y),
+    );
+    return score <= 1 ? score : null;
+  }
+
+  private nearestAnimalHit(point: Vec2): {
+    animal: AnimalState;
+    distance: number;
+    score: number;
+  } | null {
+    let nearest: {
+      animal: AnimalState;
+      distance: number;
+      score: number;
+    } | null = null;
     for (const animal of this.animals) {
+      const score = this.animalHitScore(point, animal);
+      if (score === null) continue;
       const distance = Math.sqrt(distanceSquared(point, animal.position));
-      if (!nearest || distance < nearest.distance) nearest = { animal, distance };
+      if (!nearest || score < nearest.score) {
+        nearest = { animal, distance, score };
+      }
     }
     return nearest;
   }
 
-  private nearestCarcass(point: Vec2): { carcass: AnimalCarcassState; distance: number } | null {
-    let nearest: { carcass: AnimalCarcassState; distance: number } | null = null;
+  private carcassHitScore(
+    point: Vec2,
+    carcass: AnimalCarcassState,
+    visualPoint: Vec2,
+  ): number | null {
+    const radii = carcass.speciesId === 'japanese-ricefish'
+      ? {
+        x: Math.max(16, carcass.bodyLength * 0.78),
+        y: Math.max(16, carcass.bodyLength * 0.78),
+      }
+      : animalVisualHitRadii(carcass.speciesId, carcass.bodyLength);
+    const facingSign = carcass.facing < 0 ? -1 : 1;
+    const rotation = carcass.speciesId === 'daphnia'
+      ? facingSign * 0.46
+      : carcass.speciesId === 'cherry-shrimp'
+        ? facingSign * 0.24
+        : facingSign * 0.64;
+    const dx = point.x - visualPoint.x;
+    const dy = point.y - visualPoint.y;
+    const cosine = Math.cos(rotation);
+    const sine = Math.sin(rotation);
+    const localX = dx * cosine + dy * sine;
+    const localY = -dx * sine + dy * cosine;
+    const score = Math.sqrt(
+      (localX * localX) / (radii.x * radii.x) +
+      (localY * localY) / (radii.y * radii.y),
+    );
+    return score <= 1 ? score : null;
+  }
+
+  private nearestCarcassHit(point: Vec2): {
+    carcass: AnimalCarcassState;
+    visualPoint: Vec2;
+    distance: number;
+    score: number;
+  } | null {
+    let nearest: {
+      carcass: AnimalCarcassState;
+      visualPoint: Vec2;
+      distance: number;
+      score: number;
+    } | null = null;
     for (const carcass of this.carcasses) {
-      const distance = Math.sqrt(distanceSquared(point, carcass.position));
-      if (!nearest || distance < nearest.distance) nearest = { carcass, distance };
+      const visualPoint = animalCarcassVisualPoint({
+        speciesId: carcass.speciesId,
+        x: carcass.position.x,
+        y: carcass.position.y,
+        ageSeconds: carcass.ageSeconds,
+      });
+      const score = this.carcassHitScore(point, carcass, visualPoint);
+      if (score === null) continue;
+      const distance = Math.sqrt(distanceSquared(point, visualPoint));
+      if (!nearest || score < nearest.score) {
+        nearest = { carcass, visualPoint, distance, score };
+      }
     }
     return nearest;
-  }
-
-  private animalHitRadius(animal: AnimalState): number {
-    return Math.max(14, animal.bodyLength * 0.72);
-  }
-
-  private carcassHitRadius(carcass: AnimalCarcassState): number {
-    return Math.max(16, carcass.bodyLength * 0.78);
   }
 
   private isAnimalPlacementPoint(point: Vec2): boolean {
@@ -6143,6 +8025,25 @@ export class SimulationWorld {
     return {
       x: clamp(point.x, 18, TANK_WIDTH - 18),
       y: clamp(point.y, WATER_TOP + 18, GROUND_Y - 16),
+    };
+  }
+
+  /**
+   * Surface cells describe the physical surface itself, while a shrimp's
+   * position describes its body centre. Edge substrate cells can therefore
+   * lie just outside the centre's legal movement bounds. Navigation, target
+   * scoring and grazing must all use the same reachable contact point or an
+   * animal can pursue a perfectly edible edge cell forever without getting
+   * close enough to bite it.
+   */
+  private shrimpSurfaceContactPoint(cell: SurfaceCellState): Vec2 {
+    return this.clampAnimalPoint(this.cellWorldPoint(cell));
+  }
+
+  private clampDaphniaPoint(point: Vec2): Vec2 {
+    return {
+      x: clamp(point.x, 10, TANK_WIDTH - 10),
+      y: clamp(point.y, WATER_TOP + 12, GROUND_Y - 14),
     };
   }
 
