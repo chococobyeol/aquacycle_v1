@@ -8,16 +8,22 @@ import {
   GROUND_Y,
   TANK_WIDTH,
   WATER_TOP,
+  type AnimalSpeciesId,
   type Vec2,
 } from '../src/simulation/types';
 
 const SHRIMP = 'cherry-shrimp' as const;
 
 interface ReproductionAnimalState {
+  id: string;
+  speciesId: AnimalSpeciesId;
   position: Vec2;
+  velocity: Vec2;
   targetCellId: string | null;
   behavior: string;
   behaviorTimer: number;
+  nextTargetEvaluation: number;
+  lifeStage: 'juvenile' | 'adult' | 'egg';
   grazingSessionIntake: number;
   sex: 'female' | 'male';
   energy: number;
@@ -37,6 +43,9 @@ interface ReproductionWorldInternals {
   animals: ReproductionAnimalState[];
   stepAnimalEcology(deltaSeconds: number): void;
   stepAnimalMotion(deltaSeconds: number): void;
+  rebuildShrimpMotionBuckets(): void;
+  shrimpMotionBucketsScratch: ReproductionAnimalState[][];
+  shrimpMotionUsedBucketIndicesScratch: number[];
   chooseFoodTarget(animal: ReproductionAnimalState): TestSurfaceCell | null;
   allCells(): TestSurfaceCell[];
   shrimpSurfaceContactPoint(cell: TestSurfaceCell): Vec2;
@@ -63,6 +72,11 @@ type WorldSnapshot = ReturnType<SimulationWorld['snapshot']>;
 
 const placeShrimp = (world: SimulationWorld, point: Vec2): void => {
   world.handle({ type: 'pick-animal', speciesId: SHRIMP, point });
+  world.handle({ type: 'drop-held', point });
+};
+
+const placeDaphnia = (world: SimulationWorld, point: Vec2): void => {
+  world.handle({ type: 'pick-plankton', planktonKind: 'daphnia', point });
   world.handle({ type: 'drop-held', point });
 };
 
@@ -171,6 +185,52 @@ const waterFields = (
     toxicWaste: Float64Array;
   };
 
+const moveShrimpWithNeighbor = (
+  neighbor: 'none' | 'daphnia' | 'cherry-shrimp',
+  deltaSeconds: number,
+): { position: Vec2; velocity: Vec2 } => {
+  const world = new SimulationWorld('mission-7');
+  const start = { x: 600, y: 300 };
+  placeShrimp(world, start);
+  if (neighbor === 'daphnia') {
+    placeDaphnia(world, { x: start.x + 8, y: start.y });
+  } else if (neighbor === 'cherry-shrimp') {
+    placeShrimp(world, { x: start.x + 8, y: start.y });
+  }
+
+  const internals = reproductionInternals(world);
+  const shrimp = internals.animals.find(
+    (animal) => animal.speciesId === SHRIMP,
+  );
+  if (!shrimp) throw new Error('motion fixture needs a cherry shrimp');
+  shrimp.position = { ...start };
+  shrimp.velocity = { x: 0, y: 0 };
+  shrimp.energy = 0.4;
+  shrimp.ovarianProgress = 0;
+  shrimp.reproductiveBiomass = 0;
+  shrimp.behavior = 'traveling';
+  shrimp.behaviorTimer = 10;
+  shrimp.nextTargetEvaluation = 10;
+  const target = internals.allCells().reduce((farthest, cell) =>
+    Math.abs(cell.x - start.x) > Math.abs(farthest.x - start.x)
+      ? cell
+      : farthest
+  );
+  shrimp.targetCellId = target.id;
+
+  for (const other of internals.animals) {
+    if (other.id === shrimp.id) continue;
+    other.position = { x: start.x + 8, y: start.y };
+    other.velocity = { x: 0, y: 0 };
+  }
+
+  internals.stepAnimalMotion(deltaSeconds);
+  return {
+    position: { ...shrimp.position },
+    velocity: { ...shrimp.velocity },
+  };
+};
+
 describe('shrimp population safety contract', () => {
   it('does not let unrelated Daphnia IDs change supplied shrimp traits', () => {
     const direct = new SimulationWorld('mission-7');
@@ -201,6 +261,130 @@ describe('shrimp population safety contract', () => {
     };
 
     expect(traits(afterDaphnia)).toEqual(traits(direct));
+  });
+
+  it('ignores Daphnia in shrimp separation at normal and coarse motion steps', () => {
+    for (const deltaSeconds of [0.1, 0.25]) {
+      const alone = moveShrimpWithNeighbor('none', deltaSeconds);
+      const withDaphnia = moveShrimpWithNeighbor('daphnia', deltaSeconds);
+
+      expect(withDaphnia).toEqual(alone);
+    }
+  });
+
+  it('preserves the shrimp separation force in bucket and fallback paths', () => {
+    for (const deltaSeconds of [0.1, 0.25]) {
+      const alone = moveShrimpWithNeighbor('none', deltaSeconds);
+      const withShrimp = moveShrimpWithNeighbor('cherry-shrimp', deltaSeconds);
+      const separationPressure = (24 - 8) / 24;
+      const response = 1 - Math.exp(-deltaSeconds * 4.2);
+      const expectedVelocityDifference =
+        -separationPressure * 34 * response;
+
+      expect(withShrimp.velocity.x - alone.velocity.x)
+        .toBeCloseTo(expectedVelocityDifference, 10);
+      expect(withShrimp.velocity.y).toBeCloseTo(alone.velocity.y, 10);
+      expect(withShrimp.position.x - alone.position.x)
+        .toBeCloseTo(expectedVelocityDifference * deltaSeconds, 10);
+    }
+  });
+
+  it('finds a shrimp that moved in from the second neighboring bucket ring', () => {
+    const advancePair = (
+      leadingStartX: number,
+    ): { leading: ReproductionAnimalState; following: ReproductionAnimalState } => {
+      const world = new SimulationWorld('mission-7');
+      placeShrimp(world, { x: leadingStartX, y: 300 });
+      placeShrimp(world, { x: 600, y: 300 });
+      const internals = reproductionInternals(world);
+      const [leading, following] = internals.animals;
+      const target = internals.allCells().reduce((rightmost, cell) =>
+        cell.x > rightmost.x ? cell : rightmost
+      );
+      for (const animal of internals.animals) {
+        animal.energy = 0.4;
+        animal.ovarianProgress = 0;
+        animal.reproductiveBiomass = 0;
+        animal.behavior = 'traveling';
+        animal.behaviorTimer = 10;
+        animal.nextTargetEvaluation = 10;
+        animal.targetCellId = target.id;
+      }
+      leading.position = { x: leadingStartX, y: 300 };
+      leading.velocity = { x: 100, y: 0 };
+      following.position = { x: 600, y: 300 };
+      following.velocity = { x: 0, y: 0 };
+
+      internals.stepAnimalMotion(0.1);
+      return { leading, following };
+    };
+
+    // 575 and 600 begin two 24 px bucket columns apart and just outside the
+    // separation radius. The first shrimp then moves inside the radius before
+    // the second shrimp is processed.
+    const nearby = advancePair(575);
+    const distant = advancePair(300);
+
+    expect(nearby.leading.position.x).toBeGreaterThan(576);
+    expect(600 - nearby.leading.position.x).toBeLessThan(24);
+    expect(nearby.following.velocity.x).toBeGreaterThan(
+      distant.following.velocity.x,
+    );
+  });
+
+  it('keeps only shrimp in reusable motion buckets and clears references on reset', () => {
+    const world = new SimulationWorld('mission-7');
+    placeShrimp(world, { x: 600, y: 300 });
+    placeDaphnia(world, { x: 608, y: 300 });
+    const internals = reproductionInternals(world);
+
+    internals.rebuildShrimpMotionBuckets();
+    const bucketAnimals = internals.shrimpMotionBucketsScratch.flat();
+    expect(bucketAnimals).toHaveLength(1);
+    expect(bucketAnimals.every((animal) => animal.speciesId === SHRIMP)).toBe(true);
+    expect(internals.shrimpMotionUsedBucketIndicesScratch.length).toBeGreaterThan(0);
+
+    world.initialize('laboratory');
+
+    expect(internals.shrimpMotionUsedBucketIndicesScratch).toHaveLength(0);
+    expect(
+      internals.shrimpMotionBucketsScratch.every((bucket) => bucket.length === 0),
+    ).toBe(true);
+  });
+
+  it('selects the nearest eligible male without allocating a sorted candidate list', () => {
+    const world = new SimulationWorld('laboratory');
+    for (let index = 0; index < 4; index += 1) {
+      placeShrimp(world, { x: 300 + index * 120, y: 300 });
+    }
+    const internals = reproductionInternals(world);
+    const female = internals.animals.find((animal) => animal.sex === 'female');
+    const males = internals.animals.filter((animal) => animal.sex === 'male');
+    if (!female || males.length < 2) {
+      throw new Error('nearest-mate fixture needs one female and two males');
+    }
+
+    for (const animal of internals.animals) {
+      animal.velocity = { x: 0, y: 0 };
+      animal.energy = 0.9;
+      animal.reproductionCooldown = 0;
+      animal.ovarianProgress = 0;
+      animal.reproductiveBiomass = 0;
+      animal.behavior = 'resting';
+      animal.behaviorTimer = 100;
+    }
+    female.position = { x: 600, y: 300 };
+    female.ovarianProgress = 1;
+    female.reproductiveBiomass = 1;
+    female.gestationRemaining = null;
+    males[0].position = { x: 700, y: 300 };
+    males[1].position = { x: 580, y: 300 };
+
+    internals.stepAnimalMotion(0.1);
+
+    expect(female.behavior).toBe('courting');
+    expect(female.velocity.x).toBeLessThan(0);
+    expect(female.position.x).toBeLessThan(600);
   });
 
   it('derives condition from conserved body matter instead of killing on a stale hunger value', () => {

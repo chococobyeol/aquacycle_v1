@@ -56,9 +56,17 @@ const REPRODUCTIVE_STATES: readonly AnimalReproductiveState[] = [
 ];
 
 const numericId = (id: string): number => {
-  const separator = id.lastIndexOf('-');
-  const value = Number.parseInt(separator >= 0 ? id.slice(separator + 1) : id, 10);
-  return Number.isFinite(value) ? value : 0;
+  let value = 0;
+  let multiplier = 1;
+  let foundDigit = false;
+  for (let index = id.length - 1; index >= 0; index -= 1) {
+    const code = id.charCodeAt(index) - 48;
+    if (code < 0 || code > 9) break;
+    foundDigit = true;
+    value += code * multiplier;
+    multiplier *= 10;
+  }
+  return foundDigit && Number.isSafeInteger(value) ? value : 0;
 };
 
 const enumIndex = <T extends string>(values: readonly T[], value: T): number => {
@@ -70,6 +78,12 @@ export interface SharedMotionChannel {
   control: SharedArrayBuffer;
   payload: SharedArrayBuffer;
 }
+
+export const sharedMotionMessageFitsChannel = (
+  message: Pick<WorkerMotionMessage, 'structures' | 'animals'>,
+): boolean =>
+  message.structures.length <= SHARED_MOTION_MAX_STRUCTURES &&
+  message.animals.length <= SHARED_MOTION_MAX_ANIMALS;
 
 export const createSharedMotionChannel = (): SharedMotionChannel => ({
   control: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * CONTROL_WORDS),
@@ -90,16 +104,14 @@ export class SharedMotionWriter {
   }
 
   public publish(message: WorkerMotionMessage): boolean {
-    if (
-      message.structures.length > SHARED_MOTION_MAX_STRUCTURES ||
-      message.animals.length > SHARED_MOTION_MAX_ANIMALS
-    ) return false;
+    if (!sharedMotionMessageFitsChannel(message)) return false;
 
     Atomics.add(this.control, CONTROL_GENERATION, 1);
     this.payload[HEADER_SAMPLED_AT_MS] = message.sampledAtMs;
 
     let offset = HEADER_WORDS;
-    for (const structure of message.structures) {
+    for (let index = 0; index < message.structures.length; index += 1) {
+      const structure = message.structures[index];
       this.payload[offset] = numericId(structure.id);
       this.payload[offset + 1] = structure.x;
       this.payload[offset + 2] = structure.y;
@@ -111,7 +123,8 @@ export class SharedMotionWriter {
     }
 
     offset = HEADER_WORDS + SHARED_MOTION_MAX_STRUCTURES * STRUCTURE_WORDS;
-    for (const animal of message.animals) {
+    for (let index = 0; index < message.animals.length; index += 1) {
+      const animal = message.animals[index];
       this.payload[offset] = numericId(animal.id);
       this.payload[offset + 1] = animal.x;
       this.payload[offset + 2] = animal.y;
@@ -197,19 +210,27 @@ const emptyMessage = (): WorkerMotionMessage => ({
 });
 
 /**
- * Reads into two alternating object graphs. The motion store retains exactly
- * the previous and current graph, so neither high-frequency JSON parsing nor
- * per-frame arrays are needed while animals move.
+ * Reads into three rotating object graphs. The motion store retains the
+ * previous and current graphs; the third remains private staging storage until
+ * the generation check succeeds. A concurrent publication can therefore make
+ * a read fail without partially mutating either frame currently interpolated
+ * by the renderer.
  */
 export class SharedMotionReader {
   private readonly control: Int32Array;
   private readonly payload: Float64Array;
-  private readonly messages = [emptyMessage(), emptyMessage()] as const;
+  private readonly messages = [
+    emptyMessage(),
+    emptyMessage(),
+    emptyMessage(),
+  ] as const;
   private readonly structureNumericIds = [
+    new Int32Array(SHARED_MOTION_MAX_STRUCTURES),
     new Int32Array(SHARED_MOTION_MAX_STRUCTURES),
     new Int32Array(SHARED_MOTION_MAX_STRUCTURES),
   ] as const;
   private readonly animalNumericIds = [
+    new Int32Array(SHARED_MOTION_MAX_ANIMALS),
     new Int32Array(SHARED_MOTION_MAX_ANIMALS),
     new Int32Array(SHARED_MOTION_MAX_ANIMALS),
   ] as const;
@@ -296,7 +317,7 @@ export class SharedMotionReader {
     const generationAfter = Atomics.load(this.control, CONTROL_GENERATION);
     if (generationBefore !== generationAfter || generationAfter % 2 !== 0) return null;
     this.lastGeneration = generationAfter;
-    this.nextMessageIndex = this.nextMessageIndex === 0 ? 1 : 0;
+    this.nextMessageIndex = (this.nextMessageIndex + 1) % this.messages.length;
     return target;
   }
 }

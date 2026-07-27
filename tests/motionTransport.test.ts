@@ -13,7 +13,10 @@ import { createSharedMotionChannel } from '../src/simulation/sharedMotionTelemet
 import { createSharedTelemetryChannel } from '../src/simulation/sharedTelemetry';
 import {
   addPendingWorkerTime,
+  MAX_WORKER_IMMEDIATE_CATCH_UP_TASKS,
+  planWorkerContinuation,
   takeWorkerSimulationQuantum,
+  WORKER_OVERLOAD_YIELD_MS,
   WORKER_SIMULATION_QUANTUM_SECONDS,
 } from '../src/simulation/workerCadence';
 
@@ -155,7 +158,7 @@ describe('simulation worker motion cadence', () => {
     expect(overlay).not.toHaveProperty('structures');
   });
 
-  it('slices worker catch-up into fixed 120 Hz tasks instead of one delayed burst', () => {
+  it('represents pending time only as fixed 120 Hz quanta', () => {
     let pendingSeconds = addPendingWorkerTime(0, 0.1);
     const deltas: number[] = [];
     while (true) {
@@ -170,5 +173,133 @@ describe('simulation worker motion cadence', () => {
       expect(deltaSeconds).toBeCloseTo(WORKER_SIMULATION_QUANTUM_SECONDS, 10);
     }
     expect(pendingSeconds).toBeCloseTo(0, 10);
+  });
+
+  it('drops unattainable debt and positively yields when a quantum is slower than real time', () => {
+    const slowWorkMs = WORKER_SIMULATION_QUANTUM_SECONDS * 1000 + 4;
+    let clockMs = 0;
+    let lastSchedulerAtMs = 0;
+    let pendingSeconds = WORKER_SIMULATION_QUANTUM_SECONDS;
+    let consecutiveImmediateCatchUps = 0;
+    let executedQuanta = 0;
+    let longestZeroDelayRun = 0;
+    let currentZeroDelayRun = 0;
+    let overloadYields = 0;
+
+    for (let callback = 0; callback < 4_000; callback += 1) {
+      const taskStartedAtMs = clockMs;
+      const elapsedSeconds = (taskStartedAtMs - lastSchedulerAtMs) / 1000;
+      lastSchedulerAtMs = taskStartedAtMs;
+      pendingSeconds = addPendingWorkerTime(pendingSeconds, elapsedSeconds);
+      const quantum = takeWorkerSimulationQuantum(pendingSeconds);
+
+      if (!quantum) {
+        consecutiveImmediateCatchUps = 0;
+        const delayMs = Math.max(
+          1,
+          (WORKER_SIMULATION_QUANTUM_SECONDS - pendingSeconds) * 1000,
+        );
+        currentZeroDelayRun = 0;
+        clockMs += delayMs;
+        continue;
+      }
+
+      executedQuanta += 1;
+      expect(quantum.deltaSeconds).toBe(WORKER_SIMULATION_QUANTUM_SECONDS);
+      pendingSeconds = quantum.remainingSeconds;
+      const taskFinishedAtMs = taskStartedAtMs + slowWorkMs;
+      const continuation = planWorkerContinuation(
+        pendingSeconds,
+        taskFinishedAtMs - taskStartedAtMs,
+        consecutiveImmediateCatchUps,
+      );
+      pendingSeconds = continuation.pendingSeconds;
+      consecutiveImmediateCatchUps =
+        continuation.consecutiveImmediateCatchUps;
+      if (continuation.rebaseClock) {
+        lastSchedulerAtMs = taskFinishedAtMs;
+      }
+      if (continuation.droppedDebt) {
+        overloadYields += 1;
+        expect(continuation.delayMs).toBe(WORKER_OVERLOAD_YIELD_MS);
+        expect(pendingSeconds).toBe(0);
+        expect(lastSchedulerAtMs).toBe(taskFinishedAtMs);
+      }
+      if (continuation.delayMs === 0) {
+        currentZeroDelayRun += 1;
+        longestZeroDelayRun = Math.max(
+          longestZeroDelayRun,
+          currentZeroDelayRun,
+        );
+      } else {
+        currentZeroDelayRun = 0;
+      }
+      clockMs = taskFinishedAtMs + continuation.delayMs;
+    }
+
+    expect(executedQuanta).toBeGreaterThan(1_000);
+    expect(overloadYields).toBe(executedQuanta);
+    expect(longestZeroDelayRun).toBe(0);
+    expect(clockMs).toBeGreaterThan(0);
+  });
+
+  it('bounds zero-delay catch-up even when old pending time is at the cap', () => {
+    const fastWorkMs = 0.25;
+    let clockMs = 0;
+    let lastSchedulerAtMs = 0;
+    let pendingSeconds = addPendingWorkerTime(0, 0.1);
+    let consecutiveImmediateCatchUps = 0;
+    let longestZeroDelayRun = 0;
+    let currentZeroDelayRun = 0;
+    let droppedDebt = 0;
+
+    for (let callback = 0; callback < 2_000; callback += 1) {
+      const taskStartedAtMs = clockMs;
+      const elapsedSeconds = (taskStartedAtMs - lastSchedulerAtMs) / 1000;
+      lastSchedulerAtMs = taskStartedAtMs;
+      pendingSeconds = addPendingWorkerTime(pendingSeconds, elapsedSeconds);
+      const quantum = takeWorkerSimulationQuantum(pendingSeconds);
+
+      if (!quantum) {
+        consecutiveImmediateCatchUps = 0;
+        currentZeroDelayRun = 0;
+        clockMs += Math.max(
+          1,
+          (WORKER_SIMULATION_QUANTUM_SECONDS - pendingSeconds) * 1000,
+        );
+        continue;
+      }
+
+      pendingSeconds = quantum.remainingSeconds;
+      const taskFinishedAtMs = taskStartedAtMs + fastWorkMs;
+      const continuation = planWorkerContinuation(
+        pendingSeconds,
+        fastWorkMs,
+        consecutiveImmediateCatchUps,
+      );
+      pendingSeconds = continuation.pendingSeconds;
+      consecutiveImmediateCatchUps =
+        continuation.consecutiveImmediateCatchUps;
+      if (continuation.rebaseClock) {
+        lastSchedulerAtMs = taskFinishedAtMs;
+      }
+      if (continuation.droppedDebt) droppedDebt += 1;
+      if (continuation.delayMs === 0) {
+        currentZeroDelayRun += 1;
+        longestZeroDelayRun = Math.max(
+          longestZeroDelayRun,
+          currentZeroDelayRun,
+        );
+      } else {
+        currentZeroDelayRun = 0;
+      }
+      clockMs = taskFinishedAtMs + continuation.delayMs;
+    }
+
+    expect(droppedDebt).toBeGreaterThan(0);
+    expect(longestZeroDelayRun).toBeLessThanOrEqual(
+      MAX_WORKER_IMMEDIATE_CATCH_UP_TASKS,
+    );
+    expect(clockMs).toBeGreaterThan(0);
   });
 });

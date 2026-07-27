@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import type { AnimalSnapshot, Vec2 } from '../src/simulation/types';
 
@@ -96,4 +96,29 @@ describe('renderer performance contracts', () => {
     // thermally throttled machine after the long ecology suite.
   }, 20_000);
 
+  it('keeps 30 Hz transport poses flat without recomputing observational water fields', () => {
+    const world = new SimulationWorld('laboratory');
+    populateShrimp(world, 4);
+    const ledger = (world as unknown as {
+      biogeochemistry: { sampleAt(point: Vec2): unknown };
+    }).biogeochemistry;
+    const sampleAt = vi.spyOn(ledger, 'sampleAt');
+
+    const first = world.motionTransportSnapshot();
+    const animals = [...first.animals];
+    for (let sample = 0; sample < 40; sample += 1) {
+      const next = world.motionTransportSnapshot(first);
+      expect(next).toBe(first);
+      expect(next.animals).toBe(first.animals);
+      expect(next.animals).toHaveLength(4);
+      next.animals.forEach((animal, index) => {
+        expect(animal).toBe(animals[index]);
+        expectCompleteMotionPose(animal);
+      });
+    }
+    expect(sampleAt).not.toHaveBeenCalled();
+
+    world.motionSnapshot();
+    expect(sampleAt).toHaveBeenCalledTimes(4);
+  });
 });

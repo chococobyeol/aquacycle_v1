@@ -21,6 +21,7 @@ import {
   BiogeochemistryLedger,
   emptyBiofilm,
   type BiofilmReactionSite,
+  type PlanktonSample,
   type ShrimpFoodCueSite,
   type ShrimpMateCueSite,
 } from './biogeochemistry';
@@ -33,6 +34,11 @@ import { oxygenEquivalentInventory } from './stoichiometry';
 import { FIXED_LAMP_WIDTH, FIXED_LAMP_X, FIXED_LAMP_Y } from './lightGeometry';
 import { dayNightStateAt, type DayNightPhase, type DayNightState } from './dayNight';
 import {
+  ALGAE_PHYSIOLOGY_GROSS,
+  ALGAE_PHYSIOLOGY_NET,
+  ALGAE_PHYSIOLOGY_RESPIRATION,
+  ALGAE_PHYSIOLOGY_STRESS,
+  ALGAE_PHYSIOLOGY_VALUE_COUNT,
   algaePhysiology,
   clamp01,
   emptyBiomass,
@@ -41,6 +47,7 @@ import {
   netGrowthPotential,
   occupied,
   type AlgaePhysiologyRates,
+  writeAlgaePhysiologyRates,
 } from './growth';
 import {
   sampleEcologyFace,
@@ -57,6 +64,10 @@ import {
   vallisneriaLeafPoint,
   vallisneriaLeaves,
   vallisneriaRenderDepth,
+  writeVallisneriaCanopyBounds,
+  writeVallisneriaLeaves,
+  type VallisneriaCanopyBounds as VallisneriaCanopyBoundsState,
+  type VallisneriaLeafGeometry,
 } from './vallisneriaGeometry';
 import {
   DEFAULT_SIMULATION_SPEED,
@@ -125,6 +136,14 @@ interface SurfaceCellState extends LocalSurfaceCell {
   biofilm: BiofilmBiomass;
   localNeighborIds: string[];
   neighborIds: string[];
+  /** Reused runtime coordinates; never serialized into saves or snapshots. */
+  worldPoint: Vec2;
+  shrimpContactPoint: Vec2;
+  worldTransformX: number;
+  worldTransformY: number;
+  worldTransformAngle: number;
+  shrimpContactSourceX: number;
+  shrimpContactSourceY: number;
 }
 
 interface MissionCellView {
@@ -139,6 +158,17 @@ interface GrowthRecruitmentTransfer {
   receiverIndex: number;
   speciesId: SpeciesId;
   amount: number;
+}
+
+interface WaterEscapeVector extends Vec2 {
+  stress: number;
+}
+
+interface MotionSnapshotState {
+  structures: StructureSnapshot[];
+  animals: AnimalSnapshot[];
+  holding: HoldingSnapshot | null;
+  probe: ProbeSnapshot | null;
 }
 
 const GROWTH_SPECIES_INDEX: Record<SpeciesId, number> = {
@@ -532,6 +562,36 @@ const SHRIMP_MATING_ENCOUNTER_RADIUS = 36;
 const SHRIMP_MATING_ATTRACTION_RADIUS = 140;
 const SHRIMP_MATING_SECONDS = 3;
 const SHRIMP_MALE_POST_MATING_COOLDOWN = 45;
+const SHRIMP_SEPARATION_RADIUS = 24;
+const SHRIMP_SEPARATION_FORCE = 34;
+const SHRIMP_MOTION_BUCKET_SIZE = SHRIMP_SEPARATION_RADIUS;
+const SHRIMP_MOTION_BUCKET_COLUMNS = Math.ceil(
+  TANK_WIDTH / SHRIMP_MOTION_BUCKET_SIZE,
+);
+const SHRIMP_MOTION_BUCKET_ROWS = Math.ceil(
+  (GROUND_Y - WATER_TOP) / SHRIMP_MOTION_BUCKET_SIZE,
+);
+const SHRIMP_MOTION_BUCKET_NEIGHBOR_RANGE = 2;
+const LOCAL_WATER_SENSE_DIRECTIONS: readonly Readonly<Vec2>[] = [
+  { x: 1, y: 0 },
+  { x: Math.SQRT1_2, y: Math.SQRT1_2 },
+  { x: 0, y: 1 },
+  { x: -Math.SQRT1_2, y: Math.SQRT1_2 },
+  { x: -1, y: 0 },
+  { x: -Math.SQRT1_2, y: -Math.SQRT1_2 },
+  { x: 0, y: -1 },
+  { x: Math.SQRT1_2, y: -Math.SQRT1_2 },
+];
+const LOCAL_CUE_SENSE_DIRECTIONS: readonly Readonly<Vec2>[] = [
+  { x: 1, y: 0 },
+  { x: -1, y: 0 },
+  { x: 0, y: 1 },
+  { x: 0, y: -1 },
+  { x: Math.SQRT1_2, y: Math.SQRT1_2 },
+  { x: Math.SQRT1_2, y: -Math.SQRT1_2 },
+  { x: -Math.SQRT1_2, y: Math.SQRT1_2 },
+  { x: -Math.SQRT1_2, y: -Math.SQRT1_2 },
+];
 const SHRIMP_CARCASS_LIFETIME_SECONDS = 55;
 const DAPHNIA_CARCASS_LIFETIME_SECONDS = 140;
 const RICEFISH_CARCASS_LIFETIME_SECONDS = 70;
@@ -800,45 +860,90 @@ export class SimulationWorld {
   private readonly biofilmReactionSitesScratch: BiofilmReactionSite[] = [];
   private readonly shrimpFoodCueSitesScratch: ShrimpFoodCueSite[] = [];
   private readonly shrimpMateCueSitesScratch: ShrimpMateCueSite[] = [];
-  private readonly growthOriginalScratch: SpeciesBiomass[] = [];
-  private readonly growthNextScratch: SpeciesBiomass[] = [];
+  private readonly shrimpFoodCellIndexByIdScratch = new Map<string, number>();
+  private shrimpFoodReservationCountsScratch = new Uint16Array(0);
+  private shrimpFoodReservationsActive = false;
+  private readonly planktonSampleScratch: PlanktonSample = {
+    phytoplankton: 0,
+    planktonicDecomposer: 0,
+    daphniaJuveniles: 0,
+    daphniaAdults: 0,
+  };
+  private readonly waterVelocityScratch: Vec2 = { x: 0, y: 0 };
+  private readonly localSamplePointScratch: Vec2 = { x: 0, y: 0 };
+  private readonly waterEscapeScratch: WaterEscapeVector = {
+    x: 0,
+    y: 0,
+    stress: 0,
+  };
+  private readonly cueDirectionScratch: Vec2 = { x: 0, y: 0 };
+  private readonly shrimpMotionBucketsScratch: AnimalState[][] = Array.from(
+    {
+      length:
+        SHRIMP_MOTION_BUCKET_COLUMNS * SHRIMP_MOTION_BUCKET_ROWS,
+    },
+    () => [],
+  );
+  private readonly shrimpMotionUsedBucketIndicesScratch: number[] = [];
+  /**
+   * Species ecology runs sequentially. Reuse these three flat workspaces so a
+   * fast-forward tick does not allocate two filtered copies plus one spread
+   * copy of the complete animal population for every species.
+   */
+  private readonly ecologySpeciesAnimalsScratch: AnimalState[] = [];
+  private readonly ecologyLivingAnimalsScratch: AnimalState[] = [];
+  private readonly ecologyNewbornAnimalsScratch: AnimalState[] = [];
+  private readonly ecologyEatenAnimalIdsScratch = new Set<string>();
+  private readonly biofilmCellIndexByIdScratch = new Map<string, number>();
+  private biofilmTransferSourceScratch = new Int32Array(0);
+  private biofilmTransferReceiverScratch = new Int32Array(0);
+  private biofilmTransferGuildScratch = new Uint8Array(0);
+  private biofilmTransferAmountScratch = new Float64Array(0);
+  private biofilmIncomingDemandScratch = new Float64Array(0);
+  private biofilmOutgoingDemandScratch = new Float64Array(0);
+  private growthOriginalScratch = new Float64Array(0);
+  private growthNextScratch = new Float64Array(0);
   private readonly growthCellIndexByIdScratch = new Map<string, number>();
   private readonly growthRecruitmentTransfersScratch: GrowthRecruitmentTransfer[] = [];
   private growthIncomingDemandScratch = new Float64Array(0);
   private growthOutgoingDemandScratch = new Float64Array(0);
-  private readonly growthRatesScratch = emptyBiomass();
-  private readonly growthResourceFactorsScratch = emptyBiomass();
+  private readonly growthRatesScratch = new Float64Array(3);
+  private readonly growthResourceFactorsScratch = new Float64Array(3);
   private readonly growthActivityPointsScratch: Record<SpeciesId, Vec2> = {
     oedogonium: { x: 0, y: 0 },
     nitzschia: { x: 0, y: 0 },
     vallisneria: { x: 0, y: 0 },
   };
-  private readonly growthPhysiologyScratch: Record<SpeciesId, AlgaePhysiologyRates> = {
-    oedogonium: {
-      grossPhotosynthesis: 0,
-      respiration: 0,
-      lightStressTurnover: 0,
-      netGrowth: 0,
-    },
-    nitzschia: {
-      grossPhotosynthesis: 0,
-      respiration: 0,
-      lightStressTurnover: 0,
-      netGrowth: 0,
-    },
-    vallisneria: {
-      grossPhotosynthesis: 0,
-      respiration: 0,
-      lightStressTurnover: 0,
-      netGrowth: 0,
-    },
-  };
+  private readonly growthPhysiologyScratch = new Float64Array(
+    3 * ALGAE_PHYSIOLOGY_VALUE_COUNT,
+  );
   private readonly vallisneriaPhysiologySampleScratch: AlgaePhysiologyRates = {
     grossPhotosynthesis: 0,
     respiration: 0,
     lightStressTurnover: 0,
     netGrowth: 0,
   };
+  private readonly vallisneriaPhysiologyTotalScratch: AlgaePhysiologyRates = {
+    grossPhotosynthesis: 0,
+    respiration: 0,
+    lightStressTurnover: 0,
+    netGrowth: 0,
+  };
+  private readonly vallisneriaLeavesScratch: VallisneriaLeafGeometry[] = [];
+  private readonly vallisneriaCanopyPointsScratch: Vec2[] = [];
+  private readonly vallisneriaCanopyLightsScratch = new Float64Array(32);
+  private readonly vallisneriaLeafPointScratch: Vec2 = { x: 0, y: 0 };
+  private readonly vallisneriaActivityPointScratch: Vec2 = { x: 0, y: 0 };
+  private readonly vallisneriaUptakePointScratch: Vec2 = { x: 0, y: 0 };
+  private readonly vallisneriaCanopyBoundsScratch: VallisneriaCanopyBoundsState = {
+    minX: 0,
+    minY: 0,
+    maxX: 0,
+    maxY: 0,
+  };
+  private readonly vallisneriaPhysiologyRatesScratch = new Float64Array(
+    ALGAE_PHYSIOLOGY_VALUE_COUNT,
+  );
   private message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
   public constructor(scenarioId: ScenarioId = 'mission-1') {
@@ -878,6 +983,7 @@ export class SimulationWorld {
     this.measurements = [];
     this.selection = null;
     this.seedPlacements = [];
+    this.clearShrimpMotionBuckets();
     this.animals = [];
     this.carcasses = [];
     this.animalPopulationEvents = [];
@@ -1367,6 +1473,26 @@ export class SimulationWorld {
     return target;
   }
 
+  /**
+   * The 30 Hz binary channel needs only fields encoded by SharedMotionWriter.
+   * Keep observational water, attachment, generation, and thermal calculations
+   * on the one-second full snapshot path instead of repeating them for every
+   * animal on every presentation sample.
+   */
+  public motionTransportSnapshot(reuse?: MotionSnapshotState): MotionSnapshotState {
+    const target = reuse ?? {
+      structures: [],
+      animals: [],
+      holding: null,
+      probe: null,
+    };
+    target.structures = this.structureSnapshots(target.structures);
+    target.animals = this.animalMotionSnapshots(target.animals);
+    target.holding = this.holdingSnapshot();
+    target.probe = this.probe ? { ...this.probe, trends: { ...this.probe.trends } } : null;
+    return target;
+  }
+
   public motionSnapshot(): {
     structures: StructureSnapshot[];
     animals: AnimalSnapshot[];
@@ -1828,6 +1954,16 @@ export class SimulationWorld {
       biofilm: emptyBiofilm(),
       localNeighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
       neighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
+      worldPoint: { x: cell.x, y: cell.y },
+      shrimpContactPoint: {
+        x: clamp(cell.x, 18, TANK_WIDTH - 18),
+        y: clamp(cell.y, WATER_TOP + 18, GROUND_Y - 16),
+      },
+      worldTransformX: cell.x,
+      worldTransformY: cell.y,
+      worldTransformAngle: 0,
+      shrimpContactSourceX: cell.x,
+      shrimpContactSourceY: cell.y,
     }));
   }
 
@@ -1889,6 +2025,13 @@ export class SimulationWorld {
         biofilm: emptyBiofilm(),
         localNeighborIds: cell.neighborIndices.map((neighbor) => cellIds[neighbor]),
         neighborIds: cell.neighborIndices.map((neighbor) => cellIds[neighbor]),
+        worldPoint: { x: 0, y: 0 },
+        shrimpContactPoint: { x: 0, y: 0 },
+        worldTransformX: Number.NaN,
+        worldTransformY: Number.NaN,
+        worldTransformAngle: Number.NaN,
+        shrimpContactSourceX: Number.NaN,
+        shrimpContactSourceY: Number.NaN,
       })),
     };
     this.structures.push(structure);
@@ -3757,19 +3900,71 @@ export class SimulationWorld {
     this.crossConnectionsDirty = false;
   }
 
+  private clearShrimpMotionBuckets(): void {
+    for (const index of this.shrimpMotionUsedBucketIndicesScratch) {
+      this.shrimpMotionBucketsScratch[index].length = 0;
+    }
+    this.shrimpMotionUsedBucketIndicesScratch.length = 0;
+  }
+
+  private shrimpMotionBucketIndex(point: Vec2): number {
+    const column = clamp(
+      Math.floor(point.x / SHRIMP_MOTION_BUCKET_SIZE),
+      0,
+      SHRIMP_MOTION_BUCKET_COLUMNS - 1,
+    );
+    const row = clamp(
+      Math.floor((point.y - WATER_TOP) / SHRIMP_MOTION_BUCKET_SIZE),
+      0,
+      SHRIMP_MOTION_BUCKET_ROWS - 1,
+    );
+    return row * SHRIMP_MOTION_BUCKET_COLUMNS + column;
+  }
+
+  private rebuildShrimpMotionBuckets(): void {
+    this.clearShrimpMotionBuckets();
+    for (const animal of this.animals) {
+      if (animal.speciesId !== 'cherry-shrimp') continue;
+      const index = this.shrimpMotionBucketIndex(animal.position);
+      const bucket = this.shrimpMotionBucketsScratch[index];
+      if (bucket.length === 0) {
+        this.shrimpMotionUsedBucketIndicesScratch.push(index);
+      }
+      bucket.push(animal);
+    }
+  }
+
   private stepAnimalMotion(deltaSeconds: number): void {
+    const useShrimpMotionBuckets =
+      deltaSeconds <= FAST_ANIMAL_MOTION_STEP_SECONDS + 1e-10;
+    if (useShrimpMotionBuckets) {
+      this.rebuildShrimpMotionBuckets();
+    } else {
+      // Direct tests and diagnostic callers sometimes use a coarse motion
+      // delta. Do not leave prior bucket references alive when falling back to
+      // the exact species-filtered scan.
+      this.clearShrimpMotionBuckets();
+    }
     if (!this.animals.length) return;
+    // Build target occupancy once for the substep. Removing each animal before
+    // it moves and restoring its final target preserves the previous
+    // "scan every other animal" ordering, including targets changed by animals
+    // processed earlier in this same substep.
+    this.prepareShrimpFoodReservations();
+    this.shrimpFoodReservationsActive = true;
     for (const animal of this.animals) {
       animal.nextTargetEvaluation -= deltaSeconds;
       animal.behaviorTimer = Math.max(0, animal.behaviorTimer - deltaSeconds);
-      if (animal.speciesId === 'japanese-ricefish') {
-        this.stepRicefishMotion(animal, deltaSeconds);
-        continue;
-      }
-      if (animal.speciesId === 'daphnia') {
-        this.stepDaphniaMotion(animal, deltaSeconds);
-        continue;
-      }
+      this.adjustShrimpFoodReservation(animal.targetCellId, -1);
+      try {
+        if (animal.speciesId === 'japanese-ricefish') {
+          this.stepRicefishMotion(animal, deltaSeconds);
+          continue;
+        }
+        if (animal.speciesId === 'daphnia') {
+          this.stepDaphniaMotion(animal, deltaSeconds);
+          continue;
+        }
       const waterEscape = this.shrimpLocalWaterEscape(animal);
       if (waterEscape) {
         // Unsafe water takes priority over courtship and feeding. A shrimp
@@ -3790,7 +3985,7 @@ export class SimulationWorld {
           (waterEscape.y * desiredSpeed - animal.velocity.y) * response;
         animal.position.x += animal.velocity.x * deltaSeconds;
         animal.position.y += animal.velocity.y * deltaSeconds;
-        animal.position = this.clampAnimalPoint(animal.position);
+        this.clampAnimalPoint(animal.position, animal.position);
         if (Math.abs(animal.velocity.x) > 2.5) {
           animal.facing = animal.velocity.x < 0 ? -1 : 1;
         }
@@ -3807,21 +4002,34 @@ export class SimulationWorld {
         (animal.ovarianProgress ?? 0) >= 1 &&
         animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
         animal.energy >= SHRIMP_REPRODUCTION_ENERGY;
-      const nearbyMate = readyToMate
-        ? this.animals
-          .filter((candidate) =>
-            candidate.id !== animal.id &&
-            candidate.speciesId === 'cherry-shrimp' &&
-            candidate.lifeStage === 'adult' &&
-            candidate.sex === 'male' &&
+      let nearbyMate: AnimalState | undefined;
+      if (readyToMate) {
+        const attractionDistanceSquared =
+          SHRIMP_MATING_ATTRACTION_RADIUS * SHRIMP_MATING_ATTRACTION_RADIUS;
+        let nearestMateDistanceSquared = Number.POSITIVE_INFINITY;
+        for (const candidate of this.animals) {
+          if (
+            candidate.id === animal.id ||
+            candidate.speciesId !== 'cherry-shrimp' ||
+            candidate.lifeStage !== 'adult' ||
+            candidate.sex !== 'male'
+          ) continue;
+          if (!(
             candidate.energy >= SHRIMP_ECOLOGY_RULES.maleReproductionEnergy &&
-            candidate.reproductionCooldown <= 0 &&
-            distanceSquared(candidate.position, animal.position) <=
-              SHRIMP_MATING_ATTRACTION_RADIUS * SHRIMP_MATING_ATTRACTION_RADIUS)
-          .sort((left, right) =>
-            distanceSquared(animal.position, left.position) -
-            distanceSquared(animal.position, right.position))[0]
-        : undefined;
+            candidate.reproductionCooldown <= 0
+          )) continue;
+          const candidateDistanceSquared = distanceSquared(
+            candidate.position,
+            animal.position,
+          );
+          if (
+            !(candidateDistanceSquared <= attractionDistanceSquared) ||
+            candidateDistanceSquared >= nearestMateDistanceSquared
+          ) continue;
+          nearbyMate = candidate;
+          nearestMateDistanceSquared = candidateDistanceSquared;
+        }
+      }
       if (nearbyMate) {
         const dx = nearbyMate.position.x - animal.position.x;
         const dy = nearbyMate.position.y - animal.position.y;
@@ -3834,7 +4042,7 @@ export class SimulationWorld {
         animal.velocity.y += (desiredY - animal.velocity.y) * response;
         animal.position.x += animal.velocity.x * deltaSeconds;
         animal.position.y += animal.velocity.y * deltaSeconds;
-        animal.position = this.clampAnimalPoint(animal.position);
+        this.clampAnimalPoint(animal.position, animal.position);
         animal.targetCellId = null;
         animal.behavior = 'courting';
         if (Math.abs(animal.velocity.x) > 2.5) {
@@ -4039,15 +4247,88 @@ export class SimulationWorld {
         desiredX += (-dy / distance) * lateralWave;
         desiredY += (dx / distance) * lateralWave;
 
-        for (const other of this.animals) {
-          if (other.id === animal.id) continue;
-          const separationX = animal.position.x - other.position.x;
-          const separationY = animal.position.y - other.position.y;
-          const separationDistance = Math.hypot(separationX, separationY);
-          if (separationDistance <= 0.001 || separationDistance >= 24) continue;
-          const pressure = (24 - separationDistance) / 24;
-          desiredX += (separationX / separationDistance) * pressure * 34;
-          desiredY += (separationY / separationDistance) * pressure * 34;
+        if (useShrimpMotionBuckets) {
+          const bucketIndex = this.shrimpMotionBucketIndex(animal.position);
+          const bucketColumn = bucketIndex % SHRIMP_MOTION_BUCKET_COLUMNS;
+          const bucketRow = Math.floor(
+            bucketIndex / SHRIMP_MOTION_BUCKET_COLUMNS,
+          );
+          const minimumColumn = Math.max(
+            0,
+            bucketColumn - SHRIMP_MOTION_BUCKET_NEIGHBOR_RANGE,
+          );
+          const maximumColumn = Math.min(
+            SHRIMP_MOTION_BUCKET_COLUMNS - 1,
+            bucketColumn + SHRIMP_MOTION_BUCKET_NEIGHBOR_RANGE,
+          );
+          const minimumRow = Math.max(
+            0,
+            bucketRow - SHRIMP_MOTION_BUCKET_NEIGHBOR_RANGE,
+          );
+          const maximumRow = Math.min(
+            SHRIMP_MOTION_BUCKET_ROWS - 1,
+            bucketRow + SHRIMP_MOTION_BUCKET_NEIGHBOR_RANGE,
+          );
+          for (let row = minimumRow; row <= maximumRow; row += 1) {
+            const rowOffset = row * SHRIMP_MOTION_BUCKET_COLUMNS;
+            for (
+              let column = minimumColumn;
+              column <= maximumColumn;
+              column += 1
+            ) {
+              const bucket =
+                this.shrimpMotionBucketsScratch[rowOffset + column];
+              for (const other of bucket) {
+                if (other.id === animal.id) continue;
+                const separationX = animal.position.x - other.position.x;
+                const separationY = animal.position.y - other.position.y;
+                const separationDistance = Math.hypot(
+                  separationX,
+                  separationY,
+                );
+                if (
+                  separationDistance <= 0.001 ||
+                  separationDistance >= SHRIMP_SEPARATION_RADIUS
+                ) continue;
+                const pressure =
+                  (SHRIMP_SEPARATION_RADIUS - separationDistance) /
+                  SHRIMP_SEPARATION_RADIUS;
+                desiredX +=
+                  (separationX / separationDistance) *
+                  pressure *
+                  SHRIMP_SEPARATION_FORCE;
+                desiredY +=
+                  (separationY / separationDistance) *
+                  pressure *
+                  SHRIMP_SEPARATION_FORCE;
+              }
+            }
+          }
+        } else {
+          for (const other of this.animals) {
+            if (
+              other.id === animal.id ||
+              other.speciesId !== 'cherry-shrimp'
+            ) continue;
+            const separationX = animal.position.x - other.position.x;
+            const separationY = animal.position.y - other.position.y;
+            const separationDistance = Math.hypot(separationX, separationY);
+            if (
+              separationDistance <= 0.001 ||
+              separationDistance >= SHRIMP_SEPARATION_RADIUS
+            ) continue;
+            const pressure =
+              (SHRIMP_SEPARATION_RADIUS - separationDistance) /
+              SHRIMP_SEPARATION_RADIUS;
+            desiredX +=
+              (separationX / separationDistance) *
+              pressure *
+              SHRIMP_SEPARATION_FORCE;
+            desiredY +=
+              (separationY / separationDistance) *
+              pressure *
+              SHRIMP_SEPARATION_FORCE;
+          }
         }
 
         const response = 1 - Math.exp(-deltaSeconds * 4.2);
@@ -4057,14 +4338,22 @@ export class SimulationWorld {
         animal.position.y += animal.velocity.y * deltaSeconds;
       }
 
-      animal.position = this.clampAnimalPoint(animal.position);
+      this.clampAnimalPoint(animal.position, animal.position);
       if (Math.abs(animal.velocity.x) > 2.5) animal.facing = animal.velocity.x < 0 ? -1 : 1;
       animal.poseAngle = clamp(
         Math.atan2(animal.velocity.y, Math.max(5, Math.abs(animal.velocity.x))),
         -0.34,
         0.34,
       );
+      } finally {
+        this.adjustShrimpFoodReservation(animal.targetCellId, 1);
+      }
     }
+    this.shrimpFoodReservationsActive = false;
+    // Buckets are rebuilt from current positions for every motion substep.
+    // Releasing their object references now also keeps animals removed by the
+    // following ecology step from being retained while the simulation pauses.
+    this.clearShrimpMotionBuckets();
   }
 
   private stepDaphniaMotion(
@@ -4072,7 +4361,10 @@ export class SimulationWorld {
     deltaSeconds: number,
   ): void {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
-    const localFood = this.biogeochemistry.planktonAt(animal.position);
+    const localFood = this.biogeochemistry.planktonAt(
+      animal.position,
+      this.planktonSampleScratch,
+    );
     const centerFood = localFood.phytoplankton +
       localFood.planktonicDecomposer * rules.maximumBacteriaDietFraction;
     const hungry = centerFood < rules.phytoplanktonHalfSaturation ||
@@ -4136,7 +4428,10 @@ export class SimulationWorld {
     const roamingWeight = hungry
       ? 1.08
       : 0.78 + (1 - localFoodResponse) * 0.18;
-    const current = this.biogeochemistry.velocityAt(animal.position);
+    const current = this.biogeochemistry.velocityAt(
+      animal.position,
+      this.waterVelocityScratch,
+    );
     // A hard positional clamp leaves outward velocity intact and can pin a
     // Daphnia to the glass while only its appendages animate. Steer away
     // before contact, then reflect any remaining outward velocity.
@@ -4197,22 +4492,22 @@ export class SimulationWorld {
     const response = 1 - Math.exp(-deltaSeconds * (hop > 0 ? 7 : 2.8));
     animal.velocity.x += (desiredX - animal.velocity.x) * response;
     animal.velocity.y += (desiredY - animal.velocity.y) * response;
-    const proposed = {
-      x: animal.position.x + animal.velocity.x * deltaSeconds,
-      y: animal.position.y + animal.velocity.y * deltaSeconds,
-    };
-    const clamped = this.clampDaphniaPoint(proposed);
-    if (clamped.x !== proposed.x) {
-      animal.velocity.x = clamped.x <= 10
+    const proposedX = animal.position.x + animal.velocity.x * deltaSeconds;
+    const proposedY = animal.position.y + animal.velocity.y * deltaSeconds;
+    const clampedX = clamp(proposedX, 10, TANK_WIDTH - 10);
+    const clampedY = clamp(proposedY, WATER_TOP + 12, GROUND_Y - 14);
+    if (clampedX !== proposedX) {
+      animal.velocity.x = clampedX <= 10
         ? Math.abs(animal.velocity.x) * 0.62
         : -Math.abs(animal.velocity.x) * 0.62;
     }
-    if (clamped.y !== proposed.y) {
-      animal.velocity.y = clamped.y <= waterTop
+    if (clampedY !== proposedY) {
+      animal.velocity.y = clampedY <= waterTop
         ? Math.abs(animal.velocity.y) * 0.58
         : -Math.abs(animal.velocity.y) * 0.58;
     }
-    animal.position = clamped;
+    animal.position.x = clampedX;
+    animal.position.y = clampedY;
     if (Math.abs(animal.velocity.x) > 0.8) animal.facing = animal.velocity.x < 0 ? -1 : 1;
     animal.poseAngle = clamp(
       Math.atan2(animal.velocity.y, Math.max(3, Math.abs(animal.velocity.x))),
@@ -4231,7 +4526,11 @@ export class SimulationWorld {
       const attachment = animal.attachmentCellId
         ? this.cellById(animal.attachmentCellId)
         : undefined;
-      if (attachment) animal.position = this.cellWorldPoint(attachment);
+      if (attachment) {
+        const point = this.cellWorldPoint(attachment);
+        animal.position.x = point.x;
+        animal.position.y = point.y;
+      }
       animal.velocity.x = 0;
       animal.velocity.y = 0;
       animal.poseAngle = 0;
@@ -4240,11 +4539,11 @@ export class SimulationWorld {
     }
 
     const rules = RICEFISH_ECOLOGY_RULES;
-    const water = this.biogeochemistry.effectsEnabled
-      ? this.biogeochemistry.sampleAt(animal.position)
+    const localOxygen = this.biogeochemistry.effectsEnabled
+      ? this.biogeochemistry.oxygenAt(animal.position)
       : null;
-    const oxygenActivity = water
-      ? clamp((water.oxygen - rules.oxygenSevereStress) /
+    const oxygenActivity = localOxygen !== null
+      ? clamp((localOxygen - rules.oxygenSevereStress) /
         (rules.oxygenStressStart - rules.oxygenSevereStress), 0.35, 1)
       : 1;
     const isNight = this.currentDayNightState()?.phase === 'night';
@@ -4261,20 +4560,30 @@ export class SimulationWorld {
         rules.eggClutchMinimum * WATER_CYCLE_RULES.ricefish.eggBiomass &&
       animal.health > 0.72 &&
       animal.energy >= rules.matingEnergy;
-    const mate = matingReady
-      ? this.animals
-        .filter((candidate) =>
-          candidate.id !== animal.id &&
-          candidate.speciesId === 'japanese-ricefish' &&
-          candidate.lifeStage === 'adult' &&
-          candidate.sex === 'male' &&
-          candidate.health > 0.72 &&
-          distanceSquared(candidate.position, animal.position) <= 420 * 420 &&
-          this.ricefishHasLineOfSight(animal.position, candidate.position))
-        .sort((left, right) =>
-          distanceSquared(animal.position, left.position) -
-          distanceSquared(animal.position, right.position))[0]
-      : undefined;
+    let mate: AnimalState | undefined;
+    if (matingReady) {
+      let nearestMateDistanceSquared = Number.POSITIVE_INFINITY;
+      for (const candidate of this.animals) {
+        if (
+          candidate.id === animal.id ||
+          candidate.speciesId !== 'japanese-ricefish' ||
+          candidate.lifeStage !== 'adult' ||
+          candidate.sex !== 'male' ||
+          candidate.health <= 0.72
+        ) continue;
+        const candidateDistanceSquared = distanceSquared(
+          candidate.position,
+          animal.position,
+        );
+        if (
+          candidateDistanceSquared > 420 * 420 ||
+          candidateDistanceSquared >= nearestMateDistanceSquared ||
+          !this.ricefishHasLineOfSight(animal.position, candidate.position)
+        ) continue;
+        mate = candidate;
+        nearestMateDistanceSquared = candidateDistanceSquared;
+      }
+    }
 
     let prey = animal.targetAnimalId
       ? this.animals.find((candidate) =>
@@ -4386,10 +4695,9 @@ export class SimulationWorld {
       desiredY += (centreY - animal.position.y) * 0.11 + headingY / neighbourCount * 0.12;
     }
 
-    const proposed = {
-      x: animal.position.x + desiredX * deltaSeconds,
-      y: animal.position.y + desiredY * deltaSeconds,
-    };
+    const proposed = this.localSamplePointScratch;
+    proposed.x = animal.position.x + desiredX * deltaSeconds;
+    proposed.y = animal.position.y + desiredY * deltaSeconds;
     if (!this.ricefishHasLineOfSight(animal.position, proposed)) {
       desiredX = -desiredY * 0.72;
       desiredY = animal.facing * Math.abs(desiredX) * 0.32;
@@ -4403,7 +4711,7 @@ export class SimulationWorld {
     animal.velocity.y += (desiredY - animal.velocity.y) * response;
     animal.position.x += animal.velocity.x * deltaSeconds;
     animal.position.y += animal.velocity.y * deltaSeconds;
-    animal.position = this.clampAnimalPoint(animal.position);
+    this.clampAnimalPoint(animal.position, animal.position);
     if (Math.abs(animal.velocity.x) > 2.5) animal.facing = animal.velocity.x < 0 ? -1 : 1;
     animal.poseAngle = clamp(
       Math.atan2(animal.velocity.y, Math.max(12, Math.abs(animal.velocity.x))),
@@ -4510,21 +4818,43 @@ export class SimulationWorld {
   private stepBiofilmDispersal(deltaSeconds: number): void {
     if (!this.biogeochemistry.effectsEnabled || deltaSeconds <= 0) return;
     const cells = this.allCells();
-    const byId = new Map(cells.map((cell) => [cell.id, cell]));
-    interface Transfer {
-      source: SurfaceCellState;
-      receiver: SurfaceCellState;
-      guildId: MicrobeGuildId;
-      amount: number;
+    const cellIndexById = this.biofilmCellIndexByIdScratch;
+    cellIndexById.clear();
+    let maximumTransferCount = 0;
+    for (let index = 0; index < cells.length; index += 1) {
+      const cell = cells[index];
+      cellIndexById.set(cell.id, index);
+      // An undirected edge can propose two guild transfers; the sum of the
+      // directed neighbor counts is exactly that upper bound.
+      maximumTransferCount += cell.neighborIds.length;
     }
-    const transfers: Transfer[] = [];
+    if (this.biofilmTransferAmountScratch.length < maximumTransferCount) {
+      this.biofilmTransferSourceScratch = new Int32Array(maximumTransferCount);
+      this.biofilmTransferReceiverScratch = new Int32Array(maximumTransferCount);
+      this.biofilmTransferGuildScratch = new Uint8Array(maximumTransferCount);
+      this.biofilmTransferAmountScratch = new Float64Array(maximumTransferCount);
+    }
+    if (this.biofilmIncomingDemandScratch.length !== cells.length) {
+      this.biofilmIncomingDemandScratch = new Float64Array(cells.length);
+      this.biofilmOutgoingDemandScratch = new Float64Array(cells.length * 2);
+    }
+    const transferSources = this.biofilmTransferSourceScratch;
+    const transferReceivers = this.biofilmTransferReceiverScratch;
+    const transferGuilds = this.biofilmTransferGuildScratch;
+    const transferAmounts = this.biofilmTransferAmountScratch;
+    let transferCount = 0;
 
-    for (const cell of cells) {
+    for (let cellIndex = 0; cellIndex < cells.length; cellIndex += 1) {
+      const cell = cells[cellIndex];
       for (const neighborId of cell.neighborIds) {
         if (cell.id >= neighborId) continue;
-        const neighbor = byId.get(neighborId);
-        if (!neighbor) continue;
-        for (const guildId of ['decomposer', 'nitrifier'] as const) {
+        const neighborIndex = cellIndexById.get(neighborId);
+        if (neighborIndex === undefined) continue;
+        const neighbor = cells[neighborIndex];
+        for (let guildIndex = 0; guildIndex < 2; guildIndex += 1) {
+          const guildId: MicrobeGuildId = guildIndex === 0
+            ? 'decomposer'
+            : 'nitrifier';
           const response = 1 - Math.exp(
             -MICROBE_ECOLOGY_RULES[guildId].surfaceSpreadRate * deltaSeconds,
           );
@@ -4537,43 +4867,60 @@ export class SimulationWorld {
             1 - receiver.biofilm.decomposer - receiver.biofilm.nitrifier,
           );
           const amount = Math.min(available, Math.abs(difference) * response * 0.5);
-          if (amount > 0) transfers.push({ source, receiver, guildId, amount });
+          if (amount <= 0) continue;
+          transferSources[transferCount] = difference > 0 ? cellIndex : neighborIndex;
+          transferReceivers[transferCount] = difference > 0 ? neighborIndex : cellIndex;
+          transferGuilds[transferCount] = guildIndex;
+          transferAmounts[transferCount] = amount;
+          transferCount += 1;
         }
       }
     }
 
-    const incoming = new Map<string, number>();
-    const outgoing = new Map<string, number>();
-    for (const transfer of transfers) {
-      incoming.set(
-        transfer.receiver.id,
-        (incoming.get(transfer.receiver.id) ?? 0) + transfer.amount,
-      );
-      const sourceKey = `${transfer.source.id}\0${transfer.guildId}`;
-      outgoing.set(sourceKey, (outgoing.get(sourceKey) ?? 0) + transfer.amount);
+    const incomingDemand = this.biofilmIncomingDemandScratch;
+    const outgoingDemand = this.biofilmOutgoingDemandScratch;
+    incomingDemand.fill(0);
+    outgoingDemand.fill(0);
+    for (let index = 0; index < transferCount; index += 1) {
+      const amount = transferAmounts[index];
+      incomingDemand[transferReceivers[index]] += amount;
+      outgoingDemand[transferSources[index] * 2 + transferGuilds[index]] += amount;
     }
-    for (const transfer of transfers) {
+    for (let index = 0; index < transferCount; index += 1) {
+      const sourceIndex = transferSources[index];
+      const receiverIndex = transferReceivers[index];
+      const guildIndex = transferGuilds[index];
+      const guildId: MicrobeGuildId = guildIndex === 0
+        ? 'decomposer'
+        : 'nitrifier';
+      const source = cells[sourceIndex];
+      const receiver = cells[receiverIndex];
       const receiverCapacity = Math.max(
         0,
-        1 - transfer.receiver.biofilm.decomposer - transfer.receiver.biofilm.nitrifier,
+        1 - receiver.biofilm.decomposer - receiver.biofilm.nitrifier,
       );
-      const incomingDemand = incoming.get(transfer.receiver.id) ?? 0;
-      if (incomingDemand > receiverCapacity && incomingDemand > 0) {
-        transfer.amount *= receiverCapacity / incomingDemand;
+      const receiverDemand = incomingDemand[receiverIndex];
+      if (receiverDemand > receiverCapacity && receiverDemand > 0) {
+        transferAmounts[index] *= receiverCapacity / receiverDemand;
       }
-      const sourceKey = `${transfer.source.id}\0${transfer.guildId}`;
-      const outgoingDemand = outgoing.get(sourceKey) ?? 0;
-      const available = transfer.source.biofilm[transfer.guildId];
-      if (outgoingDemand > available && outgoingDemand > 0) {
-        transfer.amount *= available / outgoingDemand;
+      const sourceDemand = outgoingDemand[sourceIndex * 2 + guildIndex];
+      const available = source.biofilm[guildId];
+      if (sourceDemand > available && sourceDemand > 0) {
+        transferAmounts[index] *= available / sourceDemand;
       }
     }
-    for (const transfer of transfers) {
-      transfer.source.biofilm[transfer.guildId] = Math.max(
+    for (let index = 0; index < transferCount; index += 1) {
+      const source = cells[transferSources[index]];
+      const receiver = cells[transferReceivers[index]];
+      const guildId: MicrobeGuildId = transferGuilds[index] === 0
+        ? 'decomposer'
+        : 'nitrifier';
+      const amount = transferAmounts[index];
+      source.biofilm[guildId] = Math.max(
         0,
-        transfer.source.biofilm[transfer.guildId] - transfer.amount,
+        source.biofilm[guildId] - amount,
       );
-      transfer.receiver.biofilm[transfer.guildId] += transfer.amount;
+      receiver.biofilm[guildId] += amount;
     }
 
     // A small viable fraction leaves mature films, is carried by unresolved
@@ -4581,7 +4928,10 @@ export class SimulationWorld {
     // This is mass-conserving: every suspended propagule is removed from a
     // source film first, then either settles or loses viability.
     for (const cell of cells) {
-      for (const guildId of ['decomposer', 'nitrifier'] as const) {
+      for (let guildIndex = 0; guildIndex < 2; guildIndex += 1) {
+        const guildId: MicrobeGuildId = guildIndex === 0
+          ? 'decomposer'
+          : 'nitrifier';
         const kinetics = MICROBE_ECOLOGY_RULES[guildId];
         const detached = cell.biofilm[guildId] *
           (1 - Math.exp(-kinetics.waterborneExportRate * deltaSeconds));
@@ -4598,7 +4948,10 @@ export class SimulationWorld {
       }
     }
 
-    for (const guildId of ['decomposer', 'nitrifier'] as const) {
+    for (let guildIndex = 0; guildIndex < 2; guildIndex += 1) {
+      const guildId: MicrobeGuildId = guildIndex === 0
+        ? 'decomposer'
+        : 'nitrifier';
       const kinetics = MICROBE_ECOLOGY_RULES[guildId];
       if (guildId === 'nitrifier') {
         const suspendedBeforeDecay = this.suspendedBiofilm.nitrifier;
@@ -4662,6 +5015,58 @@ export class SimulationWorld {
     }
   }
 
+  private collectAnimalSpecies(speciesId: AnimalSpeciesId): AnimalState[] {
+    const collected = this.ecologySpeciesAnimalsScratch;
+    collected.length = 0;
+    for (let index = 0; index < this.animals.length; index += 1) {
+      const animal = this.animals[index];
+      if (animal.speciesId === speciesId) collected.push(animal);
+    }
+    return collected;
+  }
+
+  /**
+   * Preserve the former `[...nonSpecies, ...living, ...newborns]` ordering
+   * while compacting the owned array in place.
+   */
+  private replaceAnimalSpecies(
+    speciesId: AnimalSpeciesId,
+    living: AnimalState[],
+    newborns: AnimalState[],
+  ): void {
+    let writeIndex = 0;
+    for (let readIndex = 0; readIndex < this.animals.length; readIndex += 1) {
+      const animal = this.animals[readIndex];
+      if (animal.speciesId === speciesId) continue;
+      this.animals[writeIndex] = animal;
+      writeIndex += 1;
+    }
+    for (let index = 0; index < living.length; index += 1) {
+      this.animals[writeIndex] = living[index];
+      writeIndex += 1;
+    }
+    for (let index = 0; index < newborns.length; index += 1) {
+      this.animals[writeIndex] = newborns[index];
+      writeIndex += 1;
+    }
+    this.animals.length = writeIndex;
+    this.ecologySpeciesAnimalsScratch.length = 0;
+    living.length = 0;
+    newborns.length = 0;
+  }
+
+  private removeAnimalsById(ids: ReadonlySet<string>): void {
+    if (!ids.size) return;
+    let writeIndex = 0;
+    for (let readIndex = 0; readIndex < this.animals.length; readIndex += 1) {
+      const animal = this.animals[readIndex];
+      if (ids.has(animal.id)) continue;
+      this.animals[writeIndex] = animal;
+      writeIndex += 1;
+    }
+    this.animals.length = writeIndex;
+  }
+
   private stepAnimalEcology(deltaSeconds: number): void {
     if (this.carcasses.length) {
       let retainedCarcasses = 0;
@@ -4683,8 +5088,7 @@ export class SimulationWorld {
     this.stepDaphniaEcology(deltaSeconds);
     this.stepRicefishEcology(deltaSeconds);
     if (!this.animals.length) return;
-    const shrimpAnimals = this.animals.filter((animal) =>
-      animal.speciesId === 'cherry-shrimp');
+    const shrimpAnimals = this.collectAnimalSpecies('cherry-shrimp');
     if (!shrimpAnimals.length) return;
     interface GrazingRequest {
       animal: AnimalState;
@@ -4992,8 +5396,10 @@ export class SimulationWorld {
       );
     }
 
-    const newborns: AnimalState[] = [];
-    const living: AnimalState[] = [];
+    const newborns = this.ecologyNewbornAnimalsScratch;
+    const living = this.ecologyLivingAnimalsScratch;
+    newborns.length = 0;
+    living.length = 0;
     for (const animal of shrimpAnimals) {
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
@@ -5264,28 +5670,29 @@ export class SimulationWorld {
       }
       living.push(animal);
     }
-    this.animals = [
-      ...this.animals.filter((animal) => animal.speciesId !== 'cherry-shrimp'),
-      ...living,
-      ...newborns,
-    ];
+    this.replaceAnimalSpecies('cherry-shrimp', living, newborns);
     this.snapshotDirty = true;
   }
 
   private stepDaphniaEcology(deltaSeconds: number): void {
-    const daphnia = this.animals.filter((animal) => animal.speciesId === 'daphnia');
+    const daphnia = this.collectAnimalSpecies('daphnia');
     if (!daphnia.length) {
       this.syncDaphniaIndividuals();
       return;
     }
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
-    const living: AnimalState[] = [];
-    const newborns: AnimalState[] = [];
+    const living = this.ecologyLivingAnimalsScratch;
+    const newborns = this.ecologyNewbornAnimalsScratch;
+    living.length = 0;
+    newborns.length = 0;
     for (const animal of daphnia) {
       animal.ageSeconds += deltaSeconds;
       animal.recentIntake *= Math.exp(-deltaSeconds / 6);
       animal.secondsSinceFood += deltaSeconds;
-      const local = this.biogeochemistry.planktonAt(animal.position);
+      const local = this.biogeochemistry.planktonAt(
+        animal.position,
+        this.planktonSampleScratch,
+      );
       // Suspended-food intake follows ordinary type-II saturation. At trace
       // concentrations intake becomes proportionally tiny but no hidden
       // uneatable food floor remains.
@@ -5793,23 +6200,21 @@ export class SimulationWorld {
         living.push(animal);
       }
     }
-    this.animals = [
-      ...this.animals.filter((animal) => animal.speciesId !== 'daphnia'),
-      ...living,
-      ...newborns,
-    ];
+    this.replaceAnimalSpecies('daphnia', living, newborns);
     this.syncDaphniaIndividuals();
     this.snapshotDirty = true;
   }
 
   private stepRicefishEcology(deltaSeconds: number): void {
-    const ricefish = this.animals.filter((animal) =>
-      animal.speciesId === 'japanese-ricefish');
+    const ricefish = this.collectAnimalSpecies('japanese-ricefish');
     if (!ricefish.length) return;
     const rules = RICEFISH_ECOLOGY_RULES;
-    const eatenAnimalIds = new Set<string>();
-    const newbornEggs: AnimalState[] = [];
-    const livingFish: AnimalState[] = [];
+    const eatenAnimalIds = this.ecologyEatenAnimalIdsScratch;
+    const newbornEggs = this.ecologyNewbornAnimalsScratch;
+    const livingFish = this.ecologyLivingAnimalsScratch;
+    eatenAnimalIds.clear();
+    newbornEggs.length = 0;
+    livingFish.length = 0;
 
     for (const fish of ricefish) {
       fish.ageSeconds += deltaSeconds;
@@ -6186,13 +6591,10 @@ export class SimulationWorld {
         this.selection.animalId &&
         eatenAnimalIds.has(this.selection.animalId)
       ) this.selection = null;
-      this.animals = this.animals.filter((animal) => !eatenAnimalIds.has(animal.id));
+      this.removeAnimalsById(eatenAnimalIds);
     }
-    this.animals = [
-      ...this.animals.filter((animal) => animal.speciesId !== 'japanese-ricefish'),
-      ...livingFish,
-      ...newbornEggs,
-    ];
+    this.replaceAnimalSpecies('japanese-ricefish', livingFish, newbornEggs);
+    eatenAnimalIds.clear();
     this.snapshotDirty = true;
   }
 
@@ -6582,21 +6984,52 @@ export class SimulationWorld {
     );
   }
 
-  private chooseFoodTarget(animal: AnimalState): SurfaceCellState | null {
-    const reservations = new Map<string, number>();
-    for (const candidate of this.animals) {
-      if (!candidate.targetCellId || candidate.id === animal.id) continue;
-      reservations.set(candidate.targetCellId, (reservations.get(candidate.targetCellId) ?? 0) + 1);
+  private prepareShrimpFoodReservations(): void {
+    this.allCells();
+    const reservations = this.shrimpFoodReservationCountsScratch;
+    reservations.fill(0);
+    for (const animal of this.animals) {
+      if (!animal.targetCellId) continue;
+      const cellIndex = this.shrimpFoodCellIndexByIdScratch.get(
+        animal.targetCellId,
+      );
+      if (cellIndex === undefined) continue;
+      reservations[cellIndex] += 1;
     }
-    let best: { cell: SurfaceCellState; score: number } | null = null;
-    for (const cell of this.allCells()) {
+  }
+
+  private adjustShrimpFoodReservation(
+    targetCellId: string | null,
+    delta: -1 | 1,
+  ): void {
+    if (!targetCellId) return;
+    const cellIndex = this.shrimpFoodCellIndexByIdScratch.get(targetCellId);
+    if (cellIndex === undefined) return;
+    this.shrimpFoodReservationCountsScratch[cellIndex] += delta;
+  }
+
+  private chooseFoodTarget(animal: AnimalState): SurfaceCellState | null {
+    if (!this.shrimpFoodReservationsActive) {
+      this.prepareShrimpFoodReservations();
+    }
+    const ownTargetIndex = !this.shrimpFoodReservationsActive &&
+      animal.targetCellId
+      ? this.shrimpFoodCellIndexByIdScratch.get(animal.targetCellId)
+      : undefined;
+    let bestCell: SurfaceCellState | null = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    const cells = this.allCells();
+    for (let cellIndex = 0; cellIndex < cells.length; cellIndex += 1) {
+      const cell = cells[cellIndex];
       const food = this.edibleBiomass(cell);
       if (food <= 0) continue;
       const point = this.shrimpSurfaceContactPoint(cell);
       const distance = Math.sqrt(distanceSquared(animal.position, point));
       if (distance > SHRIMP_LOCAL_FOOD_RADIUS) continue;
       if (this.shrimpWaterStressAt(point) > 0) continue;
-      const congestion = reservations.get(cell.id) ?? 0;
+      const congestion =
+        this.shrimpFoodReservationCountsScratch[cellIndex] -
+        (cellIndex === ownTargetIndex ? 1 : 0);
       // Preserve a target only while traveling toward it, so movement does not
       // jitter between neighboring cells. A completed grazing target is cleared
       // before this scorer runs and receives no persistent memory or tabu state.
@@ -6618,9 +7051,12 @@ export class SimulationWorld {
       // trips to the nearest nearly-empty cell.
       const score =
         -distance + foodUtility - congestion * 20 + targetCommitment + noise;
-      if (!best || score > best.score) best = { cell, score };
+      if (score > bestScore) {
+        bestCell = cell;
+        bestScore = score;
+      }
     }
-    return best?.cell ?? null;
+    return bestCell;
   }
 
   private shrimpFoodProfitability(
@@ -6676,15 +7112,16 @@ export class SimulationWorld {
   private daphniaWaterStressAt(point: Vec2): number {
     if (!this.biogeochemistry.effectsEnabled) return 0;
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
-    const water = this.biogeochemistry.sampleAt(point);
+    const oxygen = this.biogeochemistry.oxygenAt(point);
+    const toxicWaste = this.biogeochemistry.toxicWasteAt(point);
     const oxygenStress = clamp(
-      (rules.oxygenStressStart - water.oxygen) /
+      (rules.oxygenStressStart - oxygen) /
         rules.oxygenStressStart,
       0,
       1,
     );
     const toxicStress = clamp(
-      (water.toxicWaste - rules.toxicWasteStressStart) /
+      (toxicWaste - rules.toxicWasteStressStart) /
         Math.max(
           1,
           rules.toxicWasteFullStress - rules.toxicWasteStressStart,
@@ -6706,35 +7143,43 @@ export class SimulationWorld {
     const currentStress = this.daphniaWaterStressAt(animal.position);
     if (currentStress <= 0) return null;
 
-    const diagonal = Math.SQRT1_2;
-    const directions: readonly Vec2[] = [
-      { x: 1, y: 0 },
-      { x: diagonal, y: diagonal },
-      { x: 0, y: 1 },
-      { x: -diagonal, y: diagonal },
-      { x: -1, y: 0 },
-      { x: -diagonal, y: -diagonal },
-      { x: 0, y: -1 },
-      { x: diagonal, y: -diagonal },
-    ];
-    let bestDirection: Vec2 | null = null;
+    let bestDirectionIndex = -1;
     let bestStress = currentStress;
-    for (const direction of directions) {
-      const candidate = this.clampDaphniaPoint({
-        x: animal.position.x +
+    const candidate = this.localSamplePointScratch;
+    for (
+      let directionIndex = 0;
+      directionIndex < LOCAL_WATER_SENSE_DIRECTIONS.length;
+      directionIndex += 1
+    ) {
+      const direction = LOCAL_WATER_SENSE_DIRECTIONS[directionIndex];
+      candidate.x = clamp(
+        animal.position.x +
           direction.x * DAPHNIA_LOCAL_WATER_SENSE_RADIUS,
-        y: animal.position.y +
+        10,
+        TANK_WIDTH - 10,
+      );
+      candidate.y = clamp(
+        animal.position.y +
           direction.y * DAPHNIA_LOCAL_WATER_SENSE_RADIUS,
-      });
-      if (distanceSquared(candidate, animal.position) < 1) continue;
+        WATER_TOP + 12,
+        GROUND_Y - 14,
+      );
+      const candidateX = candidate.x - animal.position.x;
+      const candidateY = candidate.y - animal.position.y;
+      if (candidateX * candidateX + candidateY * candidateY < 1) continue;
       const stress = this.daphniaWaterStressAt(candidate);
       if (stress < bestStress - 1e-4) {
         bestStress = stress;
-        bestDirection = direction;
+        bestDirectionIndex = directionIndex;
       }
     }
-    if (bestDirection) {
-      return { ...bestDirection, stress: currentStress };
+    const escape = this.waterEscapeScratch;
+    if (bestDirectionIndex >= 0) {
+      const direction = LOCAL_WATER_SENSE_DIRECTIONS[bestDirectionIndex];
+      escape.x = direction.x;
+      escape.y = direction.y;
+      escape.stress = currentStress;
+      return escape;
     }
 
     // In the flat centre of a plume, retain one local escape heading for a
@@ -6755,24 +7200,24 @@ export class SimulationWorld {
     const angle = deterministicNoise(
       motionSeed * 2.17 + phase * 13.9,
     ) * Math.PI * 2;
-    return {
-      x: Math.cos(angle),
-      y: Math.sin(angle),
-      stress: currentStress,
-    };
+    escape.x = Math.cos(angle);
+    escape.y = Math.sin(angle);
+    escape.stress = currentStress;
+    return escape;
   }
 
   private shrimpWaterStressAt(point: Vec2): number {
     if (!this.biogeochemistry.effectsEnabled) return 0;
-    const water = this.biogeochemistry.sampleAt(point);
+    const oxygen = this.biogeochemistry.oxygenAt(point);
+    const toxicWaste = this.biogeochemistry.toxicWasteAt(point);
     const oxygenStress = clamp(
-      (SHRIMP_OXYGEN_STRESS_START - water.oxygen) /
+      (SHRIMP_OXYGEN_STRESS_START - oxygen) /
         SHRIMP_OXYGEN_STRESS_START,
       0,
       1,
     );
     const toxicStress = clamp(
-      (water.toxicWaste - SHRIMP_TOXIC_STRESS_START) /
+      (toxicWaste - SHRIMP_TOXIC_STRESS_START) /
         (SHRIMP_TOXIC_STRESS_FULL - SHRIMP_TOXIC_STRESS_START),
       0,
       1,
@@ -6792,36 +7237,44 @@ export class SimulationWorld {
     const currentStress = this.shrimpWaterStressAt(animal.position);
     if (currentStress <= 0) return null;
 
-    const diagonal = Math.SQRT1_2;
-    const directions: readonly Vec2[] = [
-      { x: 1, y: 0 },
-      { x: diagonal, y: diagonal },
-      { x: 0, y: 1 },
-      { x: -diagonal, y: diagonal },
-      { x: -1, y: 0 },
-      { x: -diagonal, y: -diagonal },
-      { x: 0, y: -1 },
-      { x: diagonal, y: -diagonal },
-    ];
-    let bestDirection: Vec2 | null = null;
+    let bestDirectionIndex = -1;
     let bestStress = currentStress;
-    for (const direction of directions) {
-      const candidate = this.clampAnimalPoint({
-        x: animal.position.x +
+    const candidate = this.localSamplePointScratch;
+    for (
+      let directionIndex = 0;
+      directionIndex < LOCAL_WATER_SENSE_DIRECTIONS.length;
+      directionIndex += 1
+    ) {
+      const direction = LOCAL_WATER_SENSE_DIRECTIONS[directionIndex];
+      candidate.x = clamp(
+        animal.position.x +
           direction.x * SHRIMP_LOCAL_WATER_SENSE_RADIUS,
-        y: animal.position.y +
+        18,
+        TANK_WIDTH - 18,
+      );
+      candidate.y = clamp(
+        animal.position.y +
           direction.y * SHRIMP_LOCAL_WATER_SENSE_RADIUS,
-      });
-      if (distanceSquared(candidate, animal.position) < 1) continue;
+        WATER_TOP + 18,
+        GROUND_Y - 16,
+      );
+      const candidateX = candidate.x - animal.position.x;
+      const candidateY = candidate.y - animal.position.y;
+      if (candidateX * candidateX + candidateY * candidateY < 1) continue;
       const stress = this.shrimpWaterStressAt(candidate);
       if (stress < bestStress - 1e-4) {
         bestStress = stress;
-        bestDirection = direction;
+        bestDirectionIndex = directionIndex;
       }
     }
 
-    if (bestDirection) {
-      return { ...bestDirection, stress: currentStress };
+    const escape = this.waterEscapeScratch;
+    if (bestDirectionIndex >= 0) {
+      const direction = LOCAL_WATER_SENSE_DIRECTIONS[bestDirectionIndex];
+      escape.x = direction.x;
+      escape.y = direction.y;
+      escape.stress = currentStress;
+      return escape;
     }
 
     // A deterministic six-second heading is local random motion, not hidden
@@ -6831,17 +7284,16 @@ export class SimulationWorld {
     const angle = deterministicNoise(
       animal.randomSeed * 1.91 + phase * 17.3,
     ) * Math.PI * 2;
-    return {
-      x: Math.cos(angle),
-      y: Math.sin(angle),
-      stress: currentStress,
-    };
+    escape.x = Math.cos(angle);
+    escape.y = Math.sin(angle);
+    escape.stress = currentStress;
+    return escape;
   }
 
   private shrimpFoodCueDirection(animal: AnimalState): Vec2 | null {
     return this.shrimpLocalCueDirection(
       animal,
-      (point) => this.biogeochemistry.shrimpFoodCueAt(point),
+      'food',
       SHRIMP_FOOD_CUE_SAMPLE_RADIUS,
       SHRIMP_FOOD_CUE_MINIMUM,
       SHRIMP_FOOD_CUE_GRADIENT_MINIMUM,
@@ -6859,7 +7311,7 @@ export class SimulationWorld {
     ) return null;
     return this.shrimpLocalCueDirection(
       animal,
-      (point) => this.biogeochemistry.shrimpMateCueAt(point),
+      'mate',
       SHRIMP_MATE_CUE_SAMPLE_RADIUS,
       SHRIMP_MATE_CUE_MINIMUM,
       SHRIMP_MATE_CUE_GRADIENT_MINIMUM,
@@ -6874,33 +7326,38 @@ export class SimulationWorld {
    */
   private shrimpLocalCueDirection(
     animal: AnimalState,
-    cueAt: (point: Vec2) => number,
+    cueKind: 'food' | 'mate',
     sampleRadius: number,
     minimumCue: number,
     minimumGradient: number,
     upstreamWeight: number,
   ): Vec2 | null {
-    const diagonal = Math.SQRT1_2;
-    const directions: Vec2[] = [
-      { x: 1, y: 0 },
-      { x: -1, y: 0 },
-      { x: 0, y: 1 },
-      { x: 0, y: -1 },
-      { x: diagonal, y: diagonal },
-      { x: diagonal, y: -diagonal },
-      { x: -diagonal, y: diagonal },
-      { x: -diagonal, y: -diagonal },
-    ];
-    const centreCue = cueAt(animal.position);
+    const centreCue = cueKind === 'food'
+      ? this.biogeochemistry.shrimpFoodCueAt(animal.position)
+      : this.biogeochemistry.shrimpMateCueAt(animal.position);
     let strongestCue = centreCue;
     let gradientX = 0;
     let gradientY = 0;
-    for (const direction of directions) {
-      const samplePoint = this.clampAnimalPoint({
-        x: animal.position.x + direction.x * sampleRadius,
-        y: animal.position.y + direction.y * sampleRadius,
-      });
-      const cue = cueAt(samplePoint);
+    const samplePoint = this.localSamplePointScratch;
+    for (
+      let directionIndex = 0;
+      directionIndex < LOCAL_CUE_SENSE_DIRECTIONS.length;
+      directionIndex += 1
+    ) {
+      const direction = LOCAL_CUE_SENSE_DIRECTIONS[directionIndex];
+      samplePoint.x = clamp(
+        animal.position.x + direction.x * sampleRadius,
+        18,
+        TANK_WIDTH - 18,
+      );
+      samplePoint.y = clamp(
+        animal.position.y + direction.y * sampleRadius,
+        WATER_TOP + 18,
+        GROUND_Y - 16,
+      );
+      const cue = cueKind === 'food'
+        ? this.biogeochemistry.shrimpFoodCueAt(samplePoint)
+        : this.biogeochemistry.shrimpMateCueAt(samplePoint);
       strongestCue = Math.max(strongestCue, cue);
       const difference = cue - centreCue;
       gradientX += difference * direction.x;
@@ -6909,7 +7366,10 @@ export class SimulationWorld {
     if (strongestCue < minimumCue) return null;
 
     const gradientMagnitude = Math.hypot(gradientX, gradientY);
-    const velocity = this.biogeochemistry.velocityAt(animal.position);
+    const velocity = this.biogeochemistry.velocityAt(
+      animal.position,
+      this.waterVelocityScratch,
+    );
     const flowMagnitude = Math.hypot(velocity.x, velocity.y);
     if (gradientMagnitude >= minimumGradient) {
       gradientX /= gradientMagnitude;
@@ -6926,19 +7386,19 @@ export class SimulationWorld {
       }
       const blendedMagnitude = Math.hypot(gradientX, gradientY);
       if (blendedMagnitude > 1e-6) {
-        return {
-          x: gradientX / blendedMagnitude,
-          y: gradientY / blendedMagnitude,
-        };
+        this.cueDirectionScratch.x = gradientX / blendedMagnitude;
+        this.cueDirectionScratch.y = gradientY / blendedMagnitude;
+        return this.cueDirectionScratch;
       }
     }
 
     // In a locally flat part of a moving plume, upstream rheotaxis remains a
     // local response. With neither a gradient nor flow, ordinary casting is
     // handled by the existing correlated random walk.
-    return flowMagnitude > 1e-4
-      ? { x: -velocity.x / flowMagnitude, y: -velocity.y / flowMagnitude }
-      : null;
+    if (flowMagnitude <= 1e-4) return null;
+    this.cueDirectionScratch.x = -velocity.x / flowMagnitude;
+    this.cueDirectionScratch.y = -velocity.y / flowMagnitude;
+    return this.cueDirectionScratch;
   }
 
   private chooseExplorationTarget(
@@ -6993,6 +7453,19 @@ export class SimulationWorld {
     return this.lightField.values[row * this.lightField.columns + column] ?? 0;
   }
 
+  private vallisneriaRametForCell(
+    cell: SurfaceCellState,
+  ): SeedPlacementState | undefined {
+    for (let index = 0; index < this.seedPlacements.length; index += 1) {
+      const placement = this.seedPlacements[index];
+      if (
+        placement.speciesId === 'vallisneria' &&
+        placement.cellId === cell.id
+      ) return placement;
+    }
+    return undefined;
+  }
+
   private producerActivityPoint(
     cell: SurfaceCellState,
     speciesId: SpeciesId,
@@ -7001,16 +7474,23 @@ export class SimulationWorld {
     if (speciesId !== 'vallisneria') return surfacePoint;
     // Structural leaf size follows the much slower ramet life cycle, not the
     // reserve biomass lost and regained within one night/day cycle.
-    const ramet = this.seedPlacements.find((placement) =>
-      placement.speciesId === 'vallisneria' && placement.cellId === cell.id
-    );
+    const ramet = this.vallisneriaRametForCell(cell);
     const anchor = ramet ? this.vallisneriaRootPosition(ramet, cell) : surfacePoint;
     const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
-    const canopy = vallisneriaCanopyBounds(cell.index, anchor, structuralScale);
-    return {
-      x: anchor.x,
-      y: Math.max(WATER_TOP + 16, canopy.minY + 5),
-    };
+    const canopy = writeVallisneriaCanopyBounds(
+      cell.index,
+      anchor,
+      structuralScale,
+      this.vallisneriaCanopyBoundsScratch,
+      this.vallisneriaLeavesScratch,
+      this.vallisneriaLeafPointScratch,
+    );
+    this.vallisneriaActivityPointScratch.x = anchor.x;
+    this.vallisneriaActivityPointScratch.y = Math.max(
+      WATER_TOP + 16,
+      canopy.minY + 5,
+    );
+    return this.vallisneriaActivityPointScratch;
   }
 
   /**
@@ -7020,24 +7500,42 @@ export class SimulationWorld {
    * stone. Average several positions along every painted leaf so partial shade
    * reduces production without creating a single-point collapse loop.
    */
-  private vallisneriaCanopySamplePoints(cell: SurfaceCellState): Vec2[] {
-    const ramet = this.seedPlacements.find((placement) =>
-      placement.speciesId === 'vallisneria' && placement.cellId === cell.id
-    );
+  private vallisneriaCanopySamplePoints(cell: SurfaceCellState): number {
+    const ramet = this.vallisneriaRametForCell(cell);
     const anchor = ramet
       ? this.vallisneriaRootPosition(ramet, cell)
       : this.cellWorldPoint(cell);
     const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
-    return vallisneriaLeaves(cell.index, anchor, structuralScale)
-      .flatMap((leaf) => [0.25, 0.5, 0.75, 1].map((position) =>
-        vallisneriaLeafPoint(leaf, position)
-      ));
+    const leafCount = writeVallisneriaLeaves(
+      cell.index,
+      anchor,
+      structuralScale,
+      this.vallisneriaLeavesScratch,
+    );
+    let pointCount = 0;
+    for (let leafIndex = 0; leafIndex < leafCount; leafIndex += 1) {
+      const leaf = this.vallisneriaLeavesScratch[leafIndex];
+      for (let positionIndex = 0; positionIndex < 4; positionIndex += 1) {
+        const point = this.vallisneriaCanopyPointsScratch[pointCount] ?? {
+          x: 0,
+          y: 0,
+        };
+        vallisneriaLeafPoint(leaf, (positionIndex + 1) * 0.25, point);
+        this.vallisneriaCanopyPointsScratch[pointCount] = point;
+        pointCount += 1;
+      }
+    }
+    return pointCount;
   }
 
-  private vallisneriaCanopyLightSamples(cell: SurfaceCellState): number[] {
-    return this.vallisneriaCanopySamplePoints(cell).map((point) =>
-      this.sampleLightField(point)
-    );
+  private vallisneriaCanopyLightSamples(cell: SurfaceCellState): number {
+    const pointCount = this.vallisneriaCanopySamplePoints(cell);
+    for (let index = 0; index < pointCount; index += 1) {
+      this.vallisneriaCanopyLightsScratch[index] = this.sampleLightField(
+        this.vallisneriaCanopyPointsScratch[index],
+      );
+    }
+    return pointCount;
   }
 
   /**
@@ -7047,27 +7545,38 @@ export class SimulationWorld {
    * withdraws every unit from that finite local ledger.
    */
   private vallisneriaUptakePoint(cell: SurfaceCellState): Vec2 {
-    const ramet = this.seedPlacements.find((placement) =>
-      placement.speciesId === 'vallisneria' && placement.cellId === cell.id
-    );
+    const ramet = this.vallisneriaRametForCell(cell);
     const root = ramet
       ? this.vallisneriaRootPosition(ramet, cell)
       : this.cellWorldPoint(cell);
-    const candidates = [root, ...this.vallisneriaCanopySamplePoints(cell)];
-    return candidates.reduce((best, candidate) =>
-      this.biogeochemistry.algaeResourceFactor(candidate) >
-        this.biogeochemistry.algaeResourceFactor(best)
-        ? candidate
-        : best
-    );
+    this.vallisneriaUptakePointScratch.x = root.x;
+    this.vallisneriaUptakePointScratch.y = root.y;
+    const pointCount = this.vallisneriaCanopySamplePoints(cell);
+    for (let index = 0; index < pointCount; index += 1) {
+      const candidate = this.vallisneriaCanopyPointsScratch[index];
+      if (
+        this.biogeochemistry.algaeResourceFactor(candidate) >
+        this.biogeochemistry.algaeResourceFactor(
+          this.vallisneriaUptakePointScratch,
+        )
+      ) {
+        this.vallisneriaUptakePointScratch.x = candidate.x;
+        this.vallisneriaUptakePointScratch.y = candidate.y;
+      }
+    }
+    return this.vallisneriaUptakePointScratch;
   }
 
   private vallisneriaCanopyLight(cell: SurfaceCellState): number {
-    const samples = this.vallisneriaCanopyLightSamples(cell);
-    if (samples.length === 0) {
+    const sampleCount = this.vallisneriaCanopyLightSamples(cell);
+    if (sampleCount === 0) {
       return this.sampleLightField(this.producerActivityPoint(cell, 'vallisneria'));
     }
-    return samples.reduce((sum, light) => sum + light, 0) / samples.length;
+    let total = 0;
+    for (let index = 0; index < sampleCount; index += 1) {
+      total += this.vallisneriaCanopyLightsScratch[index];
+    }
+    return total / sampleCount;
   }
 
   private vallisneriaCanopyPhysiology(
@@ -7075,8 +7584,8 @@ export class SimulationWorld {
     temperature: number,
     reuse?: AlgaePhysiologyRates,
   ): ReturnType<typeof algaePhysiology> {
-    const samples = this.vallisneriaCanopyLightSamples(cell);
-    if (samples.length === 0) {
+    const sampleCount = this.vallisneriaCanopyLightSamples(cell);
+    if (sampleCount === 0) {
       return algaePhysiology(
         'vallisneria',
         this.vallisneriaCanopyLight(cell),
@@ -7084,51 +7593,69 @@ export class SimulationWorld {
         reuse,
       );
     }
-    const total = reuse ?? {
+    const output = reuse ?? {
       grossPhotosynthesis: 0,
       respiration: 0,
       lightStressTurnover: 0,
       netGrowth: 0,
     };
+    // Keep the per-leaf result distinct from the accumulator even if a future
+    // caller accidentally passes the usual sample scratch as its reuse target.
+    // Aliasing these objects overwrites the running sum on every leaf.
+    const total = output === this.vallisneriaPhysiologySampleScratch
+      ? this.vallisneriaPhysiologyTotalScratch
+      : output;
     total.grossPhotosynthesis = 0;
     total.respiration = 0;
     total.lightStressTurnover = 0;
     total.netGrowth = 0;
-    for (const light of samples) {
-      const sample = algaePhysiology(
+    const rates = this.vallisneriaPhysiologyRatesScratch;
+    for (let index = 0; index < sampleCount; index += 1) {
+      writeAlgaePhysiologyRates(
         'vallisneria',
-        light,
+        this.vallisneriaCanopyLightsScratch[index],
         temperature,
-        this.vallisneriaPhysiologySampleScratch,
+        rates,
       );
-      total.grossPhotosynthesis += sample.grossPhotosynthesis;
-      total.respiration += sample.respiration;
-      total.lightStressTurnover += sample.lightStressTurnover;
-      total.netGrowth += sample.netGrowth;
+      total.grossPhotosynthesis += rates[ALGAE_PHYSIOLOGY_GROSS];
+      total.respiration += rates[ALGAE_PHYSIOLOGY_RESPIRATION];
+      total.lightStressTurnover += rates[ALGAE_PHYSIOLOGY_STRESS];
+      total.netGrowth += rates[ALGAE_PHYSIOLOGY_NET];
     }
-    const divisor = samples.length;
-    total.grossPhotosynthesis /= divisor;
-    total.respiration /= divisor;
-    total.lightStressTurnover /= divisor;
-    total.netGrowth /= divisor;
-    return total;
+    total.grossPhotosynthesis /= sampleCount;
+    total.respiration /= sampleCount;
+    total.lightStressTurnover /= sampleCount;
+    total.netGrowth /= sampleCount;
+    if (total !== output) {
+      output.grossPhotosynthesis = total.grossPhotosynthesis;
+      output.respiration = total.respiration;
+      output.lightStressTurnover = total.lightStressTurnover;
+      output.netGrowth = total.netGrowth;
+    }
+    return output;
   }
 
   private vallisneriaCanopySuitability(
     cell: SurfaceCellState,
     temperature: number,
   ): number {
-    const samples = this.vallisneriaCanopyLightSamples(cell);
-    if (samples.length === 0) {
+    const sampleCount = this.vallisneriaCanopyLightSamples(cell);
+    if (sampleCount === 0) {
       return habitatSuitability(
         'vallisneria',
         this.vallisneriaCanopyLight(cell),
         temperature,
       );
     }
-    return samples.reduce((sum, light) =>
-      sum + habitatSuitability('vallisneria', light, temperature), 0
-    ) / samples.length;
+    let total = 0;
+    for (let index = 0; index < sampleCount; index += 1) {
+      total += habitatSuitability(
+        'vallisneria',
+        this.vallisneriaCanopyLightsScratch[index],
+        temperature,
+      );
+    }
+    return total / sampleCount;
   }
 
   private createSeedPlacement(
@@ -7435,6 +7962,11 @@ export class SimulationWorld {
 
   private stepGrowth(deltaSeconds: number): void {
     const cells = this.allCells();
+    const biomassValueCount = cells.length * 3;
+    if (this.growthOriginalScratch.length !== biomassValueCount) {
+      this.growthOriginalScratch = new Float64Array(biomassValueCount);
+      this.growthNextScratch = new Float64Array(biomassValueCount);
+    }
     const original = this.growthOriginalScratch;
     const next = this.growthNextScratch;
     const cellIndexById = this.growthCellIndexByIdScratch;
@@ -7443,18 +7975,15 @@ export class SimulationWorld {
     for (let index = 0; index < cells.length; index += 1) {
       const cell = cells[index];
       const source = cell.biomass;
-      const copied = original[index] ?? emptyBiomass();
-      copied.oedogonium = source.oedogonium;
-      copied.nitzschia = source.nitzschia;
-      copied.vallisneria = source.vallisneria;
-      original[index] = copied;
-      next[index] ??= emptyBiomass();
+      const offset = index * 3;
+      original[offset + GROWTH_SPECIES_INDEX.oedogonium] = source.oedogonium;
+      original[offset + GROWTH_SPECIES_INDEX.nitzschia] = source.nitzschia;
+      original[offset + GROWTH_SPECIES_INDEX.vallisneria] = source.vallisneria;
       cellIndexById.set(cell.id, index);
       currentProducerBiomass +=
         source.oedogonium + source.nitzschia + source.vallisneria;
     }
-    original.length = cells.length;
-    next.length = cells.length;
+    next.fill(0);
     const backgroundProducerCapacity = this.scenario.waterCycle
       ? null
       : this.scenario.backgroundProducerCapacity;
@@ -7464,81 +7993,103 @@ export class SimulationWorld {
 
     for (let cellIndex = 0; cellIndex < cells.length; cellIndex += 1) {
       const cell = cells[cellIndex];
-      const current = original[cellIndex];
-      const total = current.oedogonium + current.nitzschia + current.vallisneria;
+      const cellOffset = cellIndex * 3;
+      const total =
+        original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] +
+        original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] +
+        original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria];
       const freeCapacity = clamp01(1 - total);
       const cellPoint = this.cellWorldPoint(cell);
       const rates = this.growthRatesScratch;
-      rates.oedogonium = 0;
-      rates.nitzschia = 0;
-      rates.vallisneria = 0;
+      rates.fill(0);
       const physiology = this.growthPhysiologyScratch;
       const resourceFactors = this.growthResourceFactorsScratch;
-      resourceFactors.oedogonium = 0;
-      resourceFactors.nitzschia = 0;
-      resourceFactors.vallisneria = 0;
+      resourceFactors.fill(0);
       const activityPoints = this.growthActivityPointsScratch;
       for (const speciesId of this.scenario.allowedSpecies) {
+        const speciesIndex = GROWTH_SPECIES_INDEX[speciesId];
         // An absent producer contributes neither to this cell's weighted
         // growth nor to its material flux. In particular, do not build a full
         // Vallisneria leaf canopy for every empty grid cell once per ecology
         // second.
-        if (current[speciesId] <= 0) continue;
+        if (original[cellOffset + speciesIndex] <= 0) continue;
         const physiologyPoint = this.producerActivityPoint(cell, speciesId);
         const activityPoint = speciesId === 'vallisneria'
           ? this.vallisneriaUptakePoint(cell)
           : physiologyPoint;
         const localTemperature = this.biogeochemistry.temperatureAt(physiologyPoint);
-        const response = speciesId === 'vallisneria'
-          ? this.vallisneriaCanopyPhysiology(
+        const physiologyOffset = speciesIndex * ALGAE_PHYSIOLOGY_VALUE_COUNT;
+        if (speciesId === 'vallisneria') {
+          const response = this.vallisneriaCanopyPhysiology(
             cell,
             localTemperature,
-            physiology[speciesId],
-          )
-          : algaePhysiology(
+            // The accumulator must not alias the per-leaf sample scratch used
+            // inside vallisneriaCanopyPhysiology. Aliasing overwrites the
+            // running sum on every leaf and underestimates the canopy rate.
+            this.vallisneriaPhysiologyTotalScratch,
+          );
+          physiology[physiologyOffset + ALGAE_PHYSIOLOGY_GROSS] =
+            response.grossPhotosynthesis;
+          physiology[physiologyOffset + ALGAE_PHYSIOLOGY_RESPIRATION] =
+            response.respiration;
+          physiology[physiologyOffset + ALGAE_PHYSIOLOGY_STRESS] =
+            response.lightStressTurnover;
+          physiology[physiologyOffset + ALGAE_PHYSIOLOGY_NET] =
+            response.netGrowth;
+        } else {
+          writeAlgaePhysiologyRates(
             speciesId,
             cell.light,
             localTemperature,
-            physiology[speciesId],
+            physiology,
+            physiologyOffset,
           );
+        }
         const resourceFactor =
           this.biogeochemistry.algaeResourceFactor(activityPoint) *
           backgroundNutrientFactor;
         activityPoints[speciesId] = activityPoint;
-        physiology[speciesId] = response;
-        resourceFactors[speciesId] = resourceFactor;
-        rates[speciesId] = response.netGrowth > 0
-          ? response.netGrowth * resourceFactor
-          : response.netGrowth;
+        resourceFactors[speciesIndex] = resourceFactor;
+        const netGrowth = physiology[physiologyOffset + ALGAE_PHYSIOLOGY_NET];
+        rates[speciesIndex] = netGrowth > 0
+          ? netGrowth * resourceFactor
+          : netGrowth;
       }
       const weightedAverage = total > 0
         ? (
-          current.oedogonium * rates.oedogonium +
-          current.nitzschia * rates.nitzschia +
-          current.vallisneria * rates.vallisneria
+          original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] *
+            rates[GROWTH_SPECIES_INDEX.oedogonium] +
+          original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] *
+            rates[GROWTH_SPECIES_INDEX.nitzschia] +
+          original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria] *
+            rates[GROWTH_SPECIES_INDEX.vallisneria]
         ) / total
         : 0;
-      const result = next[cellIndex];
-      result.oedogonium = 0;
-      result.nitzschia = 0;
-      result.vallisneria = 0;
       let fixedBiomass = 0;
       let respiredBiomass = 0;
       for (const speciesId of this.scenario.allowedSpecies) {
-        const amount = current[speciesId];
+        const speciesIndex = GROWTH_SPECIES_INDEX[speciesId];
+        const amount = original[cellOffset + speciesIndex];
         if (amount <= 0) continue;
-        const response = physiology[speciesId];
+        const physiologyOffset = speciesIndex * ALGAE_PHYSIOLOGY_VALUE_COUNT;
+        const grossPhotosynthesis =
+          physiology[physiologyOffset + ALGAE_PHYSIOLOGY_GROSS];
+        const respirationRate =
+          physiology[physiologyOffset + ALGAE_PHYSIOLOGY_RESPIRATION];
+        const lightStressTurnover =
+          physiology[physiologyOffset + ALGAE_PHYSIOLOGY_STRESS];
+        const netGrowth = physiology[physiologyOffset + ALGAE_PHYSIOLOGY_NET];
         const activityPoint = activityPoints[speciesId];
-        const resourceFactor = resourceFactors[speciesId];
-        const rate = rates[speciesId];
+        const resourceFactor = resourceFactors[speciesIndex];
+        const rate = rates[speciesIndex];
         // Density-dependent limitation throttles only the photosynthesis left
         // after replacing respiration and stress losses. This preserves the
         // established logistic net-growth curve while the ledger can still
         // observe gross production and respiration as separate real fluxes.
-        const densityAdjustedGross = response.netGrowth > 0
-          ? response.respiration + response.lightStressTurnover +
-            response.netGrowth * resourceFactor * freeCapacity
-          : response.grossPhotosynthesis;
+        const densityAdjustedGross = netGrowth > 0
+          ? respirationRate + lightStressTurnover +
+            netGrowth * resourceFactor * freeCapacity
+          : grossPhotosynthesis;
         const requestedProduction = amount * densityAdjustedGross * deltaSeconds;
         const production = this.biogeochemistry.commitAlgaeProduction(
           activityPoint,
@@ -7547,14 +8098,14 @@ export class SimulationWorld {
         fixedBiomass += production;
         const requestedRespiration = Math.min(
           amount + production,
-          amount * response.respiration * deltaSeconds,
+          amount * respirationRate * deltaSeconds,
         );
         const respiration = this.biogeochemistry.commitAlgaeRespiration(
           activityPoint,
           requestedRespiration,
         );
         respiredBiomass += respiration;
-        const stressTurnover = amount * response.lightStressTurnover * deltaSeconds;
+        const stressTurnover = amount * lightStressTurnover * deltaSeconds;
         const replacement = total > 0.04
           ? amount * (rate - weightedAverage) * total * 1.35 * deltaSeconds
           : 0;
@@ -7563,23 +8114,31 @@ export class SimulationWorld {
             ? VALLISNERIA_BACKGROUND_TURNOVER_PER_SECOND
             : 0.0018
         ) * deltaSeconds;
-        result[speciesId] = Math.max(
+        next[cellOffset + speciesIndex] = Math.max(
           0,
           amount + production - respiration - stressTurnover + replacement - naturalTurnover,
         );
       }
 
       // A developed filamentous canopy shades the low-profile diatom film below it.
-      if (current.oedogonium > 0.24 && rates.oedogonium > rates.nitzschia) {
-        result.nitzschia = Math.max(
+      const oedogoniumIndex = cellOffset + GROWTH_SPECIES_INDEX.oedogonium;
+      const nitzschiaIndex = cellOffset + GROWTH_SPECIES_INDEX.nitzschia;
+      const vallisneriaIndex = cellOffset + GROWTH_SPECIES_INDEX.vallisneria;
+      if (
+        original[oedogoniumIndex] > 0.24 &&
+        rates[GROWTH_SPECIES_INDEX.oedogonium] >
+          rates[GROWTH_SPECIES_INDEX.nitzschia]
+      ) {
+        next[nitzschiaIndex] = Math.max(
           0,
-          result.nitzschia - current.nitzschia * current.oedogonium * 0.018 * deltaSeconds,
+          next[nitzschiaIndex] -
+            original[nitzschiaIndex] * original[oedogoniumIndex] * 0.018 * deltaSeconds,
         );
       }
       const localLoss = Math.max(
         0,
         total + fixedBiomass - respiredBiomass -
-          result.oedogonium - result.nitzschia - result.vallisneria,
+          next[oedogoniumIndex] - next[nitzschiaIndex] - next[vallisneriaIndex],
       );
       this.biogeochemistry.recordAlgaeTurnover(cellPoint, localLoss);
     }
@@ -7591,18 +8150,22 @@ export class SimulationWorld {
     // result stays deterministic and independent of cell iteration order.
     for (let sourceIndex = 0; sourceIndex < cells.length; sourceIndex += 1) {
       const cell = cells[sourceIndex];
-      const source = original[sourceIndex];
+      const sourceOffset = sourceIndex * 3;
       for (const neighborId of cell.neighborIds) {
         const receiverIndex = cellIndexById.get(neighborId);
         if (receiverIndex === undefined) continue;
         const neighbor = cells[receiverIndex];
-        const receiver = next[receiverIndex];
-        const receiverTotal = receiver.oedogonium + receiver.nitzschia + receiver.vallisneria;
+        const receiverOffset = receiverIndex * 3;
+        const receiverTotal =
+          next[receiverOffset + GROWTH_SPECIES_INDEX.oedogonium] +
+          next[receiverOffset + GROWTH_SPECIES_INDEX.nitzschia] +
+          next[receiverOffset + GROWTH_SPECIES_INDEX.vallisneria];
         const freeCapacity = clamp01(1 - receiverTotal);
         if (freeCapacity <= 0.0001) continue;
         for (const speciesId of this.scenario.allowedSpecies) {
+          const speciesIndex = GROWTH_SPECIES_INDEX[speciesId];
           if (SPECIES[speciesId].dispersalRate <= 0) continue;
-          if (source[speciesId] < 0.012) continue;
+          if (original[sourceOffset + speciesIndex] < 0.012) continue;
           const suitability = habitatSuitability(
             speciesId,
             neighbor.light,
@@ -7611,7 +8174,7 @@ export class SimulationWorld {
           if (suitability <= 0.01) continue;
           const recruitment =
             SPECIES[speciesId].dispersalRate *
-            source[speciesId] *
+            original[sourceOffset + speciesIndex] *
             deltaSeconds *
             suitability *
             freeCapacity /
@@ -7648,9 +8211,12 @@ export class SimulationWorld {
     }
     for (let index = 0; index < recruitmentTransferCount; index += 1) {
       const transfer = recruitmentTransfers[index];
-      const receiver = next[transfer.receiverIndex];
+      const receiverOffset = transfer.receiverIndex * 3;
       const freeCapacity = clamp01(
-        1 - receiver.oedogonium - receiver.nitzschia - receiver.vallisneria,
+        1 -
+          next[receiverOffset + GROWTH_SPECIES_INDEX.oedogonium] -
+          next[receiverOffset + GROWTH_SPECIES_INDEX.nitzschia] -
+          next[receiverOffset + GROWTH_SPECIES_INDEX.vallisneria],
       );
       const demand = incomingDemand[transfer.receiverIndex];
       if (demand > freeCapacity && demand > 0) {
@@ -7677,7 +8243,7 @@ export class SimulationWorld {
       const demandIndex =
         transfer.sourceIndex * 3 + GROWTH_SPECIES_INDEX[transfer.speciesId];
       const demand = outgoingDemand[demandIndex];
-      const available = next[transfer.sourceIndex][transfer.speciesId];
+      const available = next[demandIndex];
       if (demand > available && demand > 0) {
         transfer.amount *= available / demand;
       }
@@ -7685,24 +8251,27 @@ export class SimulationWorld {
 
     for (let index = 0; index < recruitmentTransferCount; index += 1) {
       const transfer = recruitmentTransfers[index];
-      const source = next[transfer.sourceIndex];
-      const receiver = next[transfer.receiverIndex];
-      source[transfer.speciesId] -= transfer.amount;
-      receiver[transfer.speciesId] += transfer.amount;
+      const speciesIndex = GROWTH_SPECIES_INDEX[transfer.speciesId];
+      next[transfer.sourceIndex * 3 + speciesIndex] -= transfer.amount;
+      next[transfer.receiverIndex * 3 + speciesIndex] += transfer.amount;
     }
 
     for (let index = 0; index < cells.length; index += 1) {
       const cell = cells[index];
-      const result = next[index];
-      const total = result.oedogonium + result.nitzschia + result.vallisneria;
+      const offset = index * 3;
+      const oedogoniumIndex = offset + GROWTH_SPECIES_INDEX.oedogonium;
+      const nitzschiaIndex = offset + GROWTH_SPECIES_INDEX.nitzschia;
+      const vallisneriaIndex = offset + GROWTH_SPECIES_INDEX.vallisneria;
+      const total =
+        next[oedogoniumIndex] + next[nitzschiaIndex] + next[vallisneriaIndex];
       if (total > 1) {
-        result.oedogonium /= total;
-        result.nitzschia /= total;
-        result.vallisneria /= total;
+        next[oedogoniumIndex] /= total;
+        next[nitzschiaIndex] /= total;
+        next[vallisneriaIndex] /= total;
       }
-      cell.biomass.oedogonium = clamp01(result.oedogonium);
-      cell.biomass.nitzschia = clamp01(result.nitzschia);
-      cell.biomass.vallisneria = clamp01(result.vallisneria);
+      cell.biomass.oedogonium = clamp01(next[oedogoniumIndex]);
+      cell.biomass.nitzschia = clamp01(next[nitzschiaIndex]);
+      cell.biomass.vallisneria = clamp01(next[vallisneriaIndex]);
     }
   }
 
@@ -7911,6 +8480,71 @@ export class SimulationWorld {
       snapshots[index] = snapshot;
     }
     snapshots.length = this.structures.length;
+    return snapshots;
+  }
+
+  private animalMotionSnapshots(reuse?: AnimalSnapshot[]): AnimalSnapshot[] {
+    const snapshots = reuse ?? [];
+    for (let index = 0; index < this.animals.length; index += 1) {
+      const animal = this.animals[index];
+      const snapshot = snapshots[index] ?? {} as AnimalSnapshot;
+      snapshot.id = animal.id;
+      snapshot.speciesId = animal.speciesId;
+      snapshot.x = animal.position.x;
+      snapshot.y = animal.position.y;
+      snapshot.vx = animal.velocity.x;
+      snapshot.vy = animal.velocity.y;
+      snapshot.facing = animal.facing;
+      snapshot.poseAngle = animal.poseAngle;
+      snapshot.bodyLength = animal.bodyLength;
+      snapshot.lifeStage = animal.lifeStage;
+      snapshot.sex = animal.sex;
+      snapshot.ageSeconds = animal.ageSeconds;
+      snapshot.lifespanSeconds = animal.lifespanSeconds;
+      snapshot.energy = animal.energy;
+      snapshot.health = animal.health;
+      snapshot.behavior = this.held?.kind === 'animal' && this.held.animalId === animal.id
+        ? 'held'
+        : animal.behavior;
+      snapshot.reproductiveState = animal.speciesId === 'japanese-ricefish'
+        ? animal.lifeStage === 'egg'
+          ? 'incubating'
+          : animal.gestationRemaining !== null
+            ? 'carrying-eggs'
+            : animal.lifeStage === 'adult' &&
+              animal.reproductionCooldown <= 0 &&
+              animal.reproductiveBiomass >=
+                RICEFISH_ECOLOGY_RULES.eggClutchMinimum *
+                WATER_CYCLE_RULES.ricefish.eggBiomass
+              ? 'ready'
+              : 'none'
+        : animal.speciesId === 'daphnia'
+          ? animal.gestationRemaining !== null
+            ? 'carrying-eggs'
+            : animal.lifeStage === 'adult' &&
+              (animal.moltProgress ?? 0) >= 0.75 &&
+              animal.energy >=
+                PLANKTON_ECOLOGY_RULES.daphnia.reproductionStartEnergy &&
+              animal.reproductiveBiomass >=
+                PLANKTON_ECOLOGY_RULES.daphnia.minimumBroodSize *
+                PLANKTON_ECOLOGY_RULES.daphnia.juvenileBirthBiomass
+              ? 'ready'
+              : 'none'
+          : animal.gestationRemaining !== null
+            ? 'berried'
+            : animal.lifeStage === 'adult' &&
+              (animal.ovarianProgress ?? 0) >= 1 &&
+              animal.energy >= SHRIMP_REPRODUCTION_ENERGY &&
+              animal.reproductiveBiomass >= SHRIMP_MINIMUM_BROOD_BIOMASS &&
+              this.animals.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
+              ? 'ready'
+              : 'none';
+      snapshot.recentIntake = animal.recentIntake;
+      snapshot.consumedBiomass = animal.consumedBiomass;
+      snapshot.secondsSinceFood = animal.secondsSinceFood;
+      snapshots[index] = snapshot;
+    }
+    snapshots.length = this.animals.length;
     return snapshots;
   }
 
@@ -8861,11 +9495,13 @@ export class SimulationWorld {
       point.y >= WATER_TOP + 18 && point.y <= GROUND_Y - 16;
   }
 
-  private clampAnimalPoint(point: Vec2): Vec2 {
-    return {
-      x: clamp(point.x, 18, TANK_WIDTH - 18),
-      y: clamp(point.y, WATER_TOP + 18, GROUND_Y - 16),
-    };
+  private clampAnimalPoint(point: Vec2, reuse?: Vec2): Vec2 {
+    const x = clamp(point.x, 18, TANK_WIDTH - 18);
+    const y = clamp(point.y, WATER_TOP + 18, GROUND_Y - 16);
+    const target = reuse ?? { x: 0, y: 0 };
+    target.x = x;
+    target.y = y;
+    return target;
   }
 
   /**
@@ -8877,14 +9513,25 @@ export class SimulationWorld {
    * close enough to bite it.
    */
   private shrimpSurfaceContactPoint(cell: SurfaceCellState): Vec2 {
-    return this.clampAnimalPoint(this.cellWorldPoint(cell));
+    const point = this.cellWorldPoint(cell);
+    if (
+      cell.shrimpContactSourceX === point.x &&
+      cell.shrimpContactSourceY === point.y
+    ) return cell.shrimpContactPoint;
+    cell.shrimpContactPoint.x = clamp(point.x, 18, TANK_WIDTH - 18);
+    cell.shrimpContactPoint.y = clamp(point.y, WATER_TOP + 18, GROUND_Y - 16);
+    cell.shrimpContactSourceX = point.x;
+    cell.shrimpContactSourceY = point.y;
+    return cell.shrimpContactPoint;
   }
 
-  private clampDaphniaPoint(point: Vec2): Vec2 {
-    return {
-      x: clamp(point.x, 10, TANK_WIDTH - 10),
-      y: clamp(point.y, WATER_TOP + 12, GROUND_Y - 14),
-    };
+  private clampDaphniaPoint(point: Vec2, reuse?: Vec2): Vec2 {
+    const x = clamp(point.x, 10, TANK_WIDTH - 10);
+    const y = clamp(point.y, WATER_TOP + 12, GROUND_Y - 14);
+    const target = reuse ?? { x: 0, y: 0 };
+    target.x = x;
+    target.y = y;
+    return target;
   }
 
   private allCells(): SurfaceCellState[] {
@@ -8893,6 +9540,21 @@ export class SimulationWorld {
     this.allCellsCache.push(...this.substrateCells);
     for (const structure of this.structures) {
       this.allCellsCache.push(...structure.cells);
+    }
+    this.shrimpFoodCellIndexByIdScratch.clear();
+    for (let index = 0; index < this.allCellsCache.length; index += 1) {
+      this.shrimpFoodCellIndexByIdScratch.set(
+        this.allCellsCache[index].id,
+        index,
+      );
+    }
+    if (
+      this.shrimpFoodReservationCountsScratch.length !==
+      this.allCellsCache.length
+    ) {
+      this.shrimpFoodReservationCountsScratch = new Uint16Array(
+        this.allCellsCache.length,
+      );
     }
     this.allCellsCacheDirty = false;
     return this.allCellsCache;
@@ -8905,15 +9567,31 @@ export class SimulationWorld {
   }
 
   private cellWorldPoint(cell: SurfaceCellState): Vec2 {
-    if (cell.surfaceKind === 'substrate') return { x: cell.x, y: cell.y };
+    if (cell.surfaceKind === 'substrate') return cell.worldPoint;
     const structure = this.structureById(cell.ownerId);
-    if (!structure) return { x: cell.x, y: cell.y };
-    return structureAuthoredPointToWorld(
-      { x: cell.x, y: cell.y },
+    if (!structure) {
+      cell.worldPoint.x = cell.x;
+      cell.worldPoint.y = cell.y;
+      return cell.worldPoint;
+    }
+    const position = structure.body.position;
+    const angle = structure.body.angle;
+    if (
+      cell.worldTransformX === position.x &&
+      cell.worldTransformY === position.y &&
+      cell.worldTransformAngle === angle
+    ) return cell.worldPoint;
+    const point = structureAuthoredPointToWorld(
+      cell,
       STRUCTURES[structure.definitionId].collisionPolygon,
-      structure.body.position,
-      structure.body.angle,
+      position,
+      angle,
+      cell.worldPoint,
     );
+    cell.worldTransformX = position.x;
+    cell.worldTransformY = position.y;
+    cell.worldTransformAngle = angle;
+    return point;
   }
 
   private nearestCell(

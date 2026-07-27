@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   createSharedMotionChannel,
   SharedMotionReader,
@@ -75,7 +75,7 @@ describe('shared binary motion telemetry', () => {
     });
   });
 
-  it('alternates two retained object graphs while coalescing old generations', () => {
+  it('keeps a third staging graph behind the two retained interpolation frames', () => {
     const channel = createSharedMotionChannel();
     const writer = new SharedMotionWriter(channel);
     const reader = new SharedMotionReader(channel);
@@ -88,10 +88,54 @@ describe('shared binary motion telemetry', () => {
     const third = reader.readLatest()!;
 
     expect(first).not.toBe(second);
-    expect(third).toBe(first);
+    expect(third).not.toBe(first);
+    expect(third).not.toBe(second);
+    expect(first.animals[0].x).toBe(100);
     expect(third.animals[0].x).toBe(300);
     expect(second.animals[0].x).toBe(200);
+
+    writer.publish(motionMessage(4, 400));
+    const fourth = reader.readLatest()!;
+    expect(fourth).toBe(first);
+    expect(fourth.animals[0].x).toBe(400);
+    expect(second.animals[0].x).toBe(200);
+    expect(third.animals[0].x).toBe(300);
     expect(reader.readLatest()).toBeNull();
+  });
+
+  it('does not corrupt either retained frame when publication races a read', () => {
+    const channel = createSharedMotionChannel();
+    const writer = new SharedMotionWriter(channel);
+    const reader = new SharedMotionReader(channel);
+
+    writer.publish(motionMessage(1, 100));
+    const first = reader.readLatest()!;
+    writer.publish(motionMessage(2, 200));
+    const second = reader.readLatest()!;
+    writer.publish(motionMessage(3, 300));
+
+    const originalLoad = Atomics.load.bind(Atomics);
+    let generationLoads = 0;
+    const loadSpy = vi.spyOn(Atomics, 'load').mockImplementation(
+      ((array: Int32Array, index: number): number => {
+        if (index === 0) {
+          generationLoads += 1;
+          if (generationLoads === 2) {
+            writer.publish(motionMessage(4, 400));
+          }
+        }
+        return originalLoad(array, index);
+      }) as typeof Atomics.load,
+    );
+
+    expect(reader.readLatest()).toBeNull();
+    loadSpy.mockRestore();
+    expect(first.animals[0].x).toBe(100);
+    expect(second.animals[0].x).toBe(200);
+
+    const latest = reader.readLatest()!;
+    expect(latest.sequence).toBe(4);
+    expect(latest.animals[0].x).toBe(400);
   });
 
   it('preserves ricefish species, life stage, behavior, and reproductive state', () => {

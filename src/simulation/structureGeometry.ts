@@ -33,16 +33,17 @@ export const structureAuthoredPointToWorld = (
   collisionPolygon: ReadonlyArray<Vec2>,
   bodyPosition: Vec2,
   bodyAngle: number,
+  reuse?: Vec2,
 ): Vec2 => {
   const offset = structureVisualOffset(collisionPolygon);
   const localX = authoredPoint.x + offset.x;
   const localY = authoredPoint.y + offset.y;
   const cosine = Math.cos(bodyAngle);
   const sine = Math.sin(bodyAngle);
-  return {
-    x: bodyPosition.x + localX * cosine - localY * sine,
-    y: bodyPosition.y + localX * sine + localY * cosine,
-  };
+  const point = reuse ?? { x: 0, y: 0 };
+  point.x = bodyPosition.x + localX * cosine - localY * sine;
+  point.y = bodyPosition.y + localX * sine + localY * cosine;
+  return point;
 };
 
 export const structureAuthoredPolygonToWorld = (

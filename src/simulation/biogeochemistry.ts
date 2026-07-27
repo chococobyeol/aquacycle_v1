@@ -34,6 +34,7 @@ import {
   nitrifierStoichiometry,
   organicCarbonOxygenDemand,
   producerOxygenProduction,
+  type NitrifierStoichiometry,
 } from './stoichiometry';
 
 export const WATER_COLUMNS = 36;
@@ -79,6 +80,13 @@ export interface ShrimpFoodCueSite {
 export interface ShrimpMateCueSite {
   point: Vec2;
   strength: number;
+}
+
+export interface PlanktonSample {
+  phytoplankton: number;
+  planktonicDecomposer: number;
+  daphniaJuveniles: number;
+  daphniaAdults: number;
 }
 
 export interface ClosedMaterialState {
@@ -168,6 +176,14 @@ export class BiogeochemistryLedger {
   private readonly toxicWasteProductsScratch = new Float64Array(CELL_COUNT);
   private readonly nutrientProductsScratch = new Float64Array(CELL_COUNT);
   private readonly carbonProductsScratch = new Float64Array(CELL_COUNT);
+  private readonly nitrifierReactionScratch: NitrifierStoichiometry = {
+    processedNitrogen: 0,
+    retainedNitrogen: 0,
+    nitrateProduced: 0,
+    growthBiomass: 0,
+    fixedCarbon: 0,
+    oxygenDemand: 0,
+  };
   private readonly waterCellPoints = Array.from(
     { length: CELL_COUNT },
     (_, index): Vec2 => {
@@ -290,8 +306,8 @@ export class BiogeochemistryLedger {
     return this.transport.sampleTemperatureAt(point);
   }
 
-  public velocityAt(point: Vec2): Vec2 {
-    return this.transport.sampleVelocityAt(point);
+  public velocityAt(point: Vec2, reuse?: Vec2): Vec2 {
+    return this.transport.sampleVelocityAt(point, reuse);
   }
 
   /** Local, non-material food odour available to shrimp chemosensation. */
@@ -334,11 +350,12 @@ export class BiogeochemistryLedger {
    */
   public algaeResourceFactor(point: Vec2): number {
     if (!this.effectsEnabled) return 1;
-    const quality = this.sampleAt(point);
-    const mineralNitrogen = quality.toxicWaste + quality.nutrients;
-    const carbon = this.dissolvedInorganicCarbon[this.indexAt(point)];
+    const index = this.indexAt(point);
+    const mineralNitrogen = this.toxicWaste[index] + this.nutrients[index];
+    const carbon = this.dissolvedInorganicCarbon[index];
     const waterClarity = Math.exp(
-      -WATER_CYCLE_RULES.algae.organicLightAttenuation * quality.organicMatter,
+      -WATER_CYCLE_RULES.algae.organicLightAttenuation *
+        this.organicMatter[index],
     );
     return Math.min(
       saturation(
@@ -713,19 +730,20 @@ export class BiogeochemistryLedger {
     return this.fieldMass(this.planktonicDecomposer);
   }
 
-  public planktonAt(point: Vec2): {
-    phytoplankton: number;
-    planktonicDecomposer: number;
-    daphniaJuveniles: number;
-    daphniaAdults: number;
-  } {
+  public planktonAt(point: Vec2, reuse?: PlanktonSample): PlanktonSample {
     const index = this.indexAt(point);
-    return {
-      phytoplankton: this.phytoplankton[index],
-      planktonicDecomposer: this.planktonicDecomposer[index],
-      daphniaJuveniles: this.daphniaJuveniles[index],
-      daphniaAdults: this.daphniaFounderAdults[index] + this.daphniaBornAdults[index],
+    const sample = reuse ?? {
+      phytoplankton: 0,
+      planktonicDecomposer: 0,
+      daphniaJuveniles: 0,
+      daphniaAdults: 0,
     };
+    sample.phytoplankton = this.phytoplankton[index];
+    sample.planktonicDecomposer = this.planktonicDecomposer[index];
+    sample.daphniaJuveniles = this.daphniaJuveniles[index];
+    sample.daphniaAdults =
+      this.daphniaFounderAdults[index] + this.daphniaBornAdults[index];
+    return sample;
   }
 
   public advance(
@@ -818,10 +836,14 @@ export class BiogeochemistryLedger {
     }
     this.exchangeClosedHeadspace(dt);
 
-    this.biofilmTotals = sites.reduce<BiofilmBiomass>((total, site) => ({
-      decomposer: total.decomposer + site.biofilm.decomposer,
-      nitrifier: total.nitrifier + site.biofilm.nitrifier,
-    }), emptyBiofilm());
+    let decomposerTotal = 0;
+    let nitrifierTotal = 0;
+    for (let siteIndex = 0; siteIndex < sites.length; siteIndex += 1) {
+      decomposerTotal += sites[siteIndex].biofilm.decomposer;
+      nitrifierTotal += sites[siteIndex].biofilm.nitrifier;
+    }
+    this.biofilmTotals.decomposer = decomposerTotal;
+    this.biofilmTotals.nitrifier = nitrifierTotal;
     this.fieldRevision += 1;
   }
 
@@ -951,6 +973,14 @@ export class BiogeochemistryLedger {
       nutrients: this.nutrients[index],
       oxygen: this.oxygen[index],
     };
+  }
+
+  public oxygenAt(point: Vec2): number {
+    return this.oxygen[this.indexAt(point)];
+  }
+
+  public toxicWasteAt(point: Vec2): number {
+    return this.toxicWaste[this.indexAt(point)];
   }
 
   public microbeNetGrowthAt(
@@ -1728,14 +1758,11 @@ export class BiogeochemistryLedger {
         const biomass = site.biofilm[guildId];
         if (biomass <= 0) continue;
         const kinetics = MICROBE_ECOLOGY_RULES[guildId];
-        const quality: WaterQualityValues = {
-          organicMatter: initialOrganicMatter[index],
-          toxicWaste: initialToxicWaste[index],
-          nutrients: initialNutrients[index],
-          oxygen: initialOxygen[index],
-        };
-        const activity = saturation(quality[kinetics.substrate], kinetics.halfSaturation) *
-          saturation(quality.oxygen, kinetics.oxygenHalfSaturation);
+        const substrate = guildId === 'decomposer'
+          ? initialOrganicMatter[index]
+          : initialToxicWaste[index];
+        const activity = saturation(substrate, kinetics.halfSaturation) *
+          saturation(initialOxygen[index], kinetics.oxygenHalfSaturation);
         const temperatureFactor = thetaTemperatureFactor(
           this.temperatureAt(site.point),
           kinetics.referenceTemperature,
@@ -1778,28 +1805,32 @@ export class BiogeochemistryLedger {
           const retainedNitrogenFraction = kinetics.biomassYield * freeSurface;
           const productCapacity = this.capacityAround(nutrientProducts, index);
           const availableCarbon = this.massAround(carbonWithdrawal, index);
-          const reactionAt = (processedNitrogen: number) => {
-            const potentialGrowth =
-              processedNitrogen * retainedNitrogenFraction /
-              WATER_CYCLE_RULES.biomassNitrogen;
-            const carbonLimitedGrowth = Math.min(
-              potentialGrowth,
-              availableCarbon / WATER_CYCLE_RULES.biomassCarbon,
-            );
-            return nitrifierStoichiometry(processedNitrogen, carbonLimitedGrowth);
-          };
-          const feasible = (processedNitrogen: number): boolean => {
-            const reaction = reactionAt(processedNitrogen);
-            return reaction.oxygenDemand <= oxygenAvailable + 1e-12 &&
-              reaction.nitrateProduced <= productCapacity + 1e-12;
-          };
-          if (!feasible(actual)) {
+          let reaction = this.nitrifierReaction(
+            actual,
+            retainedNitrogenFraction,
+            availableCarbon,
+          );
+          if (
+            reaction.oxygenDemand > oxygenAvailable + 1e-12 ||
+            reaction.nitrateProduced > productCapacity + 1e-12
+          ) {
             let low = 0;
             let high = actual;
             for (let iteration = 0; iteration < 32; iteration += 1) {
               const middle = (low + high) / 2;
-              if (feasible(middle)) low = middle;
-              else high = middle;
+              reaction = this.nitrifierReaction(
+                middle,
+                retainedNitrogenFraction,
+                availableCarbon,
+              );
+              if (
+                reaction.oxygenDemand <= oxygenAvailable + 1e-12 &&
+                reaction.nitrateProduced <= productCapacity + 1e-12
+              ) {
+                low = middle;
+              } else {
+                high = middle;
+              }
             }
             actual = low;
           }
@@ -1847,7 +1878,11 @@ export class BiogeochemistryLedger {
             potentialGrowth,
             availableCarbon / WATER_CYCLE_RULES.biomassCarbon,
           );
-          const reaction = nitrifierStoichiometry(consumed, carbonLimitedGrowth);
+          const reaction = nitrifierStoichiometry(
+            consumed,
+            carbonLimitedGrowth,
+            this.nitrifierReactionScratch,
+          );
           growth = reaction.growthBiomass;
           oxygenDemand = reaction.oxygenDemand;
           this.removeMassAround(
@@ -1898,6 +1933,25 @@ export class BiogeochemistryLedger {
         this.detritus[index] += excess;
       }
     }
+  }
+
+  private nitrifierReaction(
+    processedNitrogen: number,
+    retainedNitrogenFraction: number,
+    availableCarbon: number,
+  ): NitrifierStoichiometry {
+    const potentialGrowth =
+      processedNitrogen * retainedNitrogenFraction /
+      WATER_CYCLE_RULES.biomassNitrogen;
+    const carbonLimitedGrowth = Math.min(
+      potentialGrowth,
+      availableCarbon / WATER_CYCLE_RULES.biomassCarbon,
+    );
+    return nitrifierStoichiometry(
+      processedNitrogen,
+      carbonLimitedGrowth,
+      this.nitrifierReactionScratch,
+    );
   }
 
   private releaseRespiredBiomass(index: number, biomass: number): number {
@@ -1993,7 +2047,9 @@ export class BiogeochemistryLedger {
 
   private fieldMass(field: Float32Array | Float64Array): number {
     let total = 0;
-    for (const value of field) total += value;
+    for (let index = 0; index < field.length; index += 1) {
+      total += field[index];
+    }
     return total / CELL_COUNT;
   }
 
@@ -2028,20 +2084,31 @@ export class BiogeochemistryLedger {
   }
 
   private massAround(field: Float32Array | Float64Array, index: number): number {
-    return this.indicesAround(index).reduce((sum, candidate) => sum + field[candidate], 0) /
-      CELL_COUNT;
+    const indices = this.indicesAround(index);
+    let total = 0;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      total += field[indices[offset]];
+    }
+    return total / CELL_COUNT;
   }
 
   private capacityAround(field: Float32Array | Float64Array, index: number): number {
-    return this.indicesAround(index).reduce(
-      (sum, candidate) => sum + Math.max(0, MAX_CONCENTRATION - field[candidate]),
-      0,
-    ) / CELL_COUNT;
+    const indices = this.indicesAround(index);
+    let capacity = 0;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      capacity += Math.max(
+        0,
+        MAX_CONCENTRATION - field[indices[offset]],
+      );
+    }
+    return capacity / CELL_COUNT;
   }
 
   private fieldCapacity(field: Float32Array | Float64Array): number {
     let capacity = 0;
-    for (const value of field) capacity += Math.max(0, MAX_CONCENTRATION - value);
+    for (let index = 0; index < field.length; index += 1) {
+      capacity += Math.max(0, MAX_CONCENTRATION - field[index]);
+    }
     return capacity / CELL_COUNT;
   }
 
@@ -2091,11 +2158,18 @@ export class BiogeochemistryLedger {
     requested: number,
   ): number {
     if (requested <= 0 || !indices.length) return 0;
-    const available = indices.reduce((sum, index) => sum + field[index], 0) / CELL_COUNT;
+    let availableConcentration = 0;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      availableConcentration += field[indices[offset]];
+    }
+    const available = availableConcentration / CELL_COUNT;
     const actual = Math.min(requested, available);
     if (actual <= 0 || available <= 0) return 0;
     const ratio = actual / available;
-    for (const index of indices) field[index] = finiteConcentration(field[index] * (1 - ratio));
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      const index = indices[offset];
+      field[index] = finiteConcentration(field[index] * (1 - ratio));
+    }
     return actual;
   }
 
@@ -2105,14 +2179,19 @@ export class BiogeochemistryLedger {
     requested: number,
   ): number {
     if (requested <= 0 || !indices.length) return 0;
-    const capacity = indices.reduce(
-      (sum, index) => sum + Math.max(0, MAX_CONCENTRATION - field[index]),
-      0,
-    ) / CELL_COUNT;
+    let availableCapacity = 0;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      availableCapacity += Math.max(
+        0,
+        MAX_CONCENTRATION - field[indices[offset]],
+      );
+    }
+    const capacity = availableCapacity / CELL_COUNT;
     const actual = Math.min(requested, capacity);
     if (actual <= 0 || capacity <= 0) return 0;
     const ratio = actual / capacity;
-    for (const index of indices) {
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      const index = indices[offset];
       const free = Math.max(0, MAX_CONCENTRATION - field[index]);
       field[index] = finiteConcentration(field[index] + free * ratio);
     }

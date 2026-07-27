@@ -33,6 +33,71 @@ export interface AnimalVisualHitRadii {
   y: number;
 }
 
+export interface AnimalCarcassRenderPose {
+  x: number;
+  y: number;
+  facing: number;
+  bodyLength: number;
+}
+
+export interface AnimalCarcassVisualSnapshot extends AnimalCarcassRenderPose {
+  ageSeconds: number;
+  lifetimeSeconds: number;
+}
+
+/**
+ * Snapshot decoders reuse carcass objects, so object identity cannot tell the
+ * renderer whether age or pose actually advanced. Keep one tiny scalar copy
+ * per display and compare it before waking a settled carcass.
+ */
+export const animalCarcassVisualSnapshotChanged = (
+  previous: AnimalCarcassVisualSnapshot,
+  target: AnimalCarcassVisualSnapshot,
+): boolean =>
+  previous.x !== target.x ||
+  previous.y !== target.y ||
+  previous.facing !== target.facing ||
+  previous.bodyLength !== target.bodyLength ||
+  previous.ageSeconds !== target.ageSeconds ||
+  previous.lifetimeSeconds !== target.lifetimeSeconds;
+
+export const writeAnimalCarcassVisualSnapshot = (
+  target: AnimalCarcassVisualSnapshot,
+  reuse?: AnimalCarcassVisualSnapshot,
+): AnimalCarcassVisualSnapshot => {
+  const snapshot = reuse ?? {
+    x: target.x,
+    y: target.y,
+    facing: target.facing,
+    bodyLength: target.bodyLength,
+    ageSeconds: target.ageSeconds,
+    lifetimeSeconds: target.lifetimeSeconds,
+  };
+  snapshot.x = target.x;
+  snapshot.y = target.y;
+  snapshot.facing = target.facing;
+  snapshot.bodyLength = target.bodyLength;
+  snapshot.ageSeconds = target.ageSeconds;
+  snapshot.lifetimeSeconds = target.lifetimeSeconds;
+  return snapshot;
+};
+
+/**
+ * A carcass whose hand-off pose has reached its snapshot pose is completely
+ * static until the next one-second ecology publication advances its age.
+ */
+export const animalCarcassTransitionSettled = (
+  target: AnimalCarcassRenderPose,
+  renderX: number,
+  renderY: number,
+  renderFacing: number,
+  renderBodyLength: number,
+): boolean =>
+  Math.abs(target.x - renderX) <= 0.01 &&
+  Math.abs(target.y - renderY) <= 0.01 &&
+  Math.abs(target.facing - renderFacing) <= 0.001 &&
+  Math.abs(target.bodyLength - renderBodyLength) <= 0.001;
+
 export const ANIMAL_CARCASS_DISPLAY_LIMITS: Record<AnimalSpeciesId, number> = {
   daphnia: 128,
   'cherry-shrimp': 64,

@@ -209,9 +209,12 @@ export class WaterTransportGrid {
     return this.temperature[this.indexAt(point)];
   }
 
-  public sampleVelocityAt(point: Vec2): Vec2 {
+  public sampleVelocityAt(point: Vec2, reuse?: Vec2): Vec2 {
     const index = this.indexAt(point);
-    return { x: this.velocityX[index], y: this.velocityY[index] };
+    const velocity = reuse ?? { x: 0, y: 0 };
+    velocity.x = this.velocityX[index];
+    velocity.y = this.velocityY[index];
+    return velocity;
   }
 
   public averageTemperature(): number {

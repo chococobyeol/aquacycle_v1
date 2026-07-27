@@ -28,19 +28,25 @@ export interface AlgaePhysiologyRates {
   netGrowth: number;
 }
 
+export const ALGAE_PHYSIOLOGY_VALUE_COUNT = 4;
+export const ALGAE_PHYSIOLOGY_GROSS = 0;
+export const ALGAE_PHYSIOLOGY_RESPIRATION = 1;
+export const ALGAE_PHYSIOLOGY_STRESS = 2;
+export const ALGAE_PHYSIOLOGY_NET = 3;
+
 /**
- * Separates the former net light curve into observable gross photosynthesis,
- * continuous respiration and non-respiratory light/temperature stress. At the
- * 24°C reference the resulting net rate is exactly the established light
- * curve, preserving the earlier mission balance while making night oxygen
- * demand explicit and mass-conserving.
+ * Allocation-free form used by the one-second ecology hot loop. Reassigning
+ * several numeric properties on a shared object still creates boxed heap
+ * numbers in Chromium's worker isolate; a fixed numeric buffer avoids that
+ * sustained young-generation churn.
  */
-export const algaePhysiology = (
+export const writeAlgaePhysiologyRates = (
   speciesId: SpeciesId,
   light: number,
-  temperature = 24,
-  reuse?: AlgaePhysiologyRates,
-): AlgaePhysiologyRates => {
+  temperature: number,
+  target: Float64Array,
+  offset = 0,
+): number => {
   const definition = SPECIES[speciesId];
   const referenceNet = referenceNetLightRate(speciesId, light);
   const referenceRespiration = definition.respirationRateAtReference;
@@ -55,21 +61,54 @@ export const algaePhysiology = (
     2.1,
   );
   const grossPhotosynthesis = referenceGross * suitability;
-  const temperatureStress = (1 - suitability) * 0.012;
+  const lightStressTurnover = referenceStress + (1 - suitability) * 0.012;
+  const netGrowth = grossPhotosynthesis - respiration - lightStressTurnover;
+  target[offset + ALGAE_PHYSIOLOGY_GROSS] = grossPhotosynthesis;
+  target[offset + ALGAE_PHYSIOLOGY_RESPIRATION] = respiration;
+  target[offset + ALGAE_PHYSIOLOGY_STRESS] = lightStressTurnover;
+  target[offset + ALGAE_PHYSIOLOGY_NET] = netGrowth;
+  return netGrowth;
+};
+
+const algaePhysiologyCompatibilityScratch = new Float64Array(
+  ALGAE_PHYSIOLOGY_VALUE_COUNT,
+);
+
+/**
+ * Separates the former net light curve into observable gross photosynthesis,
+ * continuous respiration and non-respiratory light/temperature stress. At the
+ * 24°C reference the resulting net rate is exactly the established light
+ * curve, preserving the earlier mission balance while making night oxygen
+ * demand explicit and mass-conserving.
+ */
+export const algaePhysiology = (
+  speciesId: SpeciesId,
+  light: number,
+  temperature = 24,
+  reuse?: AlgaePhysiologyRates,
+): AlgaePhysiologyRates => {
+  writeAlgaePhysiologyRates(
+    speciesId,
+    light,
+    temperature,
+    algaePhysiologyCompatibilityScratch,
+  );
   // The response depends on local irradiance, not on whether darkness came
   // from the clock, a structure, or a switched-off lamp. Any future
   // photoacclimation must be driven by stored light history, never scenario ID.
-  const lightStressTurnover = referenceStress + temperatureStress;
   const rates = reuse ?? {
     grossPhotosynthesis: 0,
     respiration: 0,
     lightStressTurnover: 0,
     netGrowth: 0,
   };
-  rates.grossPhotosynthesis = grossPhotosynthesis;
-  rates.respiration = respiration;
-  rates.lightStressTurnover = lightStressTurnover;
-  rates.netGrowth = grossPhotosynthesis - respiration - lightStressTurnover;
+  rates.grossPhotosynthesis =
+    algaePhysiologyCompatibilityScratch[ALGAE_PHYSIOLOGY_GROSS];
+  rates.respiration =
+    algaePhysiologyCompatibilityScratch[ALGAE_PHYSIOLOGY_RESPIRATION];
+  rates.lightStressTurnover =
+    algaePhysiologyCompatibilityScratch[ALGAE_PHYSIOLOGY_STRESS];
+  rates.netGrowth = algaePhysiologyCompatibilityScratch[ALGAE_PHYSIOLOGY_NET];
   return rates;
 };
 
@@ -78,7 +117,13 @@ export const netGrowthPotential = (
   light: number,
   temperature = 24,
 ): number => {
-  return algaePhysiology(speciesId, light, temperature).netGrowth;
+  writeAlgaePhysiologyRates(
+    speciesId,
+    light,
+    temperature,
+    algaePhysiologyCompatibilityScratch,
+  );
+  return algaePhysiologyCompatibilityScratch[ALGAE_PHYSIOLOGY_NET];
 };
 
 export const temperatureSuitability = (

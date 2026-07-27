@@ -4,6 +4,7 @@ import {
   nitrifierStoichiometry,
   organicCarbonOxygenDemand,
   producerOxygenProduction,
+  type NitrifierStoichiometry,
 } from '../src/simulation/stoichiometry';
 
 const redoxDelta = (
@@ -43,6 +44,25 @@ describe('stoichiometric reaction columns', () => {
       reaction.fixedCarbon,
       reaction.nitrateProduced,
     )).toBeCloseTo(0, 12);
+  });
+
+  it('can overwrite a caller-owned nitrifier result without changing the reaction', () => {
+    const expected = nitrifierStoichiometry(0.08, 0.11);
+    const reuse: NitrifierStoichiometry = {
+      processedNitrogen: Number.NaN,
+      retainedNitrogen: Number.NaN,
+      nitrateProduced: Number.NaN,
+      growthBiomass: Number.NaN,
+      fixedCarbon: Number.NaN,
+      oxygenDemand: Number.NaN,
+    };
+
+    expect(nitrifierStoichiometry(0.08, 0.11, reuse)).toBe(reuse);
+    expect(reuse).toEqual(expected);
+
+    const nextExpected = nitrifierStoichiometry(0.027, 0.006);
+    expect(nitrifierStoichiometry(0.027, 0.006, reuse)).toBe(reuse);
+    expect(reuse).toEqual(nextExpected);
   });
 
   it('returns a complete nitrate-assisted producer/mineraliser/nitrifier loop to zero', () => {

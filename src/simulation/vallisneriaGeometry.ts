@@ -52,31 +52,39 @@ const cubicPoint = (
   controlB: Vec2,
   end: Vec2,
   t: number,
+  reuse?: Vec2,
 ): Vec2 => {
   const inverse = 1 - t;
   const inverseSquared = inverse * inverse;
   const tSquared = t * t;
-  return {
-    x: inverseSquared * inverse * start.x +
-      3 * inverseSquared * t * controlA.x +
-      3 * inverse * tSquared * controlB.x +
-      tSquared * t * end.x,
-    y: inverseSquared * inverse * start.y +
-      3 * inverseSquared * t * controlA.y +
-      3 * inverse * tSquared * controlB.y +
-      tSquared * t * end.y,
-  };
+  const target = reuse ?? { x: 0, y: 0 };
+  target.x = inverseSquared * inverse * start.x +
+    3 * inverseSquared * t * controlA.x +
+    3 * inverse * tSquared * controlB.x +
+    tSquared * t * end.x;
+  target.y = inverseSquared * inverse * start.y +
+    3 * inverseSquared * t * controlA.y +
+    3 * inverse * tSquared * controlB.y +
+    tSquared * t * end.y;
+  return target;
 };
 
-export const vallisneriaLeaves = (
+/**
+ * Writes the deterministic leaf geometry into a caller-owned workspace.
+ * `target.length` is treated as capacity: callers should iterate only the
+ * returned count so leaves that temporarily disappear while a ramet shrinks
+ * remain available if it grows again.
+ */
+export const writeVallisneriaLeaves = (
   cellIndex: number,
   anchor: Vec2,
   structuralScale: number,
-): VallisneriaLeafGeometry[] => {
+  target: VallisneriaLeafGeometry[],
+): number => {
   const plantHash = (cellIndex * 0.61803398875) % 1;
   const baseHeight = (184 + plantHash * 34) * vallisneriaLeafHeightScale(structuralScale);
   const leafCount = Math.max(3, Math.round(2 + structuralScale * 6));
-  return Array.from({ length: leafCount }, (_, index) => {
+  for (let index = 0; index < leafCount; index += 1) {
     const ratio = leafCount <= 1 ? 0.5 : index / (leafCount - 1);
     const side = ratio * 2 - 1;
     const phase = cellIndex * 0.73 + index * 1.37;
@@ -90,23 +98,44 @@ export const vallisneriaLeaves = (
     const ribbonWidth = 4.6 + structuralScale * 2.5 + (index % 3) * 0.35;
     const swayA = Math.sin(phase * 1.11) * (3 + structuralScale * 6);
     const swayB = Math.cos(phase * 0.83) * (4 + structuralScale * 8);
-    return {
-      // The stored placement point is the painted bottom of the plant. Keeping
-      // these coordinates identical makes depth ordering and the visible root
-      // agree without an extra rendering offset.
-      root: { x: rootX, y: anchor.y },
-      controlA: {
-        x: rootX + lean * 0.18 + swayA,
-        y: anchor.y - leafHeight * 0.3,
-      },
-      controlB: {
-        x: rootX + lean * 0.7 + swayB,
-        y: anchor.y - leafHeight * 0.72,
-      },
-      tip: { x: tipX, y: anchor.y - leafHeight },
-      ribbonWidth,
+    const leaf = target[index] ?? {
+      root: { x: 0, y: 0 },
+      controlA: { x: 0, y: 0 },
+      controlB: { x: 0, y: 0 },
+      tip: { x: 0, y: 0 },
+      ribbonWidth: 0,
     };
-  });
+    // The stored placement point is the painted bottom of the plant. Keeping
+    // these coordinates identical makes depth ordering and the visible root
+    // agree without an extra rendering offset.
+    leaf.root.x = rootX;
+    leaf.root.y = anchor.y;
+    leaf.controlA.x = rootX + lean * 0.18 + swayA;
+    leaf.controlA.y = anchor.y - leafHeight * 0.3;
+    leaf.controlB.x = rootX + lean * 0.7 + swayB;
+    leaf.controlB.y = anchor.y - leafHeight * 0.72;
+    leaf.tip.x = tipX;
+    leaf.tip.y = anchor.y - leafHeight;
+    leaf.ribbonWidth = ribbonWidth;
+    target[index] = leaf;
+  }
+  return leafCount;
+};
+
+export const vallisneriaLeaves = (
+  cellIndex: number,
+  anchor: Vec2,
+  structuralScale: number,
+): VallisneriaLeafGeometry[] => {
+  const leaves: VallisneriaLeafGeometry[] = [];
+  const leafCount = writeVallisneriaLeaves(
+    cellIndex,
+    anchor,
+    structuralScale,
+    leaves,
+  );
+  leaves.length = leafCount;
+  return leaves;
 };
 
 /**
@@ -119,21 +148,42 @@ export const vallisneriaRenderDepth = (anchor: Vec2): VallisneriaRenderDepth =>
 export const vallisneriaLeafPoint = (
   leaf: VallisneriaLeafGeometry,
   t: number,
-): Vec2 => cubicPoint(leaf.root, leaf.controlA, leaf.controlB, leaf.tip, t);
+  reuse?: Vec2,
+): Vec2 => cubicPoint(
+  leaf.root,
+  leaf.controlA,
+  leaf.controlB,
+  leaf.tip,
+  t,
+  reuse,
+);
 
-export const vallisneriaCanopyBounds = (
+/**
+ * Allocation-free canopy bounds for ecology hot paths. Rendering and hit
+ * testing retain the convenient allocating wrappers above.
+ */
+export const writeVallisneriaCanopyBounds = (
   cellIndex: number,
   anchor: Vec2,
   structuralScale: number,
+  target: VallisneriaCanopyBounds,
+  leavesScratch: VallisneriaLeafGeometry[],
+  pointScratch: Vec2,
 ): VallisneriaCanopyBounds => {
-  const leaves = vallisneriaLeaves(cellIndex, anchor, structuralScale);
+  const leafCount = writeVallisneriaLeaves(
+    cellIndex,
+    anchor,
+    structuralScale,
+    leavesScratch,
+  );
   let minX = anchor.x;
   let minY = anchor.y;
   let maxX = anchor.x;
   let maxY = anchor.y;
-  for (const leaf of leaves) {
+  for (let leafIndex = 0; leafIndex < leafCount; leafIndex += 1) {
+    const leaf = leavesScratch[leafIndex];
     for (let sample = 0; sample <= 12; sample += 1) {
-      const point = vallisneriaLeafPoint(leaf, sample / 12);
+      const point = vallisneriaLeafPoint(leaf, sample / 12, pointScratch);
       const margin = leaf.ribbonWidth / 2 + 5;
       minX = Math.min(minX, point.x - margin);
       minY = Math.min(minY, point.y - margin);
@@ -141,7 +191,27 @@ export const vallisneriaCanopyBounds = (
       maxY = Math.max(maxY, point.y + margin);
     }
   }
-  return { minX, minY, maxX, maxY };
+  target.minX = minX;
+  target.minY = minY;
+  target.maxX = maxX;
+  target.maxY = maxY;
+  return target;
+};
+
+export const vallisneriaCanopyBounds = (
+  cellIndex: number,
+  anchor: Vec2,
+  structuralScale: number,
+): VallisneriaCanopyBounds => {
+  const bounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  return writeVallisneriaCanopyBounds(
+    cellIndex,
+    anchor,
+    structuralScale,
+    bounds,
+    [],
+    { x: 0, y: 0 },
+  );
 };
 
 const distanceToSegment = (point: Vec2, start: Vec2, end: Vec2): number => {

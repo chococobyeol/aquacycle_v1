@@ -8,15 +8,53 @@ vi.hoisted(() => {
 });
 
 import {
+  animalCarcassTransitionSettled,
+  animalCarcassVisualSnapshotChanged,
   animalCarcassVisualPoint,
   animalVisualHitRadii,
   daphniaVisualScale,
   shrimpVisualScale,
+  writeAnimalCarcassVisualSnapshot,
 } from '../src/simulation/animalPresentation';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import { GROUND_Y } from '../src/simulation/types';
 
 describe('Daphnia carcass visual continuity', () => {
+  it('stops per-frame corpse work once the living-to-dead handoff converges', () => {
+    const target = { x: 600, y: 300, facing: 1, bodyLength: 9 };
+    expect(animalCarcassTransitionSettled(target, 600, 300, 1, 9)).toBe(true);
+    expect(animalCarcassTransitionSettled(target, 599, 300, 1, 9)).toBe(false);
+    expect(animalCarcassTransitionSettled(
+      target,
+      600.005,
+      299.995,
+      1.0005,
+      9.0005,
+    )).toBe(true);
+  });
+
+  it('wakes a settled corpse only when its ecology pose or age advances', () => {
+    const target = {
+      x: 600,
+      y: 300,
+      facing: 1,
+      bodyLength: 9,
+      ageSeconds: 12,
+      lifetimeSeconds: 45,
+    };
+    const previous = writeAnimalCarcassVisualSnapshot(target);
+
+    expect(animalCarcassVisualSnapshotChanged(previous, target)).toBe(false);
+    expect(animalCarcassVisualSnapshotChanged(previous, {
+      ...target,
+      ageSeconds: 13,
+    })).toBe(true);
+    expect(animalCarcassVisualSnapshotChanged(previous, {
+      ...target,
+      y: 301,
+    })).toBe(true);
+  });
+
   it('starts at the death position and sinks at a bounded linear speed', () => {
     const pointAt = (ageSeconds: number) => animalCarcassVisualPoint({
       speciesId: 'daphnia',

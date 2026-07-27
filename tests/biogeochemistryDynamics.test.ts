@@ -14,6 +14,40 @@ const site = (decomposer: number, nitrifier: number): BiofilmReactionSite => ({
 });
 
 describe('active biogeochemistry', () => {
+  it('reuses local vector and plankton samples while scalar accessors keep the same cell lookup', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 3, toxicWaste: 1.5, nutrients: 50, oxygen: 76 },
+    });
+    ledger.addPlankton(point, 'phytoplankton', 0.8);
+    ledger.addPlankton(point, 'daphnia', 0.3);
+    ledger.addPlanktonicDecomposer(point, 0.2);
+
+    const expectedPlankton = ledger.planktonAt(point);
+    const planktonReuse = {
+      phytoplankton: Number.NaN,
+      planktonicDecomposer: Number.NaN,
+      daphniaJuveniles: Number.NaN,
+      daphniaAdults: Number.NaN,
+    };
+    expect(ledger.planktonAt(point, planktonReuse)).toBe(planktonReuse);
+    expect(planktonReuse).toEqual(expectedPlankton);
+
+    const velocityReuse = { x: Number.NaN, y: Number.NaN };
+    expect(ledger.velocityAt(point, velocityReuse)).toBe(velocityReuse);
+    expect(velocityReuse).toEqual(ledger.velocityAt(point));
+
+    for (const samplePoint of [
+      point,
+      { x: -100, y: -100 },
+      { x: 10_000, y: 10_000 },
+    ]) {
+      const quality = ledger.sampleAt(samplePoint);
+      expect(ledger.oxygenAt(samplePoint)).toBe(quality.oxygen);
+      expect(ledger.toxicWasteAt(samplePoint)).toBe(quality.toxicWaste);
+    }
+  });
+
   it('lets algae assimilate local ammonium but never consumes organic detritus directly', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,

@@ -18,10 +18,14 @@ import {
   STRUCTURES,
 } from '../../simulation/config';
 import {
+  animalCarcassTransitionSettled,
+  animalCarcassVisualSnapshotChanged,
   animalCarcassVisualDrop,
   daphniaVisualScale,
   presentedAnimalCarcasses,
   shrimpVisualScale,
+  writeAnimalCarcassVisualSnapshot,
+  type AnimalCarcassVisualSnapshot,
 } from '../../simulation/animalPresentation';
 import type { SimulationMotionSource } from '../hooks/useSimulation';
 import {
@@ -324,6 +328,12 @@ interface AnimalCarcassDisplay {
   renderFacing: number;
   renderBodyLength: number;
   phaseOffset: number;
+  lastVisualSnapshot: AnimalCarcassVisualSnapshot;
+  /**
+   * Full corpse pose work is needed only while handing off a just-dead living
+   * rig or when a one-second ecology snapshot advances sinking/fading.
+   */
+  animationSettled: boolean;
 }
 
 type AnimalDisplayPool = BoundedReusePool<string, AnimalDisplay>;
@@ -770,22 +780,21 @@ const WATER_QUALITY_DRAW_ORDER: readonly WaterQualityVariable[] = [
 const isDissolvedLayer = (layer: WaterQualityLayer): layer is WaterQualityVariable =>
   WATER_QUALITY_DRAW_ORDER.includes(layer as WaterQualityVariable);
 
-const analysisOverlayKey = (
+export const analysisOverlayKey = (
   snapshot: SimulationSnapshot,
   selectedLayers: readonly WaterQualityLayer[],
 ): string => {
+  if (selectedLayers.length === 0) return 'hidden';
   const needsDissolvedGrid = selectedLayers.some(isDissolvedLayer);
   const needsPelagicGrid = selectedLayers.some(isPelagicLayer);
   const needsTransportGrid = selectedLayers.includes('temperature') ||
     selectedLayers.includes('flow');
-  const { decomposer, nitrifier } = snapshot.biogeochemistry.biofilmTotals;
   return [
+    snapshot.revision,
     needsDissolvedGrid || needsPelagicGrid
       ? snapshot.biogeochemistry.water.revision
       : 'water-idle',
     needsTransportGrid ? snapshot.biogeochemistry.transport.revision : 'transport-idle',
-    decomposer.toFixed(3),
-    nitrifier.toFixed(3),
     selectedLayers.join(',') || 'none',
   ].join(':');
 };
@@ -1194,11 +1203,15 @@ const drawBiofilmStain = (
  * into one independent raster. The light texture remains untouched, so
  * switching observation channels cannot disturb normal tank shading.
  */
-const drawAnalysisOverlay = (
+export const drawAnalysisOverlay = (
   layer: Sprite,
   snapshot: SimulationSnapshot,
   selectedLayers: readonly WaterQualityLayer[],
 ): void => {
+  if (selectedLayers.length === 0) {
+    layer.visible = false;
+    return;
+  }
   const rasterWidth = Math.round(TANK_WIDTH * ANALYSIS_RASTER_SCALE);
   const rasterHeight = Math.round((GROUND_Y - WATER_TOP) * ANALYSIS_RASTER_SCALE);
   const surface = getRasterSurface(layer, rasterWidth, rasterHeight);
@@ -2108,6 +2121,8 @@ const createAnimalCarcassDisplay = (
       renderFacing: target.facing,
       renderBodyLength: target.bodyLength,
       phaseOffset: animalHash(target.id) * Math.PI * 2,
+      lastVisualSnapshot: writeAnimalCarcassVisualSnapshot(target),
+      animationSettled: false,
     };
   }
   if (target.speciesId === 'japanese-ricefish') {
@@ -2136,6 +2151,8 @@ const createAnimalCarcassDisplay = (
       renderFacing: target.facing,
       renderBodyLength: target.bodyLength,
       phaseOffset: animalHash(target.id) * Math.PI * 2,
+      lastVisualSnapshot: writeAnimalCarcassVisualSnapshot(target),
+      animationSettled: false,
     };
   }
   const container = new Container();
@@ -2179,6 +2196,8 @@ const createAnimalCarcassDisplay = (
     renderFacing: target.facing,
     renderBodyLength: target.bodyLength,
     phaseOffset: animalHash(target.id) * Math.PI * 2,
+    lastVisualSnapshot: writeAnimalCarcassVisualSnapshot(target),
+    animationSettled: false,
   };
 };
 
@@ -2192,6 +2211,8 @@ const resetAnimalCarcassDisplay = (
   display.renderFacing = target.facing;
   display.renderBodyLength = target.bodyLength;
   display.phaseOffset = animalHash(target.id) * Math.PI * 2;
+  writeAnimalCarcassVisualSnapshot(target, display.lastVisualSnapshot);
+  display.animationSettled = false;
   display.container.position.set(target.x, target.y);
   display.container.visible = true;
   display.art.position.set(0, 0);
@@ -2272,7 +2293,18 @@ const syncAnimalCarcasses = (
       displays.set(carcass.id, display);
       layer.addChild(display.container);
     }
+    const visualSnapshotChanged = animalCarcassVisualSnapshotChanged(
+      display.lastVisualSnapshot,
+      carcass,
+    );
     display.target = carcass;
+    if (visualSnapshotChanged) {
+      // Holding/probe overlays can replace the React snapshot shell at 30 Hz
+      // without advancing carcass state. Wake only for an actual ecology pose
+      // or age change; decoder object identity is intentionally reusable.
+      writeAnimalCarcassVisualSnapshot(carcass, display.lastVisualSnapshot);
+      display.animationSettled = false;
+    }
   }
 };
 
@@ -2629,6 +2661,7 @@ const animateAnimalCarcasses = (
 ): void => {
   const delta = Math.max(0, Math.min(0.05, deltaSeconds));
   for (const display of displays.values()) {
+    if (display.animationSettled) continue;
     const { target } = display;
     const positionEase = 1 - Math.exp(-delta * 10);
     const scaleEase = 1 - Math.exp(-delta * 12);
@@ -2636,6 +2669,19 @@ const animateAnimalCarcasses = (
     display.renderY += (target.y - display.renderY) * positionEase;
     display.renderFacing += (target.facing - display.renderFacing) * scaleEase;
     display.renderBodyLength += (target.bodyLength - display.renderBodyLength) * scaleEase;
+    const transitionSettled = animalCarcassTransitionSettled(
+      target,
+      display.renderX,
+      display.renderY,
+      display.renderFacing,
+      display.renderBodyLength,
+    );
+    if (transitionSettled) {
+      display.renderX = target.x;
+      display.renderY = target.y;
+      display.renderFacing = target.facing;
+      display.renderBodyLength = target.bodyLength;
+    }
 
     const age = Math.max(0, target.ageSeconds);
     const lifetime = Math.max(0.001, target.lifetimeSeconds);
@@ -2665,6 +2711,7 @@ const animateAnimalCarcasses = (
       display.art.rotation = facingSign * (0.42 + settle * 0.42);
       display.tail.rotation = 0;
       display.legs.alpha = 0.48;
+      display.animationSettled = transitionSettled;
       continue;
     }
 
@@ -2676,6 +2723,7 @@ const animateAnimalCarcasses = (
       display.legs.rotation = -0.2;
       display.tail.rotation = 0.12;
       display.legs.alpha = 0.42;
+      display.animationSettled = transitionSettled;
       continue;
     }
 
@@ -2698,6 +2746,7 @@ const animateAnimalCarcasses = (
     display.legs.alpha = 0.46;
     display.antennae.rotation = 0.2;
     display.antennae.alpha = 0.56;
+    display.animationSettled = transitionSettled;
   }
 };
 

@@ -10,6 +10,20 @@ import { SimulationWorld } from '../src/simulation/SimulationWorld';
 const zeros = (): number[] => Array.from({ length: TRANSPORT_CELL_COUNT }, () => 0);
 
 describe('spatial water temperature', () => {
+  it('can overwrite a caller-owned velocity sample without changing its value', () => {
+    const grid = new WaterTransportGrid(22);
+    const state = grid.exportSaveState();
+    state.velocityX.fill(0.031);
+    state.velocityY.fill(-0.027);
+    grid.restoreSaveState(state, 22);
+    const point = { x: 600, y: 420 };
+    const expected = grid.sampleVelocityAt(point);
+    const reuse = { x: Number.NaN, y: Number.NaN };
+
+    expect(grid.sampleVelocityAt(point, reuse)).toBe(reuse);
+    expect(reuse).toEqual(expected);
+  });
+
   it('keeps a uniform unlit tank at ambient temperature', () => {
     const grid = new WaterTransportGrid(22);
     grid.setEnvironment(zeros(), []);

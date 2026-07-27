@@ -52,6 +52,7 @@ export const organicCarbonOxygenDemand = (mineralizedCarbon: number): number =>
 export const nitrifierStoichiometry = (
   processedNitrogen: number,
   requestedGrowthBiomass: number,
+  reuse?: NitrifierStoichiometry,
 ): NitrifierStoichiometry => {
   const processed = nonNegative(processedNitrogen);
   const maximumGrowth = processed / WATER_CYCLE_RULES.biomassNitrogen;
@@ -67,14 +68,24 @@ export const nitrifierStoichiometry = (
   const carbonReductionCredit =
     fixedCarbon * WATER_CYCLE_RULES.oxygenPerOrganicCarbon;
 
-  return {
-    processedNitrogen: processed,
-    retainedNitrogen,
-    nitrateProduced,
-    growthBiomass,
-    fixedCarbon,
-    oxygenDemand: Math.max(0, grossNitrificationDemand - carbonReductionCredit),
+  const result = reuse ?? {
+    processedNitrogen: 0,
+    retainedNitrogen: 0,
+    nitrateProduced: 0,
+    growthBiomass: 0,
+    fixedCarbon: 0,
+    oxygenDemand: 0,
   };
+  result.processedNitrogen = processed;
+  result.retainedNitrogen = retainedNitrogen;
+  result.nitrateProduced = nitrateProduced;
+  result.growthBiomass = growthBiomass;
+  result.fixedCarbon = fixedCarbon;
+  result.oxygenDemand = Math.max(
+    0,
+    grossNitrificationDemand - carbonReductionCredit,
+  );
+  return result;
 };
 
 /**
