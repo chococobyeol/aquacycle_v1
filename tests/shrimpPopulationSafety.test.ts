@@ -76,7 +76,7 @@ const configureReadyPair = (
   nourished: boolean,
 ): ReproductionWorldInternals => {
   placeShrimp(world, { x: 560, y: 590 });
-  placeShrimp(world, { x: 600, y: 590 });
+  placeShrimp(world, { x: 590, y: 590 });
   const internals = reproductionInternals(world);
   for (const animal of internals.animals) {
     animal.energy = nourished ? 0.9 : 0.2;
@@ -154,6 +154,37 @@ const waterFields = (
   };
 
 describe('shrimp population safety contract', () => {
+  it('does not let unrelated Daphnia IDs change supplied shrimp traits', () => {
+    const direct = new SimulationWorld('mission-7');
+    placeShrimp(direct, { x: 420, y: 610 });
+
+    const afterDaphnia = new SimulationWorld('mission-7');
+    for (const x of [420, 600, 780]) {
+      const point = { x, y: 320 };
+      afterDaphnia.handle({
+        type: 'pick-plankton',
+        planktonKind: 'daphnia',
+        point,
+      });
+      afterDaphnia.handle({ type: 'drop-held', point });
+    }
+    placeShrimp(afterDaphnia, { x: 420, y: 610 });
+
+    const traits = (world: SimulationWorld) => {
+      const shrimp = world.exportSaveData().animals.find(
+        (animal) => animal.speciesId === SHRIMP,
+      );
+      return shrimp && {
+        lifespanSeconds: shrimp.lifespanSeconds,
+        maturationTargetSeconds: shrimp.maturationTargetSeconds,
+        ovarianProgress: shrimp.ovarianProgress,
+        randomSeed: shrimp.randomSeed,
+      };
+    };
+
+    expect(traits(afterDaphnia)).toEqual(traits(direct));
+  });
+
   it('derives condition from conserved body matter instead of killing on a stale hunger value', () => {
     const world = new SimulationWorld('laboratory');
     placeShrimp(world, { x: 600, y: 590 });
@@ -338,7 +369,7 @@ describe('shrimp population safety contract', () => {
 
     expect(internals.chooseFoodTarget(shrimp)).toBeNull();
 
-    shrimp.position = { x: farCell.x - 80, y: farCell.y };
+    shrimp.position = { x: farCell.x - 50, y: farCell.y };
     expect(internals.chooseFoodTarget(shrimp)).not.toBeNull();
   });
 
@@ -354,8 +385,8 @@ describe('shrimp population safety contract', () => {
       Math.abs(cell.x - 600) < Math.abs(best.x - 600) ? cell : best
     );
     const colony = substrate.reduce((best, cell) =>
-      Math.abs(cell.x - (trace.x - 170)) <
-        Math.abs(best.x - (trace.x - 170))
+      Math.abs(cell.x - (trace.x - 45)) <
+        Math.abs(best.x - (trace.x - 45))
         ? cell
         : best
     );

@@ -53,7 +53,7 @@ const sampleAt = (
 };
 
 const passingEvidence = (): Mission7AcceptanceEvidence => ({
-  samples: Array.from({ length: 61 }, (_, index) =>
+  samples: Array.from({ length: 91 }, (_, index) =>
     sampleAt(index * 120, index),
   ),
   events: [
@@ -78,6 +78,8 @@ const passingEvidence = (): Mission7AcceptanceEvidence => ({
     daphniaDescendants: 6,
     daphniaMaximumLivingGeneration: 5,
     shrimpBornDescendants: 4,
+    shrimpFemales: 4,
+    shrimpMales: 3,
     shrimpAdultFemales: 3,
     shrimpAdultMales: 2,
     suppliedVallisneria: 0,
@@ -113,7 +115,7 @@ describe('mission 7 acceptance matrix fixtures', () => {
     );
   });
 
-  it('uses the seasoned substrate without silently adding another inoculation in the minimal fixture', () => {
+  it('uses explicit cycling cultures in the minimal fixture', () => {
     const world = new SimulationWorld('mission-7');
 
     applyMission7AcceptanceFixture(world, 'starter-only-minimal');
@@ -121,12 +123,29 @@ describe('mission 7 acceptance matrix fixtures', () => {
     const snapshot = world.snapshot();
     const saved = world.exportSaveData();
     expect(saved.microbeInventoryUsed).toEqual({
-      decomposer: 0,
-      nitrifier: 0,
+      decomposer: 2,
+      nitrifier: 2,
     });
     expect(snapshot.animalPopulation['cherry-shrimp'].total).toBe(4);
     expect(snapshot.animalPopulation.daphnia.total).toBe(3);
     expect(snapshot.plants).toHaveLength(3);
+    expect(snapshot.structures).toHaveLength(4);
+    expect(snapshot.structures.every(
+      (structure) => structure.definitionId === 'round-stone',
+    )).toBe(true);
+    const shrimp = snapshot.animals
+      .filter((animal) => animal.speciesId === 'cherry-shrimp')
+      .sort((left, right) => left.x - right.x);
+    expect(shrimp.map((animal) => animal.sex)).toEqual([
+      'female',
+      'male',
+      'female',
+      'male',
+    ]);
+    expect(shrimp[1].x - shrimp[0].x).toBeLessThan(100);
+    expect(shrimp[2].x - shrimp[1].x).toBeGreaterThan(100);
+    expect(shrimp[2].x - shrimp[1].x).toBeLessThan(250);
+    expect(shrimp[3].x - shrimp[2].x).toBeLessThan(100);
     expect(saved.seedPlacements.filter(
       (placement) => placement.speciesId === 'oedogonium',
     )).toHaveLength(1);
@@ -171,9 +190,33 @@ describe('mission 7 acceptance matrix fixtures', () => {
 });
 
 describe('mission 7 shared long-run acceptance contract', () => {
-  it('requires a renewing lineage without prescribing a population phase', () => {
-    expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumCount).toBe(1);
+  it('requires a renewable prey reserve rather than token lineage survival', () => {
+    expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumCount).toBe(15);
+    expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumMeanCount).toBe(30);
+    expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumFinalCount).toBe(20);
     expect(MISSION7_LONG_RUN_ACCEPTANCE.daphnia.maximumCount).toBe(1_000);
+    expect(MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumCount).toBe(4);
+  });
+
+  it('does not treat a single 19-versus-20 boundary sample as a biological failure', () => {
+    const evidence = passingEvidence();
+    const firstTailIndex = evidence.samples.findIndex(
+      (sample) => sample.time >=
+        MISSION7_LONG_RUN_ACCEPTANCE.tailStartSeconds,
+    );
+    evidence.samples[firstTailIndex] = {
+      ...evidence.samples[firstTailIndex]!,
+      daphniaCount: 19,
+    };
+
+    const report = evaluateMission7Acceptance(
+      'full-stock-stress',
+      evidence,
+    );
+
+    expect(report.checks.find(
+      (check) => check.id === 'daphnia-density',
+    )?.passed).toBe(true);
   });
 
   it.each([

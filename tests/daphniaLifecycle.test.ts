@@ -119,6 +119,37 @@ describe('individual Daphnia life cycle', () => {
       .toBe(true);
   });
 
+  it('does not let unrelated shrimp IDs change Daphnia founder traits', () => {
+    const direct = new SimulationWorld('mission-7');
+    inoculateDaphnia(direct);
+
+    const afterShrimp = new SimulationWorld('mission-7');
+    for (const x of [180, 360, 540, 720]) {
+      const point = { x, y: 610 };
+      afterShrimp.handle({
+        type: 'pick-animal',
+        speciesId: 'cherry-shrimp',
+        point,
+      });
+      afterShrimp.handle({ type: 'drop-held', point });
+    }
+    inoculateDaphnia(afterShrimp);
+
+    const founderTraits = (world: SimulationWorld) => {
+      const founder = world.exportSaveData().animals.find(
+        (animal) => animal.speciesId === 'daphnia',
+      );
+      return founder && {
+        lifespanSeconds: founder.lifespanSeconds,
+        maturationTargetInstars: founder.maturationTargetInstars,
+        moltCycleSeconds: founder.moltCycleSeconds,
+        randomSeed: founder.randomSeed,
+      };
+    };
+
+    expect(founderTraits(afterShrimp)).toEqual(founderTraits(direct));
+  });
+
   it('freezes individual motion while paused and resumes from the same positions', () => {
     const world = new SimulationWorld('mission-7');
     inoculateDaphnia(world);

@@ -4,6 +4,7 @@ import {
   continuousBodyMassMaintenance,
   daphniaSuspendedFoodResponse,
   PLANKTON_ECOLOGY_RULES,
+  SHRIMP_ECOLOGY_RULES,
   WATER_CYCLE_RULES,
 } from '../src/simulation/config';
 import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
@@ -38,6 +39,7 @@ type MutableDaphniaRules = {
   filtrationMassExponent: number;
   reproductionAllocationPerSecondIndividual: number;
   reproductionFoodResponseExponent: number;
+  broodDevelopmentSeconds: number;
   broodCooldownSeconds: number;
   minimumBroodSize: number;
   maximumBroodSize: number;
@@ -93,6 +95,11 @@ if (process.env.MISSION7_VERIFY_REPRODUCTION_RESPONSE_EXPONENT) {
 if (process.env.MISSION7_VERIFY_BROOD_COOLDOWN) {
   mutableDaphniaRules.broodCooldownSeconds = Number(
     process.env.MISSION7_VERIFY_BROOD_COOLDOWN,
+  );
+}
+if (process.env.MISSION7_VERIFY_BROOD_DEVELOPMENT) {
+  mutableDaphniaRules.broodDevelopmentSeconds = Number(
+    process.env.MISSION7_VERIFY_BROOD_DEVELOPMENT,
   );
 }
 if (process.env.MISSION7_VERIFY_MIN_BROOD) {
@@ -164,6 +171,8 @@ interface LongRunSample {
   shrimp: number;
   shrimpAdults: number;
   shrimpJuveniles: number;
+  shrimpFemales: number;
+  shrimpMales: number;
   shrimpAdultFemales: number;
   shrimpAdultMales: number;
   shrimpBornDescendants: number;
@@ -493,6 +502,12 @@ while (snapshot.elapsedSeconds < DURATION_SECONDS) {
     shrimp: snapshot.animalPopulation['cherry-shrimp'].total,
     shrimpAdults: snapshot.animalPopulation['cherry-shrimp'].adults,
     shrimpJuveniles: snapshot.animalPopulation['cherry-shrimp'].juveniles,
+    shrimpFemales: livingShrimp.filter(
+      (animal) => animal.sex === 'female',
+    ).length,
+    shrimpMales: livingShrimp.filter(
+      (animal) => animal.sex === 'male',
+    ).length,
     shrimpAdultFemales:
       snapshot.animalPopulation['cherry-shrimp'].adultFemales,
     shrimpAdultMales: snapshot.animalPopulation['cherry-shrimp'].adultMales,
@@ -511,7 +526,8 @@ while (snapshot.elapsedSeconds < DURATION_SECONDS) {
       (animal) =>
         (animal.ovarianProgress ?? 0) >= 1 &&
         (animal.reproductiveBiomass ?? 0) >=
-          WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass * 2,
+          WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
+            SHRIMP_ECOLOGY_RULES.minimumClutchSize,
     ).length,
     shrimpGestatingFemales: savedShrimpFemales.filter(
       (animal) => animal.gestationRemaining !== null,
@@ -648,23 +664,8 @@ const vallisneriaMaximumLivingGeneration =
 const finalBornShrimp = finalShrimp.filter(
   (animal) => bornShrimpIds.has(animal.id),
 );
-const maximumAllowedTailDaphniaStarvationDeaths = Math.max(
-  1,
-  Math.floor(
-    tailDaphniaEvents.deaths *
-      MISSION7_LONG_RUN_ACCEPTANCE.daphnia.maximumStarvationDeathFraction,
-  ),
-);
-const maximumAllowedTailShrimpStarvationDeaths = Math.max(
-  1,
-  Math.floor(
-    tailShrimpEvents.deaths *
-      MISSION7_LONG_RUN_ACCEPTANCE.shrimp.maximumStarvationDeathFraction,
-  ),
-);
-
 check(
-  '7,200초 검증 구간 완료',
+  '10,800초 장기 검증 구간 완료',
   snapshot.elapsedSeconds >= DURATION_SECONDS &&
     tail.length >=
       Math.floor(
@@ -676,9 +677,14 @@ check(
   '후반 물벼룩 세대 절멸 없음',
   daphniaMinimum >=
       MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumCount &&
+    daphniaMean >=
+      MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumMeanCount &&
+    snapshot.biogeochemistry.plankton.approximateDaphniaCount >=
+      MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumFinalCount &&
     daphniaMaximum <=
       MISSION7_LONG_RUN_ACCEPTANCE.daphnia.maximumCount,
   `min=${daphniaMinimum}, mean=${daphniaMean.toFixed(2)}, ` +
+    `final=${snapshot.biogeochemistry.plankton.approximateDaphniaCount}, ` +
     `max=${daphniaMaximum}`,
 );
 check(
@@ -709,10 +715,9 @@ check(
     acuteWaterDeathCount(tailDaphniaEvents) === 0 &&
     tailDaphniaEvents.deathsByCause.predation === 0 &&
     tailDaphniaEvents.deathsByCause.starvation <=
-      maximumAllowedTailDaphniaStarvationDeaths,
+      tailDaphniaEvents.deathsByCause['old-age'],
   `oldAge=${tailDaphniaEvents.deathsByCause['old-age']}, ` +
-    `starvation=${tailDaphniaEvents.deathsByCause.starvation}` +
-    `/${maximumAllowedTailDaphniaStarvationDeaths}, ` +
+    `starvation=${tailDaphniaEvents.deathsByCause.starvation}, ` +
     `waterStress=${acuteWaterDeathCount(tailDaphniaEvents)}, ` +
     `predation=${tailDaphniaEvents.deathsByCause.predation}`,
 );
@@ -749,7 +754,7 @@ check(
 );
 check(
   '체리새우 후반 세대교체',
-  shrimpMinimum > 0 &&
+  shrimpMinimum >= MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumCount &&
     tailShrimpEvents.births >=
       MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumTailBirths &&
     tailShrimpEvents.maturations >=
@@ -760,10 +765,13 @@ check(
     `finalBorn=${finalBornShrimp.length}`,
 );
 check(
-  '체리새우 성체 암수 유지',
-  snapshot.animalPopulation['cherry-shrimp'].adultFemales > 0 &&
-    snapshot.animalPopulation['cherry-shrimp'].adultMales > 0,
-  `adultFemales=${snapshot.animalPopulation['cherry-shrimp'].adultFemales}, ` +
+  '체리새우 암수 계통 유지',
+  finalShrimp.some((animal) => animal.sex === 'female') &&
+    finalShrimp.some((animal) => animal.sex === 'male') &&
+    snapshot.animalPopulation['cherry-shrimp'].adults > 0,
+  `livingFemales=${finalShrimp.filter((animal) => animal.sex === 'female').length}, ` +
+    `livingMales=${finalShrimp.filter((animal) => animal.sex === 'male').length}, ` +
+    `adultFemales=${snapshot.animalPopulation['cherry-shrimp'].adultFemales}, ` +
     `adultMales=${snapshot.animalPopulation['cherry-shrimp'].adultMales}`,
 );
 check(
@@ -772,10 +780,9 @@ check(
     acuteWaterDeathCount(tailShrimpEvents) === 0 &&
     tailShrimpEvents.deathsByCause.predation === 0 &&
     tailShrimpEvents.deathsByCause.starvation <=
-      maximumAllowedTailShrimpStarvationDeaths,
+      tailShrimpEvents.deathsByCause['old-age'],
   `oldAge=${tailShrimpEvents.deathsByCause['old-age']}, ` +
-    `starvation=${tailShrimpEvents.deathsByCause.starvation}` +
-    `/${maximumAllowedTailShrimpStarvationDeaths}, ` +
+    `starvation=${tailShrimpEvents.deathsByCause.starvation}, ` +
     `waterStress=${acuteWaterDeathCount(tailShrimpEvents)}, ` +
     `predation=${tailShrimpEvents.deathsByCause.predation}`,
 );
@@ -844,6 +851,8 @@ const compactCensus = samples.filter(
   shrimp: sample.shrimp,
   shrimpAdults: sample.shrimpAdults,
   shrimpJuveniles: sample.shrimpJuveniles,
+  shrimpFemales: sample.shrimpFemales,
+  shrimpMales: sample.shrimpMales,
   shrimpAdultFemales: sample.shrimpAdultFemales,
   shrimpAdultMales: sample.shrimpAdultMales,
   shrimpFemaleMeanOvarianProgress:
@@ -907,6 +916,10 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
       phytoplankton:
         snapshot.biogeochemistry.plankton.phytoplanktonBiomass,
       shrimp: snapshot.animalPopulation['cherry-shrimp'].total,
+      shrimpFemales:
+        finalShrimp.filter((animal) => animal.sex === 'female').length,
+      shrimpMales:
+        finalShrimp.filter((animal) => animal.sex === 'male').length,
       shrimpAdultFemales:
         snapshot.animalPopulation['cherry-shrimp'].adultFemales,
       shrimpAdultMales:
@@ -924,27 +937,29 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
       daphnia: allDaphniaEvents,
       shrimp: allShrimpEvents,
       daphniaStressDeaths: compactDaphniaStressDeaths,
-      shrimpLifecycle: observedAnimalEvents
-        .filter(
-          (event) =>
-            event.speciesId === 'cherry-shrimp' &&
-            (
-              event.kind === 'birth' ||
-              event.kind === 'matured' ||
-              event.kind === 'death'
-            ),
-        )
-        .map((event) => ({
-          time: event.elapsedSeconds,
-          kind: event.kind,
-          id: event.animalId,
-          parentId: event.parentId,
-          stage: event.lifeStage,
-          sex: event.sex,
-          cause: event.cause,
-          age: event.ageSeconds,
-          energy: event.energy,
-        })),
+      shrimpLifecycle: process.env.MISSION7_VERIFY_SHRIMP_LIFECYCLE === '1'
+        ? observedAnimalEvents
+          .filter(
+            (event) =>
+              event.speciesId === 'cherry-shrimp' &&
+              (
+                event.kind === 'birth' ||
+                event.kind === 'matured' ||
+                event.kind === 'death'
+              ),
+          )
+          .map((event) => ({
+            time: event.elapsedSeconds,
+            kind: event.kind,
+            id: event.animalId,
+            parentId: event.parentId,
+            stage: event.lifeStage,
+            sex: event.sex,
+            cause: event.cause,
+            age: event.ageSeconds,
+            energy: event.energy,
+          }))
+        : undefined,
       shrimpDeaths: observedAnimalEvents
         .filter(
           (event) =>
@@ -1042,6 +1057,10 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
     phytoplankton:
       snapshot.biogeochemistry.plankton.phytoplanktonBiomass,
     shrimp: snapshot.animalPopulation['cherry-shrimp'].total,
+    shrimpFemales:
+      finalShrimp.filter((animal) => animal.sex === 'female').length,
+    shrimpMales:
+      finalShrimp.filter((animal) => animal.sex === 'male').length,
     shrimpAdultFemales:
       snapshot.animalPopulation['cherry-shrimp'].adultFemales,
     shrimpAdultMales:

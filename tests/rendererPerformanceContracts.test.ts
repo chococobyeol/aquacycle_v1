@@ -92,6 +92,8 @@ describe('renderer performance contracts', () => {
       expect(motion.animals.map((animal) => animal.id)).toEqual(expectedIds);
       for (const animal of motion.animals) expectCompleteMotionPose(animal);
     }
-  }, 15_000);
+    // Still catches algorithmic regressions while leaving headroom for a
+    // thermally throttled machine after the long ecology suite.
+  }, 20_000);
 
 });

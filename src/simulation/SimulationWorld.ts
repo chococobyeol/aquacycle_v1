@@ -20,6 +20,9 @@ import {
 import {
   BiogeochemistryLedger,
   emptyBiofilm,
+  type BiofilmReactionSite,
+  type ShrimpFoodCueSite,
+  type ShrimpMateCueSite,
 } from './biogeochemistry';
 import {
   animalCarcassVisualPoint,
@@ -426,10 +429,25 @@ const SHRIMP_GRAZING_HALF_SATURATION = 0.8;
 const SHRIMP_DECOMPOSER_FOOD_WEIGHT = 0.45;
 const SHRIMP_NITRIFIER_FOOD_WEIGHT = 0.22;
 const SHRIMP_LOCAL_FOOD_RADIUS = 64;
-// A hungry shrimp samples a somewhat wider nearby area, never the whole tank.
-// Longer-range discovery happens only through ordinary exploratory movement.
-const SHRIMP_EMERGENCY_FOOD_RADIUS = 240;
-const SHRIMP_EMERGENCY_SEARCH_ENERGY = 0.35;
+// Dissolved food odour is sampled across approximately one water-grid cell.
+// It guides movement without identifying a distant food cell.
+const SHRIMP_FOOD_CUE_SAMPLE_RADIUS = 42;
+const SHRIMP_FOOD_CUE_MINIMUM = 0.004;
+const SHRIMP_FOOD_CUE_GRADIENT_MINIMUM = 0.0008;
+const SHRIMP_FOOD_CUE_UPSTREAM_WEIGHT = 0.18;
+// A contact-scale trace remains edible, but it is not adopted as the next
+// grazing destination when its expected assimilation cannot pay the act of
+// grazing there. Without this sensory profitability threshold, ubiquitous
+// sub-visible biofilm suppresses odour-guided travel toward viable patches.
+const SHRIMP_MINIMUM_TARGET_PROFITABILITY = 1;
+// N. davidi males are pure-searching rather than long-range mate homing.
+// A ready female therefore supplies only a short-lived local chemical hint;
+// physical proximity is still required for mating.
+const SHRIMP_MATE_CUE_SAMPLE_RADIUS = 42;
+const SHRIMP_MATE_CUE_MINIMUM = 0.006;
+const SHRIMP_MATE_CUE_GRADIENT_MINIMUM = 0.001;
+const SHRIMP_MATE_CUE_UPSTREAM_WEIGHT = 0.12;
+const SHRIMP_MATE_CUE_EMISSION_START_PROGRESS = 0.82;
 // Cherry shrimp detect deteriorating water with short-range chemical and
 // oxygen cues. The probe radius is deliberately about one-and-a-half adult
 // body lengths: it lets an animal follow a local gradient away from a waste
@@ -484,14 +502,11 @@ const SHRIMP_REPRODUCTIVE_SOMATIC_RESERVE_FLOOR = 0.16;
 // fed juvenile into an immediately starving one, without using the old
 // all-or-nothing "ate within 12 seconds" gate.
 const SHRIMP_JUVENILE_GROWTH_RESERVE_FLOOR = 0.04;
-// Mating is a local encounter, not a tank-wide lookup. The radius is wider
-// than the grazing contact distance to stand in for short-range chemical and
-// tactile cues without revealing animals elsewhere in the aquarium.
-const SHRIMP_MATING_ENCOUNTER_RADIUS = 300;
-// A ready female can follow a short-range dissolved/tactile cue toward a mate.
-// This is deliberately much smaller than the 1,200-wide tank and is unrelated
-// to food discovery, so sparse adults can meet without gaining a tank radar.
-const SHRIMP_MATING_ATTRACTION_RADIUS = 420;
+// A female can recognise and close on a male only after he enters the local
+// encounter neighbourhood. Longer approach is handled by the dissolved mate
+// cue and ordinary search; the mating timer itself requires near-body contact.
+const SHRIMP_MATING_ENCOUNTER_RADIUS = 36;
+const SHRIMP_MATING_ATTRACTION_RADIUS = 140;
 const SHRIMP_MATING_SECONDS = 3;
 const SHRIMP_MALE_POST_MATING_COOLDOWN = 45;
 const SHRIMP_CARCASS_LIFETIME_SECONDS = 55;
@@ -570,6 +585,13 @@ const shrimpMaturationTargetSeconds = (seed: number): number =>
     seed * 0.053 + 17.3,
     SHRIMP_ECOLOGY_RULES.maturationMinimumSeconds,
     SHRIMP_ECOLOGY_RULES.maturationMaximumSeconds,
+  );
+
+const shrimpAdultLifespanSeconds = (seed: number): number =>
+  seededRange(
+    seed * 19 + 13.7,
+    SHRIMP_MIN_LIFESPAN_SECONDS,
+    SHRIMP_MAX_LIFESPAN_SECONDS,
   );
 
 const shrimpOvarianCycleSeconds = (
@@ -1620,12 +1642,6 @@ export class SimulationWorld {
   private createSubstrateCells(): SurfaceCellState[] {
     const sampled = sampleSubstrate();
     const ids = sampled.map((_, index) => `substrate:cell-${index}`);
-    const exposedRow = sampled.reduce(
-      (topRow, cell) => Math.max(topRow, cell.row),
-      Number.NEGATIVE_INFINITY,
-    );
-    const exposedCellCount = sampled.filter((cell) => cell.row === exposedRow).length;
-    const initialBiofilm = this.scenario.waterCycle?.initialBiofilm;
     return sampled.map((cell, index) => ({
       ...cell,
       id: ids[index],
@@ -1635,12 +1651,7 @@ export class SimulationWorld {
       index,
       light: 0,
       biomass: emptyBiomass(),
-      biofilm: initialBiofilm && cell.row === exposedRow && exposedCellCount > 0
-        ? {
-          decomposer: initialBiofilm.decomposer / exposedCellCount,
-          nitrifier: initialBiofilm.nitrifier / exposedCellCount,
-        }
-        : emptyBiofilm(),
+      biofilm: emptyBiofilm(),
       localNeighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
       neighborIds: cell.neighborIndices.map((neighbor) => ids[neighbor]),
     }));
@@ -3691,7 +3702,20 @@ export class SimulationWorld {
         justFinishedGrazing = true;
       }
 
-      if (animal.behavior === 'resting' && animal.behaviorTimer > 0 && animal.energy > SHRIMP_WEAK_ENERGY) {
+      const mateCueDirection = !seeking
+        ? this.shrimpMateCueDirection(animal)
+        : null;
+      if (mateCueDirection && animal.behavior === 'resting') {
+        animal.behavior = 'exploring';
+        animal.behaviorTimer = 0;
+        animal.nextTargetEvaluation = 0;
+      }
+      if (
+        animal.behavior === 'resting' &&
+        animal.behaviorTimer > 0 &&
+        animal.energy > SHRIMP_WEAK_ENERGY &&
+        !mateCueDirection
+      ) {
         animal.targetCellId = null;
         const damping = Math.exp(-deltaSeconds * 5);
         animal.velocity.x *= damping;
@@ -3702,7 +3726,13 @@ export class SimulationWorld {
 
       // Crossing the full-energy threshold ends food pursuit immediately rather
       // than leaving the animal parked on a still-edible surface until retarget.
-      if (!seeking && wasForaging && !justFinishedGrazing && animal.behavior !== 'resting') {
+      if (
+        !seeking &&
+        wasForaging &&
+        !justFinishedGrazing &&
+        animal.behavior !== 'resting' &&
+        !mateCueDirection
+      ) {
         animal.targetCellId = null;
         animal.behavior = 'resting';
         animal.behaviorTimer = 1.8 + behaviorNoise * 2.6;
@@ -3725,6 +3755,7 @@ export class SimulationWorld {
 
       if (
         !seeking &&
+        !mateCueDirection &&
         animal.nextTargetEvaluation <= 0 &&
         currentTarget &&
         currentTargetDistance <= 24 &&
@@ -3746,12 +3777,17 @@ export class SimulationWorld {
         (seeking && targetFood <= 0 && currentTargetDistance <= 24)
       ) {
         const foodTarget = seeking ? this.chooseFoodTarget(animal) : null;
+        const foodCueDirection =
+          seeking && !foodTarget ? this.shrimpFoodCueDirection(animal) : null;
+        const localCueDirection = foodCueDirection ?? mateCueDirection;
         const retainExplorationTarget = Boolean(
           seeking && currentTarget &&
           targetFood <= 0 && currentTargetDistance > 24,
         );
         animal.targetCellId = foodTarget?.id ??
-          (retainExplorationTarget ? currentTarget!.id : this.chooseExplorationTarget(animal)?.id ?? null);
+          (retainExplorationTarget
+            ? currentTarget!.id
+            : this.chooseExplorationTarget(animal, localCueDirection)?.id ?? null);
         animal.nextTargetEvaluation = foodTarget
           ? 0.8 + behaviorNoise * 0.6
           : forcedRoaming
@@ -4158,12 +4194,56 @@ export class SimulationWorld {
   }
 
   private resolveBiogeochemistry(deltaSeconds: number): void {
+    const shrimpMateCueSites: ShrimpMateCueSite[] = [];
+    for (const animal of this.animals) {
+      if (
+        animal.speciesId !== 'cherry-shrimp' ||
+        animal.lifeStage !== 'adult' ||
+        animal.sex !== 'female' ||
+        animal.gestationRemaining !== null ||
+        animal.energy < SHRIMP_REPRODUCTION_ENERGY ||
+        animal.reproductiveBiomass < SHRIMP_MINIMUM_BROOD_BIOMASS
+      ) continue;
+      const progress = animal.ovarianProgress ?? 0;
+      if (progress < SHRIMP_MATE_CUE_EMISSION_START_PROGRESS) continue;
+      shrimpMateCueSites.push({
+        point: animal.position,
+        strength: clamp01(
+          (progress - SHRIMP_MATE_CUE_EMISSION_START_PROGRESS) /
+            (1 - SHRIMP_MATE_CUE_EMISSION_START_PROGRESS),
+        ) * animal.health,
+      });
+    }
+
+    const cells = this.allCells();
+    const reactionSites: BiofilmReactionSite[] = [];
+    const shrimpFoodCueSites: ShrimpFoodCueSite[] = [];
+    const hasShrimp = this.animals.some(
+      (animal) => animal.speciesId === 'cherry-shrimp',
+    );
+    // Food can only reach a surface after an algae or microbial inoculation.
+    // Skip four diet-component reads per bare cell in empty layout and
+    // rendering-performance fixtures.
+    const surfaceFoodMayExist = hasShrimp && (
+      this.seedPlacements.some(
+        (placement) => placement.speciesId !== 'vallisneria',
+      ) ||
+      this.microbeInventoryUsed.decomposer > 0 ||
+      this.microbeInventoryUsed.nitrifier > 0
+    );
+    for (const cell of cells) {
+      const point = this.cellWorldPoint(cell);
+      reactionSites.push({ point, biofilm: cell.biofilm });
+      if (!surfaceFoodMayExist) continue;
+      const strength = this.edibleBiomass(cell);
+      if (strength > 0) shrimpFoodCueSites.push({ point, strength });
+    }
+
     this.biogeochemistry.advance(
       deltaSeconds,
-      this.allCells().map((cell) => ({
-        point: this.cellWorldPoint(cell),
-        biofilm: cell.biofilm,
-      })),
+      reactionSites,
+      shrimpMateCueSites,
+      shrimpFoodCueSites,
     );
     if (this.probe) this.setProbe(this.probe);
   }
@@ -4686,7 +4766,10 @@ export class SimulationWorld {
         continue;
       }
 
-      if (animal.ageSeconds >= animal.lifespanSeconds) {
+      if (
+        animal.lifeStage === 'adult' &&
+        animal.ageSeconds >= animal.lifespanSeconds
+      ) {
         this.killAnimal(animal, 'old-age');
         continue;
       }
@@ -4722,6 +4805,12 @@ export class SimulationWorld {
           animal.growthProgress >= 1
         ) {
           animal.lifeStage = 'adult';
+          // Adult longevity begins at biological maturation. A food-limited
+          // juvenile can take longer than its nominal growth target, but it
+          // must not emerge with most of a fixed birth-to-death timer already
+          // spent. Starvation and water stress remain active before maturity.
+          animal.lifespanSeconds =
+            animal.ageSeconds + shrimpAdultLifespanSeconds(animal.randomSeed);
           animal.bodyLength = SHRIMP_ADULT_LENGTH;
           animal.reproductiveCycleIndex = 0;
           animal.ovarianProgress = animal.sex === 'female'
@@ -6236,10 +6325,6 @@ export class SimulationWorld {
   }
 
   private chooseFoodTarget(animal: AnimalState): SurfaceCellState | null {
-    const emergencySearch = animal.energy <= SHRIMP_EMERGENCY_SEARCH_ENERGY;
-    const detectionRadius = emergencySearch
-      ? SHRIMP_EMERGENCY_FOOD_RADIUS
-      : SHRIMP_LOCAL_FOOD_RADIUS;
     const reservations = new Map<string, number>();
     for (const candidate of this.animals) {
       if (!candidate.targetCellId || candidate.id === animal.id) continue;
@@ -6251,14 +6336,8 @@ export class SimulationWorld {
       if (food <= 0) continue;
       const point = this.shrimpSurfaceContactPoint(cell);
       const distance = Math.sqrt(distanceSquared(animal.position, point));
-      if (distance > detectionRadius) continue;
-      // Water quality is sensed only once the surface is inside the ordinary
-      // local cue radius. Emergency food search may notice a distant colony,
-      // but it does not grant knowledge of chemistry across the tank.
-      if (
-        distance <= SHRIMP_LOCAL_WATER_SENSE_RADIUS &&
-        this.shrimpWaterStressAt(point) > 0
-      ) continue;
+      if (distance > SHRIMP_LOCAL_FOOD_RADIUS) continue;
+      if (this.shrimpWaterStressAt(point) > 0) continue;
       const congestion = reservations.get(cell.id) ?? 0;
       // Preserve a target only while traveling toward it, so movement does not
       // jitter between neighboring cells. A completed grazing target is cleared
@@ -6268,13 +6347,13 @@ export class SimulationWorld {
         animal.randomSeed + cell.index * 1.7 + point.x * 0.01,
       ) * 3;
       const profitability = this.shrimpFoodProfitability(animal, cell);
+      if (profitability < SHRIMP_MINIMUM_TARGET_PROFITABILITY) continue;
       // Compare a sensed patch's potential assimilation with the metabolic
-      // cost of grazing there. Scaling by the *local* detection radius keeps
-      // this a nearby cue, while allowing a starving animal to cross that
-      // radius for a viable colony instead of selecting a microscopic film
-      // merely because it is underfoot.
+      // cost of grazing there. Only food physically inside the contact-scale
+      // neighbourhood can become a target; dissolved odour affects direction,
+      // never this cell selection.
       const foodUtility =
-        Math.min(2.5, profitability) * detectionRadius * 0.55;
+        Math.min(2.5, profitability) * SHRIMP_LOCAL_FOOD_RADIUS * 0.55;
       // Food search is an encounter, not omniscience: choose a nearby edible
       // surface. Within that sensed neighbourhood, a dense patch is worth a
       // somewhat longer trip than a trace film, avoiding repeated starvation
@@ -6490,16 +6569,126 @@ export class SimulationWorld {
     };
   }
 
-  private chooseExplorationTarget(animal: AnimalState): SurfaceCellState | null {
+  private shrimpFoodCueDirection(animal: AnimalState): Vec2 | null {
+    return this.shrimpLocalCueDirection(
+      animal,
+      (point) => this.biogeochemistry.shrimpFoodCueAt(point),
+      SHRIMP_FOOD_CUE_SAMPLE_RADIUS,
+      SHRIMP_FOOD_CUE_MINIMUM,
+      SHRIMP_FOOD_CUE_GRADIENT_MINIMUM,
+      SHRIMP_FOOD_CUE_UPSTREAM_WEIGHT,
+    );
+  }
+
+  private shrimpMateCueDirection(animal: AnimalState): Vec2 | null {
+    if (
+      animal.speciesId !== 'cherry-shrimp' ||
+      animal.lifeStage !== 'adult' ||
+      animal.sex !== 'male' ||
+      animal.energy < SHRIMP_ECOLOGY_RULES.maleReproductionEnergy ||
+      animal.reproductionCooldown > 0
+    ) return null;
+    return this.shrimpLocalCueDirection(
+      animal,
+      (point) => this.biogeochemistry.shrimpMateCueAt(point),
+      SHRIMP_MATE_CUE_SAMPLE_RADIUS,
+      SHRIMP_MATE_CUE_MINIMUM,
+      SHRIMP_MATE_CUE_GRADIENT_MINIMUM,
+      SHRIMP_MATE_CUE_UPSTREAM_WEIGHT,
+    );
+  }
+
+  /**
+   * Sample a dissolved cue only at the animal and eight neighbouring points.
+   * The caller supplies cue identity and sensory thresholds; no emitter
+   * position or remote surface/animal id is exposed to movement.
+   */
+  private shrimpLocalCueDirection(
+    animal: AnimalState,
+    cueAt: (point: Vec2) => number,
+    sampleRadius: number,
+    minimumCue: number,
+    minimumGradient: number,
+    upstreamWeight: number,
+  ): Vec2 | null {
+    const diagonal = Math.SQRT1_2;
+    const directions: Vec2[] = [
+      { x: 1, y: 0 },
+      { x: -1, y: 0 },
+      { x: 0, y: 1 },
+      { x: 0, y: -1 },
+      { x: diagonal, y: diagonal },
+      { x: diagonal, y: -diagonal },
+      { x: -diagonal, y: diagonal },
+      { x: -diagonal, y: -diagonal },
+    ];
+    const centreCue = cueAt(animal.position);
+    let strongestCue = centreCue;
+    let gradientX = 0;
+    let gradientY = 0;
+    for (const direction of directions) {
+      const samplePoint = this.clampAnimalPoint({
+        x: animal.position.x + direction.x * sampleRadius,
+        y: animal.position.y + direction.y * sampleRadius,
+      });
+      const cue = cueAt(samplePoint);
+      strongestCue = Math.max(strongestCue, cue);
+      const difference = cue - centreCue;
+      gradientX += difference * direction.x;
+      gradientY += difference * direction.y;
+    }
+    if (strongestCue < minimumCue) return null;
+
+    const gradientMagnitude = Math.hypot(gradientX, gradientY);
+    const velocity = this.biogeochemistry.velocityAt(animal.position);
+    const flowMagnitude = Math.hypot(velocity.x, velocity.y);
+    if (gradientMagnitude >= minimumGradient) {
+      gradientX /= gradientMagnitude;
+      gradientY /= gradientMagnitude;
+      if (flowMagnitude > 1e-4) {
+        const upstreamX = -velocity.x / flowMagnitude;
+        const upstreamY = -velocity.y / flowMagnitude;
+        gradientX =
+          gradientX * (1 - upstreamWeight) +
+          upstreamX * upstreamWeight;
+        gradientY =
+          gradientY * (1 - upstreamWeight) +
+          upstreamY * upstreamWeight;
+      }
+      const blendedMagnitude = Math.hypot(gradientX, gradientY);
+      if (blendedMagnitude > 1e-6) {
+        return {
+          x: gradientX / blendedMagnitude,
+          y: gradientY / blendedMagnitude,
+        };
+      }
+    }
+
+    // In a locally flat part of a moving plume, upstream rheotaxis remains a
+    // local response. With neither a gradient nor flow, ordinary casting is
+    // handled by the existing correlated random walk.
+    return flowMagnitude > 1e-4
+      ? { x: -velocity.x / flowMagnitude, y: -velocity.y / flowMagnitude }
+      : null;
+  }
+
+  private chooseExplorationTarget(
+    animal: AnimalState,
+    localCueDirection: Vec2 | null = null,
+  ): SurfaceCellState | null {
     const cells = this.allCells();
     if (!cells.length) return null;
     const phase = Math.floor(animal.ageSeconds / 4.5);
-    const heading =
+    const randomHeading =
       deterministicNoise(animal.randomSeed + phase * 19 + 0.37) * Math.PI * 2;
-    const roamingDistance = 170;
+    const direction = localCueDirection ?? {
+      x: Math.cos(randomHeading),
+      y: Math.sin(randomHeading),
+    };
+    const roamingDistance = localCueDirection ? 210 : 170;
     const desiredPoint = {
-      x: animal.position.x + Math.cos(heading) * roamingDistance,
-      y: animal.position.y + Math.sin(heading) * roamingDistance,
+      x: animal.position.x + direction.x * roamingDistance,
+      y: animal.position.y + direction.y * roamingDistance,
     };
     let best: { cell: SurfaceCellState; score: number } | null = null;
     const samples = Math.min(48, cells.length);
@@ -6509,11 +6698,10 @@ export class SimulationWorld {
       ) * cells.length);
       const cell = cells[sampleIndex];
       const point = this.shrimpSurfaceContactPoint(cell);
-      // Roaming has no hidden knowledge of food outside the local sensing
-      // radius. A time-varying individual heading defines a local random walk,
-      // and the closest reachable surface is chosen from geometry alone;
-      // food can only become a target after the shrimp physically approaches
-      // it and chooseFoodTarget detects it locally.
+      // Geometry alone chooses the next reachable surface. The heading is
+      // either the correlated random walk or a locally sampled food/mate
+      // odour-flow direction; a source cell or animal itself remains unknown
+      // until it enters the existing contact-scale encounter radius.
       const score =
         -Math.sqrt(distanceSquared(point, desiredPoint)) -
         (point.y < WATER_TOP + 80 ? 120 : 0);
@@ -7768,10 +7956,15 @@ export class SimulationWorld {
     if (speciesId === 'daphnia') {
       return this.createAdultDaphniaState(id, point, origin, 0, null);
     }
-    const characteristicSeed = deterministicStringSeed(`${id}:shrimp`);
-    const suppliedIndex = this.animals.filter((animal) =>
-      animal.speciesId === 'cherry-shrimp' && animal.origin === 'supplied').length;
-    const lifespanNoise = deterministicNoise(characteristicSeed * 0.019 + 13.7);
+    // Inventory usage is the species-specific introduction sequence. Unlike
+    // counting currently living founders, it does not restart after a supplied
+    // animal dies in an unlimited laboratory scenario.
+    const suppliedIndex = this.animalInventoryUsed['cherry-shrimp'];
+    const characteristicSeed = deterministicStringSeed(
+      origin === 'supplied'
+        ? `shrimp-supplied-${suppliedIndex}`
+        : `${id}:shrimp`,
+    );
     const motionNoise = deterministicNoise(characteristicSeed * 0.031 + 31.1);
     const individualSeed = characteristicSeed * 0.001;
     const isFemale = suppliedIndex % 2 === 0;
@@ -7782,6 +7975,9 @@ export class SimulationWorld {
         SHRIMP_ECOLOGY_RULES.suppliedOvarianProgressMaximum,
       )
       : 0;
+    const ageSeconds = SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS +
+      deterministicNoise(characteristicSeed * 0.013 + 7.1) *
+      (SHRIMP_SUPPLIED_ADULT_MAX_AGE_SECONDS - SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS);
     return {
       id,
       speciesId,
@@ -7794,12 +7990,9 @@ export class SimulationWorld {
         (0.94 + deterministicNoise(characteristicSeed * 0.037) * 0.12),
       lifeStage: 'adult',
       sex: isFemale ? 'female' : 'male',
-      ageSeconds: SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS +
-        deterministicNoise(characteristicSeed * 0.013 + 7.1) *
-        (SHRIMP_SUPPLIED_ADULT_MAX_AGE_SECONDS - SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS),
-      lifespanSeconds: SHRIMP_MIN_LIFESPAN_SECONDS +
-        lifespanNoise *
-        (SHRIMP_MAX_LIFESPAN_SECONDS - SHRIMP_MIN_LIFESPAN_SECONDS),
+      ageSeconds,
+      lifespanSeconds:
+        ageSeconds + shrimpAdultLifespanSeconds(individualSeed),
       energy: 0.52 + (suppliedIndex % 4) * 0.01,
       structuralBiomass: WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
       storedBiomass: WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass,
@@ -7845,7 +8038,15 @@ export class SimulationWorld {
     parentId: string | null,
   ): AnimalState {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
-    const seed = deterministicStringSeed(`${id}:daphnia`);
+    const suppliedIndex = this.animalInventoryUsed.daphnia;
+    // Founder traits belong to the Daphnia inoculation sequence, not the
+    // global animal ID. Otherwise an unrelated shrimp birth just before an
+    // inoculation changes the founder's lifespan and molt schedule.
+    const seed = deterministicStringSeed(
+      origin === 'supplied'
+        ? `daphnia-supplied-${suppliedIndex}`
+        : `${id}:daphnia`,
+    );
     const lifespanNoise = deterministicNoise(seed * 0.019 + 13.7);
     const instarTarget = daphniaMaturationInstarTarget(seed * 0.001);
     const moltCount = instarTarget +
@@ -7912,7 +8113,13 @@ export class SimulationWorld {
   ): AnimalState {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
     const id = `animal-${++this.animalCounter}`;
-    const seed = deterministicStringSeed(`${id}:daphnia`);
+    // Demographic variation follows the maternal lineage and brood number.
+    // The display/event ID remains globally unique, but shrimp births can no
+    // longer perturb Daphnia lifespan and instar draws by consuming IDs first.
+    const seed = deterministicStringSeed(
+      `daphnia-lineage-${parent.randomSeed.toPrecision(12)}-` +
+      `${parent.moltCount ?? 0}-${broodIndex}`,
+    );
     const angle = deterministicNoise(parent.randomSeed + broodIndex * 7.31) *
       Math.PI * 2;
     const distance = 4 + deterministicNoise(parent.randomSeed + broodIndex * 3.17) * 7;
@@ -7984,11 +8191,19 @@ export class SimulationWorld {
 
   private createJuvenileAnimalState(parent: AnimalState, clutchIndex: number): AnimalState {
     const id = `animal-${++this.animalCounter}`;
-    const characteristicSeed = deterministicStringSeed(`${id}:shrimp`);
+    // As with Daphnia, lineage traits must not depend on how many animals of
+    // another species happened to consume global display IDs first.
+    const characteristicSeed = deterministicStringSeed(
+      `shrimp-lineage-${parent.randomSeed.toPrecision(12)}-` +
+      `${parent.reproductiveCycleIndex ?? 0}-${clutchIndex}`,
+    );
     const cohortSexOffset =
       deterministicNoise(parent.randomSeed + parent.ageSeconds * 0.017) < 0.5 ? 0 : 1;
     const angle = deterministicNoise(parent.randomSeed + clutchIndex * 3.7) * Math.PI * 2;
     const distance = 7 + deterministicNoise(parent.randomSeed + clutchIndex * 8.9) * 12;
+    const individualSeed = characteristicSeed * 0.001;
+    const maturationTargetSeconds =
+      shrimpMaturationTargetSeconds(individualSeed);
     return {
       id,
       speciesId: parent.speciesId,
@@ -8004,9 +8219,11 @@ export class SimulationWorld {
       lifeStage: 'juvenile',
       sex: (clutchIndex + cohortSexOffset) % 2 === 0 ? 'female' : 'male',
       ageSeconds: 0,
-      lifespanSeconds: SHRIMP_MIN_LIFESPAN_SECONDS +
-        deterministicNoise(characteristicSeed * 0.019 + 13.7) *
-        (SHRIMP_MAX_LIFESPAN_SECONDS - SHRIMP_MIN_LIFESPAN_SECONDS),
+      // Before maturation this is only the nominal death age shown in
+      // diagnostics. The actual adult death age is rebased when conserved
+      // growth reaches maturity.
+      lifespanSeconds:
+        maturationTargetSeconds + shrimpAdultLifespanSeconds(individualSeed),
       energy: 0.46,
       structuralBiomass: WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
       storedBiomass: 0,
@@ -8027,12 +8244,11 @@ export class SimulationWorld {
       growthProgress: 0,
       reproductionCooldown: 0,
       gestationRemaining: null,
-      maturationTargetSeconds:
-        shrimpMaturationTargetSeconds(characteristicSeed * 0.001),
+      maturationTargetSeconds,
       ovarianProgress: 0,
       reproductiveCycleIndex: 0,
       matingAccumulator: 0,
-      randomSeed: characteristicSeed * 0.001,
+      randomSeed: individualSeed,
     };
   }
 

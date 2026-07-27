@@ -532,6 +532,16 @@ export interface BiogeochemistrySaveState {
   daphniaBornAdults?: number[];
   /** Optional, non-material behavioural field for version-1 save compatibility. */
   daphniaCrowdingCue?: number[];
+  /**
+   * Dissolved food odour used only for shrimp navigation. It is deliberately
+   * excluded from the closed material ledger.
+   */
+  shrimpFoodCue?: number[];
+  /**
+   * Short-lived reproductive cue from receptive shrimp females. Like food
+   * odour, this is behavioural information rather than conserved matter.
+   */
+  shrimpMateCue?: number[];
   planktonCounters?: PlanktonSnapshot['cumulativeEvents'] & {
     filteredPhytoplankton: number;
     filteredPlanktonicDecomposer: number;

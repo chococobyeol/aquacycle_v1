@@ -5,18 +5,21 @@ import type {
 } from '../src/simulation/types';
 
 export const MISSION7_LONG_RUN_ACCEPTANCE = {
-  durationSeconds: 7_200,
+  durationSeconds: 10_800,
   tailStartSeconds: 3_600,
   sampleSeconds: 120,
   daphnia: {
-    // Mission 7 verifies an independently renewing Daphnia lineage, not a
-    // stockpile for a future fish mission. A trough of one living descendant
-    // is valid if births and maturations continue; a higher arbitrary count
-    // would turn population phase into a hidden mission answer.
-    minimumCount: 1,
+    // A single boundary sample at 19 versus 20 has no biological meaning.
+    // Reject a true demographic bottleneck with a low tail floor, then require
+    // the whole tail and final state to retain a prey reservoir measured in
+    // tens rather than tuning life-history rates to one sampling edge.
+    minimumCount: 15,
+    minimumMeanCount: 30,
+    minimumFinalCount: 20,
     // This is only a runaway diagnostic, never a gameplay population cap.
-    // Hundreds of small zooplankton are expected; only an approach toward the
-    // thousands within this two-hour fixture indicates unbounded growth.
+    // Hundreds of tiny zooplankton can be a healthy prey reservoir. Only an
+    // approach toward the thousands in this small fixture indicates a likely
+    // unbounded rise.
     maximumCount: 1_000,
     minimumTailBirths: 1,
     minimumTailMaturations: 1,
@@ -24,6 +27,7 @@ export const MISSION7_LONG_RUN_ACCEPTANCE = {
     minimumLivingGeneration: 2,
   },
   shrimp: {
+    minimumCount: 4,
     minimumTailBirths: 1,
     minimumTailMaturations: 1,
   },

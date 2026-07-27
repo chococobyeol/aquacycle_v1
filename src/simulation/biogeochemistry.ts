@@ -41,12 +41,32 @@ export const WATER_ROWS = 20;
 const CELL_COUNT = WATER_COLUMNS * WATER_ROWS;
 const MAX_CONCENTRATION = 100;
 const LOCAL_REACTION_RADIUS = 2;
+const SHRIMP_FOOD_CUE_MIXING_PER_SECOND = 0.08;
+const SHRIMP_FOOD_CUE_SOURCE_HALF_SATURATION = 0.08;
+const SHRIMP_FOOD_CUE_SOURCE_RESPONSE_PER_SECOND = 0.9;
+const SHRIMP_FOOD_CUE_HALF_LIFE_SECONDS = 45;
+const SHRIMP_FOOD_CUE_MINIMUM = 1e-9;
+const SHRIMP_MATE_CUE_MIXING_PER_SECOND = 0.04;
+const SHRIMP_MATE_CUE_SOURCE_RESPONSE_PER_SECOND = 1.4;
+const SHRIMP_MATE_CUE_HALF_LIFE_SECONDS = 18;
+const SHRIMP_MATE_CUE_MINIMUM = 1e-9;
 
 export const emptyBiofilm = (): BiofilmBiomass => ({ decomposer: 0, nitrifier: 0 });
 
 export interface BiofilmReactionSite {
   point: Vec2;
   biofilm: BiofilmBiomass;
+}
+
+export interface ShrimpFoodCueSite {
+  point: Vec2;
+  /** Non-material dissolved cue emitted by edible surface biomass. */
+  strength: number;
+}
+
+export interface ShrimpMateCueSite {
+  point: Vec2;
+  strength: number;
 }
 
 export interface ClosedMaterialState {
@@ -109,6 +129,10 @@ export class BiogeochemistryLedger {
   private readonly daphniaFounderAdults = new Float64Array(CELL_COUNT);
   private readonly daphniaBornAdults = new Float64Array(CELL_COUNT);
   private readonly planktonLight = new Float64Array(CELL_COUNT);
+  private readonly shrimpFoodCue = new Float64Array(CELL_COUNT);
+  private readonly shrimpFoodCueSources = new Float64Array(CELL_COUNT);
+  private readonly shrimpMateCue = new Float64Array(CELL_COUNT);
+  private readonly shrimpMateCueSources = new Float64Array(CELL_COUNT);
   private readonly transport: WaterTransportGrid;
 
   private headspaceCarbonDioxide: number = WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide;
@@ -124,6 +148,10 @@ export class BiogeochemistryLedger {
   private stepAlgaeOxygenDemand = 0;
   private fieldRevision = 0;
   private dissolvedAdvectionAccumulator = 0;
+  private shrimpFoodCueAdvectionAccumulator = 0;
+  private shrimpMateCueAdvectionAccumulator = 0;
+  private shrimpFoodCueActive = false;
+  private shrimpMateCueActive = false;
   private biofilmTotals = emptyBiofilm();
   private cumulativeFilteredPhytoplankton = 0;
   private cumulativeFilteredPlanktonicDecomposer = 0;
@@ -188,6 +216,16 @@ export class BiogeochemistryLedger {
 
   public velocityAt(point: Vec2): Vec2 {
     return this.transport.sampleVelocityAt(point);
+  }
+
+  /** Local, non-material food odour available to shrimp chemosensation. */
+  public shrimpFoodCueAt(point: Vec2): number {
+    return this.shrimpFoodCue[this.indexAt(point)];
+  }
+
+  /** Short-range, non-material cue released by a receptive shrimp female. */
+  public shrimpMateCueAt(point: Vec2): number {
+    return this.shrimpMateCue[this.indexAt(point)];
   }
 
   public averageTemperature(): number {
@@ -614,9 +652,17 @@ export class BiogeochemistryLedger {
     };
   }
 
-  public advance(deltaSeconds: number, sites: BiofilmReactionSite[]): void {
-    if (!this.effectsEnabled || deltaSeconds <= 0) return;
+  public advance(
+    deltaSeconds: number,
+    sites: BiofilmReactionSite[],
+    shrimpMateCueSites: ShrimpMateCueSite[] = [],
+    shrimpFoodCueSites: ShrimpFoodCueSite[] = [],
+  ): void {
+    if (deltaSeconds <= 0) return;
     const dt = Math.max(0, deltaSeconds);
+    this.advanceShrimpFoodCue(dt, shrimpFoodCueSites);
+    this.advanceShrimpMateCue(dt, shrimpMateCueSites);
+    if (!this.effectsEnabled) return;
     const solubilization = 1 - Math.exp(-WATER_CYCLE_RULES.detritusSolubilizationRate * dt);
     for (let index = 0; index < CELL_COUNT; index += 1) {
       const requested = this.detritus[index] * solubilization;
@@ -703,6 +749,124 @@ export class BiogeochemistryLedger {
     this.fieldRevision += 1;
   }
 
+  private advanceShrimpFoodCue(
+    deltaSeconds: number,
+    sites: ShrimpFoodCueSite[],
+  ): void {
+    if (!sites.length && !this.shrimpFoodCueActive) return;
+
+    this.shrimpFoodCueSources.fill(0);
+    for (const site of sites) {
+      const strength = Math.max(0, site.strength);
+      if (strength <= 0) continue;
+      // A trace biofilm should not create nearly the same navigational signal
+      // as a viable colony merely because many trace cells exist. A type-III
+      // source response also represents sensory detection against background
+      // odour while remaining continuous at zero.
+      const strengthSquared = strength * strength;
+      const halfSaturationSquared =
+        SHRIMP_FOOD_CUE_SOURCE_HALF_SATURATION *
+        SHRIMP_FOOD_CUE_SOURCE_HALF_SATURATION;
+      const normalized =
+        strengthSquared / (halfSaturationSquared + strengthSquared);
+      this.shrimpFoodCueSources[this.indexAt(site.point)] += normalized;
+    }
+
+    const sourceResponse =
+      1 - Math.exp(-SHRIMP_FOOD_CUE_SOURCE_RESPONSE_PER_SECOND * deltaSeconds);
+    for (let index = 0; index < CELL_COUNT; index += 1) {
+      const source = this.shrimpFoodCueSources[index];
+      if (source <= 0) continue;
+      const localTarget = 1 - Math.exp(-source);
+      if (localTarget > this.shrimpFoodCue[index]) {
+        this.shrimpFoodCue[index] +=
+          (localTarget - this.shrimpFoodCue[index]) * sourceResponse;
+      }
+    }
+
+    this.transport.disperseConservativeField(
+      this.shrimpFoodCue,
+      deltaSeconds,
+      SHRIMP_FOOD_CUE_MIXING_PER_SECOND,
+    );
+    this.shrimpFoodCueAdvectionAccumulator += deltaSeconds;
+    if (this.shrimpFoodCueAdvectionAccumulator + 1e-9 >= 1) {
+      this.transport.advectConservativeField(
+        this.shrimpFoodCue,
+        this.shrimpFoodCueAdvectionAccumulator,
+        1,
+      );
+      this.shrimpFoodCueAdvectionAccumulator = 0;
+    }
+
+    const retention = Math.exp(
+      -Math.LN2 * deltaSeconds / SHRIMP_FOOD_CUE_HALF_LIFE_SECONDS,
+    );
+    let active = false;
+    for (let index = 0; index < CELL_COUNT; index += 1) {
+      const retained = this.shrimpFoodCue[index] * retention;
+      const value = retained >= SHRIMP_FOOD_CUE_MINIMUM ? retained : 0;
+      this.shrimpFoodCue[index] = value;
+      active ||= value > 0;
+    }
+    this.shrimpFoodCueActive = active;
+    if (!active) this.shrimpFoodCueAdvectionAccumulator = 0;
+  }
+
+  private advanceShrimpMateCue(
+    deltaSeconds: number,
+    sites: ShrimpMateCueSite[],
+  ): void {
+    if (!sites.length && !this.shrimpMateCueActive) return;
+
+    this.shrimpMateCueSources.fill(0);
+    for (const site of sites) {
+      const strength = clamp(site.strength, 0, 1);
+      if (strength <= 0) continue;
+      this.shrimpMateCueSources[this.indexAt(site.point)] += strength;
+    }
+
+    const sourceResponse =
+      1 - Math.exp(-SHRIMP_MATE_CUE_SOURCE_RESPONSE_PER_SECOND * deltaSeconds);
+    for (let index = 0; index < CELL_COUNT; index += 1) {
+      const source = this.shrimpMateCueSources[index];
+      if (source <= 0) continue;
+      const localTarget = 1 - Math.exp(-source);
+      if (localTarget > this.shrimpMateCue[index]) {
+        this.shrimpMateCue[index] +=
+          (localTarget - this.shrimpMateCue[index]) * sourceResponse;
+      }
+    }
+
+    this.transport.disperseConservativeField(
+      this.shrimpMateCue,
+      deltaSeconds,
+      SHRIMP_MATE_CUE_MIXING_PER_SECOND,
+    );
+    this.shrimpMateCueAdvectionAccumulator += deltaSeconds;
+    if (this.shrimpMateCueAdvectionAccumulator + 1e-9 >= 1) {
+      this.transport.advectConservativeField(
+        this.shrimpMateCue,
+        this.shrimpMateCueAdvectionAccumulator,
+        1,
+      );
+      this.shrimpMateCueAdvectionAccumulator = 0;
+    }
+
+    const retention = Math.exp(
+      -Math.LN2 * deltaSeconds / SHRIMP_MATE_CUE_HALF_LIFE_SECONDS,
+    );
+    let active = false;
+    for (let index = 0; index < CELL_COUNT; index += 1) {
+      const retained = this.shrimpMateCue[index] * retention;
+      const value = retained >= SHRIMP_MATE_CUE_MINIMUM ? retained : 0;
+      this.shrimpMateCue[index] = value;
+      active ||= value > 0;
+    }
+    this.shrimpMateCueActive = active;
+    if (!active) this.shrimpMateCueAdvectionAccumulator = 0;
+  }
+
   public sampleAt(point: Vec2): WaterQualityValues {
     const index = this.indexAt(point);
     return {
@@ -773,6 +937,8 @@ export class BiogeochemistryLedger {
       daphniaJuveniles: Array.from(this.daphniaJuveniles),
       daphniaFounderAdults: Array.from(this.daphniaFounderAdults),
       daphniaBornAdults: Array.from(this.daphniaBornAdults),
+      shrimpFoodCue: Array.from(this.shrimpFoodCue),
+      shrimpMateCue: Array.from(this.shrimpMateCue),
       planktonCounters: {
         births: this.cumulativeDaphniaBirths,
         maturations: this.cumulativeDaphniaMaturations,
@@ -825,6 +991,24 @@ export class BiogeochemistryLedger {
     if (state.daphniaBornAdults?.length === CELL_COUNT) {
       restoreField(this.daphniaBornAdults, state.daphniaBornAdults);
     }
+    if (state.shrimpFoodCue?.length === CELL_COUNT) {
+      restoreField(this.shrimpFoodCue, state.shrimpFoodCue);
+      for (let index = 0; index < CELL_COUNT; index += 1) {
+        this.shrimpFoodCue[index] = Math.min(1, this.shrimpFoodCue[index]);
+      }
+    } else {
+      this.shrimpFoodCue.fill(0);
+    }
+    this.shrimpFoodCueActive = this.shrimpFoodCue.some((value) => value > 0);
+    if (state.shrimpMateCue?.length === CELL_COUNT) {
+      restoreField(this.shrimpMateCue, state.shrimpMateCue);
+      for (let index = 0; index < CELL_COUNT; index += 1) {
+        this.shrimpMateCue[index] = Math.min(1, this.shrimpMateCue[index]);
+      }
+    } else {
+      this.shrimpMateCue.fill(0);
+    }
+    this.shrimpMateCueActive = this.shrimpMateCue.some((value) => value > 0);
     this.cumulativeDaphniaBirths = Math.max(0, state.planktonCounters?.births ?? 0);
     this.cumulativeDaphniaMaturations = Math.max(
       0,
@@ -850,6 +1034,8 @@ export class BiogeochemistryLedger {
     this.cumulativeDissolvedWaste = Math.max(0, state.cumulativeDissolvedWaste);
     this.fieldRevision = Math.max(0, Math.floor(state.fieldRevision));
     this.dissolvedAdvectionAccumulator = 0;
+    this.shrimpFoodCueAdvectionAccumulator = 0;
+    this.shrimpMateCueAdvectionAccumulator = 0;
     this.individualDaphniaManaged = false;
     this.daphniaIndividualCount = 0;
     this.daphniaIndividualJuvenileBiomass = 0;

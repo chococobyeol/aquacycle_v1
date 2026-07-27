@@ -11,27 +11,18 @@ const totalBiofilm = (world: SimulationWorld) =>
     { decomposer: 0, nitrifier: 0 },
   );
 
-describe('mission 7 seasoned substrate', () => {
-  it('distributes the declared resident films only across the exposed substrate row', () => {
+describe('mission 7 explicit cycling cultures', () => {
+  it('starts with an empty substrate and unlimited player-supplied cultures', () => {
     const world = new SimulationWorld('mission-7');
-    const substrate = world.snapshot().cells.filter(
-      (cell) => cell.surfaceKind === 'substrate',
-    );
-    const exposedY = Math.min(...substrate.map((cell) => cell.y));
-    const exposed = substrate.filter((cell) => cell.y === exposedY);
-    const buried = substrate.filter((cell) => cell.y !== exposedY);
-    const configured = SCENARIOS['mission-7'].waterCycle?.initialBiofilm;
 
-    expect(configured).toEqual({ decomposer: 0.36, nitrifier: 0.36 });
-    expect(exposed).toHaveLength(120);
-    expect(exposed.every(
-      (cell) => cell.biofilm.decomposer > 0 && cell.biofilm.nitrifier > 0,
-    )).toBe(true);
-    expect(buried.every(
-      (cell) => cell.biofilm.decomposer === 0 && cell.biofilm.nitrifier === 0,
-    )).toBe(true);
-    expect(totalBiofilm(world).decomposer).toBeCloseTo(0.36, 12);
-    expect(totalBiofilm(world).nitrifier).toBeCloseTo(0.36, 12);
+    expect(totalBiofilm(world)).toEqual({
+      decomposer: 0,
+      nitrifier: 0,
+    });
+    expect(SCENARIOS['mission-7'].waterCycle?.microbeBudget).toEqual({
+      decomposer: null,
+      nitrifier: null,
+    });
     expect(world.snapshot().remainingMicrobes).toEqual({
       decomposer: null,
       nitrifier: null,
@@ -47,7 +38,7 @@ describe('mission 7 seasoned substrate', () => {
     });
   });
 
-  it('restores saved resident and added films without seeding them a second time', () => {
+  it('restores explicitly added films without seeding them a second time', () => {
     const world = new SimulationWorld('mission-7');
     const exposed = world.snapshot().cells
       .filter((cell) => cell.surfaceKind === 'substrate')
@@ -60,7 +51,9 @@ describe('mission 7 seasoned substrate', () => {
       point: inoculationPoint,
     });
     world.handle({ type: 'drop-held', point: inoculationPoint });
-    expect(totalBiofilm(world).decomposer).toBeCloseTo(0.54, 12);
+    const inoculatedDecomposer = totalBiofilm(world).decomposer;
+    expect(inoculatedDecomposer).toBeGreaterThan(0);
+    expect(totalBiofilm(world).nitrifier).toBe(0);
 
     world.handle({ type: 'start' });
     const saved = world.exportSaveData();
@@ -74,8 +67,9 @@ describe('mission 7 seasoned substrate', () => {
     restored.loadSaveData(saved);
     const resaved = restored.exportSaveData();
 
-    expect(totalBiofilm(restored).decomposer).toBeCloseTo(0.54, 12);
-    expect(totalBiofilm(restored).nitrifier).toBeCloseTo(0.36, 12);
+    expect(totalBiofilm(restored).decomposer)
+      .toBeCloseTo(inoculatedDecomposer, 12);
+    expect(totalBiofilm(restored).nitrifier).toBe(0);
     expect(resaved.microbeInventoryUsed).toEqual(saved.microbeInventoryUsed);
     expect(resaved.materialReference).toEqual(referenceBefore);
     const balance = restored.snapshot().biogeochemistry.materialBalance;

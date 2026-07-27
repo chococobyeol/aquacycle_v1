@@ -7,6 +7,7 @@ import type {
   PlantRametSnapshot,
   PlanktonKind,
   SpeciesId,
+  StructureDefinitionId,
   SurfaceCellSnapshot,
   Vec2,
 } from '../src/simulation/types';
@@ -26,9 +27,15 @@ export interface Mission7AcceptanceFixture {
   id: Mission7AcceptanceScenarioId;
   label: string;
   purpose: string;
+  structurePlacements: ReadonlyArray<{
+    definitionId: StructureDefinitionId;
+    point: Vec2;
+  }>;
   seedPlacements: ReadonlyArray<{
     speciesId: SpeciesId;
-    substrateFraction: number;
+    target:
+      | { kind: 'substrate'; fraction: number }
+      | { kind: 'structure'; structureIndex: number; cellFraction: number };
   }>;
   shrimpPlacements: readonly Vec2[];
   planktonPlacements: ReadonlyArray<{
@@ -58,48 +65,71 @@ const daphniaPlacements = [
   { planktonKind: 'daphnia', point: { x: 690, y: 300 } },
 ] as const satisfies Mission7AcceptanceFixture['planktonPlacements'];
 
+const habitatStructures = [
+  // Low rounded stones leave illuminated gaps for rooted plants and put their
+  // edible faces near the bottom-dwelling shrimp. Four tall plates cast a
+  // continuous low-light band over all three Vallisneria roots.
+  { definitionId: 'round-stone', point: { x: 240, y: 360 } },
+  { definitionId: 'round-stone', point: { x: 480, y: 360 } },
+  { definitionId: 'round-stone', point: { x: 720, y: 360 } },
+  { definitionId: 'round-stone', point: { x: 960, y: 360 } },
+] as const satisfies Mission7AcceptanceFixture['structurePlacements'];
+
 const shrimpPlacements = [
-  // The minimal fixture has only two attached-algae inocula. Each supplied
-  // female/male pair begins beside one visible food patch so the acceptance
-  // result measures the food web rather than a lucky first random walk outside
-  // the species' deliberately local food-sensing radius.
-  { x: 180, y: 610 },
-  { x: 220, y: 610 },
-  { x: 400, y: 610 },
-  { x: 440, y: 610 },
+  // Keep one female/male pair beside each central food inoculum. The adjacent
+  // rounded stones leave separate grazing surfaces but overlapping odour and
+  // walking corridors, so low-density mating is an outcome of placement
+  // rather than a whole-tank partner search.
+  { x: 450, y: 610 },
+  { x: 510, y: 610 },
+  { x: 690, y: 610 },
+  { x: 750, y: 610 },
 ] as const;
+
+const explicitCyclingCultures = [
+  { guildId: 'decomposer', point: { x: 360, y: 630 } },
+  { guildId: 'decomposer', point: { x: 540, y: 630 } },
+  { guildId: 'nitrifier', point: { x: 720, y: 630 } },
+  { guildId: 'nitrifier', point: { x: 900, y: 630 } },
+] as const satisfies Mission7AcceptanceFixture['additionalBiofilmPlacements'];
 
 /**
  * Two fixtures prevent the long-run gate from validating only one convenient
  * setup:
  *
- * - starter-only-minimal uses the mission's seasoned substrate and no extra
- *   bacterial inoculation. It represents a normal player who places the
- *   mission's featured organisms plus one patch of each attached alga.
- * - full-stock-stress spends every finite organism/seed item and adds the same
- *   two inocula per guild used by the former 7,200-second verifier.
+ * - starter-only-minimal explicitly inoculates both cycling guilds and places
+ *   the mission's featured organisms plus one patch of each attached alga.
+ * - full-stock-stress spends every finite organism/seed item with the same
+ *   explicit two inocula per guild.
  */
 export const MISSION7_ACCEPTANCE_MATRIX: Readonly<
   Record<Mission7AcceptanceScenarioId, Mission7AcceptanceFixture>
 > = {
   'starter-only-minimal': {
     id: 'starter-only-minimal',
-    label: '길든 바닥재 · 최소 정상 배치',
+    label: '명시적 순환 접종 · 최소 정상 배치',
     purpose:
-      '추가 균 접종 없이 지급된 기초 균막과 최소 표면 먹이만으로 전체 세대가 이어지는지 확인',
+      '숨은 기초 균막 없이 두 균 기능군을 직접 접종한 최소 구성에서 전체 세대가 이어지는지 확인',
+    structurePlacements: habitatStructures,
     seedPlacements: [
-      { speciesId: 'oedogonium', substrateFraction: 0.14 },
-      { speciesId: 'nitzschia', substrateFraction: 0.34 },
-      { speciesId: 'vallisneria', substrateFraction: 0.48 },
-      { speciesId: 'vallisneria', substrateFraction: 0.66 },
-      { speciesId: 'vallisneria', substrateFraction: 0.82 },
+      {
+        speciesId: 'oedogonium',
+        target: { kind: 'structure', structureIndex: 1, cellFraction: 0.45 },
+      },
+      {
+        speciesId: 'nitzschia',
+        target: { kind: 'structure', structureIndex: 2, cellFraction: 0.45 },
+      },
+      { speciesId: 'vallisneria', target: { kind: 'substrate', fraction: 0.1 } },
+      { speciesId: 'vallisneria', target: { kind: 'substrate', fraction: 0.5 } },
+      { speciesId: 'vallisneria', target: { kind: 'substrate', fraction: 0.9 } },
     ],
     shrimpPlacements,
     planktonPlacements: [
       ...phytoplanktonPlacements,
       ...daphniaPlacements,
     ],
-    additionalBiofilmPlacements: [],
+    additionalBiofilmPlacements: explicitCyclingCultures,
     ricefishPredationLoad: 'not-verified',
   },
   'full-stock-stress': {
@@ -107,30 +137,34 @@ export const MISSION7_ACCEPTANCE_MATRIX: Readonly<
     label: '지급 풀스톡 · 추가 균 접종',
     purpose:
       '표면 생산자와 소비자를 모두 배치한 높은 생물 부하에서 장기 순환을 확인',
+    structurePlacements: habitatStructures,
     seedPlacements: [
-      { speciesId: 'oedogonium', substrateFraction: 0.08 },
-      { speciesId: 'nitzschia', substrateFraction: 0.16 },
-      { speciesId: 'vallisneria', substrateFraction: 0.24 },
-      { speciesId: 'oedogonium', substrateFraction: 0.32 },
-      { speciesId: 'nitzschia', substrateFraction: 0.4 },
-      { speciesId: 'vallisneria', substrateFraction: 0.48 },
-      { speciesId: 'oedogonium', substrateFraction: 0.56 },
-      { speciesId: 'nitzschia', substrateFraction: 0.64 },
-      { speciesId: 'vallisneria', substrateFraction: 0.72 },
-      { speciesId: 'oedogonium', substrateFraction: 0.8 },
-      { speciesId: 'nitzschia', substrateFraction: 0.88 },
+      ...Array.from({ length: 4 }, (_, structureIndex) => ({
+        speciesId: 'oedogonium' as const,
+        target: {
+          kind: 'structure' as const,
+          structureIndex,
+          cellFraction: 0.34,
+        },
+      })),
+      ...Array.from({ length: 4 }, (_, structureIndex) => ({
+        speciesId: 'nitzschia' as const,
+        target: {
+          kind: 'structure' as const,
+          structureIndex,
+          cellFraction: 0.66,
+        },
+      })),
+      { speciesId: 'vallisneria', target: { kind: 'substrate', fraction: 0.1 } },
+      { speciesId: 'vallisneria', target: { kind: 'substrate', fraction: 0.5 } },
+      { speciesId: 'vallisneria', target: { kind: 'substrate', fraction: 0.9 } },
     ],
     shrimpPlacements,
     planktonPlacements: [
       ...phytoplanktonPlacements,
       ...daphniaPlacements,
     ],
-    additionalBiofilmPlacements: [
-      { guildId: 'decomposer', point: { x: 360, y: 630 } },
-      { guildId: 'decomposer', point: { x: 540, y: 630 } },
-      { guildId: 'nitrifier', point: { x: 720, y: 630 } },
-      { guildId: 'nitrifier', point: { x: 900, y: 630 } },
-    ],
+    additionalBiofilmPlacements: explicitCyclingCultures,
     ricefishPredationLoad: 'not-verified',
   },
 };
@@ -149,6 +183,48 @@ const substrateCellAtFraction = (
   const cell = substrate[index];
   if (!cell) throw new Error('Mission 7 fixture requires substrate cells.');
   return cell;
+};
+
+const structureCellAtFraction = (
+  world: SimulationWorld,
+  structureIndex: number,
+  fraction: number,
+): SurfaceCellSnapshot => {
+  const snapshot = world.snapshot();
+  const structure = snapshot.structures[structureIndex];
+  if (!structure) {
+    throw new Error(
+      `Mission 7 fixture requires structure ${structureIndex}.`,
+    );
+  }
+  const cells = snapshot.cells
+    .filter((cell) => cell.ownerId === structure.id)
+    .sort((left, right) => left.y - right.y || left.x - right.x);
+  const index = Math.min(
+    cells.length - 1,
+    Math.max(0, Math.round((cells.length - 1) * fraction)),
+  );
+  const cell = cells[index];
+  if (!cell) {
+    throw new Error(
+      `Mission 7 fixture structure ${structureIndex} has no surface cells.`,
+    );
+  }
+  return cell;
+};
+
+const dropStructure = (
+  world: SimulationWorld,
+  definitionId: StructureDefinitionId,
+  point: Vec2,
+): void => {
+  world.handle({ type: 'pick-structure', definitionId, point });
+  world.handle({ type: 'drop-held', point });
+  // The public placement path uses the same falling/settling physics as play.
+  // Finish that setup motion before selecting its authored surface cells.
+  for (let index = 0; index < 720; index += 1) {
+    world.tick(1 / 60);
+  }
 };
 
 const dropPlankton = (
@@ -196,14 +272,23 @@ export const applyMission7AcceptanceFixture = (
   scenarioId: Mission7AcceptanceScenarioId,
 ): Mission7AcceptanceFixture => {
   const fixture = MISSION7_ACCEPTANCE_MATRIX[scenarioId];
+  for (const placement of fixture.structurePlacements) {
+    dropStructure(world, placement.definitionId, placement.point);
+  }
   for (const placement of fixture.planktonPlacements) {
     dropPlankton(world, placement.planktonKind, placement.point);
   }
   for (const placement of fixture.seedPlacements) {
-    const point = substrateCellAtFraction(
-      world.snapshot().cells,
-      placement.substrateFraction,
-    );
+    const point = placement.target.kind === 'substrate'
+      ? substrateCellAtFraction(
+        world.snapshot().cells,
+        placement.target.fraction,
+      )
+      : structureCellAtFraction(
+        world,
+        placement.target.structureIndex,
+        placement.target.cellFraction,
+      );
     dropSeed(world, placement.speciesId, point);
   }
   for (const point of fixture.shrimpPlacements) {
@@ -239,6 +324,8 @@ export interface Mission7AcceptanceFinalState {
   daphniaDescendants: number;
   daphniaMaximumLivingGeneration: number;
   shrimpBornDescendants: number;
+  shrimpFemales: number;
+  shrimpMales: number;
   shrimpAdultFemales: number;
   shrimpAdultMales: number;
   suppliedVallisneria: number;
@@ -388,8 +475,12 @@ export const evaluateMission7Acceptance = (
   add(
     'daphnia-density',
     daphniaRange[0] >= thresholds.daphnia.minimumCount &&
+      mean(daphniaCounts) >= thresholds.daphnia.minimumMeanCount &&
+      (daphniaCounts.at(-1) ?? 0) >=
+        thresholds.daphnia.minimumFinalCount &&
       daphniaRange[1] <= thresholds.daphnia.maximumCount,
-    `min=${daphniaRange[0]}, mean=${mean(daphniaCounts).toFixed(2)}, max=${daphniaRange[1]}`,
+    `min=${daphniaRange[0]}, mean=${mean(daphniaCounts).toFixed(2)}, ` +
+      `final=${daphniaCounts.at(-1) ?? 0}, max=${daphniaRange[1]}`,
   );
   add(
     'daphnia-generation',
@@ -443,7 +534,7 @@ export const evaluateMission7Acceptance = (
   );
   add(
     'shrimp-generation',
-    shrimpRange[0] > 0 &&
+    shrimpRange[0] >= thresholds.shrimp.minimumCount &&
       shrimpEvents.births >= thresholds.shrimp.minimumTailBirths &&
       shrimpEvents.maturations >= thresholds.shrimp.minimumTailMaturations &&
       evidence.final.shrimpBornDescendants >= 2,
@@ -452,9 +543,14 @@ export const evaluateMission7Acceptance = (
   );
   add(
     'shrimp-breeding-pair',
-    evidence.final.shrimpAdultFemales > 0 &&
-      evidence.final.shrimpAdultMales > 0,
-    `females=${evidence.final.shrimpAdultFemales}, males=${evidence.final.shrimpAdultMales}`,
+    evidence.final.shrimpFemales > 0 &&
+      evidence.final.shrimpMales > 0 &&
+      evidence.final.shrimpAdultFemales +
+        evidence.final.shrimpAdultMales > 0,
+    `livingFemales=${evidence.final.shrimpFemales}, ` +
+      `livingMales=${evidence.final.shrimpMales}, ` +
+      `adultFemales=${evidence.final.shrimpAdultFemales}, ` +
+      `adultMales=${evidence.final.shrimpAdultMales}`,
   );
   add(
     'shrimp-deaths',

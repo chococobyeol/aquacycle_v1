@@ -1,6 +1,5 @@
 import type {
   AnimalSpeciesId,
-  BiofilmBiomass,
   MicrobeGuildId,
   PlanktonKind,
   ScenarioId,
@@ -202,7 +201,7 @@ const OXYGEN_PER_NITRIFIED_NITROGEN =
 
 /**
  * One physical Daphnia body budget shared by the water ledger and the
- * individual life-cycle model. A rendered Daphnia is approximately 1/90 of a
+ * individual life-cycle model. A rendered Daphnia is approximately 1/102 of a
  * cherry shrimp in gameplay matter. The former 1/45 scale left only a handful
  * of individuals at an otherwise viable consumer biomass, so ordinary
  * producer-consumer troughs became deterministic demographic extinction.
@@ -229,7 +228,7 @@ export const DAPHNIA_BODY_BUDGET = {
   adultMinimumStructure: 0.00225,
   maturationStructuralFraction: 0.25,
   reproductiveReserveFloor: 0.00075,
-  reproductionAllocationPerSecondIndividual: 0.000005,
+  reproductionAllocationPerSecondIndividual: 0.000007,
   juvenileGrowthPerSecond: 0.00005,
   adultSomaticGrowthPerSecond: 0.00005,
   adultSomaticGrowthAllocationFraction: 0.2,
@@ -478,7 +477,7 @@ export const PLANKTON_ECOLOGY_RULES = {
     // maintenance but stop provisioning new eggs. This models the observed
     // food dependence of Daphnia clutch formation; it does not make the
     // remaining phytoplankton inaccessible or protect it from grazing.
-    minimumFoodQualityForReproduction: 0.3,
+    minimumFoodQualityForReproduction: 0.5,
     // One rendered Daphnia is much lighter than a cherry shrimp. Keeping the
     // former 0.095-unit adult made the consumer guild only about eleven times
     // lighter than a shrimp and forced a three-animal demographic bottleneck.
@@ -531,16 +530,17 @@ export const PLANKTON_ECOLOGY_RULES = {
     maximumLifespanSeconds: 1_550,
     suppliedAdultAgeMinimumSeconds: 90,
     suppliedAdultAgeMaximumSeconds: 190,
-    // At about 20–25°C D. magna commonly releases its first brood after
-    // roughly one quarter of its life and subsequent clutches at about one
-    // tenth of a lifespan. The compressed clock preserves those ratios:
+    // At about 20–25°C D. magna commonly releases a clutch with each adult
+    // molt. The compressed clock keeps the 4–6 juvenile instars at 240 seconds
+    // while an adult instar is shorter, instead of making one adult molt almost
+    // as long as the entire juvenile period:
     // maturation is allowed at 25% of final structural mass, just above the
     // adult viability floor. A newly mature
     // female can provision her first brood immediately. Embryos complete
     // development within an ordinary adult molt cycle and are released at the
     // following molt instead of on an independent hatching timer.
-    broodDevelopmentSeconds: 170,
-    broodCooldownSeconds: 220,
+    broodDevelopmentSeconds: 110,
+    broodCooldownSeconds: 150,
     adultMoltCycleMinimumFactor: 0.82,
     adultMoltCycleMaximumFactor: 1.18,
     minimumBroodSize: 1,
@@ -686,14 +686,16 @@ export const MICROBE_ECOLOGY_RULES = {
 } as const;
 
 export const SHRIMP_ECOLOGY_RULES = {
+  // Adult-stage longevity begins when conserved growth reaches maturity.
+  // Food-limited juvenile development therefore cannot consume most of a
+  // fixed birth-to-death timer before the first ovarian cycle even starts.
   minimumLifespanSeconds: 1_200,
-  // A wider individual range prevents every offspring cohort from reaching
-  // senescence together. It represents the broad 10-20 month adult-life
-  // variation on the same compressed scale, not an immortal low-population
-  // exception.
-  maximumLifespanSeconds: 2_200,
-  // Inventory shrimp arrive as young adults. The individual ID may seed the
-  // variation, but its magnitude must never make later introductions older.
+  // A wider individual adult-life range prevents every offspring cohort from
+  // reaching senescence together. It is not an immortal low-population
+  // exception; juveniles still die from starvation and environmental stress.
+  maximumLifespanSeconds: 2_400,
+  // Inventory shrimp arrive as young adults. Their supplied-species sequence
+  // seeds variation, so unrelated Daphnia births cannot change these traits.
   suppliedAdultMinimumAgeSeconds: 180,
   suppliedAdultMaximumAgeSeconds: 300,
   // Calibrated against the realised grazing duty cycle, not the instantaneous
@@ -758,11 +760,13 @@ export const SHRIMP_ECOLOGY_RULES = {
   newAdultOvarianProgressMaximum: 0.14,
   gestationMinimumSeconds: 68,
   gestationMaximumSeconds: 82,
-  // The visual population represents a compressed colony. Every completed
-  // brood therefore contains at least one individual of each sex (IDs are
-  // assigned alternately), avoiding a one-offspring demographic dead end.
-  minimumClutchSize: 2,
-  maximumClutchSize: 2,
+  // The visual population represents a compressed colony. Three rendered
+  // juveniles stand in for a real multi-egg brood, and their full conserved
+  // biomass must be funded before mating. Alternating IDs still ensure that a
+  // completed brood contains both sexes without a one-offspring demographic
+  // dead end or a hidden low-population birth rule.
+  minimumClutchSize: 3,
+  maximumClutchSize: 3,
 } as const;
 
 /**
@@ -1177,13 +1181,6 @@ export interface ScenarioDefinition {
   allowedStructures: StructureDefinitionId[];
   waterCycle: {
     initial: WaterQualityValues;
-    /**
-     * One-time resident biomass already living on the exposed substrate when
-     * the scenario opens. Values are total biomass per guild, distributed
-     * evenly over the top substrate row. This is real conserved biomass, not
-     * a permanent source or a water-quality buffer.
-     */
-    initialBiofilm?: BiofilmBiomass;
     microbeBudget: Record<MicrobeGuildId, number | null>;
     allowedMicrobes: MicrobeGuildId[];
   } | null;
@@ -1510,14 +1507,14 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     title: '일곱 번째 실험 · 초록 물결을 따라서',
     subtitle: '떠다니는 먹이망',
     instruction:
-      '물기둥의 생산자와 여과섭식자가 서로의 양을 바꾸며 세대를 잇도록 하세요.',
+      '분해균과 질산화균을 직접 접종해 순환을 만들고, 물기둥의 생산자와 여과섭식자가 세대를 잇도록 하세요.',
     briefing: {
       question: '떠다니는 생산자와 소비자는 어떻게 서로의 수를 바꿀까요?',
-      goal: '수조에서 태어난 물벼룩이 성체가 되어 다시 새끼를 남기도록 하세요.',
+      goal: '두 균 기능군을 접종하고, 수조에서 태어난 물벼룩이 성체가 되어 다시 새끼를 남기도록 하세요.',
       success:
         '특정 농도나 접종 위치는 채점하지 않습니다. 두 번째 세대가 태어난 뒤 물벼룩 군집이 낮과 밤을 한 번 더 건너면 성공합니다.',
       supplied:
-        '기초 균막이 자리 잡은 길든 바닥재 · 식물플랑크톤 접종 3회 · 큰물벼룩 성체 3마리 · 체리새우 성체 4마리 · 나사말 3포기 · 추가 균 필름과 구조물 무제한 · 수질 탐침',
+        '식물플랑크톤 접종 3회 · 큰물벼룩 성체 3마리 · 체리새우 성체 4마리 · 나사말 3포기 · 분해균·질산화균 배양액과 구조물 무제한 · 수질 탐침',
     },
     // The second-generation biomass threshold is reached near the end of the
     // old 1,800-second limit under a healthy, density-regulated food web. Give
@@ -1543,14 +1540,6 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
         toxicWaste: 0.8,
         nutrients: 24,
         oxygen: 82,
-      },
-      // Mission 7 starts from a seasoned substrate rather than asking the
-      // player to repeat mission 5's mandatory cycling setup. Two ordinary
-      // inocula per guild are spread thinly across the exposed bed; players
-      // may still add cultures wherever the evolving tank needs them.
-      initialBiofilm: {
-        decomposer: 0.36,
-        nitrifier: 0.36,
       },
       microbeBudget: { decomposer: null, nitrifier: null },
       allowedMicrobes: ['decomposer', 'nitrifier'],

@@ -2242,9 +2242,7 @@ export function SimulationScreen({
                         <span className="inventory-copy">
                           <strong>{microbe.displayName}</strong>
                           <small>
-                            {(scenario.waterCycle?.initialBiofilm?.[guildId] ?? 0) > 0
-                              ? `길든 바닥재에 기초 군집 있음 · ${microbe.foodLabel} → ${microbe.productLabel}`
-                              : `${microbe.foodLabel} → ${microbe.productLabel}`}
+                            {microbe.foodLabel} → {microbe.productLabel}
                           </small>
                           <em>
                             {biofilmEditable
@@ -4481,7 +4479,7 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
               ? '실제로 먹은 건강한 성체 암수가 가까이 만나면 구애합니다. 암컷은 알을 잠시 달고 다니다 가는 식생이나 표면에 붙입니다.'
               : isDaphnia
                 ? '충분한 식물플랑크톤을 먹은 성체가 새끼를 낳습니다. 개체 수명은 새우보다 짧고, 먹이가 유지될 때 연속된 세대가 군집을 이어 갑니다.'
-                : '충분히 먹은 성체 암수가 번식합니다. 먹이가 부족해지면 번식과 성장이 멈추고, 오래 굶으면 죽습니다.'}
+                : '알을 준비한 암컷의 짧은 화학 단서를 수컷이 가까이서 따라가며, 실제로 근접한 뒤에만 교미합니다. 먹이가 부족하면 번식과 성장이 멈추고, 오래 굶으면 죽습니다.'}
           </dd>
         </div>
         <div><dt>수온 반응</dt><dd>{definition.temperature.summary}</dd></div>

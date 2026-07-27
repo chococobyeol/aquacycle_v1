@@ -194,11 +194,14 @@ describe('mission 5 microbial cycle', () => {
     expect(snapshot.missionProgress?.holdCurrent).toBeGreaterThan(0);
   });
 
-  it('cannot sustain an untreated colony from its finite starting nutrients', () => {
+  it('cannot sustain an untreated colony across multiple generations', () => {
     const world = new SimulationWorld('mission-5');
     populateTank(world);
     world.handle({ type: 'start' });
-    const final = advanceTo(world, 2_400);
+    // A stage-separated adult lifespan means 2,400 seconds can end during a
+    // transient descendant pulse. Continue beyond that pulse so the assertion
+    // judges renewal, not the phase of one generation.
+    const final = advanceTo(world, 4_200);
 
     expect(final.biogeochemistry.biofilmTotals.decomposer).toBe(0);
     expect(final.biogeochemistry.biofilmTotals.nitrifier).toBe(0);
@@ -206,7 +209,7 @@ describe('mission 5 microbial cycle', () => {
     // population loss; the mission hold clock and outcome are UI state, not
     // evidence that the ecology is or is not renewing.
     expect(final.animalPopulation['cherry-shrimp'].total).toBeLessThan(4);
-  }, 45_000);
+  }, 60_000);
 
   it('preserves the local water reading that caused a toxicity death', () => {
     const world = new SimulationWorld('mission-5');

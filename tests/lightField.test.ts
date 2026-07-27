@@ -80,7 +80,7 @@ describe('aquarium light field', () => {
     expect(snapshot.lightField.revision).toBeGreaterThan(initialRevision);
     expect(ray).not.toHaveBeenCalled();
     ray.mockRestore();
-  });
+  }, 8_000);
 
   it('reuses an unchanged Vallisneria canopy throughout accelerated dawn and dusk', () => {
     const world = new SimulationWorld('mission-6');

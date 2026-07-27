@@ -184,9 +184,9 @@ describe('mission 7 plankton challenge', () => {
     expect(snapshot.totalBiomass.vallisneria).toBeGreaterThan(0.5);
   }, 90_000);
 
-  it('uses the declared seasoned substrate without requiring repeated inoculation', async () => {
+  it('requires explicit cycling inoculation instead of hidden resident films', async () => {
     const world = new SimulationWorld('mission-7');
-    placeEverySuppliedOrganism(world, false);
+    placeEverySuppliedOrganism(world, true);
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 64 });
 
@@ -203,8 +203,8 @@ describe('mission 7 plankton challenge', () => {
 
     expect(guard).toBeLessThan(700);
     expect(world.exportSaveData().microbeInventoryUsed).toEqual({
-      decomposer: 0,
-      nitrifier: 0,
+      decomposer: 2,
+      nitrifier: 2,
     });
     expect(snapshot.biogeochemistry.biofilmTotals.decomposer).toBeGreaterThan(0);
     expect(snapshot.biogeochemistry.biofilmTotals.nitrifier).toBeGreaterThan(0);

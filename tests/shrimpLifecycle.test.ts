@@ -18,7 +18,8 @@ const MIN_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds;
 const MAX_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds;
 const MIN_SUPPLIED_ADULT_AGE_SECONDS = 180;
 const MAX_SUPPLIED_ADULT_AGE_SECONDS = 300;
-const MAX_TEST_TIME_SECONDS = MAX_LIFESPAN_SECONDS + 100;
+const MAX_TEST_TIME_SECONDS =
+  MAX_SUPPLIED_ADULT_AGE_SECONDS + MAX_LIFESPAN_SECONDS + 100;
 // The lifecycle simulation intentionally advances more than a thousand
 // in-world seconds. On slower Macs or while other long-run suites execute in
 // parallel it can take roughly a minute without indicating a simulation failure.
@@ -74,7 +75,7 @@ const configureFoodRichLaboratory = (
   for (const point of shrimpPoints) placeShrimp(world, point);
   const initial = world.snapshot();
   world.handle({ type: "start" });
-  world.handle({ type: "set-speed", speed: 16 });
+  world.handle({ type: "set-speed", speed: 64 });
   return { world, initial };
 };
 
@@ -141,9 +142,9 @@ describe("cherry shrimp lifecycle", () => {
     shrimp.targetCellId = cell.id;
     shrimp.behaviorTimer = 10;
     world.loadSaveData(save);
-    world.handle({ type: "start" });
-    world.handle({ type: "set-speed", speed: 64 });
-    world.tick(0.1);
+    (world as unknown as {
+      stepAnimalEcology(deltaSeconds: number): void;
+    }).stepAnimalEcology(1);
 
     const afterCell = world.snapshot().cells.find(
       (candidate) => candidate.id === cell.id,
@@ -182,9 +183,10 @@ describe("cherry shrimp lifecycle", () => {
     const lifespans = world.snapshot().animals.map(lifespanOf);
 
     expect(lifespans).toHaveLength(4);
-    for (const lifespan of lifespans) {
-      expect(lifespan).toBeGreaterThanOrEqual(MIN_LIFESPAN_SECONDS);
-      expect(lifespan).toBeLessThanOrEqual(MAX_LIFESPAN_SECONDS);
+    for (const [index, lifespan] of lifespans.entries()) {
+      const age = world.snapshot().animals[index]!.ageSeconds;
+      expect(lifespan - age).toBeGreaterThanOrEqual(MIN_LIFESPAN_SECONDS);
+      expect(lifespan - age).toBeLessThanOrEqual(MAX_LIFESPAN_SECONDS);
     }
     expect(new Set(lifespans).size).toBeGreaterThan(1);
   });
@@ -242,9 +244,8 @@ describe("cherry shrimp lifecycle", () => {
     expect(introduced?.id).toBe("animal-501");
     expect(introduced?.ageSeconds).toBeGreaterThanOrEqual(MIN_SUPPLIED_ADULT_AGE_SECONDS);
     expect(introduced?.ageSeconds).toBeLessThanOrEqual(MAX_SUPPLIED_ADULT_AGE_SECONDS);
-    expect((introduced?.lifespanSeconds ?? 0) - (introduced?.ageSeconds ?? 0)).toBeGreaterThanOrEqual(
-      MIN_LIFESPAN_SECONDS - MAX_SUPPLIED_ADULT_AGE_SECONDS,
-    );
+    expect((introduced?.lifespanSeconds ?? 0) - (introduced?.ageSeconds ?? 0))
+      .toBeGreaterThanOrEqual(MIN_LIFESPAN_SECONDS);
 
     world.handle({ type: "start" });
     world.tick(0.1);
