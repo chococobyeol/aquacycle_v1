@@ -5,17 +5,27 @@
  * intermediate storage for every snapshot. Chromium retains those V8 sandbox
  * mappings for the renderer process lifetime on macOS, so a long-running tank
  * eventually hit the VM-region limit and terminated with SIGTRAP. This codec
- * writes the object graph directly into one SharedArrayBuffer. It never creates
- * a packet-sized string or ArrayBuffer, and newer generations replace older
- * ones in place.
+ * writes the object graph directly into three fixed SharedArrayBuffer slots. It
+ * never creates a packet-sized string or ArrayBuffer, and the worker publishes
+ * a completed inactive slot atomically while preserving the slot a renderer is
+ * currently decoding.
  */
 
-export const SHARED_TELEMETRY_PAYLOAD_BYTES = 4 * 1024 * 1024;
+export const SHARED_TELEMETRY_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
 const CONTROL_SEQUENCE = 0;
-const CONTROL_LENGTH = 1;
+const CONTROL_LENGTH_SLOT_0 = 1;
 const CONTROL_OVERFLOW_COUNT = 2;
-const CONTROL_WORDS = 4;
+const CONTROL_PUBLISHED_SLOT = 3;
+const CONTROL_READING_SLOT = 4;
+const CONTROL_LENGTH_SLOT_1 = 5;
+const CONTROL_LENGTH_SLOT_2 = 6;
+const CONTROL_WORDS = 7;
+const CONTROL_LENGTH_BY_SLOT = [
+  CONTROL_LENGTH_SLOT_0,
+  CONTROL_LENGTH_SLOT_1,
+  CONTROL_LENGTH_SLOT_2,
+] as const;
 
 const enum ValueTag {
   Null = 0,
@@ -178,13 +188,17 @@ class SharedValueReader {
    * regions even after the prior graph is collected. Remembering each reusable
    * object's stable key order lets subsequent generations update it in place.
    */
-  private readonly objectShapes = new WeakMap<object, readonly string[]>();
+  private readonly objectShapes: WeakMap<object, readonly string[]>;
   private offset = 0;
   private limit = 0;
 
-  public constructor(buffer: SharedArrayBuffer) {
+  public constructor(
+    buffer: SharedArrayBuffer,
+    objectShapes = new WeakMap<object, readonly string[]>(),
+  ) {
     this.bytes = new Uint8Array(buffer);
     this.view = new DataView(buffer);
+    this.objectShapes = objectShapes;
   }
 
   public decode(byteLength: number, reuse?: unknown): unknown {
@@ -370,7 +384,7 @@ class SharedValueReader {
 
 export interface SharedTelemetryChannel {
   control: SharedArrayBuffer;
-  payload: SharedArrayBuffer;
+  payloads: [SharedArrayBuffer, SharedArrayBuffer, SharedArrayBuffer];
 }
 
 export const sharedTelemetryAvailable = (): boolean =>
@@ -384,33 +398,66 @@ export const createSharedTelemetryChannel = (
   }
   return {
     control: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * CONTROL_WORDS),
-    payload: new SharedArrayBuffer(payloadBytes),
+    payloads: [
+      new SharedArrayBuffer(payloadBytes),
+      new SharedArrayBuffer(payloadBytes),
+      new SharedArrayBuffer(payloadBytes),
+    ],
   };
 };
 
 export class SharedTelemetryWriter {
   private readonly control: Int32Array;
-  private readonly encoder: SharedValueWriter;
+  private readonly encoders: [
+    SharedValueWriter,
+    SharedValueWriter,
+    SharedValueWriter,
+  ];
 
   public constructor(channel: SharedTelemetryChannel) {
     this.control = new Int32Array(channel.control);
-    this.encoder = new SharedValueWriter(channel.payload);
+    this.encoders = [
+      new SharedValueWriter(channel.payloads[0]),
+      new SharedValueWriter(channel.payloads[1]),
+      new SharedValueWriter(channel.payloads[2]),
+    ];
   }
 
   public publish(value: unknown): boolean {
-    // Odd sequence numbers mean that the writer owns the payload. The reader
-    // accepts a packet only when the same even number brackets its read.
-    Atomics.add(this.control, CONTROL_SEQUENCE, 1);
+    const publishedSlot = Atomics.load(this.control, CONTROL_PUBLISHED_SLOT);
+    const readingSlot = Atomics.load(this.control, CONTROL_READING_SLOT) - 1;
+    let writeSlot = (publishedSlot + 1) % this.encoders.length;
+    if (writeSlot === readingSlot) {
+      writeSlot = (writeSlot + 1) % this.encoders.length;
+    }
+    // The writer never targets either the currently published slot or the
+    // older slot claimed by an in-flight renderer decode. Three slots ensure
+    // one safe destination even when publications lap a slow reader.
+    const priorSequence = Atomics.add(this.control, CONTROL_SEQUENCE, 1);
+    let committed = false;
     try {
-      const byteLength = this.encoder.encode(value);
-      Atomics.store(this.control, CONTROL_LENGTH, byteLength);
+      const byteLength = this.encoders[writeSlot].encode(value);
+      Atomics.store(
+        this.control,
+        CONTROL_LENGTH_BY_SLOT[writeSlot],
+        byteLength,
+      );
+      Atomics.store(this.control, CONTROL_PUBLISHED_SLOT, writeSlot);
+      committed = true;
       return true;
     } catch {
-      Atomics.store(this.control, CONTROL_LENGTH, 0);
+      Atomics.store(this.control, CONTROL_LENGTH_BY_SLOT[writeSlot], 0);
       Atomics.add(this.control, CONTROL_OVERFLOW_COUNT, 1);
       return false;
     } finally {
-      Atomics.add(this.control, CONTROL_SEQUENCE, 1);
+      // A failed encode did not publish a new generation. Restore the prior
+      // sequence so the old valid slot is not emitted again as a fresh packet;
+      // the worker's ordinary-message fallback carries the oversized value.
+      Atomics.store(
+        this.control,
+        CONTROL_SEQUENCE,
+        committed ? priorSequence + 2 : priorSequence,
+      );
     }
   }
 }
@@ -418,7 +465,11 @@ export class SharedTelemetryWriter {
 export class SharedTelemetryReader<T> {
   private readonly control: Int32Array;
   private readonly payloadByteLength: number;
-  private readonly decoder: SharedValueReader;
+  private readonly decoders: [
+    SharedValueReader,
+    SharedValueReader,
+    SharedValueReader,
+  ];
   /**
    * React may still be committing the previous snapshot while the next one is
    * decoded. Two alternating graphs keep both references valid while bounding
@@ -433,35 +484,67 @@ export class SharedTelemetryReader<T> {
 
   public constructor(channel: SharedTelemetryChannel) {
     this.control = new Int32Array(channel.control);
-    this.payloadByteLength = channel.payload.byteLength;
-    this.decoder = new SharedValueReader(channel.payload);
+    this.payloadByteLength = channel.payloads[0].byteLength;
+    // Decoded object graphs alternate independently of the payload slot. All
+    // slot decoders therefore need one shape cache for the same reused object;
+    // per-slot caches can preserve a stale union field after the slot rotates.
+    const objectShapes = new WeakMap<object, readonly string[]>();
+    this.decoders = [
+      new SharedValueReader(channel.payloads[0], objectShapes),
+      new SharedValueReader(channel.payloads[1], objectShapes),
+      new SharedValueReader(channel.payloads[2], objectShapes),
+    ];
   }
 
   /** Returns only the newest complete packet; overwritten intermediate frames are intentionally coalesced. */
   public readLatest(): T | null {
     const sequenceBefore = Atomics.load(this.control, CONTROL_SEQUENCE);
     if (sequenceBefore === this.lastSequence || sequenceBefore % 2 !== 0) return null;
-    const byteLength = Atomics.load(this.control, CONTROL_LENGTH);
-    if (byteLength <= 0 || byteLength > this.payloadByteLength) return null;
+    const publishedSlot = Atomics.load(this.control, CONTROL_PUBLISHED_SLOT);
+    if (publishedSlot < 0 || publishedSlot >= this.decoders.length) return null;
+    if (
+      Atomics.compareExchange(
+        this.control,
+        CONTROL_READING_SLOT,
+        0,
+        publishedSlot + 1,
+      ) !== 0
+    ) return null;
 
     try {
-      const decoded = this.decoder.decode(
+      // Claiming happens after the first sequence read. Recheck both values so
+      // a publication that raced the claim cannot make us decode the wrong
+      // slot under the old generation.
+      if (
+        Atomics.load(this.control, CONTROL_SEQUENCE) !== sequenceBefore ||
+        Atomics.load(this.control, CONTROL_PUBLISHED_SLOT) !== publishedSlot
+      ) return null;
+      const byteLength = Atomics.load(
+        this.control,
+        CONTROL_LENGTH_BY_SLOT[publishedSlot],
+      );
+      if (byteLength <= 0 || byteLength > this.payloadByteLength) return null;
+      const decoded = this.decoders[publishedSlot].decode(
         byteLength,
         this.decodedValues[this.nextValueIndex],
       ) as T;
       const sequenceAfter = Atomics.load(this.control, CONTROL_SEQUENCE);
-      if (sequenceBefore !== sequenceAfter || sequenceAfter % 2 !== 0) return null;
-      // Check once more after decoding. A writer can begin while the object
-      // graph is being rebuilt; that mixed-generation value must be ignored.
-      if (Atomics.load(this.control, CONTROL_SEQUENCE) !== sequenceAfter) return null;
+      const slotAfter = Atomics.load(this.control, CONTROL_PUBLISHED_SLOT);
+      if (
+        sequenceBefore !== sequenceAfter ||
+        sequenceAfter % 2 !== 0 ||
+        slotAfter !== publishedSlot
+      ) return null;
       this.lastSequence = sequenceAfter;
       this.decodedValues[this.nextValueIndex] = decoded;
       this.nextValueIndex = this.nextValueIndex === 0 ? 1 : 0;
       return decoded;
     } catch {
-      // A concurrent write can make the transient packet invalid. The completed
-      // generation is retried on the next animation frame.
+      // Malformed or version-skewed data is ignored. The writer never mutates
+      // the claimed slot, so the next complete generation can be retried.
       return null;
+    } finally {
+      Atomics.store(this.control, CONTROL_READING_SLOT, 0);
     }
   }
 

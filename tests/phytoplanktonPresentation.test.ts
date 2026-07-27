@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   createPhytoplanktonVisualPlan,
@@ -61,5 +62,21 @@ describe('phytoplankton presentation', () => {
 
     expect(low.specks.length).toBeGreaterThan(0);
     expect(high.specks.length).toBeGreaterThan(low.specks.length * 2);
+  });
+
+  it('updates pooled static marks without uploading a new canvas texture per snapshot', () => {
+    const canvasSource = readFileSync(
+      new URL('../src/renderer/tank/AquariumCanvas.tsx', import.meta.url),
+      'utf8',
+    );
+    const phytoplanktonBlock = canvasSource.slice(
+      canvasSource.indexOf('const drawPhytoplankton'),
+      canvasSource.indexOf('const drawInteraction'),
+    );
+
+    expect(phytoplanktonBlock).toContain('surface.speckSprites');
+    expect(phytoplanktonBlock).toContain('surface.hazeSprites');
+    expect(phytoplanktonBlock).not.toContain('source.update()');
+    expect(phytoplanktonBlock).not.toContain('getRasterSurface');
   });
 });

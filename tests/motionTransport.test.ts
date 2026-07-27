@@ -9,6 +9,8 @@ import {
   type WorkerMessage,
   type WorkerMotionMessage,
 } from '../src/simulation/types';
+import { createSharedMotionChannel } from '../src/simulation/sharedMotionTelemetry';
+import { createSharedTelemetryChannel } from '../src/simulation/sharedTelemetry';
 import {
   addPendingWorkerTime,
   takeWorkerSimulationQuantum,
@@ -108,6 +110,49 @@ describe('simulation worker motion cadence', () => {
       expect(Math.abs(interval - MOTION_SAMPLE_INTERVAL_MS)).toBeLessThan(1);
     }
     expect(messages.some((message) => message.type === 'snapshot')).toBe(true);
+  });
+
+  it('falls back to ordinary messages when fixed shared slots are too small', async () => {
+    vi.useFakeTimers();
+    const messages: WorkerMessage[] = [];
+    let receiveCommand: ((event: MessageEvent<SimulationCommand>) => void) | null = null;
+    const workerScope = {
+      addEventListener: vi.fn((type: string, listener: EventListener) => {
+        if (type === 'message') {
+          receiveCommand = listener as (event: MessageEvent<SimulationCommand>) => void;
+        }
+      }),
+      postMessage: vi.fn((message: WorkerMessage) => messages.push(message)),
+    };
+    vi.stubGlobal('self', workerScope);
+
+    await import('../src/simulation/sim.worker');
+    expect(receiveCommand).not.toBeNull();
+    const dispatch = (data: unknown): void => {
+      receiveCommand?.({ data } as MessageEvent<SimulationCommand>);
+    };
+    dispatch({
+      type: 'connect-telemetry',
+      snapshot: createSharedTelemetryChannel(64),
+      motion: createSharedTelemetryChannel(64),
+      binaryMotion: createSharedMotionChannel(),
+    });
+    dispatch({ type: 'initialize', scenarioId: 'laboratory' });
+    dispatch({
+      type: 'pick-animal',
+      speciesId: 'cherry-shrimp',
+      point: { x: 500, y: 500 },
+    });
+    await vi.advanceTimersByTimeAsync(40);
+
+    expect(messages.some((message) => message.type === 'snapshot')).toBe(true);
+    const overlay = messages.find((message) => message.type === 'motion-overlay');
+    expect(overlay).toMatchObject({
+      type: 'motion-overlay',
+      holding: { kind: 'animal' },
+    });
+    expect(overlay).not.toHaveProperty('animals');
+    expect(overlay).not.toHaveProperty('structures');
   });
 
   it('slices worker catch-up into fixed 120 Hz tasks instead of one delayed burst', () => {

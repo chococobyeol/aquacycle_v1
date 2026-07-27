@@ -1077,10 +1077,11 @@ export function SimulationScreen({
   }, [onMissionComplete, scenarioId, snapshot?.outcome]);
 
   useEffect(() => {
+    if (!pendingInventory) return undefined;
     const move = (event: PointerEvent): void => setPointer({ x: event.clientX, y: event.clientY });
     window.addEventListener('pointermove', move);
     return () => window.removeEventListener('pointermove', move);
-  }, []);
+  }, [pendingInventory]);
 
   useEffect(() => {
     const finishObservationScrollPointer = (): void => {

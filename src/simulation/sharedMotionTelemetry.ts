@@ -21,7 +21,7 @@ const STRUCTURE_WORDS = 7;
 const ANIMAL_WORDS = 20;
 
 export const SHARED_MOTION_MAX_STRUCTURES = 4_096;
-export const SHARED_MOTION_MAX_ANIMALS = 2_048;
+export const SHARED_MOTION_MAX_ANIMALS = 8_192;
 
 const SPECIES: readonly AnimalSpeciesId[] = [
   'cherry-shrimp',

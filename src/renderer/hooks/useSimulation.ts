@@ -54,6 +54,7 @@ export interface SimulationMotionStore extends SimulationMotionSource {
 }
 
 export const BACKGROUND_TELEMETRY_POLL_INTERVAL_MS = 16;
+const INTERACTIVE_TELEMETRY_PAYLOAD_BYTES = 64 * 1024;
 
 export interface TelemetryPollingClock {
   requestAnimationFrame: (callback: FrameRequestCallback) => number;
@@ -234,6 +235,12 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
         if (!pending) return;
         saveRequests.current.delete(message.requestId);
         pending.resolve(message.data);
+      } else if (message.type === 'motion-overlay') {
+        setSnapshot((current) => current ? {
+          ...current,
+          holding: message.holding,
+          probe: message.probe,
+        } : current);
       } else {
         const motion = message;
         motionStore.accept(motion, performance.now());
@@ -259,7 +266,9 @@ export const useSimulation = (scenarioId: ScenarioId): SimulationController => {
     if (sharedTelemetryAvailable()) {
       try {
         const snapshotChannel = createSharedTelemetryChannel();
-        const interactiveMotionChannel = createSharedTelemetryChannel();
+        const interactiveMotionChannel = createSharedTelemetryChannel(
+          INTERACTIVE_TELEMETRY_PAYLOAD_BYTES,
+        );
         const binaryMotionChannel = createSharedMotionChannel();
         const snapshotReader = new SharedTelemetryReader<WorkerMessage>(snapshotChannel);
         const interactiveMotionReader = new SharedTelemetryReader<WorkerMessage>(

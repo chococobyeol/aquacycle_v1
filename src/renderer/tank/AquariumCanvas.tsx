@@ -20,6 +20,7 @@ import {
 import {
   animalCarcassVisualDrop,
   daphniaVisualScale,
+  presentedAnimalCarcasses,
   shrimpVisualScale,
 } from '../../simulation/animalPresentation';
 import type { SimulationMotionSource } from '../hooks/useSimulation';
@@ -140,7 +141,6 @@ const ALGAE_RASTER_FAST_REFRESH_MS = 250;
 const ALGAE_RASTER_HIGH_SPEED_REFRESH_MS = 500;
 const ALGAE_VISUAL_LEVEL_COUNT = 24;
 export const ALGAE_PARTICLE_JITTER_SPAN = 0.35;
-export const ALGAE_DENSITY_FIELD_SCALE = 1 / 3;
 
 /**
  * Biomass is deliberately quantized before it reaches Pixi. Ecology snapshots
@@ -329,9 +329,8 @@ interface AnimalCarcassDisplay {
 type AnimalDisplayPool = BoundedReusePool<string, AnimalDisplay>;
 type AnimalCarcassDisplayPool = BoundedReusePool<string, AnimalCarcassDisplay>;
 
-const ANIMAL_DISPLAY_POOL_LIMIT_PER_KEY = 256;
-const ANIMAL_CARCASS_POOL_LIMIT_PER_KEY = 128;
-
+const ANIMAL_DISPLAY_POOL_LIMIT_PER_KEY = 64;
+const ANIMAL_CARCASS_POOL_LIMIT_PER_KEY = 32;
 const animalDisplayPoolKey = (
   speciesId: AnimalSnapshot['speciesId'],
   lifeStage: AnimalSnapshot['lifeStage'],
@@ -347,7 +346,7 @@ interface AquariumLayers {
   lamp: Graphics;
   base: Graphics;
   light: Sprite;
-  plankton: Sprite;
+  plankton: Container;
   substrateAlgae: Container;
   foreground: Graphics;
   structures: Container;
@@ -374,6 +373,75 @@ interface RasterSurface {
 }
 
 const rasterSurfaces = new WeakMap<Sprite, RasterSurface>();
+
+interface PhytoplanktonSurface {
+  hazeTexture: Texture;
+  speckTexture: Texture;
+  hazeSprites: Sprite[];
+  speckSprites: Sprite[];
+}
+
+const phytoplanktonSurfaces = new WeakMap<Container, PhytoplanktonSurface>();
+
+const createPhytoplanktonMarkTexture = (
+  size: number,
+  soft: boolean,
+): Texture => {
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+  if (context) {
+    const center = size / 2;
+    if (soft) {
+      const gradient = context.createRadialGradient(
+        center,
+        center,
+        0,
+        center,
+        center,
+        center,
+      );
+      gradient.addColorStop(0, 'rgba(255, 255, 255, 0.72)');
+      gradient.addColorStop(0.62, 'rgba(255, 255, 255, 0.28)');
+      gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+      context.fillStyle = gradient;
+    } else {
+      context.fillStyle = '#ffffff';
+    }
+    context.beginPath();
+    context.arc(center, center, center - 0.5, 0, Math.PI * 2);
+    context.fill();
+  }
+  const texture = Texture.from(canvas);
+  texture.source.scaleMode = 'linear';
+  return texture;
+};
+
+const createPhytoplanktonLayer = (): Container => {
+  const layer = new Container();
+  phytoplanktonSurfaces.set(layer, {
+    hazeTexture: createPhytoplanktonMarkTexture(64, true),
+    speckTexture: createPhytoplanktonMarkTexture(8, false),
+    hazeSprites: [],
+    speckSprites: [],
+  });
+  return layer;
+};
+
+const releasePhytoplanktonLayer = (layer: Container): void => {
+  const surface = phytoplanktonSurfaces.get(layer);
+  if (!surface) return;
+  const sprites = layer.removeChildren();
+  for (const sprite of sprites) {
+    sprite.destroy();
+  }
+  if (!surface.hazeTexture.destroyed) surface.hazeTexture.destroy(true);
+  if (!surface.speckTexture.destroyed) surface.speckTexture.destroy(true);
+  surface.hazeSprites.length = 0;
+  surface.speckSprites.length = 0;
+  phytoplanktonSurfaces.delete(layer);
+};
 
 interface AnalysisGridSurface {
   canvas: HTMLCanvasElement;
@@ -2159,6 +2227,16 @@ const releaseAnimalCarcassDisplay = (
   destroyDisplayTree(display.container);
 };
 
+export const visibleAnimalCarcasses = (
+  snapshot: Pick<SimulationSnapshot, 'carcasses' | 'selection'>,
+): AnimalCarcassSnapshot[] =>
+  presentedAnimalCarcasses(
+    snapshot.carcasses,
+    snapshot.selection?.kind === 'carcass'
+      ? snapshot.selection.carcassId
+      : null,
+  );
+
 const syncAnimalCarcasses = (
   layer: Container,
   snapshot: SimulationSnapshot,
@@ -2166,7 +2244,7 @@ const syncAnimalCarcasses = (
   livingDisplays?: Map<string, AnimalDisplay>,
   pool?: AnimalCarcassDisplayPool,
 ): void => {
-  const carcasses = snapshot.carcasses;
+  const carcasses = visibleAnimalCarcasses(snapshot);
   const currentIds = new Set(carcasses.map((carcass) => carcass.id));
   for (const [id, display] of displays) {
     if (currentIds.has(id)) continue;
@@ -2635,10 +2713,7 @@ type AlgaeSpeciesId = 'oedogonium' | 'nitzschia';
 
 interface AlgaeDensitySurface {
   surfaceKind: SurfaceCellSnapshot['surfaceKind'];
-  scratchCanvas: HTMLCanvasElement;
-  scratchContext: CanvasRenderingContext2D;
   speciesLayers: Record<AlgaeSpeciesId, AlgaeSpeciesDensityLayer>;
-  brushes: Record<AlgaeSpeciesId, HTMLCanvasElement>;
   fieldDirty: boolean;
   lastFieldRenderAtMs: number;
   mask: Graphics;
@@ -2649,10 +2724,9 @@ interface AlgaeDensitySurface {
 
 interface AlgaeSpeciesDensityLayer {
   container: Container;
-  densityCanvas: HTMLCanvasElement;
-  densityContext: CanvasRenderingContext2D;
-  densityTexture: Texture;
-  densitySprite: Sprite;
+  densityMarks: Container;
+  brushTexture: Texture;
+  brushSprites: Map<string, Sprite>;
   detailGraphics: Graphics;
   detailContext: GraphicsContext;
   detailGeometryKey: string;
@@ -2838,8 +2912,11 @@ const styleAlgaeDetailContext = (context: GraphicsContext): void => {
   context.batchMode = 'no-batch';
 };
 
+export const ALGAE_BRUSH_TEXTURE_SIZE = 64;
+export const ALGAE_BRUSH_SOFT_EDGE_PIXELS = 4;
+
 const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement => {
-  const size = 64;
+  const size = ALGAE_BRUSH_TEXTURE_SIZE;
   const center = size / 2;
   const canvas = document.createElement('canvas');
   canvas.width = size;
@@ -2848,7 +2925,7 @@ const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement =>
   if (!context) return canvas;
 
   context.save();
-  context.filter = 'blur(4px)';
+  context.filter = `blur(${ALGAE_BRUSH_SOFT_EDGE_PIXELS}px)`;
   const nitzschiaBrush = NITZSCHIA_VISUAL_STYLE.brush;
   context.fillStyle = speciesId === 'oedogonium'
     ? 'rgba(84, 132, 73, 0.52)'
@@ -2885,48 +2962,25 @@ const createAlgaeParticleLayer = (
   const root = new Container();
   const content = new Container();
   const mask = new Graphics();
-  const width = Math.round(TANK_WIDTH * ALGAE_DENSITY_FIELD_SCALE);
-  const height = Math.round(TANK_HEIGHT * ALGAE_DENSITY_FIELD_SCALE);
-  const scratchCanvas = document.createElement('canvas');
-  scratchCanvas.width = width;
-  scratchCanvas.height = height;
-  const scratchContext = scratchCanvas.getContext('2d');
-  if (!scratchContext) return root;
-  scratchContext.imageSmoothingEnabled = true;
-  scratchContext.imageSmoothingQuality = 'high';
-  const brushes = {
-    nitzschia: createAlgaeBrushCanvas('nitzschia'),
-    oedogonium: createAlgaeBrushCanvas('oedogonium'),
-  };
 
   const createSpeciesLayer = (speciesId: AlgaeSpeciesId): AlgaeSpeciesDensityLayer => {
     const container = new Container();
     container.visible = false;
-    const densityCanvas = document.createElement('canvas');
-    densityCanvas.width = width;
-    densityCanvas.height = height;
-    const densityContext = densityCanvas.getContext('2d');
-    if (!densityContext) {
-      throw new Error(`Unable to create ${speciesId} algae density canvas`);
-    }
-    densityContext.imageSmoothingEnabled = true;
-    densityContext.imageSmoothingQuality = 'high';
-    const densityTexture = Texture.from(densityCanvas);
-    densityTexture.source.scaleMode = 'linear';
-    const densitySprite = new Sprite(densityTexture);
-    densitySprite.width = TANK_WIDTH;
-    densitySprite.height = TANK_HEIGHT;
+    const brushTexture = Texture.from(createAlgaeBrushCanvas(speciesId));
+    brushTexture.source.scaleMode = 'linear';
+    const densityMarks = new Container();
     // Keep the density wash opaque enough to anchor the crisp detail strokes,
     // while the colony stays as light as the earlier hand-drawn version.
-    densitySprite.alpha = speciesId === 'oedogonium'
+    densityMarks.alpha = speciesId === 'oedogonium'
       ? 0.86
       : surfaceKind === 'substrate'
         ? NITZSCHIA_VISUAL_STYLE.substrateAlpha
         : NITZSCHIA_VISUAL_STYLE.structureAlpha;
 
-    // Density and biological detail deliberately use different renderers.
-    // The small dynamic bitmap produces a soft, grid-free colony boundary;
-    // the lifecycle-aware vector drawing stays crisp when the player zooms.
+    // The density wash reuses one immutable brush texture. Updating a full
+    // canvas texture for every ecology snapshot retained Chromium backing-store
+    // regions in long x64 runs; moving only Sprite transforms keeps the soft,
+    // overlapping colony boundary without recurring texture uploads.
     const detailGraphics = new Graphics();
     const detailContext = detailGraphics.context;
     styleAlgaeDetailContext(detailContext);
@@ -2937,14 +2991,13 @@ const createAlgaeParticleLayer = (
     // held-object preview are drawn. Details are already generated only for
     // biologically active cells, so drawing them directly preserves the colony
     // shape without the fragile GPU filter path.
-    container.addChild(densitySprite, detailGraphics);
+    container.addChild(densityMarks, detailGraphics);
     content.addChild(container);
     return {
       container,
-      densityCanvas,
-      densityContext,
-      densityTexture,
-      densitySprite,
+      densityMarks,
+      brushTexture,
+      brushSprites: new Map<string, Sprite>(),
       detailGraphics,
       detailContext,
       detailGeometryKey: '',
@@ -2961,10 +3014,7 @@ const createAlgaeParticleLayer = (
   root.addChild(content, mask);
   algaeDensitySurfaces.set(root, {
     surfaceKind,
-    scratchCanvas,
-    scratchContext,
     speciesLayers,
-    brushes,
     fieldDirty: true,
     lastFieldRenderAtMs: Number.NEGATIVE_INFINITY,
     mask,
@@ -2984,7 +3034,13 @@ const releaseAlgaeParticleLayer = (layer: Container): void => {
   surface.cells.clear();
   for (const speciesId of ['nitzschia', 'oedogonium'] as const) {
     surface.colonization[speciesId].clear();
-    const texture = surface.speciesLayers[speciesId].densityTexture;
+    const speciesLayer = surface.speciesLayers[speciesId];
+    const sprites = speciesLayer.densityMarks.removeChildren();
+    for (const sprite of sprites) {
+      sprite.destroy();
+    }
+    speciesLayer.brushSprites.clear();
+    const texture = speciesLayer.brushTexture;
     if (!texture.destroyed) texture.destroy(true);
   }
   algaeDensitySurfaces.delete(layer);
@@ -3025,9 +3081,8 @@ const updateAlgaeMask = (
   }
 };
 
-const drawAlgaeCellBrush = (
-  context: CanvasRenderingContext2D,
-  brush: HTMLCanvasElement,
+const syncAlgaeCellBrushSprite = (
+  layer: AlgaeSpeciesDensityLayer,
   cell: SurfaceCellSnapshot,
   speciesId: AlgaeSpeciesId,
   visualLevel: number,
@@ -3043,26 +3098,24 @@ const drawAlgaeCellBrush = (
   const sine = Math.sin(surfaceAngle);
   const jitterX = localJitterX * cosine - localJitterY * sine;
   const jitterY = localJitterX * sine + localJitterY * cosine;
-  const radius = cell.cellSize * algaeParticleRadiusRatio(visualLevel) *
-    ALGAE_DENSITY_FIELD_SCALE;
+  const radius = cell.cellSize * algaeParticleRadiusRatio(visualLevel);
   const scaleX = radius / 27 * (0.94 + hash01(cellSeed + speciesOffset + 23) * 0.12);
   const scaleY = radius / 27 * (0.94 + hash01(cellSeed + speciesOffset + 41) * 0.12);
 
-  context.save();
-  context.globalAlpha = algaeParticleAlpha(visualLevel);
-  context.translate(
-    (cell.x + jitterX) * ALGAE_DENSITY_FIELD_SCALE,
-    (cell.y + jitterY) * ALGAE_DENSITY_FIELD_SCALE,
-  );
-  context.rotate(
-    surfaceAngle + hash01(cellSeed + speciesOffset + 59) * Math.PI * 2,
-  );
-  context.scale(scaleX, scaleY);
-  context.drawImage(brush, -brush.width / 2, -brush.height / 2);
-  context.restore();
+  let sprite = layer.brushSprites.get(cell.id);
+  if (!sprite) {
+    sprite = new Sprite(layer.brushTexture);
+    sprite.anchor.set(0.5);
+    layer.brushSprites.set(cell.id, sprite);
+    layer.densityMarks.addChild(sprite);
+  }
+  sprite.position.set(cell.x + jitterX, cell.y + jitterY);
+  sprite.rotation = surfaceAngle +
+    hash01(cellSeed + speciesOffset + 59) * Math.PI * 2;
+  sprite.scale.set(scaleX, scaleY);
+  sprite.alpha = algaeParticleAlpha(visualLevel);
+  sprite.visible = true;
 };
-
-export const ALGAE_DENSITY_BLUR_PIXELS = 0.8;
 
 export const advanceAlgaeColonizationState = (
   previous: Readonly<AlgaeColonizationState> | undefined,
@@ -3199,32 +3252,28 @@ const drawAlgaeDensityField = (
   surface: AlgaeDensitySurface,
   snapshot: SimulationSnapshot,
 ): void => {
-  const { scratchContext } = surface;
   const structureAngles = new Map(
     snapshot.structures.map((structure) => [structure.id, structure.angle]),
   );
+  const surfaceCellIds = new Set<string>();
+  for (const cell of snapshot.cells) {
+    if (cell.surfaceKind === surface.surfaceKind) surfaceCellIds.add(cell.id);
+  }
 
   const speciesOrder: AlgaeSpeciesId[] = ['nitzschia', 'oedogonium'];
   for (const speciesId of speciesOrder) {
     const detailCells: SurfaceCellSnapshot[] = [];
-    scratchContext.setTransform(1, 0, 0, 1, 0, 0);
-    scratchContext.globalAlpha = 1;
-    scratchContext.globalCompositeOperation = 'source-over';
-    scratchContext.filter = 'none';
-    scratchContext.clearRect(
-      0,
-      0,
-      surface.scratchCanvas.width,
-      surface.scratchCanvas.height,
-    );
+    const speciesLayer = surface.speciesLayers[speciesId];
+    for (const sprite of speciesLayer.brushSprites.values()) {
+      sprite.visible = false;
+    }
     for (const cell of snapshot.cells) {
       if (cell.surfaceKind !== surface.surfaceKind) continue;
       const level = algaeVisualLevel(cell.biomass[speciesId]);
       if (level === 0) continue;
       detailCells.push(cell);
-      drawAlgaeCellBrush(
-        scratchContext,
-        surface.brushes[speciesId],
+      syncAlgaeCellBrushSprite(
+        speciesLayer,
         cell,
         speciesId,
         level,
@@ -3234,23 +3283,12 @@ const drawAlgaeDensityField = (
       );
     }
 
-    const speciesLayer = surface.speciesLayers[speciesId];
-    const { densityContext } = speciesLayer;
-    densityContext.setTransform(1, 0, 0, 1, 0, 0);
-    densityContext.globalAlpha = 1;
-    densityContext.globalCompositeOperation = 'source-over';
-    densityContext.filter = 'none';
-    densityContext.clearRect(
-      0,
-      0,
-      speciesLayer.densityCanvas.width,
-      speciesLayer.densityCanvas.height,
-    );
-    densityContext.save();
-    densityContext.filter = `blur(${ALGAE_DENSITY_BLUR_PIXELS}px)`;
-    densityContext.drawImage(surface.scratchCanvas, 0, 0);
-    densityContext.restore();
-    speciesLayer.densityTexture.source.update();
+    for (const [cellId, sprite] of speciesLayer.brushSprites) {
+      if (surfaceCellIds.has(cellId)) continue;
+      speciesLayer.brushSprites.delete(cellId);
+      speciesLayer.densityMarks.removeChild(sprite);
+      sprite.destroy();
+    }
     rebuildAlgaeDetailGeometry(
       surface,
       speciesId,
@@ -3540,11 +3578,10 @@ const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void =
     .fill({ color: 0x173349, alpha: darkness * 0.34 });
 };
 
-const PHYTOPLANKTON_RASTER_SCALE = 0.5;
-
-const drawPhytoplankton = (layer: Sprite, snapshot: SimulationSnapshot): void => {
+const drawPhytoplankton = (layer: Container, snapshot: SimulationSnapshot): void => {
   const water = snapshot.biogeochemistry.water;
-  if (!water.columns || !water.rows) {
+  const surface = phytoplanktonSurfaces.get(layer);
+  if (!surface || !water.columns || !water.rows) {
     layer.visible = false;
     return;
   }
@@ -3553,53 +3590,45 @@ const drawPhytoplankton = (layer: Sprite, snapshot: SimulationSnapshot): void =>
     water.columns,
     water.rows,
   );
-  const rasterWidth = Math.ceil(TANK_WIDTH * PHYTOPLANKTON_RASTER_SCALE);
-  const rasterHeight = Math.ceil(
-    (GROUND_Y - WATER_TOP) * PHYTOPLANKTON_RASTER_SCALE,
-  );
-  const surface = getRasterSurface(layer, rasterWidth, rasterHeight);
-  if (!surface) return;
-  const { context, texture } = surface;
-  context.setTransform(
-    PHYTOPLANKTON_RASTER_SCALE,
-    0,
-    0,
-    PHYTOPLANKTON_RASTER_SCALE,
-    0,
-    -WATER_TOP * PHYTOPLANKTON_RASTER_SCALE,
-  );
-  context.clearRect(
-    0,
-    WATER_TOP,
-    TANK_WIDTH,
-    GROUND_Y - WATER_TOP,
-  );
-  for (const haze of plan.haze) {
-    context.beginPath();
-    context.ellipse(
-      haze.x,
-      haze.y,
-      haze.radiusX,
-      haze.radiusY,
-      0,
-      0,
-      Math.PI * 2,
-    );
-    context.fillStyle = '#729f5a';
-    context.globalAlpha = haze.alpha;
-    context.fill();
+
+  for (let index = 0; index < plan.haze.length; index += 1) {
+    const mark = plan.haze[index];
+    const sprite = surface.hazeSprites[index] ?? new Sprite(surface.hazeTexture);
+    if (!surface.hazeSprites[index]) {
+      sprite.anchor.set(0.5);
+      sprite.tint = 0x729f5a;
+      surface.hazeSprites[index] = sprite;
+      layer.addChild(sprite);
+    }
+    sprite.position.set(mark.x, mark.y);
+    sprite.width = mark.radiusX * 2;
+    sprite.height = mark.radiusY * 2;
+    sprite.alpha = mark.alpha;
+    sprite.visible = true;
   }
-  for (const speck of plan.specks) {
-    context.beginPath();
-    context.arc(speck.x, speck.y, speck.radius, 0, Math.PI * 2);
-    context.fillStyle = `#${speck.color.toString(16).padStart(6, '0')}`;
-    context.globalAlpha = speck.alpha;
-    context.fill();
+  for (let index = plan.haze.length; index < surface.hazeSprites.length; index += 1) {
+    surface.hazeSprites[index].visible = false;
   }
-  context.globalAlpha = 1;
-  texture.source.update();
-  layer.position.set(0, WATER_TOP);
-  layer.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+
+  for (let index = 0; index < plan.specks.length; index += 1) {
+    const mark = plan.specks[index];
+    const sprite = surface.speckSprites[index] ?? new Sprite(surface.speckTexture);
+    if (!surface.speckSprites[index]) {
+      sprite.anchor.set(0.5);
+      surface.speckSprites[index] = sprite;
+      layer.addChild(sprite);
+    }
+    sprite.position.set(mark.x, mark.y);
+    sprite.width = mark.radius * 2;
+    sprite.height = mark.radius * 2;
+    sprite.alpha = mark.alpha;
+    sprite.tint = mark.color;
+    sprite.visible = true;
+  }
+  for (let index = plan.specks.length; index < surface.speckSprites.length; index += 1) {
+    surface.speckSprites[index].visible = false;
+  }
+
   layer.visible = plan.haze.length > 0 || plan.specks.length > 0;
 };
 
@@ -4167,7 +4196,7 @@ export function AquariumCanvas({
     const releaseOwnedRasterSurfaces = (): void => {
       if (!ownedLayers) return;
       releaseRasterSurface(ownedLayers.light);
-      releaseRasterSurface(ownedLayers.plankton);
+      releasePhytoplanktonLayer(ownedLayers.plankton);
       releaseRasterSurface(ownedLayers.analysis);
       releaseAnalysisGridSurface(ownedLayers.analysis);
       releaseAlgaeParticleLayer(ownedLayers.substrateAlgae);
@@ -4266,7 +4295,7 @@ export function AquariumCanvas({
         lamp: new Graphics(),
         base: new Graphics(),
         light: new Sprite(Texture.EMPTY),
-        plankton: new Sprite(Texture.EMPTY),
+        plankton: createPhytoplanktonLayer(),
         substrateAlgae: createAlgaeParticleLayer('substrate'),
         foreground: new Graphics(),
         structures: new Container(),

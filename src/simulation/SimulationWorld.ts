@@ -27,6 +27,7 @@ import {
 import {
   animalCarcassVisualPoint,
   animalVisualHitRadii,
+  presentedAnimalCarcasses,
 } from './animalPresentation';
 import { oxygenEquivalentInventory } from './stoichiometry';
 import { FIXED_LAMP_WIDTH, FIXED_LAMP_X, FIXED_LAMP_Y } from './lightGeometry';
@@ -39,6 +40,7 @@ import {
   habitatSuitability,
   netGrowthPotential,
   occupied,
+  type AlgaePhysiologyRates,
 } from './growth';
 import {
   sampleEcologyFace,
@@ -131,6 +133,19 @@ interface MissionCellView {
   biomass: SpeciesBiomass;
   targetEligible?: boolean;
 }
+
+interface GrowthRecruitmentTransfer {
+  sourceIndex: number;
+  receiverIndex: number;
+  speciesId: SpeciesId;
+  amount: number;
+}
+
+const GROWTH_SPECIES_INDEX: Record<SpeciesId, number> = {
+  oedogonium: 0,
+  nitzschia: 1,
+  vallisneria: 2,
+};
 
 interface StructureState {
   id: string;
@@ -521,6 +536,35 @@ const SHRIMP_CARCASS_LIFETIME_SECONDS = 55;
 const DAPHNIA_CARCASS_LIFETIME_SECONDS = 140;
 const RICEFISH_CARCASS_LIFETIME_SECONDS = 70;
 const MAX_ANIMAL_POPULATION_EVENTS = 240;
+
+const animalCarcassLifetimeSeconds = (speciesId: AnimalSpeciesId): number =>
+  speciesId === 'japanese-ricefish'
+    ? RICEFISH_CARCASS_LIFETIME_SECONDS
+    : speciesId === 'daphnia'
+      ? DAPHNIA_CARCASS_LIFETIME_SECONDS
+      : SHRIMP_CARCASS_LIFETIME_SECONDS;
+
+const maximumCarcassBodyLength = (speciesId: AnimalSpeciesId): number =>
+  speciesId === 'daphnia'
+    ? 10
+    : speciesId === 'japanese-ricefish'
+      ? RICEFISH_ECOLOGY_RULES.adultLength * 1.2
+      : SHRIMP_ADULT_LENGTH * 1.2;
+
+const fallbackCarcassBodyLength = (
+  speciesId: AnimalSpeciesId,
+  lifeStage: AnimalLifeStage,
+): number => speciesId === 'daphnia'
+  ? lifeStage === 'adult' ? 8.2 : 4.6
+  : speciesId === 'japanese-ricefish'
+    ? lifeStage === 'adult'
+      ? RICEFISH_ECOLOGY_RULES.adultLength
+      : lifeStage === 'juvenile'
+        ? RICEFISH_ECOLOGY_RULES.juvenileLength
+        : lifeStage === 'fry'
+          ? RICEFISH_ECOLOGY_RULES.fryLength
+          : 6
+    : lifeStage === 'adult' ? SHRIMP_ADULT_LENGTH : SHRIMP_JUVENILE_LENGTH;
 // This is not an ecological carrying capacity. It is only a last-resort guard
 // against allocating an unbounded clutch after a corrupted/extreme run. Under
 // normal rules, food depletion and mortality must limit the population first.
@@ -756,6 +800,45 @@ export class SimulationWorld {
   private readonly biofilmReactionSitesScratch: BiofilmReactionSite[] = [];
   private readonly shrimpFoodCueSitesScratch: ShrimpFoodCueSite[] = [];
   private readonly shrimpMateCueSitesScratch: ShrimpMateCueSite[] = [];
+  private readonly growthOriginalScratch: SpeciesBiomass[] = [];
+  private readonly growthNextScratch: SpeciesBiomass[] = [];
+  private readonly growthCellIndexByIdScratch = new Map<string, number>();
+  private readonly growthRecruitmentTransfersScratch: GrowthRecruitmentTransfer[] = [];
+  private growthIncomingDemandScratch = new Float64Array(0);
+  private growthOutgoingDemandScratch = new Float64Array(0);
+  private readonly growthRatesScratch = emptyBiomass();
+  private readonly growthResourceFactorsScratch = emptyBiomass();
+  private readonly growthActivityPointsScratch: Record<SpeciesId, Vec2> = {
+    oedogonium: { x: 0, y: 0 },
+    nitzschia: { x: 0, y: 0 },
+    vallisneria: { x: 0, y: 0 },
+  };
+  private readonly growthPhysiologyScratch: Record<SpeciesId, AlgaePhysiologyRates> = {
+    oedogonium: {
+      grossPhotosynthesis: 0,
+      respiration: 0,
+      lightStressTurnover: 0,
+      netGrowth: 0,
+    },
+    nitzschia: {
+      grossPhotosynthesis: 0,
+      respiration: 0,
+      lightStressTurnover: 0,
+      netGrowth: 0,
+    },
+    vallisneria: {
+      grossPhotosynthesis: 0,
+      respiration: 0,
+      lightStressTurnover: 0,
+      netGrowth: 0,
+    },
+  };
+  private readonly vallisneriaPhysiologySampleScratch: AlgaePhysiologyRates = {
+    grossPhotosynthesis: 0,
+    respiration: 0,
+    lightStressTurnover: 0,
+    netGrowth: 0,
+  };
   private message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
   public constructor(scenarioId: ScenarioId = 'mission-1') {
@@ -1537,12 +1620,40 @@ export class SimulationWorld {
         gestatingBroodSize: animal.gestatingBroodSize ?? null,
       });
     });
-    this.carcasses = data.carcasses.map((carcass) => ({
-      ...carcass,
-      position: { ...carcass.position },
-      waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
-      temperatureAtDeath: carcass.temperatureAtDeath ?? null,
-    }));
+    this.carcasses = [];
+    for (const carcass of data.carcasses) {
+      const lifetimeSeconds = animalCarcassLifetimeSeconds(carcass.speciesId);
+      const ageSeconds = Number.isFinite(carcass.ageSeconds)
+        ? Math.max(0, carcass.ageSeconds)
+        : 0;
+      // Old or malformed frozen-aquarium data must not resurrect an expired
+      // corpse or turn one corrupt length into a screen-sized Daphnia.
+      if (ageSeconds >= lifetimeSeconds) continue;
+      const fallbackLength = fallbackCarcassBodyLength(
+        carcass.speciesId,
+        carcass.lifeStage,
+      );
+      const bodyLength = Number.isFinite(carcass.bodyLength)
+        ? clamp(carcass.bodyLength, 1, maximumCarcassBodyLength(carcass.speciesId))
+        : fallbackLength;
+      this.carcasses.push({
+        ...carcass,
+        position: {
+          x: Number.isFinite(carcass.position.x)
+            ? clamp(carcass.position.x, 0, TANK_WIDTH)
+            : TANK_WIDTH / 2,
+          y: Number.isFinite(carcass.position.y)
+            ? clamp(carcass.position.y, WATER_TOP, GROUND_Y)
+            : (WATER_TOP + GROUND_Y) / 2,
+        },
+        facing: carcass.facing < 0 ? -1 : 1,
+        poseAngle: Number.isFinite(carcass.poseAngle) ? carcass.poseAngle : 0,
+        bodyLength,
+        waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
+        temperatureAtDeath: carcass.temperatureAtDeath ?? null,
+        ageSeconds,
+      });
+    }
     this.measurements = data.measurements.map((measurement) => ({
       ...measurement,
       point: { ...measurement.point },
@@ -2070,7 +2181,27 @@ export class SimulationWorld {
     if (filter === 'organism' || filter === 'all') {
       const animalHit = this.nearestAnimalHit(exact);
       const carcassHit = this.nearestCarcassHit(exact);
-      if (animalHit && (!carcassHit || animalHit.score <= carcassHit.score)) {
+      const selectedAnimalHit = Boolean(
+        animalHit &&
+        this.selection?.kind === 'animal' &&
+        this.selection.animalId === animalHit.animal.id,
+      );
+      const selectedCarcassHit = Boolean(
+        carcassHit &&
+        this.selection?.kind === 'carcass' &&
+        this.selection.carcassId === carcassHit.carcass.id,
+      );
+      // Dense blooms can put a living Daphnia directly over a corpse. Prefer
+      // the corpse on an exact tie, and cycle between the two on repeated
+      // clicks so neither target becomes permanently unreachable.
+      if (
+        animalHit &&
+        (
+          !carcassHit ||
+          selectedCarcassHit ||
+          (!selectedAnimalHit && animalHit.score < carcassHit.score)
+        )
+      ) {
         const animal = animalHit.animal;
         this.selection = {
           kind: 'animal',
@@ -4533,15 +4664,14 @@ export class SimulationWorld {
 
   private stepAnimalEcology(deltaSeconds: number): void {
     if (this.carcasses.length) {
-      this.carcasses = this.carcasses
-        .map((carcass) => ({ ...carcass, ageSeconds: carcass.ageSeconds + deltaSeconds }))
-        .filter((carcass) => carcass.ageSeconds < (
-          carcass.speciesId === 'japanese-ricefish'
-            ? RICEFISH_CARCASS_LIFETIME_SECONDS
-            : carcass.speciesId === 'daphnia'
-              ? DAPHNIA_CARCASS_LIFETIME_SECONDS
-            : SHRIMP_CARCASS_LIFETIME_SECONDS
-        ));
+      let retainedCarcasses = 0;
+      for (const carcass of this.carcasses) {
+        carcass.ageSeconds += deltaSeconds;
+        if (carcass.ageSeconds >= animalCarcassLifetimeSeconds(carcass.speciesId)) continue;
+        this.carcasses[retainedCarcasses] = carcass;
+        retainedCarcasses += 1;
+      }
+      this.carcasses.length = retainedCarcasses;
       if (
         this.selection?.kind === 'carcass' &&
         !this.carcasses.some((carcass) => carcass.id === this.selection?.carcassId)
@@ -6943,6 +7073,7 @@ export class SimulationWorld {
   private vallisneriaCanopyPhysiology(
     cell: SurfaceCellState,
     temperature: number,
+    reuse?: AlgaePhysiologyRates,
   ): ReturnType<typeof algaePhysiology> {
     const samples = this.vallisneriaCanopyLightSamples(cell);
     if (samples.length === 0) {
@@ -6950,28 +7081,37 @@ export class SimulationWorld {
         'vallisneria',
         this.vallisneriaCanopyLight(cell),
         temperature,
+        reuse,
       );
     }
-    const total = samples.reduce((rates, light) => {
-      const sample = algaePhysiology('vallisneria', light, temperature);
-      rates.grossPhotosynthesis += sample.grossPhotosynthesis;
-      rates.respiration += sample.respiration;
-      rates.lightStressTurnover += sample.lightStressTurnover;
-      rates.netGrowth += sample.netGrowth;
-      return rates;
-    }, {
+    const total = reuse ?? {
       grossPhotosynthesis: 0,
       respiration: 0,
       lightStressTurnover: 0,
       netGrowth: 0,
-    });
-    const divisor = samples.length;
-    return {
-      grossPhotosynthesis: total.grossPhotosynthesis / divisor,
-      respiration: total.respiration / divisor,
-      lightStressTurnover: total.lightStressTurnover / divisor,
-      netGrowth: total.netGrowth / divisor,
     };
+    total.grossPhotosynthesis = 0;
+    total.respiration = 0;
+    total.lightStressTurnover = 0;
+    total.netGrowth = 0;
+    for (const light of samples) {
+      const sample = algaePhysiology(
+        'vallisneria',
+        light,
+        temperature,
+        this.vallisneriaPhysiologySampleScratch,
+      );
+      total.grossPhotosynthesis += sample.grossPhotosynthesis;
+      total.respiration += sample.respiration;
+      total.lightStressTurnover += sample.lightStressTurnover;
+      total.netGrowth += sample.netGrowth;
+    }
+    const divisor = samples.length;
+    total.grossPhotosynthesis /= divisor;
+    total.respiration /= divisor;
+    total.lightStressTurnover /= divisor;
+    total.netGrowth /= divisor;
+    return total;
   }
 
   private vallisneriaCanopySuitability(
@@ -7295,12 +7435,26 @@ export class SimulationWorld {
 
   private stepGrowth(deltaSeconds: number): void {
     const cells = this.allCells();
-    const byId = new Map(cells.map((cell) => [cell.id, cell]));
-    const original = new Map(cells.map((cell) => [cell.id, cloneBiomass(cell.biomass)]));
-    const next = new Map<string, SpeciesBiomass>();
-    const currentProducerBiomass = cells.reduce((sum, cell) =>
-      sum + cell.biomass.oedogonium +
-        cell.biomass.nitzschia + cell.biomass.vallisneria, 0);
+    const original = this.growthOriginalScratch;
+    const next = this.growthNextScratch;
+    const cellIndexById = this.growthCellIndexByIdScratch;
+    cellIndexById.clear();
+    let currentProducerBiomass = 0;
+    for (let index = 0; index < cells.length; index += 1) {
+      const cell = cells[index];
+      const source = cell.biomass;
+      const copied = original[index] ?? emptyBiomass();
+      copied.oedogonium = source.oedogonium;
+      copied.nitzschia = source.nitzschia;
+      copied.vallisneria = source.vallisneria;
+      original[index] = copied;
+      next[index] ??= emptyBiomass();
+      cellIndexById.set(cell.id, index);
+      currentProducerBiomass +=
+        source.oedogonium + source.nitzschia + source.vallisneria;
+    }
+    original.length = cells.length;
+    next.length = cells.length;
     const backgroundProducerCapacity = this.scenario.waterCycle
       ? null
       : this.scenario.backgroundProducerCapacity;
@@ -7308,30 +7462,51 @@ export class SimulationWorld {
       ? 1
       : clamp01(1 - currentProducerBiomass / backgroundProducerCapacity);
 
-    for (const cell of cells) {
-      const current = original.get(cell.id)!;
+    for (let cellIndex = 0; cellIndex < cells.length; cellIndex += 1) {
+      const cell = cells[cellIndex];
+      const current = original[cellIndex];
       const total = current.oedogonium + current.nitzschia + current.vallisneria;
       const freeCapacity = clamp01(1 - total);
       const cellPoint = this.cellWorldPoint(cell);
-      const rates = emptyBiomass();
-      const physiology = new Map<SpeciesId, ReturnType<typeof algaePhysiology>>();
-      const resourceFactors = new Map<SpeciesId, number>();
-      const activityPoints = new Map<SpeciesId, Vec2>();
+      const rates = this.growthRatesScratch;
+      rates.oedogonium = 0;
+      rates.nitzschia = 0;
+      rates.vallisneria = 0;
+      const physiology = this.growthPhysiologyScratch;
+      const resourceFactors = this.growthResourceFactorsScratch;
+      resourceFactors.oedogonium = 0;
+      resourceFactors.nitzschia = 0;
+      resourceFactors.vallisneria = 0;
+      const activityPoints = this.growthActivityPointsScratch;
       for (const speciesId of this.scenario.allowedSpecies) {
+        // An absent producer contributes neither to this cell's weighted
+        // growth nor to its material flux. In particular, do not build a full
+        // Vallisneria leaf canopy for every empty grid cell once per ecology
+        // second.
+        if (current[speciesId] <= 0) continue;
         const physiologyPoint = this.producerActivityPoint(cell, speciesId);
         const activityPoint = speciesId === 'vallisneria'
           ? this.vallisneriaUptakePoint(cell)
           : physiologyPoint;
         const localTemperature = this.biogeochemistry.temperatureAt(physiologyPoint);
         const response = speciesId === 'vallisneria'
-          ? this.vallisneriaCanopyPhysiology(cell, localTemperature)
-          : algaePhysiology(speciesId, cell.light, localTemperature);
+          ? this.vallisneriaCanopyPhysiology(
+            cell,
+            localTemperature,
+            physiology[speciesId],
+          )
+          : algaePhysiology(
+            speciesId,
+            cell.light,
+            localTemperature,
+            physiology[speciesId],
+          );
         const resourceFactor =
           this.biogeochemistry.algaeResourceFactor(activityPoint) *
           backgroundNutrientFactor;
-        activityPoints.set(speciesId, activityPoint);
-        physiology.set(speciesId, response);
-        resourceFactors.set(speciesId, resourceFactor);
+        activityPoints[speciesId] = activityPoint;
+        physiology[speciesId] = response;
+        resourceFactors[speciesId] = resourceFactor;
         rates[speciesId] = response.netGrowth > 0
           ? response.netGrowth * resourceFactor
           : response.netGrowth;
@@ -7343,16 +7518,18 @@ export class SimulationWorld {
           current.vallisneria * rates.vallisneria
         ) / total
         : 0;
-      const result = emptyBiomass();
+      const result = next[cellIndex];
+      result.oedogonium = 0;
+      result.nitzschia = 0;
+      result.vallisneria = 0;
       let fixedBiomass = 0;
       let respiredBiomass = 0;
       for (const speciesId of this.scenario.allowedSpecies) {
         const amount = current[speciesId];
         if (amount <= 0) continue;
-        const response = physiology.get(speciesId)!;
-        const activityPoint = activityPoints.get(speciesId) ??
-          this.producerActivityPoint(cell, speciesId);
-        const resourceFactor = resourceFactors.get(speciesId) ?? 1;
+        const response = physiology[speciesId];
+        const activityPoint = activityPoints[speciesId];
+        const resourceFactor = resourceFactors[speciesId];
         const rate = rates[speciesId];
         // Density-dependent limitation throttles only the photosynthesis left
         // after replacing respiration and stress losses. This preserves the
@@ -7405,26 +7582,21 @@ export class SimulationWorld {
           result.oedogonium - result.nitzschia - result.vallisneria,
       );
       this.biogeochemistry.recordAlgaeTurnover(cellPoint, localLoss);
-      next.set(cell.id, result);
     }
-
-    interface RecruitmentTransfer {
-      sourceId: string;
-      receiverId: string;
-      speciesId: SpeciesId;
-      amount: number;
-    }
-    const recruitmentTransfers: RecruitmentTransfer[] = [];
+    const recruitmentTransfers = this.growthRecruitmentTransfersScratch;
+    let recruitmentTransferCount = 0;
 
     // Colonies export real biomass as propagules. Proposals are calculated from
     // the same pre-step state, then capacity-scaled and applied together, so the
     // result stays deterministic and independent of cell iteration order.
-    for (const cell of cells) {
-      const source = original.get(cell.id)!;
+    for (let sourceIndex = 0; sourceIndex < cells.length; sourceIndex += 1) {
+      const cell = cells[sourceIndex];
+      const source = original[sourceIndex];
       for (const neighborId of cell.neighborIds) {
-        const neighbor = byId.get(neighborId);
-        if (!neighbor) continue;
-        const receiver = next.get(neighbor.id)!;
+        const receiverIndex = cellIndexById.get(neighborId);
+        if (receiverIndex === undefined) continue;
+        const neighbor = cells[receiverIndex];
+        const receiver = next[receiverIndex];
         const receiverTotal = receiver.oedogonium + receiver.nitzschia + receiver.vallisneria;
         const freeCapacity = clamp01(1 - receiverTotal);
         if (freeCapacity <= 0.0001) continue;
@@ -7445,12 +7617,18 @@ export class SimulationWorld {
             freeCapacity /
             Math.max(2, cell.neighborIds.length);
           if (recruitment <= 0) continue;
-          recruitmentTransfers.push({
-            sourceId: cell.id,
-            receiverId: neighbor.id,
+          const transfer = recruitmentTransfers[recruitmentTransferCount] ?? {
+            sourceIndex,
+            receiverIndex,
             speciesId,
             amount: recruitment,
-          });
+          };
+          transfer.sourceIndex = sourceIndex;
+          transfer.receiverIndex = receiverIndex;
+          transfer.speciesId = speciesId;
+          transfer.amount = recruitment;
+          recruitmentTransfers[recruitmentTransferCount] = transfer;
+          recruitmentTransferCount += 1;
         }
       }
     }
@@ -7459,19 +7637,22 @@ export class SimulationWorld {
     // propagules proportionally rather than letting whichever cell is visited
     // first claim the receiver. This also prevents final capacity clamping from
     // silently destroying transferred mass.
-    const incomingDemand = new Map<string, number>();
-    for (const transfer of recruitmentTransfers) {
-      incomingDemand.set(
-        transfer.receiverId,
-        (incomingDemand.get(transfer.receiverId) ?? 0) + transfer.amount,
-      );
+    if (this.growthIncomingDemandScratch.length !== cells.length) {
+      this.growthIncomingDemandScratch = new Float64Array(cells.length);
     }
-    for (const transfer of recruitmentTransfers) {
-      const receiver = next.get(transfer.receiverId)!;
+    const incomingDemand = this.growthIncomingDemandScratch;
+    incomingDemand.fill(0);
+    for (let index = 0; index < recruitmentTransferCount; index += 1) {
+      const transfer = recruitmentTransfers[index];
+      incomingDemand[transfer.receiverIndex] += transfer.amount;
+    }
+    for (let index = 0; index < recruitmentTransferCount; index += 1) {
+      const transfer = recruitmentTransfers[index];
+      const receiver = next[transfer.receiverIndex];
       const freeCapacity = clamp01(
         1 - receiver.oedogonium - receiver.nitzschia - receiver.vallisneria,
       );
-      const demand = incomingDemand.get(transfer.receiverId) ?? 0;
+      const demand = incomingDemand[transfer.receiverIndex];
       if (demand > freeCapacity && demand > 0) {
         transfer.amount *= freeCapacity / demand;
       }
@@ -7479,40 +7660,49 @@ export class SimulationWorld {
 
     // A source cannot export more than remains after its own growth/turnover.
     // The same scale is applied to every destination for that species.
-    const outgoingDemand = new Map<string, number>();
-    for (const transfer of recruitmentTransfers) {
-      const key = `${transfer.sourceId}\0${transfer.speciesId}`;
-      outgoingDemand.set(key, (outgoingDemand.get(key) ?? 0) + transfer.amount);
+    const outgoingDemandLength = cells.length * 3;
+    if (this.growthOutgoingDemandScratch.length !== outgoingDemandLength) {
+      this.growthOutgoingDemandScratch = new Float64Array(outgoingDemandLength);
     }
-    for (const transfer of recruitmentTransfers) {
-      const key = `${transfer.sourceId}\0${transfer.speciesId}`;
-      const demand = outgoingDemand.get(key) ?? 0;
-      const available = next.get(transfer.sourceId)![transfer.speciesId];
+    const outgoingDemand = this.growthOutgoingDemandScratch;
+    outgoingDemand.fill(0);
+    for (let index = 0; index < recruitmentTransferCount; index += 1) {
+      const transfer = recruitmentTransfers[index];
+      const demandIndex =
+        transfer.sourceIndex * 3 + GROWTH_SPECIES_INDEX[transfer.speciesId];
+      outgoingDemand[demandIndex] += transfer.amount;
+    }
+    for (let index = 0; index < recruitmentTransferCount; index += 1) {
+      const transfer = recruitmentTransfers[index];
+      const demandIndex =
+        transfer.sourceIndex * 3 + GROWTH_SPECIES_INDEX[transfer.speciesId];
+      const demand = outgoingDemand[demandIndex];
+      const available = next[transfer.sourceIndex][transfer.speciesId];
       if (demand > available && demand > 0) {
         transfer.amount *= available / demand;
       }
     }
 
-    for (const transfer of recruitmentTransfers) {
-      const source = next.get(transfer.sourceId)!;
-      const receiver = next.get(transfer.receiverId)!;
+    for (let index = 0; index < recruitmentTransferCount; index += 1) {
+      const transfer = recruitmentTransfers[index];
+      const source = next[transfer.sourceIndex];
+      const receiver = next[transfer.receiverIndex];
       source[transfer.speciesId] -= transfer.amount;
       receiver[transfer.speciesId] += transfer.amount;
     }
 
-    for (const cell of cells) {
-      const result = next.get(cell.id)!;
+    for (let index = 0; index < cells.length; index += 1) {
+      const cell = cells[index];
+      const result = next[index];
       const total = result.oedogonium + result.nitzschia + result.vallisneria;
       if (total > 1) {
         result.oedogonium /= total;
         result.nitzschia /= total;
         result.vallisneria /= total;
       }
-      cell.biomass = {
-        oedogonium: clamp01(result.oedogonium),
-        nitzschia: clamp01(result.nitzschia),
-        vallisneria: clamp01(result.vallisneria),
-      };
+      cell.biomass.oedogonium = clamp01(result.oedogonium);
+      cell.biomass.nitzschia = clamp01(result.nitzschia);
+      cell.biomass.vallisneria = clamp01(result.vallisneria);
     }
   }
 
@@ -7849,11 +8039,7 @@ export class SimulationWorld {
     const snapshots = reuse ?? [];
     for (let index = 0; index < this.carcasses.length; index += 1) {
       const carcass = this.carcasses[index];
-      const lifetimeSeconds = carcass.speciesId === 'japanese-ricefish'
-        ? RICEFISH_CARCASS_LIFETIME_SECONDS
-        : carcass.speciesId === 'daphnia'
-          ? DAPHNIA_CARCASS_LIFETIME_SECONDS
-          : SHRIMP_CARCASS_LIFETIME_SECONDS;
+      const lifetimeSeconds = animalCarcassLifetimeSeconds(carcass.speciesId);
       const snapshot = snapshots[index] ?? {} as AnimalCarcassSnapshot;
       snapshot.id = carcass.id;
       snapshot.sourceAnimalId = carcass.sourceAnimalId;
@@ -8649,7 +8835,11 @@ export class SimulationWorld {
       distance: number;
       score: number;
     } | null = null;
-    for (const carcass of this.carcasses) {
+    const selectableCarcasses = presentedAnimalCarcasses(
+      this.carcasses,
+      this.selection?.kind === 'carcass' ? this.selection.carcassId : null,
+    );
+    for (const carcass of selectableCarcasses) {
       const visualPoint = animalCarcassVisualPoint({
         speciesId: carcass.speciesId,
         x: carcass.position.x,

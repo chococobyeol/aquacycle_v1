@@ -6,17 +6,20 @@ import {
 } from '../src/simulation/sharedTelemetry';
 
 describe('bounded shared worker telemetry', () => {
-  it('reuses one fixed payload while delivering the newest complete packet', () => {
+  it('reuses three fixed publication slots while delivering the newest complete packet', () => {
     const channel = createSharedTelemetryChannel(4096);
     const writer = new SharedTelemetryWriter(channel);
     const reader = new SharedTelemetryReader<{ sequence: number; label: string }>(channel);
-    const originalPayload = channel.payload;
+    const originalPayloads = [...channel.payloads];
 
+    expect(channel.payloads[0]).not.toBe(channel.payloads[1]);
+    expect(channel.payloads[0]).not.toBe(channel.payloads[2]);
+    expect(channel.payloads[1]).not.toBe(channel.payloads[2]);
     for (let sequence = 1; sequence <= 2_000; sequence += 1) {
       expect(writer.publish({ sequence, label: `새우-${sequence}` })).toBe(true);
     }
 
-    expect(channel.payload).toBe(originalPayload);
+    expect(channel.payloads).toEqual(originalPayloads);
     expect(reader.readLatest()).toEqual({ sequence: 2_000, label: '새우-2000' });
     expect(reader.readLatest()).toBeNull();
   });
@@ -26,12 +29,36 @@ describe('bounded shared worker telemetry', () => {
     const writer = new SharedTelemetryWriter(channel);
     const reader = new SharedTelemetryReader<{ value: string }>(channel);
 
+    expect(writer.publish({ value: '이전' })).toBe(true);
+    expect(reader.readLatest()).toEqual({ value: '이전' });
     expect(writer.publish({ value: 'x'.repeat(512) })).toBe(false);
     expect(reader.readLatest()).toBeNull();
     expect(reader.overflowCount()).toBe(1);
 
     expect(writer.publish({ value: '정상' })).toBe(true);
     expect(reader.readLatest()).toEqual({ value: '정상' });
+  });
+
+  it('never overwrites a slot claimed by a slower renderer decode', () => {
+    const channel = createSharedTelemetryChannel(4096);
+    const writer = new SharedTelemetryWriter(channel);
+    const reader = new SharedTelemetryReader<{ sequence: number }>(channel);
+    const control = new Int32Array(channel.control);
+
+    expect(writer.publish({ sequence: 1 })).toBe(true);
+    const publishedSlot = Atomics.load(control, 3);
+    // Control word 4 is the reader's encoded slot claim (zero means idle).
+    Atomics.store(control, 4, publishedSlot + 1);
+    const claimedBytes = new Uint8Array(channel.payloads[publishedSlot]);
+    const before = claimedBytes.slice();
+
+    for (let sequence = 2; sequence <= 500; sequence += 1) {
+      expect(writer.publish({ sequence })).toBe(true);
+    }
+
+    expect(claimedBytes).toEqual(before);
+    Atomics.store(control, 4, 0);
+    expect(reader.readLatest()).toEqual({ sequence: 500 });
   });
 
   it('round-trips the nested values used by simulation snapshots without JSON', () => {

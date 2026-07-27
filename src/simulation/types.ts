@@ -788,4 +788,17 @@ export interface WorkerMotionMessage {
   probe: ProbeSnapshot | null;
 }
 
-export type WorkerMessage = WorkerSnapshotMessage | WorkerMotionMessage | WorkerSaveMessage;
+export interface WorkerMotionOverlayMessage {
+  type: 'motion-overlay';
+  /** Matches the binary motion sample whose pointer metadata this accompanies. */
+  sequence: number;
+  sampledAtMs: number;
+  holding: HoldingSnapshot | null;
+  probe: ProbeSnapshot | null;
+}
+
+export type WorkerMessage =
+  | WorkerSnapshotMessage
+  | WorkerMotionMessage
+  | WorkerMotionOverlayMessage
+  | WorkerSaveMessage;

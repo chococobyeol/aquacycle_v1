@@ -13,6 +13,7 @@ import type {
   SimulationCommand,
   SimulationSnapshot,
   WorkerMotionMessage,
+  WorkerMotionOverlayMessage,
   WorkerSaveMessage,
   WorkerSnapshotMessage,
 } from './types';
@@ -32,8 +33,10 @@ let interactiveMotionDirty = false;
 let snapshotTelemetry: SharedTelemetryWriter | null = null;
 let motionTelemetry: SharedTelemetryWriter | null = null;
 let binaryMotionTelemetry: SharedMotionWriter | null = null;
+let lastOversizedMotionFallbackAtMs = Number.NEGATIVE_INFINITY;
 let reusableMotion = world.motionSnapshot();
 let reusableSnapshot: SimulationSnapshot | undefined;
+const OVERSIZED_MOTION_FALLBACK_INTERVAL_MS = 1_000;
 
 interface ConnectTelemetryCommand {
   type: 'connect-telemetry';
@@ -50,8 +53,11 @@ const publish = (): void => {
     type: 'snapshot',
     snapshot: reusableSnapshot,
   };
-  if (snapshotTelemetry) snapshotTelemetry.publish(message);
-  else scope.postMessage(message);
+  const sharedPublished = snapshotTelemetry?.publish(message) ?? false;
+  // A population spike must not silently stop every future HUD update and
+  // command acknowledgement. The fixed shared slot is the normal path; an
+  // exceptional oversized generation uses one ordinary worker message.
+  if (!sharedPublished) scope.postMessage(message);
 };
 
 const publishMotion = (): void => {
@@ -65,12 +71,36 @@ const publishMotion = (): void => {
     ...motion,
   };
   const binaryPublished = binaryMotionTelemetry?.publish(message) ?? false;
-  // Holding/probe packets contain labels and diagnostic records that are not
-  // part of the fixed numeric motion layout. They are short-lived interactive
-  // traffic; autonomous animals and settling structures stay allocation-free.
-  if (message.holding || message.probe || !binaryPublished) {
-    if (motionTelemetry) motionTelemetry.publish(message);
-    else scope.postMessage(message);
+  if (!binaryMotionTelemetry && !motionTelemetry) {
+    scope.postMessage(message);
+    return;
+  }
+  if (!binaryPublished) {
+    // An extreme population beyond the fixed binary capacity still receives a
+    // coarse full pose, but never structured-clones the giant graph at 30 Hz.
+    if (
+      sampledAtMs - lastOversizedMotionFallbackAtMs >=
+      OVERSIZED_MOTION_FALLBACK_INTERVAL_MS
+    ) {
+      lastOversizedMotionFallbackAtMs = sampledAtMs;
+      scope.postMessage(message);
+    }
+    return;
+  }
+  // Holding/probe records are not part of the numeric motion layout. Send only
+  // that small metadata beside the successful binary sample; duplicating every
+  // animal into the generic channel could overflow and structured-clone the
+  // whole population at 30 Hz while a probe or held item is active.
+  if (message.holding || message.probe) {
+    const overlay: WorkerMotionOverlayMessage = {
+      type: 'motion-overlay',
+      sequence: message.sequence,
+      sampledAtMs: message.sampledAtMs,
+      holding: message.holding,
+      probe: message.probe,
+    };
+    const sharedPublished = motionTelemetry?.publish(overlay) ?? false;
+    if (!sharedPublished) scope.postMessage(overlay);
   }
 };
 

@@ -181,7 +181,8 @@ describe('inventory preview rendering contract', () => {
   it('avoids the pooled Pixi alpha-mask filter that can freeze a partial frame', () => {
     expect(canvasSource).not.toContain('detailGraphics.setMask');
     expect(canvasSource).not.toContain('detailMaskSprite');
-    expect(canvasSource).toContain('container.addChild(densitySprite, detailGraphics);');
+    expect(canvasSource).toContain('container.addChild(densityMarks, detailGraphics);');
+    expect(canvasSource).not.toContain('densityTexture.source.update();');
     expect(canvasSource).toContain('autoStart: false');
     expect(canvasSource).toContain('app.ticker.remove(app.render, app);');
     expect(canvasSource).toContain('requestFullRendererRecovery();');

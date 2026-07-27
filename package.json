@@ -17,6 +17,7 @@
     "verify:ecology-long-run": "vitest run --pool=threads --poolOptions.threads.singleThread tests/producerMissionLongRunEcology.test.ts tests/mission4LongRunPerformance.test.ts tests/mission5LongTermEquilibrium.test.ts tests/dayNightLongRunEquilibrium.test.ts && npm run verify:long-cycle && npm run verify:mission-7-matrix",
     "verify:long-cycle": "vite-node scripts/verifyLongCycle.ts",
     "diagnose:mission-7-food-web": "vite-node scripts/diagnoseMission7FoodWeb.ts",
+    "diagnose:mission-7-allocations": "vite-node scripts/profileMission7Allocations.ts",
     "diagnose:daphnia-capacity": "vite-node scripts/diagnoseDaphniaPredatorCapacity.ts",
     "diagnose:mission-7-vallisneria": "vite-node scripts/diagnoseMission7Vallisneria.ts",
     "diagnose:mission-7-vallisneria:no-microbes": "vite-node scripts/diagnoseMission7Vallisneria.ts --no-microbes",

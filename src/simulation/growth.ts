@@ -39,6 +39,7 @@ export const algaePhysiology = (
   speciesId: SpeciesId,
   light: number,
   temperature = 24,
+  reuse?: AlgaePhysiologyRates,
 ): AlgaePhysiologyRates => {
   const definition = SPECIES[speciesId];
   const referenceNet = referenceNetLightRate(speciesId, light);
@@ -59,12 +60,17 @@ export const algaePhysiology = (
   // from the clock, a structure, or a switched-off lamp. Any future
   // photoacclimation must be driven by stored light history, never scenario ID.
   const lightStressTurnover = referenceStress + temperatureStress;
-  return {
-    grossPhotosynthesis,
-    respiration,
-    lightStressTurnover,
-    netGrowth: grossPhotosynthesis - respiration - lightStressTurnover,
+  const rates = reuse ?? {
+    grossPhotosynthesis: 0,
+    respiration: 0,
+    lightStressTurnover: 0,
+    netGrowth: 0,
   };
+  rates.grossPhotosynthesis = grossPhotosynthesis;
+  rates.respiration = respiration;
+  rates.lightStressTurnover = lightStressTurnover;
+  rates.netGrowth = grossPhotosynthesis - respiration - lightStressTurnover;
+  return rates;
 };
 
 export const netGrowthPotential = (

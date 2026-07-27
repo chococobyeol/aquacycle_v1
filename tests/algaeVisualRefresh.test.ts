@@ -8,8 +8,8 @@ vi.hoisted(() => {
 });
 
 import {
-  ALGAE_DENSITY_BLUR_PIXELS,
-  ALGAE_DENSITY_FIELD_SCALE,
+  ALGAE_BRUSH_SOFT_EDGE_PIXELS,
+  ALGAE_BRUSH_TEXTURE_SIZE,
   ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL,
   ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL,
   ALGAE_PARTICLE_JITTER_SPAN,
@@ -23,8 +23,6 @@ import {
   algaeVisualLevel,
 } from '../src/renderer/tank/AquariumCanvas';
 import {
-  TANK_HEIGHT,
-  TANK_WIDTH,
   type SurfaceCellSnapshot,
 } from '../src/simulation/types';
 
@@ -95,16 +93,12 @@ describe('algae visual refresh decisions', () => {
       .toBe(0);
   });
 
-  it('uses one bounded, interpolated field instead of presenting ecology cells at native resolution', () => {
-    const fieldWidth = Math.round(TANK_WIDTH * ALGAE_DENSITY_FIELD_SCALE);
-    const fieldHeight = Math.round(TANK_HEIGHT * ALGAE_DENSITY_FIELD_SCALE);
-    const worldBlurRadius = ALGAE_DENSITY_BLUR_PIXELS / ALGAE_DENSITY_FIELD_SCALE;
-
-    expect(fieldWidth).toBe(400);
-    expect(fieldHeight).toBe(240);
-    expect(fieldWidth * fieldHeight).toBeLessThanOrEqual(100_000);
-    expect(worldBlurRadius).toBeGreaterThanOrEqual(2);
-    expect(worldBlurRadius).toBeLessThan(4);
+  it('uses one immutable soft brush whose neighboring marks overlap the ecology grid', () => {
+    expect(ALGAE_BRUSH_TEXTURE_SIZE).toBeGreaterThanOrEqual(64);
+    expect(ALGAE_BRUSH_SOFT_EDGE_PIXELS).toBeGreaterThanOrEqual(4);
+    expect(
+      ALGAE_BRUSH_SOFT_EDGE_PIXELS / ALGAE_BRUSH_TEXTURE_SIZE,
+    ).toBeGreaterThanOrEqual(0.06);
   });
 
   it('regenerates species detail after extinction without flickering while alive', () => {
