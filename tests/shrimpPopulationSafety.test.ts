@@ -94,9 +94,27 @@ const configureReadyPair = (
 const directArrayLengths = (world: SimulationWorld): Record<string, number> =>
   Object.fromEntries(
     Object.entries(world as unknown as Record<string, unknown>)
-      .filter((entry): entry is [string, unknown[]] => Array.isArray(entry[1]))
+      .filter((entry): entry is [string, unknown[]] =>
+        Array.isArray(entry[1]) && !entry[0].endsWith('Scratch'))
       .map(([key, value]) => [key, value.length]),
   );
+
+const expectBoundedReactionWorkspaces = (
+  world: SimulationWorld,
+  snapshot: WorldSnapshot,
+): void => {
+  const workspaces = world as unknown as {
+    biofilmReactionSitesScratch: unknown[];
+    shrimpFoodCueSitesScratch: unknown[];
+    shrimpMateCueSitesScratch: unknown[];
+  };
+  expect(workspaces.biofilmReactionSitesScratch.length)
+    .toBeLessThanOrEqual(snapshot.cells.length);
+  expect(workspaces.shrimpFoodCueSitesScratch.length)
+    .toBeLessThanOrEqual(snapshot.cells.length);
+  expect(workspaces.shrimpMateCueSitesScratch.length)
+    .toBeLessThanOrEqual(snapshot.animals.length);
+};
 
 const recursiveArrayEntryCount = (value: unknown): number => {
   if (Array.isArray(value)) {
@@ -528,5 +546,6 @@ describe('shrimp population safety contract', () => {
     expect(recursiveArrayEntryCount(afterFastForward)).toBe(
       baselineSnapshotEntries,
     );
+    expectBoundedReactionWorkspaces(world, afterFastForward);
   });
 });

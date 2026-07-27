@@ -78,10 +78,17 @@ describe('background simulation continuity', () => {
       path.resolve(process.cwd(), 'src/main.ts'),
       'utf8',
     );
+    const preloadSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/preload.ts'),
+      'utf8',
+    );
     expect(mainSource).toContain('window.webContents.invalidate()');
     expect(mainSource).toContain("window.webContents.on('render-process-gone'");
     expect(mainSource).toContain('window.webContents.reload()');
     expect(mainSource).toContain("app.on('child-process-gone'");
     expect(mainSource).toContain('renderer-health.log');
+    expect(mainSource).toContain('renderer memory:');
+    expect(preloadSource).toContain('process.getProcessMemoryInfo()');
+    expect(preloadSource).toContain('process.getHeapStatistics()');
   });
 });

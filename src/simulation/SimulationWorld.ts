@@ -679,6 +679,8 @@ export class SimulationWorld {
   private outcomeAtSeconds: number | null = null;
   private structures: StructureState[] = [];
   private substrateCells: SurfaceCellState[] = [];
+  private allCellsCache: SurfaceCellState[] = [];
+  private allCellsCacheDirty = true;
   private boundaries: MatterBody[] = [];
   private structureCounter = 0;
   private seedCounter = 0;
@@ -751,6 +753,9 @@ export class SimulationWorld {
   private lightTransportCache = new Map<string, LightTransportPath>();
   private vallisneriaCanopyOptics: VallisneriaCanopyOptics[] = [];
   private canopyTransmissionCache = new Map<string, number>();
+  private readonly biofilmReactionSitesScratch: BiofilmReactionSite[] = [];
+  private readonly shrimpFoodCueSitesScratch: ShrimpFoodCueSite[] = [];
+  private readonly shrimpMateCueSitesScratch: ShrimpMateCueSite[] = [];
   private message = '목록에서 구조물과 생물을 꺼내 수조를 구성하세요.';
 
   public constructor(scenarioId: ScenarioId = 'mission-1') {
@@ -768,6 +773,7 @@ export class SimulationWorld {
     this.outcomeAtSeconds = null;
     this.structures = [];
     this.substrateCells = this.createSubstrateCells();
+    this.allCellsCacheDirty = true;
     this.structureCounter = 0;
     this.seedCounter = 0;
     this.animalCounter = 0;
@@ -1775,6 +1781,7 @@ export class SimulationWorld {
       })),
     };
     this.structures.push(structure);
+    this.allCellsCacheDirty = true;
     Composite.add(this.engine.world, body);
     this.crossConnectionsDirty = true;
     this.lightDirty = true;
@@ -2712,6 +2719,7 @@ export class SimulationWorld {
     this.seedPlacements = this.seedPlacements.filter((seed) => !cellIds.has(seed.cellId));
     Composite.remove(this.engine.world, structure.body);
     this.structures = this.structures.filter((item) => item.id !== structure.id);
+    this.allCellsCacheDirty = true;
     if (this.selection?.kind === 'structure' && this.selection.structureId === structure.id) {
       this.selection = null;
     }
@@ -4285,7 +4293,8 @@ export class SimulationWorld {
   }
 
   private resolveBiogeochemistry(deltaSeconds: number): void {
-    const shrimpMateCueSites: ShrimpMateCueSite[] = [];
+    const shrimpMateCueSites = this.shrimpMateCueSitesScratch;
+    let shrimpMateCueCount = 0;
     for (const animal of this.animals) {
       if (
         animal.speciesId !== 'cherry-shrimp' ||
@@ -4297,18 +4306,26 @@ export class SimulationWorld {
       ) continue;
       const progress = animal.ovarianProgress ?? 0;
       if (progress < SHRIMP_MATE_CUE_EMISSION_START_PROGRESS) continue;
-      shrimpMateCueSites.push({
-        point: animal.position,
-        strength: clamp01(
-          (progress - SHRIMP_MATE_CUE_EMISSION_START_PROGRESS) /
-            (1 - SHRIMP_MATE_CUE_EMISSION_START_PROGRESS),
-        ) * animal.health,
-      });
+      const site = shrimpMateCueSites[shrimpMateCueCount] ?? {
+        point: { x: 0, y: 0 },
+        strength: 0,
+      };
+      site.point.x = animal.position.x;
+      site.point.y = animal.position.y;
+      site.strength = clamp01(
+        (progress - SHRIMP_MATE_CUE_EMISSION_START_PROGRESS) /
+          (1 - SHRIMP_MATE_CUE_EMISSION_START_PROGRESS),
+      ) * animal.health;
+      shrimpMateCueSites[shrimpMateCueCount] = site;
+      shrimpMateCueCount += 1;
     }
+    shrimpMateCueSites.length = shrimpMateCueCount;
 
     const cells = this.allCells();
-    const reactionSites: BiofilmReactionSite[] = [];
-    const shrimpFoodCueSites: ShrimpFoodCueSite[] = [];
+    const reactionSites = this.biofilmReactionSitesScratch;
+    const shrimpFoodCueSites = this.shrimpFoodCueSitesScratch;
+    let reactionSiteCount = 0;
+    let shrimpFoodCueCount = 0;
     const hasShrimp = this.animals.some(
       (animal) => animal.speciesId === 'cherry-shrimp',
     );
@@ -4324,11 +4341,31 @@ export class SimulationWorld {
     );
     for (const cell of cells) {
       const point = this.cellWorldPoint(cell);
-      reactionSites.push({ point, biofilm: cell.biofilm });
+      const reactionSite = reactionSites[reactionSiteCount] ?? {
+        point: { x: 0, y: 0 },
+        biofilm: cell.biofilm,
+      };
+      reactionSite.point.x = point.x;
+      reactionSite.point.y = point.y;
+      reactionSite.biofilm = cell.biofilm;
+      reactionSites[reactionSiteCount] = reactionSite;
+      reactionSiteCount += 1;
       if (!surfaceFoodMayExist) continue;
       const strength = this.edibleBiomass(cell);
-      if (strength > 0) shrimpFoodCueSites.push({ point, strength });
+      if (strength > 0) {
+        const foodSite = shrimpFoodCueSites[shrimpFoodCueCount] ?? {
+          point: { x: 0, y: 0 },
+          strength: 0,
+        };
+        foodSite.point.x = point.x;
+        foodSite.point.y = point.y;
+        foodSite.strength = strength;
+        shrimpFoodCueSites[shrimpFoodCueCount] = foodSite;
+        shrimpFoodCueCount += 1;
+      }
     }
+    reactionSites.length = reactionSiteCount;
+    shrimpFoodCueSites.length = shrimpFoodCueCount;
 
     this.biogeochemistry.advance(
       deltaSeconds,
@@ -8661,7 +8698,14 @@ export class SimulationWorld {
   }
 
   private allCells(): SurfaceCellState[] {
-    return [...this.substrateCells, ...this.structures.flatMap((structure) => structure.cells)];
+    if (!this.allCellsCacheDirty) return this.allCellsCache;
+    this.allCellsCache.length = 0;
+    this.allCellsCache.push(...this.substrateCells);
+    for (const structure of this.structures) {
+      this.allCellsCache.push(...structure.cells);
+    }
+    this.allCellsCacheDirty = false;
+    return this.allCellsCache;
   }
 
   private cellById(id: string): SurfaceCellState | undefined {

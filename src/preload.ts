@@ -1,5 +1,24 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
+const RENDERER_MEMORY_REPORT_INTERVAL_MS = 60_000;
+
+const reportRendererMemory = async (): Promise<void> => {
+  try {
+    const memory = await process.getProcessMemoryInfo();
+    const heap = process.getHeapStatistics();
+    ipcRenderer.send('aquacycle:renderer-memory', {
+      privateKb: memory.private,
+      heapUsedKb: heap.usedHeapSize,
+      heapTotalKb: heap.totalHeapSize,
+    });
+  } catch {
+    // A diagnostic sample must never interfere with the simulation preload.
+  }
+};
+
+void reportRendererMemory();
+setInterval(() => void reportRendererMemory(), RENDERER_MEMORY_REPORT_INTERVAL_MS);
+
 contextBridge.exposeInMainWorld('aquacycleDesktop', {
   platform: process.platform,
   versions: {

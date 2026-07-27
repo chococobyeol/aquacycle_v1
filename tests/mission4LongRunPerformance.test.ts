@@ -122,12 +122,37 @@ const stableWorldArrayEntryCount = (world: SimulationWorld): number =>
       key !== 'animals' &&
       key !== 'carcasses' &&
       key !== 'animalPopulationEvents' &&
+      key !== 'allCellsCache' &&
+      !key.endsWith('Scratch') &&
       Array.isArray(value)
         ? value.length
         : 0
     ),
     0,
   );
+
+const assertBoundedWorldWorkspaces = (
+  world: SimulationWorld,
+  snapshot: WorldSnapshot,
+): void => {
+  const workspaces = world as unknown as {
+    allCellsCache: unknown[];
+    biofilmReactionSitesScratch: unknown[];
+    shrimpFoodCueSitesScratch: unknown[];
+    shrimpMateCueSitesScratch: unknown[];
+  };
+  // These arrays intentionally grow from empty on the first ecology step, but
+  // their capacity follows current topology/population rather than elapsed
+  // experiment time. Keeping explicit bounds here still catches an accidental
+  // append-only history while allowing fixed allocation workspaces.
+  expect(workspaces.allCellsCache.length).toBe(snapshot.cells.length);
+  expect(workspaces.biofilmReactionSitesScratch.length)
+    .toBeLessThanOrEqual(snapshot.cells.length);
+  expect(workspaces.shrimpFoodCueSitesScratch.length)
+    .toBeLessThanOrEqual(snapshot.cells.length);
+  expect(workspaces.shrimpMateCueSitesScratch.length)
+    .toBeLessThanOrEqual(snapshot.animals.length);
+};
 
 const assertBoundedMissionFourSnapshot = (
   snapshot: WorldSnapshot,
@@ -209,6 +234,7 @@ describe('mission 4 long-run performance contract', () => {
       expect(stableWorldArrayEntryCount(world)).toBeLessThanOrEqual(
         baselineWorldArrayEntries + MAX_STABLE_ARRAY_ENTRY_DRIFT,
       );
+      assertBoundedWorldWorkspaces(world, snapshot);
     }
 
     // This is a deterministic work-unit budget, not an elapsed-time assertion:
@@ -249,6 +275,7 @@ describe('mission 4 long-run performance contract', () => {
     expect(snapshot.waterTemperature).toBeGreaterThan(23);
     expect(snapshot.waterTemperature).toBeLessThan(25);
     assertBoundedMissionFourSnapshot(snapshot, baselineArrayEntries);
+    assertBoundedWorldWorkspaces(world, snapshot);
   }, 90_000);
 
   it('keeps the renderer ecology trace explicitly bounded', () => {

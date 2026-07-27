@@ -145,6 +145,70 @@ export class BiogeochemistryLedger {
   private readonly shrimpFoodCueSources = new Float64Array(CELL_COUNT);
   private readonly shrimpMateCue = new Float64Array(CELL_COUNT);
   private readonly shrimpMateCueSources = new Float64Array(CELL_COUNT);
+  /**
+   * These fields are workspaces, not ecological state.
+   *
+   * A 64x aquarium executes several reaction steps per worker turn. Allocating
+   * another dozen 720-element typed arrays for every one of those steps made
+   * Chromium's renderer process retain thousands of V8 backing-store regions
+   * on macOS even after garbage collection. Keep one fixed set of buffers and
+   * overwrite it before each reaction instead.
+   */
+  private readonly phytoplanktonDownwardScratch = new Float64Array(CELL_COUNT);
+  private readonly phytoplanktonOpticalDepthScratch = new Float64Array(CELL_COUNT);
+  private readonly initialOrganicMatterScratch = new Float64Array(CELL_COUNT);
+  private readonly initialToxicWasteScratch = new Float64Array(CELL_COUNT);
+  private readonly initialNutrientsScratch = new Float64Array(CELL_COUNT);
+  private readonly initialOxygenScratch = new Float64Array(CELL_COUNT);
+  private readonly initialCarbonScratch = new Float64Array(CELL_COUNT);
+  private readonly organicWithdrawalScratch = new Float64Array(CELL_COUNT);
+  private readonly toxicWasteWithdrawalScratch = new Float64Array(CELL_COUNT);
+  private readonly oxygenWithdrawalScratch = new Float64Array(CELL_COUNT);
+  private readonly carbonWithdrawalScratch = new Float64Array(CELL_COUNT);
+  private readonly toxicWasteProductsScratch = new Float64Array(CELL_COUNT);
+  private readonly nutrientProductsScratch = new Float64Array(CELL_COUNT);
+  private readonly carbonProductsScratch = new Float64Array(CELL_COUNT);
+  private readonly waterCellPoints = Array.from(
+    { length: CELL_COUNT },
+    (_, index): Vec2 => {
+      const row = Math.floor(index / WATER_COLUMNS);
+      const column = index % WATER_COLUMNS;
+      return {
+        x: (column + 0.5) / WATER_COLUMNS * TANK_WIDTH,
+        y: WATER_TOP + (row + 0.5) / WATER_ROWS * (GROUND_Y - WATER_TOP),
+      };
+    },
+  );
+  private readonly reactionNeighborhoods = Array.from(
+    { length: CELL_COUNT },
+    (_, index): number[] => {
+      const centerRow = Math.floor(index / WATER_COLUMNS);
+      const centerColumn = index % WATER_COLUMNS;
+      const indices: number[] = [];
+      for (
+        let row = Math.max(0, centerRow - LOCAL_REACTION_RADIUS);
+        row <= Math.min(WATER_ROWS - 1, centerRow + LOCAL_REACTION_RADIUS);
+        row += 1
+      ) {
+        for (
+          let column = Math.max(0, centerColumn - LOCAL_REACTION_RADIUS);
+          column <= Math.min(WATER_COLUMNS - 1, centerColumn + LOCAL_REACTION_RADIUS);
+          column += 1
+        ) {
+          indices.push(row * WATER_COLUMNS + column);
+        }
+      }
+      return indices;
+    },
+  );
+  private readonly topSurfaceIndices = Array.from(
+    { length: WATER_COLUMNS },
+    (_, column) => column,
+  );
+  private readonly allWaterIndices = Array.from(
+    { length: CELL_COUNT },
+    (_, index) => index,
+  );
   private readonly transport: WaterTransportGrid;
 
   private headspaceCarbonDioxide: number = WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide;
@@ -1313,11 +1377,13 @@ export class BiogeochemistryLedger {
   private applyPhytoplanktonReactions(deltaSeconds: number): void {
     const rules = PLANKTON_ECOLOGY_RULES.phytoplankton;
     const settlingFraction = 1 - Math.exp(-rules.settlingPerSecond * deltaSeconds);
-    const downward = new Float64Array(CELL_COUNT);
+    const downward = this.phytoplanktonDownwardScratch;
+    downward.fill(0);
     // Use the pre-reaction water column for optical depth so the result is
     // independent of loop order. Biomass in and above a cell attenuates light
     // continuously; no biomass amount is made inaccessible to grazers.
-    const opticalDepth = new Float64Array(CELL_COUNT);
+    const opticalDepth = this.phytoplanktonOpticalDepthScratch;
+    opticalDepth.fill(0);
     for (let column = 0; column < WATER_COLUMNS; column += 1) {
       let cumulativeConcentration = 0;
       for (let row = 0; row < WATER_ROWS; row += 1) {
@@ -1620,19 +1686,34 @@ export class BiogeochemistryLedger {
     //
     // Stable spatial ordering makes competition deterministic without making
     // results depend on the caller's surface-cell array order.
-    const initialOrganicMatter = new Float64Array(this.organicMatter);
-    const initialToxicWaste = new Float64Array(this.toxicWaste);
-    const initialNutrients = new Float64Array(this.nutrients);
-    const initialOxygen = new Float64Array(this.oxygen);
-    const initialCarbon = new Float64Array(this.dissolvedInorganicCarbon);
-    const organicWithdrawal = new Float64Array(initialOrganicMatter);
-    const toxicWasteWithdrawal = new Float64Array(initialToxicWaste);
-    const oxygenWithdrawal = new Float64Array(initialOxygen);
-    const carbonWithdrawal = new Float64Array(initialCarbon);
-    const toxicWasteProducts = new Float64Array(initialToxicWaste);
-    const nutrientProducts = new Float64Array(initialNutrients);
-    const carbonProducts = new Float64Array(initialCarbon);
-    const orderedSites = [...sites].sort((left, right) =>
+    const initialOrganicMatter = this.initialOrganicMatterScratch;
+    const initialToxicWaste = this.initialToxicWasteScratch;
+    const initialNutrients = this.initialNutrientsScratch;
+    const initialOxygen = this.initialOxygenScratch;
+    const initialCarbon = this.initialCarbonScratch;
+    const organicWithdrawal = this.organicWithdrawalScratch;
+    const toxicWasteWithdrawal = this.toxicWasteWithdrawalScratch;
+    const oxygenWithdrawal = this.oxygenWithdrawalScratch;
+    const carbonWithdrawal = this.carbonWithdrawalScratch;
+    const toxicWasteProducts = this.toxicWasteProductsScratch;
+    const nutrientProducts = this.nutrientProductsScratch;
+    const carbonProducts = this.carbonProductsScratch;
+    initialOrganicMatter.set(this.organicMatter);
+    initialToxicWaste.set(this.toxicWaste);
+    initialNutrients.set(this.nutrients);
+    initialOxygen.set(this.oxygen);
+    initialCarbon.set(this.dissolvedInorganicCarbon);
+    organicWithdrawal.set(initialOrganicMatter);
+    toxicWasteWithdrawal.set(initialToxicWaste);
+    oxygenWithdrawal.set(initialOxygen);
+    carbonWithdrawal.set(initialCarbon);
+    toxicWasteProducts.set(initialToxicWaste);
+    nutrientProducts.set(initialNutrients);
+    carbonProducts.set(initialCarbon);
+    // The caller supplies a reusable scratch array, so sorting that array in
+    // place preserves deterministic reaction ordering without allocating
+    // another full list every simulated second.
+    const orderedSites = sites.sort((left, right) =>
       left.point.y - right.point.y ||
       left.point.x - right.point.x ||
       left.biofilm.decomposer - right.biofilm.decomposer ||
@@ -1926,15 +2007,11 @@ export class BiogeochemistryLedger {
   }
 
   private pointAtIndex(index: number): Vec2 {
-    const row = Math.floor(index / WATER_COLUMNS);
-    const column = index % WATER_COLUMNS;
-    return {
-      x: (column + 0.5) / WATER_COLUMNS * TANK_WIDTH,
-      y: WATER_TOP + (row + 0.5) / WATER_ROWS * (GROUND_Y - WATER_TOP),
-    };
+    return this.waterCellPoints[index];
   }
 
   private indicesAround(index: number, radius = LOCAL_REACTION_RADIUS): number[] {
+    if (radius === LOCAL_REACTION_RADIUS) return this.reactionNeighborhoods[index];
     const centerRow = Math.floor(index / WATER_COLUMNS);
     const centerColumn = index % WATER_COLUMNS;
     const indices: number[] = [];
@@ -1947,7 +2024,7 @@ export class BiogeochemistryLedger {
   }
 
   private topRowIndices(): number[] {
-    return Array.from({ length: WATER_COLUMNS }, (_, column) => column);
+    return this.topSurfaceIndices;
   }
 
   private massAround(field: Float32Array | Float64Array, index: number): number {
@@ -2001,8 +2078,11 @@ export class BiogeochemistryLedger {
     const local = this.indicesAround(index);
     const locallyAdded = this.addMassToIndices(field, local, requested);
     if (locallyAdded >= requested - 1e-12) return locallyAdded;
-    const all = Array.from({ length: CELL_COUNT }, (_, candidate) => candidate);
-    return locallyAdded + this.addMassToIndices(field, all, requested - locallyAdded);
+    return locallyAdded + this.addMassToIndices(
+      field,
+      this.allWaterIndices,
+      requested - locallyAdded,
+    );
   }
 
   private removeMassFromIndices(

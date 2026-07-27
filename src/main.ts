@@ -1,12 +1,26 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { app, BrowserWindow, screen, session, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, screen, session, shell } from 'electron';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
 
 const RENDER_SAFETY_REPAINT_INTERVAL_MS = 15_000;
 const RUNTIME_LOG_MAX_BYTES = 256 * 1024;
+
+interface RendererMemoryReport {
+  privateKb: number;
+  heapUsedKb: number;
+  heapTotalKb: number;
+}
+
+const isRendererMemoryReport = (value: unknown): value is RendererMemoryReport => {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<RendererMemoryReport>;
+  return Number.isFinite(candidate.privateKb) &&
+    Number.isFinite(candidate.heapUsedKb) &&
+    Number.isFinite(candidate.heapTotalKb);
+};
 
 const appendRuntimeDiagnostic = (message: string): void => {
   try {
@@ -83,6 +97,19 @@ const createMainWindow = (): BrowserWindow => {
     notifyRenderingVisibility(true);
     requestWindowRepaint(reason);
   };
+  const recordRendererMemory = (
+    event: Electron.IpcMainEvent,
+    report: unknown,
+  ): void => {
+    if (event.sender !== window.webContents || !isRendererMemoryReport(report)) return;
+    appendRuntimeDiagnostic(
+      `renderer memory: pid=${window.webContents.getOSProcessId()} ` +
+      `privateMb=${(report.privateKb / 1024).toFixed(1)} ` +
+      `heapUsedMb=${(report.heapUsedKb / 1024).toFixed(1)} ` +
+      `heapTotalMb=${(report.heapTotalKb / 1024).toFixed(1)}`,
+    );
+  };
+  ipcMain.on('aquacycle:renderer-memory', recordRendererMemory);
 
   window.on('minimize', () => notifyRenderingVisibility(false));
   window.on('hide', () => notifyRenderingVisibility(false));
@@ -128,7 +155,10 @@ const createMainWindow = (): BrowserWindow => {
     }
   }, RENDER_SAFETY_REPAINT_INTERVAL_MS);
   repaintTimer.unref();
-  window.once('closed', () => clearInterval(repaintTimer));
+  window.once('closed', () => {
+    clearInterval(repaintTimer);
+    ipcMain.removeListener('aquacycle:renderer-memory', recordRendererMemory);
+  });
 
   return window;
 };
