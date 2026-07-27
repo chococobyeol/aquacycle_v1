@@ -53,6 +53,18 @@ const SHRIMP_MATE_CUE_MINIMUM = 1e-9;
 
 export const emptyBiofilm = (): BiofilmBiomass => ({ decomposer: 0, nitrifier: 0 });
 
+const copyNumericArray = (
+  source: ArrayLike<number>,
+  target: number[] | undefined,
+): number[] => {
+  const values = target ?? new Array<number>(source.length);
+  for (let index = 0; index < source.length; index += 1) {
+    values[index] = source[index];
+  }
+  values.length = source.length;
+  return values;
+};
+
 export interface BiofilmReactionSite {
   point: Vec2;
   biofilm: BiofilmBiomass;
@@ -1044,14 +1056,8 @@ export class BiogeochemistryLedger {
     this.transport.restoreSaveState(state.transport, fallbackTemperature);
   }
 
-  public snapshot(): BiogeochemistrySnapshot {
+  public snapshot(reuse?: BiogeochemistrySnapshot): BiogeochemistrySnapshot {
     const material = this.materialState();
-    const average: WaterQualityValues = {
-      organicMatter: material.organicMatter,
-      toxicWaste: material.toxicWaste,
-      nutrients: material.nutrients,
-      oxygen: material.dissolvedOxygen,
-    };
     const filmBiomass = this.biofilmTotals.decomposer + this.biofilmTotals.nitrifier;
     const planktonBiomass = material.planktonicDecomposer +
       material.phytoplankton + material.daphnia;
@@ -1061,80 +1067,116 @@ export class BiogeochemistryLedger {
       biologicalMatter * WATER_CYCLE_RULES.biomassNitrogen;
     const totalCarbon = material.dissolvedInorganicCarbon + material.headspaceCarbonDioxide +
       biologicalMatter * WATER_CYCLE_RULES.biomassCarbon;
-    return {
-      effectsEnabled: this.effectsEnabled,
-      potentialOxygenProduction: this.cumulativeOxygenProduction,
-      potentialOxygenDemand: this.cumulativeOxygenDemand,
-      dissolvedWasteProduced: this.cumulativeDissolvedWaste,
-      detritusMass: material.detritus,
-      water: this.effectsEnabled
-        ? {
-          columns: WATER_COLUMNS,
-          rows: WATER_ROWS,
-          organicMatter: Array.from(this.organicMatter),
-          toxicWaste: Array.from(this.toxicWaste),
-          nutrients: Array.from(this.nutrients),
-          oxygen: Array.from(this.oxygen),
-          dissolvedInorganicCarbon: Array.from(this.dissolvedInorganicCarbon),
-          planktonicDecomposer: Array.from(this.planktonicDecomposer),
-          phytoplankton: Array.from(this.phytoplankton),
-          daphniaJuveniles: Array.from(this.daphniaJuveniles),
-          daphniaAdults: Array.from(
-            this.daphniaFounderAdults,
-            (value, index) => value + this.daphniaBornAdults[index],
-          ),
-          revision: this.fieldRevision,
-        }
-        : {
-          columns: 0,
-          rows: 0,
-          organicMatter: [],
-          toxicWaste: [],
-          nutrients: [],
-          oxygen: [],
-          dissolvedInorganicCarbon: [],
-          planktonicDecomposer: [],
-          phytoplankton: [],
-          daphniaJuveniles: [],
-          daphniaAdults: [],
-          revision: this.fieldRevision,
-        },
-      transport: this.transport.snapshot(),
-      average,
-      biofilmTotals: { ...this.biofilmTotals },
-      plankton: this.planktonSnapshot(),
-      algaeFluxes: {
-        grossProductionBiomassPerSecond: this.stepGrossAlgaeProduction / this.stepDurationSeconds,
-        respirationBiomassPerSecond: this.stepAlgaeRespiration / this.stepDurationSeconds,
-        stressTurnoverBiomassPerSecond: this.stepAlgaeTurnover / this.stepDurationSeconds,
-        oxygenProducedPerSecond: this.stepAlgaeOxygenProduction / this.stepDurationSeconds,
-        oxygenConsumedPerSecond: this.stepAlgaeOxygenDemand / this.stepDurationSeconds,
-      },
-      carbonCycle: {
-        dissolvedInorganicCarbon: material.dissolvedInorganicCarbon,
-        headspaceCarbonDioxide: material.headspaceCarbonDioxide,
-        headspaceOxygen: material.headspaceOxygen,
-      },
-      gasExchange: this.gasExchangeState(material),
-      materialBalance: {
-        totalNitrogen,
-        totalCarbon,
-        oxygenEquivalent: 0,
-        referenceNitrogen: null,
-        referenceCarbon: null,
-        referenceOxygenEquivalent: null,
-        nitrogenDriftRatio: 0,
-        carbonDriftRatio: 0,
-        oxygenEquivalentDriftRatio: 0,
-      },
-    };
+    const snapshot = reuse ?? {} as BiogeochemistrySnapshot;
+    snapshot.effectsEnabled = this.effectsEnabled;
+    snapshot.potentialOxygenProduction = this.cumulativeOxygenProduction;
+    snapshot.potentialOxygenDemand = this.cumulativeOxygenDemand;
+    snapshot.dissolvedWasteProduced = this.cumulativeDissolvedWaste;
+    snapshot.detritusMass = material.detritus;
+
+    const water = snapshot.water ?? {} as BiogeochemistrySnapshot['water'];
+    water.columns = this.effectsEnabled ? WATER_COLUMNS : 0;
+    water.rows = this.effectsEnabled ? WATER_ROWS : 0;
+    if (this.effectsEnabled) {
+      water.organicMatter = copyNumericArray(this.organicMatter, water.organicMatter);
+      water.toxicWaste = copyNumericArray(this.toxicWaste, water.toxicWaste);
+      water.nutrients = copyNumericArray(this.nutrients, water.nutrients);
+      water.oxygen = copyNumericArray(this.oxygen, water.oxygen);
+      water.dissolvedInorganicCarbon = copyNumericArray(
+        this.dissolvedInorganicCarbon,
+        water.dissolvedInorganicCarbon,
+      );
+      water.planktonicDecomposer = copyNumericArray(
+        this.planktonicDecomposer,
+        water.planktonicDecomposer,
+      );
+      water.phytoplankton = copyNumericArray(
+        this.phytoplankton,
+        water.phytoplankton,
+      );
+      water.daphniaJuveniles = copyNumericArray(
+        this.daphniaJuveniles,
+        water.daphniaJuveniles,
+      );
+      water.daphniaAdults ??= new Array<number>(CELL_COUNT);
+      for (let index = 0; index < CELL_COUNT; index += 1) {
+        water.daphniaAdults[index] =
+          this.daphniaFounderAdults[index] + this.daphniaBornAdults[index];
+      }
+      water.daphniaAdults.length = CELL_COUNT;
+    } else {
+      water.organicMatter ??= [];
+      water.toxicWaste ??= [];
+      water.nutrients ??= [];
+      water.oxygen ??= [];
+      water.dissolvedInorganicCarbon ??= [];
+      water.planktonicDecomposer ??= [];
+      water.phytoplankton ??= [];
+      water.daphniaJuveniles ??= [];
+      water.daphniaAdults ??= [];
+      water.organicMatter.length = 0;
+      water.toxicWaste.length = 0;
+      water.nutrients.length = 0;
+      water.oxygen.length = 0;
+      water.dissolvedInorganicCarbon.length = 0;
+      water.planktonicDecomposer.length = 0;
+      water.phytoplankton.length = 0;
+      water.daphniaJuveniles.length = 0;
+      water.daphniaAdults.length = 0;
+    }
+    water.revision = this.fieldRevision;
+    snapshot.water = water;
+
+    snapshot.transport = this.transport.snapshot(snapshot.transport);
+    snapshot.average ??= {} as WaterQualityValues;
+    snapshot.average.organicMatter = material.organicMatter;
+    snapshot.average.toxicWaste = material.toxicWaste;
+    snapshot.average.nutrients = material.nutrients;
+    snapshot.average.oxygen = material.dissolvedOxygen;
+    snapshot.biofilmTotals ??= emptyBiofilm();
+    snapshot.biofilmTotals.decomposer = this.biofilmTotals.decomposer;
+    snapshot.biofilmTotals.nitrifier = this.biofilmTotals.nitrifier;
+    snapshot.plankton = this.planktonSnapshot(snapshot.plankton);
+
+    snapshot.algaeFluxes ??= {} as BiogeochemistrySnapshot['algaeFluxes'];
+    snapshot.algaeFluxes.grossProductionBiomassPerSecond =
+      this.stepGrossAlgaeProduction / this.stepDurationSeconds;
+    snapshot.algaeFluxes.respirationBiomassPerSecond =
+      this.stepAlgaeRespiration / this.stepDurationSeconds;
+    snapshot.algaeFluxes.stressTurnoverBiomassPerSecond =
+      this.stepAlgaeTurnover / this.stepDurationSeconds;
+    snapshot.algaeFluxes.oxygenProducedPerSecond =
+      this.stepAlgaeOxygenProduction / this.stepDurationSeconds;
+    snapshot.algaeFluxes.oxygenConsumedPerSecond =
+      this.stepAlgaeOxygenDemand / this.stepDurationSeconds;
+
+    snapshot.carbonCycle ??= {} as BiogeochemistrySnapshot['carbonCycle'];
+    snapshot.carbonCycle.dissolvedInorganicCarbon =
+      material.dissolvedInorganicCarbon;
+    snapshot.carbonCycle.headspaceCarbonDioxide = material.headspaceCarbonDioxide;
+    snapshot.carbonCycle.headspaceOxygen = material.headspaceOxygen;
+
+    snapshot.gasExchange ??= {} as BiogeochemistrySnapshot['gasExchange'];
+    Object.assign(snapshot.gasExchange, this.gasExchangeState(material));
+
+    snapshot.materialBalance ??= {} as BiogeochemistrySnapshot['materialBalance'];
+    snapshot.materialBalance.totalNitrogen = totalNitrogen;
+    snapshot.materialBalance.totalCarbon = totalCarbon;
+    snapshot.materialBalance.oxygenEquivalent = 0;
+    snapshot.materialBalance.referenceNitrogen = null;
+    snapshot.materialBalance.referenceCarbon = null;
+    snapshot.materialBalance.referenceOxygenEquivalent = null;
+    snapshot.materialBalance.nitrogenDriftRatio = 0;
+    snapshot.materialBalance.carbonDriftRatio = 0;
+    snapshot.materialBalance.oxygenEquivalentDriftRatio = 0;
+    return snapshot;
   }
 
   planktonState(): PlanktonSnapshot {
     return this.planktonSnapshot();
   }
 
-  private planktonSnapshot(): PlanktonSnapshot {
+  private planktonSnapshot(reuse?: PlanktonSnapshot): PlanktonSnapshot {
     const juvenile = this.individualDaphniaManaged
       ? this.daphniaIndividualJuvenileBiomass
       : this.fieldMass(this.daphniaJuveniles);
@@ -1154,39 +1196,39 @@ export class BiogeochemistryLedger {
           adults / PLANKTON_ECOLOGY_RULES.daphnia.representativeAdultBiomass,
         ),
       );
-    return {
-      phytoplanktonBiomass: this.fieldMass(this.phytoplankton),
-      planktonicDecomposerBiomass: this.fieldMass(this.planktonicDecomposer),
-      daphniaJuvenileBiomass: juvenile,
-      daphniaAdultBiomass: adults,
-      daphniaFounderAdultBiomass: founderAdults,
-      daphniaBornAdultBiomass: bornAdults,
-      approximateDaphniaCount,
-      cumulativeFiltration: {
-        phytoplankton: this.cumulativeFilteredPhytoplankton,
-        planktonicDecomposer: this.cumulativeFilteredPlanktonicDecomposer,
-      },
-      cumulativeEvents: {
-        births: this.cumulativeDaphniaBirths,
-        maturations: this.cumulativeDaphniaMaturations,
-        secondGenerationBirths: this.cumulativeSecondGenerationBirths,
-        deaths: this.cumulativeDaphniaDeaths,
-      },
-      fluxes: {
-        phytoplanktonGrowthPerSecond:
-          this.stepPhytoplanktonGrowth / this.stepDurationSeconds,
-        phytoplanktonRespirationPerSecond:
-          this.stepPhytoplanktonRespiration / this.stepDurationSeconds,
-        phytoplanktonMortalityPerSecond:
-          this.stepPhytoplanktonMortality / this.stepDurationSeconds,
-        daphniaFoodAssimilatedPerSecond:
-          this.stepDaphniaAssimilation / this.stepDurationSeconds,
-        daphniaRespirationPerSecond:
-          this.stepDaphniaRespiration / this.stepDurationSeconds,
-        daphniaMortalityPerSecond:
-          this.stepDaphniaMortality / this.stepDurationSeconds,
-      },
-    };
+    const snapshot = reuse ?? {} as PlanktonSnapshot;
+    snapshot.phytoplanktonBiomass = this.fieldMass(this.phytoplankton);
+    snapshot.planktonicDecomposerBiomass = this.fieldMass(this.planktonicDecomposer);
+    snapshot.daphniaJuvenileBiomass = juvenile;
+    snapshot.daphniaAdultBiomass = adults;
+    snapshot.daphniaFounderAdultBiomass = founderAdults;
+    snapshot.daphniaBornAdultBiomass = bornAdults;
+    snapshot.approximateDaphniaCount = approximateDaphniaCount;
+    snapshot.cumulativeFiltration ??= {} as PlanktonSnapshot['cumulativeFiltration'];
+    snapshot.cumulativeFiltration.phytoplankton =
+      this.cumulativeFilteredPhytoplankton;
+    snapshot.cumulativeFiltration.planktonicDecomposer =
+      this.cumulativeFilteredPlanktonicDecomposer;
+    snapshot.cumulativeEvents ??= {} as PlanktonSnapshot['cumulativeEvents'];
+    snapshot.cumulativeEvents.births = this.cumulativeDaphniaBirths;
+    snapshot.cumulativeEvents.maturations = this.cumulativeDaphniaMaturations;
+    snapshot.cumulativeEvents.secondGenerationBirths =
+      this.cumulativeSecondGenerationBirths;
+    snapshot.cumulativeEvents.deaths = this.cumulativeDaphniaDeaths;
+    snapshot.fluxes ??= {} as PlanktonSnapshot['fluxes'];
+    snapshot.fluxes.phytoplanktonGrowthPerSecond =
+      this.stepPhytoplanktonGrowth / this.stepDurationSeconds;
+    snapshot.fluxes.phytoplanktonRespirationPerSecond =
+      this.stepPhytoplanktonRespiration / this.stepDurationSeconds;
+    snapshot.fluxes.phytoplanktonMortalityPerSecond =
+      this.stepPhytoplanktonMortality / this.stepDurationSeconds;
+    snapshot.fluxes.daphniaFoodAssimilatedPerSecond =
+      this.stepDaphniaAssimilation / this.stepDurationSeconds;
+    snapshot.fluxes.daphniaRespirationPerSecond =
+      this.stepDaphniaRespiration / this.stepDurationSeconds;
+    snapshot.fluxes.daphniaMortalityPerSecond =
+      this.stepDaphniaMortality / this.stepDurationSeconds;
+    return snapshot;
   }
 
   private applyPlanktonicDecomposerReactions(deltaSeconds: number): void {

@@ -61,4 +61,47 @@ describe('bounded shared worker telemetry', () => {
     expect(decoded.values[7]).toBe('새우🦐');
     expect(decoded.nested).toEqual(value.nested);
   });
+
+  it('alternates two reusable object graphs instead of rebuilding every snapshot', () => {
+    const channel = createSharedTelemetryChannel(16 * 1024);
+    const writer = new SharedTelemetryWriter(channel);
+    const reader = new SharedTelemetryReader<{
+      sequence: number;
+      animals: Array<{ id: string; x: number; traits: { stage: string } }>;
+      holding: Record<string, unknown>;
+    }>(channel);
+    const roots = new Set<object>();
+    const animalArrays = new Set<object>();
+    const animals = new Set<object>();
+    const traits = new Set<object>();
+
+    for (let sequence = 1; sequence <= 2_000; sequence += 1) {
+      const holding = sequence % 3 === 0
+        ? { kind: 'seed', speciesId: 'vallisneria' }
+        : { kind: 'animal', animalId: `animal-${sequence}` };
+      expect(writer.publish({
+        sequence,
+        animals: [{
+          id: `animal-${sequence}`,
+          x: sequence * 0.5,
+          traits: { stage: sequence % 2 === 0 ? 'adult' : 'juvenile' },
+        }],
+        holding,
+      })).toBe(true);
+      const decoded = reader.readLatest()!;
+      roots.add(decoded);
+      animalArrays.add(decoded.animals);
+      animals.add(decoded.animals[0]);
+      traits.add(decoded.animals[0].traits);
+      expect(decoded.sequence).toBe(sequence);
+      expect(decoded.animals[0].id).toBe(`animal-${sequence}`);
+      expect(decoded.holding).toEqual(holding);
+      expect(Object.keys(decoded.holding).sort()).toEqual(Object.keys(holding).sort());
+    }
+
+    expect(roots.size).toBe(2);
+    expect(animalArrays.size).toBe(2);
+    expect(animals.size).toBe(2);
+    expect(traits.size).toBe(2);
+  });
 });

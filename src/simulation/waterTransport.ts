@@ -57,6 +57,18 @@ const mean = (values: ArrayLike<number>): number => {
   return values.length ? total / values.length : 0;
 };
 
+const copyNumericArray = (
+  source: ArrayLike<number>,
+  target: number[] | undefined,
+): number[] => {
+  const values = target ?? new Array<number>(source.length);
+  for (let index = 0; index < source.length; index += 1) {
+    values[index] = source[index];
+  }
+  values.length = source.length;
+  return values;
+};
+
 export interface WaterTransportObstacle {
   polygon: Vec2[];
   /**
@@ -438,7 +450,7 @@ export class WaterTransportGrid {
     this.revision = Math.max(this.revision + 1, Math.floor(state.revision || 0));
   }
 
-  public snapshot(): WaterTransportSnapshot {
+  public snapshot(reuse?: WaterTransportSnapshot): WaterTransportSnapshot {
     let minimumTemperature = Number.POSITIVE_INFINITY;
     let maximumTemperature = Number.NEGATIVE_INFINITY;
     let maximumSpeed = 0;
@@ -450,21 +462,27 @@ export class WaterTransportGrid {
         Math.hypot(this.velocityX[index], this.velocityY[index]),
       );
     }
-    return {
-      columns: TRANSPORT_COLUMNS,
-      rows: TRANSPORT_ROWS,
-      temperature: Array.from(this.temperature),
-      velocityX: Array.from(this.velocityX),
-      velocityY: Array.from(this.velocityY),
-      solidFraction: Array.from(this.solidFraction),
-      flowResistance: Array.from(this.flowResistance),
-      averageTemperature: this.averageTemperature(),
-      minimumTemperature,
-      maximumTemperature,
-      maximumSpeed,
-      cumulativeExternalHeat: this.cumulativeExternalHeat,
-      revision: this.revision,
-    };
+    const snapshot = reuse ?? {} as WaterTransportSnapshot;
+    snapshot.columns = TRANSPORT_COLUMNS;
+    snapshot.rows = TRANSPORT_ROWS;
+    snapshot.temperature = copyNumericArray(this.temperature, snapshot.temperature);
+    snapshot.velocityX = copyNumericArray(this.velocityX, snapshot.velocityX);
+    snapshot.velocityY = copyNumericArray(this.velocityY, snapshot.velocityY);
+    snapshot.solidFraction = copyNumericArray(
+      this.solidFraction,
+      snapshot.solidFraction,
+    );
+    snapshot.flowResistance = copyNumericArray(
+      this.flowResistance,
+      snapshot.flowResistance,
+    );
+    snapshot.averageTemperature = this.averageTemperature();
+    snapshot.minimumTemperature = minimumTemperature;
+    snapshot.maximumTemperature = maximumTemperature;
+    snapshot.maximumSpeed = maximumSpeed;
+    snapshot.cumulativeExternalHeat = this.cumulativeExternalHeat;
+    snapshot.revision = this.revision;
+    return snapshot;
   }
 
   private advanceHeatSubstep(deltaSeconds: number, ambientTemperature: number): void {

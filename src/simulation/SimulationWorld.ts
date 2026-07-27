@@ -77,6 +77,7 @@ import {
   type AnimalPopulationEventKind,
   type AnimalPopulationEventSnapshot,
   type AnimalPopulationEventTotals,
+  type AnimalPopulationSnapshot,
   type AnimalSnapshot,
   type BiofilmBiomass,
   type AnimalCarcassSnapshot,
@@ -122,6 +123,13 @@ interface SurfaceCellState extends LocalSurfaceCell {
   biofilm: BiofilmBiomass;
   localNeighborIds: string[];
   neighborIds: string[];
+}
+
+interface MissionCellView {
+  surfaceKind: SurfaceKind;
+  light: number;
+  biomass: SpeciesBiomass;
+  targetEligible?: boolean;
 }
 
 interface StructureState {
@@ -536,6 +544,18 @@ const cloneBiomass = (biomass: SpeciesBiomass): SpeciesBiomass => ({
   nitzschia: biomass.nitzschia,
   vallisneria: biomass.vallisneria ?? 0,
 });
+
+const copyNumericArray = (
+  source: ArrayLike<number>,
+  target: number[] | undefined,
+): number[] => {
+  const values = target ?? new Array<number>(source.length);
+  for (let index = 0; index < source.length; index += 1) {
+    values[index] = source[index];
+  }
+  values.length = source.length;
+  return values;
+};
 
 const emptyAnimalPopulationEventTotals = (): AnimalPopulationEventTotals => ({
   introduced: 0,
@@ -1102,127 +1122,160 @@ export class SimulationWorld {
     return false;
   }
 
-  public snapshot(): SimulationSnapshot {
+  public snapshot(reuse?: SimulationSnapshot): SimulationSnapshot {
     this.refreshColonySelection();
-    const cells = this.surfaceSnapshots();
-    const eligibleCells = cells.filter((cell) => cell.targetEligible);
-    const totalBiomass = cells.reduce<SpeciesBiomass>(
-      (total, cell) => ({
-        oedogonium: total.oedogonium + cell.biomass.oedogonium,
-        nitzschia: total.nitzschia + cell.biomass.nitzschia,
-        vallisneria: total.vallisneria + cell.biomass.vallisneria,
-      }),
-      emptyBiomass(),
-    );
-    const coverageRatio = eligibleCells.length
-      ? eligibleCells.filter((cell) => occupied(cell.biomass)).length / eligibleCells.length
+    const target = reuse ?? {} as SimulationSnapshot;
+    const cells = this.surfaceSnapshots(target.cells);
+    const totalBiomass = target.totalBiomass ?? emptyBiomass();
+    totalBiomass.oedogonium = 0;
+    totalBiomass.nitzschia = 0;
+    totalBiomass.vallisneria = 0;
+    let eligibleCellCount = 0;
+    let occupiedCellCount = 0;
+    let decomposerBiofilm = 0;
+    let nitrifierBiofilm = 0;
+    for (const cell of cells) {
+      totalBiomass.oedogonium += cell.biomass.oedogonium;
+      totalBiomass.nitzschia += cell.biomass.nitzschia;
+      totalBiomass.vallisneria += cell.biomass.vallisneria;
+      decomposerBiofilm += cell.biofilm.decomposer;
+      nitrifierBiofilm += cell.biofilm.nitrifier;
+      if (!cell.targetEligible) continue;
+      eligibleCellCount += 1;
+      if (occupied(cell.biomass)) occupiedCellCount += 1;
+    }
+    const coverageRatio = eligibleCellCount
+      ? occupiedCellCount / eligibleCellCount
       : 0;
-    const biogeochemistry = this.biogeochemistry.snapshot();
-    biogeochemistry.biofilmTotals = cells.reduce<BiofilmBiomass>((total, cell) => ({
-      decomposer: total.decomposer + cell.biofilm.decomposer,
-      nitrifier: total.nitrifier + cell.biofilm.nitrifier,
-    }), emptyBiofilm());
+    const missionProgress = this.missionProgress(coverageRatio, cells);
+    const biogeochemistry = this.biogeochemistry.snapshot(target.biogeochemistry);
+    biogeochemistry.biofilmTotals.decomposer = decomposerBiofilm;
+    biogeochemistry.biofilmTotals.nitrifier = nitrifierBiofilm;
     const materialTotals = this.computeMaterialTotals();
     const reference = this.materialReference;
-    biogeochemistry.materialBalance = {
-      totalNitrogen: materialTotals.nitrogen,
-      totalCarbon: materialTotals.carbon,
-      oxygenEquivalent: materialTotals.oxygenEquivalent,
-      referenceNitrogen: reference?.nitrogen ?? null,
-      referenceCarbon: reference?.carbon ?? null,
-      referenceOxygenEquivalent: reference?.oxygenEquivalent ?? null,
-      nitrogenDriftRatio: reference && reference.nitrogen > 0
-        ? (materialTotals.nitrogen - reference.nitrogen) / reference.nitrogen
-        : 0,
-      carbonDriftRatio: reference && reference.carbon > 0
-        ? (materialTotals.carbon - reference.carbon) / reference.carbon
-        : 0,
-      oxygenEquivalentDriftRatio: reference &&
-        Math.abs(reference.oxygenEquivalent) > 1e-9
-        ? (materialTotals.oxygenEquivalent - reference.oxygenEquivalent) /
-          Math.abs(reference.oxygenEquivalent)
-        : 0,
-    };
+    const materialBalance = biogeochemistry.materialBalance;
+    materialBalance.totalNitrogen = materialTotals.nitrogen;
+    materialBalance.totalCarbon = materialTotals.carbon;
+    materialBalance.oxygenEquivalent = materialTotals.oxygenEquivalent;
+    materialBalance.referenceNitrogen = reference?.nitrogen ?? null;
+    materialBalance.referenceCarbon = reference?.carbon ?? null;
+    materialBalance.referenceOxygenEquivalent = reference?.oxygenEquivalent ?? null;
+    materialBalance.nitrogenDriftRatio = reference && reference.nitrogen > 0
+      ? (materialTotals.nitrogen - reference.nitrogen) / reference.nitrogen
+      : 0;
+    materialBalance.carbonDriftRatio = reference && reference.carbon > 0
+      ? (materialTotals.carbon - reference.carbon) / reference.carbon
+      : 0;
+    materialBalance.oxygenEquivalentDriftRatio = reference &&
+      Math.abs(reference.oxygenEquivalent) > 1e-9
+      ? (materialTotals.oxygenEquivalent - reference.oxygenEquivalent) /
+        Math.abs(reference.oxygenEquivalent)
+      : 0;
 
     this.revision += 1;
     this.snapshotDirty = false;
-    return {
-      scenarioId: this.scenario.id,
-      mode: this.scenario.mode,
-      phase: this.phase,
-      outcome: this.outcome,
-      outcomeAtSeconds: this.outcomeAtSeconds,
-      currentTargetMet: this.currentTargetMet(),
-      elapsedSeconds: this.elapsedSeconds,
-      timeLimitSeconds: this.scenario.timeLimitSeconds,
-      speed: this.speed,
-      allSettled: this.allSettled,
-      hasStarted: this.hasStarted,
-      lightOutput: this.lightOutput,
-      naturalLightOutput: this.naturalLightOutput,
-      dayNightEnabled: this.dayNightEnabled,
-      dayNight: this.currentDayNightSnapshot(),
-      waterTemperature: this.waterTemperature,
-      structures: this.structureSnapshots(),
-      cells,
-      seeds: this.seedSnapshots(),
-      plants: this.plantSnapshots(),
-      animals: this.animalSnapshots(),
-      carcasses: this.carcassSnapshots(),
-      holding: this.holdingSnapshot(),
-      lightField: {
-        columns: this.lightField.columns,
-        rows: this.lightField.rows,
-        values: [...this.lightField.values],
-        revision: this.lightField.revision,
-      },
-      probe: this.probe ? { ...this.probe, trends: { ...this.probe.trends } } : null,
-      measurements: this.measurementSnapshots(),
-      selection: this.selection ? { ...this.selection } : null,
-      remainingSeeds: {
-        oedogonium: this.remainingSeeds('oedogonium'),
-        nitzschia: this.remainingSeeds('nitzschia'),
-        vallisneria: this.remainingSeeds('vallisneria'),
-      },
-      remainingAnimals: {
-        'cherry-shrimp': this.remainingAnimals('cherry-shrimp'),
-        'japanese-ricefish': this.remainingAnimals('japanese-ricefish'),
-        daphnia: this.remainingAnimals('daphnia'),
-      },
-      remainingMicrobes: {
-        decomposer: this.remainingMicrobes('decomposer'),
-        nitrifier: this.remainingMicrobes('nitrifier'),
-      },
-      remainingPlankton: {
-        phytoplankton: this.remainingPlankton('phytoplankton'),
-        daphnia: this.remainingPlankton('daphnia'),
-      },
-      remainingStructures: {
-        'flat-stone': this.remainingStructures('flat-stone'),
-        'round-stone': this.remainingStructures('round-stone'),
-        'tall-stone': this.remainingStructures('tall-stone'),
-      },
-      totalBiomass,
-      totalAlgaeConsumed: this.totalAlgaeConsumed,
-      animalPopulation: {
-        'cherry-shrimp': this.animalPopulation('cherry-shrimp'),
-        'japanese-ricefish': this.animalPopulation('japanese-ricefish'),
-        daphnia: this.animalPopulation('daphnia'),
-      },
-      animalPopulationEvents: this.animalPopulationEvents.map((event) => ({
-        ...event,
-        water: event.water ? { ...event.water } : null,
-      })),
-      animalPopulationEventTotals: {
-        ...this.animalPopulationEventTotals,
-        deathsByCause: { ...this.animalPopulationEventTotals.deathsByCause },
-      },
-      biogeochemistry,
-      coverageRatio,
-      missionProgress: this.missionProgress(coverageRatio),
-      message: this.message,
-      revision: this.revision,
-    };
+    target.scenarioId = this.scenario.id;
+    target.mode = this.scenario.mode;
+    target.phase = this.phase;
+    target.outcome = this.outcome;
+    target.outcomeAtSeconds = this.outcomeAtSeconds;
+    target.currentTargetMet = missionProgress
+      ? missionProgress.current >= missionProgress.target
+      : false;
+    target.elapsedSeconds = this.elapsedSeconds;
+    target.timeLimitSeconds = this.scenario.timeLimitSeconds;
+    target.speed = this.speed;
+    target.allSettled = this.allSettled;
+    target.hasStarted = this.hasStarted;
+    target.lightOutput = this.lightOutput;
+    target.naturalLightOutput = this.naturalLightOutput;
+    target.dayNightEnabled = this.dayNightEnabled;
+    target.dayNight = this.currentDayNightSnapshot();
+    target.waterTemperature = this.waterTemperature;
+    target.structures = this.structureSnapshots(target.structures);
+    target.cells = cells;
+    target.seeds = this.seedSnapshots(target.seeds);
+    target.plants = this.plantSnapshots(target.plants);
+    target.animals = this.animalSnapshots(target.animals);
+    target.carcasses = this.carcassSnapshots(target.carcasses);
+    target.holding = this.holdingSnapshot();
+    const lightField = target.lightField ?? {} as LightFieldSnapshot;
+    lightField.columns = this.lightField.columns;
+    lightField.rows = this.lightField.rows;
+    lightField.values = copyNumericArray(this.lightField.values, lightField.values);
+    lightField.revision = this.lightField.revision;
+    target.lightField = lightField;
+    target.probe = this.probe ? { ...this.probe, trends: { ...this.probe.trends } } : null;
+    target.measurements = this.measurementSnapshots(target.measurements);
+    target.selection = this.selection ? { ...this.selection } : null;
+
+    target.remainingSeeds ??= {} as SimulationSnapshot['remainingSeeds'];
+    target.remainingSeeds.oedogonium = this.remainingSeeds('oedogonium');
+    target.remainingSeeds.nitzschia = this.remainingSeeds('nitzschia');
+    target.remainingSeeds.vallisneria = this.remainingSeeds('vallisneria');
+    target.remainingAnimals ??= {} as SimulationSnapshot['remainingAnimals'];
+    target.remainingAnimals['cherry-shrimp'] = this.remainingAnimals('cherry-shrimp');
+    target.remainingAnimals['japanese-ricefish'] = this.remainingAnimals('japanese-ricefish');
+    target.remainingAnimals.daphnia = this.remainingAnimals('daphnia');
+    target.remainingMicrobes ??= {} as SimulationSnapshot['remainingMicrobes'];
+    target.remainingMicrobes.decomposer = this.remainingMicrobes('decomposer');
+    target.remainingMicrobes.nitrifier = this.remainingMicrobes('nitrifier');
+    target.remainingPlankton ??= {} as SimulationSnapshot['remainingPlankton'];
+    target.remainingPlankton.phytoplankton = this.remainingPlankton('phytoplankton');
+    target.remainingPlankton.daphnia = this.remainingPlankton('daphnia');
+    target.remainingStructures ??= {} as SimulationSnapshot['remainingStructures'];
+    target.remainingStructures['flat-stone'] = this.remainingStructures('flat-stone');
+    target.remainingStructures['round-stone'] = this.remainingStructures('round-stone');
+    target.remainingStructures['tall-stone'] = this.remainingStructures('tall-stone');
+    target.totalBiomass = totalBiomass;
+    target.totalAlgaeConsumed = this.totalAlgaeConsumed;
+
+    target.animalPopulation ??= {} as SimulationSnapshot['animalPopulation'];
+    target.animalPopulation['cherry-shrimp'] = this.animalPopulation(
+      'cherry-shrimp',
+      target.animalPopulation['cherry-shrimp'],
+    );
+    target.animalPopulation['japanese-ricefish'] = this.animalPopulation(
+      'japanese-ricefish',
+      target.animalPopulation['japanese-ricefish'],
+    );
+    target.animalPopulation.daphnia = this.animalPopulation(
+      'daphnia',
+      target.animalPopulation.daphnia,
+    );
+
+    const populationEvents = target.animalPopulationEvents ?? [];
+    for (let index = 0; index < this.animalPopulationEvents.length; index += 1) {
+      const event = this.animalPopulationEvents[index];
+      const eventSnapshot = populationEvents[index] ??
+        {} as AnimalPopulationEventSnapshot;
+      const reusableWater = eventSnapshot.water;
+      Object.assign(eventSnapshot, event);
+      eventSnapshot.water = event.water
+        ? Object.assign(reusableWater ?? {}, event.water)
+        : null;
+      populationEvents[index] = eventSnapshot;
+    }
+    populationEvents.length = this.animalPopulationEvents.length;
+    target.animalPopulationEvents = populationEvents;
+
+    const eventTotals = target.animalPopulationEventTotals ??
+      emptyAnimalPopulationEventTotals();
+    const deathsByCause = eventTotals.deathsByCause;
+    eventTotals.introduced = this.animalPopulationEventTotals.introduced;
+    eventTotals.removed = this.animalPopulationEventTotals.removed;
+    eventTotals.births = this.animalPopulationEventTotals.births;
+    eventTotals.hatches = this.animalPopulationEventTotals.hatches;
+    eventTotals.maturations = this.animalPopulationEventTotals.maturations;
+    eventTotals.deaths = this.animalPopulationEventTotals.deaths;
+    Object.assign(deathsByCause, this.animalPopulationEventTotals.deathsByCause);
+    target.animalPopulationEventTotals = eventTotals;
+    target.biogeochemistry = biogeochemistry;
+    target.coverageRatio = coverageRatio;
+    target.missionProgress = missionProgress;
+    target.message = this.message;
+    target.revision = this.revision;
+    return target;
   }
 
   public motionSnapshot(): {
@@ -3077,12 +3130,18 @@ export class SimulationWorld {
     this.snapshotDirty = true;
   }
 
-  private measurementSnapshots(): MeasurementSnapshot[] {
-    return this.measurements.map((measurement) => ({
-      id: measurement.id,
-      kind: measurement.kind,
-      ...this.measureAt(measurement.point),
-    }));
+  private measurementSnapshots(reuse?: MeasurementSnapshot[]): MeasurementSnapshot[] {
+    const snapshots = reuse ?? [];
+    for (let index = 0; index < this.measurements.length; index += 1) {
+      const measurement = this.measurements[index];
+      const snapshot = snapshots[index] ?? {} as MeasurementSnapshot;
+      Object.assign(snapshot, this.measureAt(measurement.point));
+      snapshot.id = measurement.id;
+      snapshot.kind = measurement.kind;
+      snapshots[index] = snapshot;
+    }
+    snapshots.length = this.measurements.length;
+    return snapshots;
   }
 
   private currentDayNightState(): DayNightState | null {
@@ -7456,15 +7515,21 @@ export class SimulationWorld {
     }
   }
 
-  private missionProgress(coverageRatio: number): MissionProgressSnapshot | null {
+  private missionProgress(
+    coverageRatio: number,
+    cells?: readonly MissionCellView[],
+  ): MissionProgressSnapshot | null {
     const target = this.scenario.target;
     if (!target) return null;
     if (target.type === 'born-stage') {
-      const current = this.animals.filter((animal) =>
-        animal.speciesId === target.speciesId &&
-        animal.origin === 'born' &&
-        animal.lifeStage === target.lifeStage,
-      ).length;
+      let current = 0;
+      for (const animal of this.animals) {
+        if (
+          animal.speciesId === target.speciesId &&
+          animal.origin === 'born' &&
+          animal.lifeStage === target.lifeStage
+        ) current += 1;
+      }
       return {
         current,
         target: target.count,
@@ -7500,14 +7565,22 @@ export class SimulationWorld {
       };
     }
     if (target.type === 'habitat-coverage') {
-      const eligible = this.surfaceSnapshots().filter((cell) => cell.targetEligible);
-      const current = eligible.length
-        ? eligible.filter((cell) =>
+      const sourceCells: readonly MissionCellView[] = cells ?? this.allCells();
+      let eligibleCount = 0;
+      let suitableCount = 0;
+      for (const cell of sourceCells) {
+        const eligible = cell.targetEligible ??
+          (cell.surfaceKind === 'structure-face' ||
+            this.scenario.targetIncludesSubstrate);
+        if (!eligible) continue;
+        eligibleCount += 1;
+        if (
           cell.light >= target.minLight &&
           cell.light <= target.maxLight &&
-          cell.biomass[target.speciesId] >= target.minBiomass,
-        ).length / eligible.length
-        : 0;
+          cell.biomass[target.speciesId] >= target.minBiomass
+        ) suitableCount += 1;
+      }
+      const current = eligibleCount ? suitableCount / eligibleCount : 0;
       return {
         current,
         target: target.ratio,
@@ -7519,10 +7592,10 @@ export class SimulationWorld {
       };
     }
     if (target.type === 'biomass') {
-      const current = this.surfaceSnapshots().reduce(
-        (total, cell) => total + cell.biomass[target.speciesId],
-        0,
-      );
+      let current = 0;
+      for (const cell of cells ?? this.allCells()) {
+        current += cell.biomass[target.speciesId];
+      }
       return {
         current,
         target: target.amount,
@@ -7538,18 +7611,13 @@ export class SimulationWorld {
       // Supplied founders cannot satisfy the hold condition on behalf of a
       // failed lineage. Only animals descended from the inoculated adults
       // contribute to the living reserve that must cross the next day/night.
-      const bornLineageBiomass = this.animals
-        .filter((animal) =>
-          animal.speciesId === 'daphnia' &&
-          (animal.generation ?? 0) >= 1)
-        .reduce(
-          (total, animal) =>
-            total +
-            animal.structuralBiomass +
-            animal.storedBiomass +
-            animal.reproductiveBiomass,
-          0,
-        );
+      let bornLineageBiomass = 0;
+      for (const animal of this.animals) {
+        if (animal.speciesId !== 'daphnia' || (animal.generation ?? 0) < 1) continue;
+        bornLineageBiomass += animal.structuralBiomass +
+          animal.storedBiomass +
+          animal.reproductiveBiomass;
+      }
       const current =
         bornLineageBiomass >= target.minimumBornLineageBiomass
         ? plankton.cumulativeEvents.secondGenerationBirths
@@ -7576,11 +7644,18 @@ export class SimulationWorld {
   }
 
   private currentTargetMet(): boolean {
-    const cells = this.surfaceSnapshots().filter((cell) => cell.targetEligible);
-    const coverageRatio = cells.length
-      ? cells.filter((cell) => occupied(cell.biomass)).length / cells.length
-      : 0;
-    const progress = this.missionProgress(coverageRatio);
+    const cells = this.allCells();
+    let eligibleCount = 0;
+    let occupiedCount = 0;
+    for (const cell of cells) {
+      const eligible = cell.surfaceKind === 'structure-face' ||
+        this.scenario.targetIncludesSubstrate;
+      if (!eligible) continue;
+      eligibleCount += 1;
+      if (occupied(cell.biomass)) occupiedCount += 1;
+    }
+    const coverageRatio = eligibleCount ? occupiedCount / eligibleCount : 0;
+    const progress = this.missionProgress(coverageRatio, cells);
     return progress ? progress.current >= progress.target : false;
   }
 
@@ -7718,7 +7793,7 @@ export class SimulationWorld {
     return snapshots;
   }
 
-  private carcassSnapshots(): AnimalCarcassSnapshot[] {
+  private carcassSnapshots(reuse?: AnimalCarcassSnapshot[]): AnimalCarcassSnapshot[] {
     if (this.selection?.kind === 'carcass' && this.selection.carcassId) {
       const selected = this.carcasses.find(
         (carcass) => carcass.id === this.selection?.carcassId,
@@ -7734,71 +7809,75 @@ export class SimulationWorld {
         this.selection.y = visualPoint.y;
       }
     }
-    return this.carcasses.map((carcass) => ({
-      id: carcass.id,
-      sourceAnimalId: carcass.sourceAnimalId,
-      speciesId: carcass.speciesId,
-      x: carcass.position.x,
-      y: carcass.position.y,
-      facing: carcass.facing,
-      poseAngle: carcass.poseAngle,
-      bodyLength: carcass.bodyLength,
-      lifeStage: carcass.lifeStage,
-      cause: carcass.cause,
-      waterAtDeath: carcass.waterAtDeath ? { ...carcass.waterAtDeath } : null,
-      temperatureAtDeath: carcass.temperatureAtDeath,
-      ageSeconds: carcass.ageSeconds,
-      lifetimeSeconds: carcass.speciesId === 'japanese-ricefish'
+    const snapshots = reuse ?? [];
+    for (let index = 0; index < this.carcasses.length; index += 1) {
+      const carcass = this.carcasses[index];
+      const lifetimeSeconds = carcass.speciesId === 'japanese-ricefish'
         ? RICEFISH_CARCASS_LIFETIME_SECONDS
         : carcass.speciesId === 'daphnia'
           ? DAPHNIA_CARCASS_LIFETIME_SECONDS
-        : SHRIMP_CARCASS_LIFETIME_SECONDS,
-      progress: clamp01(carcass.ageSeconds / (
-        carcass.speciesId === 'japanese-ricefish'
-          ? RICEFISH_CARCASS_LIFETIME_SECONDS
-          : carcass.speciesId === 'daphnia'
-            ? DAPHNIA_CARCASS_LIFETIME_SECONDS
-          : SHRIMP_CARCASS_LIFETIME_SECONDS
-      )),
-    }));
+          : SHRIMP_CARCASS_LIFETIME_SECONDS;
+      const snapshot = snapshots[index] ?? {} as AnimalCarcassSnapshot;
+      snapshot.id = carcass.id;
+      snapshot.sourceAnimalId = carcass.sourceAnimalId;
+      snapshot.speciesId = carcass.speciesId;
+      snapshot.x = carcass.position.x;
+      snapshot.y = carcass.position.y;
+      snapshot.facing = carcass.facing;
+      snapshot.poseAngle = carcass.poseAngle;
+      snapshot.bodyLength = carcass.bodyLength;
+      snapshot.lifeStage = carcass.lifeStage;
+      snapshot.cause = carcass.cause;
+      snapshot.waterAtDeath = carcass.waterAtDeath
+        ? Object.assign(snapshot.waterAtDeath ?? {}, carcass.waterAtDeath)
+        : null;
+      snapshot.temperatureAtDeath = carcass.temperatureAtDeath;
+      snapshot.ageSeconds = carcass.ageSeconds;
+      snapshot.lifetimeSeconds = lifetimeSeconds;
+      snapshot.progress = clamp01(carcass.ageSeconds / lifetimeSeconds);
+      snapshots[index] = snapshot;
+    }
+    snapshots.length = this.carcasses.length;
+    return snapshots;
   }
 
-  private animalPopulation(speciesId: AnimalSpeciesId): {
-    total: number;
-    eggs: number;
-    fry: number;
-    adults: number;
-    juveniles: number;
-    adultFemales: number;
-    adultMales: number;
-    juvenileFemales: number;
-    juvenileMales: number;
-  } {
-    const animals = this.animals.filter((animal) => animal.speciesId === speciesId);
-    const eggs = animals.filter((animal) => animal.lifeStage === 'egg').length;
-    const fry = animals.filter((animal) => animal.lifeStage === 'fry').length;
-    const adultFemales = animals.filter((animal) =>
-      animal.lifeStage === 'adult' && animal.sex === 'female').length;
-    const adultMales = animals.filter((animal) =>
-      animal.lifeStage === 'adult' && animal.sex === 'male').length;
-    const juvenileFemales = animals.filter((animal) =>
-      (animal.lifeStage === 'juvenile' || animal.lifeStage === 'fry') &&
-      animal.sex === 'female').length;
-    const juvenileMales = animals.filter((animal) =>
-      (animal.lifeStage === 'juvenile' || animal.lifeStage === 'fry') &&
-      animal.sex === 'male').length;
+  private animalPopulation(
+    speciesId: AnimalSpeciesId,
+    reuse?: AnimalPopulationSnapshot,
+  ): AnimalPopulationSnapshot {
+    const snapshot = reuse ?? {} as AnimalPopulationSnapshot;
+    let total = 0;
+    let eggs = 0;
+    let fry = 0;
+    let adultFemales = 0;
+    let adultMales = 0;
+    let juvenileFemales = 0;
+    let juvenileMales = 0;
+    for (const animal of this.animals) {
+      if (animal.speciesId !== speciesId) continue;
+      total += 1;
+      if (animal.lifeStage === 'egg') {
+        eggs += 1;
+      } else if (animal.lifeStage === 'adult') {
+        if (animal.sex === 'female') adultFemales += 1;
+        else adultMales += 1;
+      } else {
+        if (animal.lifeStage === 'fry') fry += 1;
+        if (animal.sex === 'female') juvenileFemales += 1;
+        else juvenileMales += 1;
+      }
+    }
     const adults = adultFemales + adultMales;
-    return {
-      total: animals.length,
-      eggs,
-      fry,
-      adults,
-      juveniles: animals.length - adults - eggs,
-      adultFemales,
-      adultMales,
-      juvenileFemales,
-      juvenileMales,
-    };
+    snapshot.total = total;
+    snapshot.eggs = eggs;
+    snapshot.fry = fry;
+    snapshot.adults = adults;
+    snapshot.juveniles = total - adults - eggs;
+    snapshot.adultFemales = adultFemales;
+    snapshot.adultMales = adultMales;
+    snapshot.juvenileFemales = juvenileFemales;
+    snapshot.juvenileMales = juvenileMales;
+    return snapshot;
   }
 
   private recordAnimalPopulationEvent(
@@ -7852,73 +7931,96 @@ export class SimulationWorld {
     this.snapshotDirty = true;
   }
 
-  private surfaceSnapshots(): SurfaceCellSnapshot[] {
-    return this.allCells().map((cell) => {
+  private surfaceSnapshots(reuse?: SurfaceCellSnapshot[]): SurfaceCellSnapshot[] {
+    const cells = this.allCells();
+    const snapshots = reuse ?? [];
+    for (let index = 0; index < cells.length; index += 1) {
+      const cell = cells[index];
       const point = this.cellWorldPoint(cell);
-      return {
-        id: cell.id,
-        ownerId: cell.ownerId,
-        ownerLabel: cell.ownerLabel,
-        surfaceKind: cell.surfaceKind,
-        index: cell.index,
-        x: point.x,
-        y: point.y,
-        cellSize: cell.cellSize,
-        light: cell.light,
-        plantCanopyLight: cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS
-          ? this.vallisneriaCanopyLight(cell)
-          : null,
-        biomass: cloneBiomass(cell.biomass),
-        biofilm: { ...cell.biofilm },
-        targetEligible:
-          cell.surfaceKind === 'structure-face' || this.scenario.targetIncludesSubstrate,
-      };
-    });
+      const snapshot = snapshots[index] ?? {} as SurfaceCellSnapshot;
+      snapshot.id = cell.id;
+      snapshot.ownerId = cell.ownerId;
+      snapshot.ownerLabel = cell.ownerLabel;
+      snapshot.surfaceKind = cell.surfaceKind;
+      snapshot.index = cell.index;
+      snapshot.x = point.x;
+      snapshot.y = point.y;
+      snapshot.cellSize = cell.cellSize;
+      snapshot.light = cell.light;
+      snapshot.plantCanopyLight = cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS
+        ? this.vallisneriaCanopyLight(cell)
+        : null;
+      snapshot.biomass ??= emptyBiomass();
+      snapshot.biomass.oedogonium = cell.biomass.oedogonium;
+      snapshot.biomass.nitzschia = cell.biomass.nitzschia;
+      snapshot.biomass.vallisneria = cell.biomass.vallisneria ?? 0;
+      snapshot.biofilm ??= emptyBiofilm();
+      snapshot.biofilm.decomposer = cell.biofilm.decomposer;
+      snapshot.biofilm.nitrifier = cell.biofilm.nitrifier;
+      snapshot.targetEligible =
+        cell.surfaceKind === 'structure-face' || this.scenario.targetIncludesSubstrate;
+      snapshots[index] = snapshot;
+    }
+    snapshots.length = cells.length;
+    return snapshots;
   }
 
-  private seedSnapshots(): SeedSnapshot[] {
-    if (this.hasStarted) return [];
-    return this.seedPlacements.flatMap((placement) => {
+  private seedSnapshots(reuse?: SeedSnapshot[]): SeedSnapshot[] {
+    const snapshots = reuse ?? [];
+    if (this.hasStarted) {
+      snapshots.length = 0;
+      return snapshots;
+    }
+    let snapshotIndex = 0;
+    for (const placement of this.seedPlacements) {
       const cell = this.cellById(placement.cellId);
-      if (!cell) return [];
+      if (!cell) continue;
       const point = placement.speciesId === 'vallisneria' && placement.plant
         ? this.vallisneriaRootPosition(placement, cell)
         : this.cellWorldPoint(cell);
-      return [{
-        id: placement.id,
-        speciesId: placement.speciesId,
-        cellId: placement.cellId,
-        locked: placement.locked,
-        x: point.x,
-        y: point.y,
-      }];
-    });
+      const snapshot = snapshots[snapshotIndex] ?? {} as SeedSnapshot;
+      snapshot.id = placement.id;
+      snapshot.speciesId = placement.speciesId;
+      snapshot.cellId = placement.cellId;
+      snapshot.locked = placement.locked;
+      snapshot.x = point.x;
+      snapshot.y = point.y;
+      snapshots[snapshotIndex] = snapshot;
+      snapshotIndex += 1;
+    }
+    snapshots.length = snapshotIndex;
+    return snapshots;
   }
 
-  private plantSnapshots(): PlantRametSnapshot[] {
-    return this.seedPlacements.flatMap((placement) => {
-      if (placement.speciesId !== 'vallisneria' || !placement.plant) return [];
+  private plantSnapshots(reuse?: PlantRametSnapshot[]): PlantRametSnapshot[] {
+    const snapshots = reuse ?? [];
+    let snapshotIndex = 0;
+    for (const placement of this.seedPlacements) {
+      if (placement.speciesId !== 'vallisneria' || !placement.plant) continue;
       const cell = this.cellById(placement.cellId);
-      if (!cell || cell.biomass.vallisneria <= 0.004) return [];
+      if (!cell || cell.biomass.vallisneria <= 0.004) continue;
       const point = this.vallisneriaRootPosition(placement, cell);
-      return [{
-        id: placement.id,
-        speciesId: 'vallisneria' as const,
-        cellId: placement.cellId,
-        x: point.x,
-        y: point.y,
-        origin: placement.origin,
-        parentId: placement.plant.parentId,
-        connectedToParent: placement.plant.connectedToParent,
-        ageSeconds: placement.plant.ageSeconds,
-        lifespanSeconds: placement.plant.lifespanSeconds,
-        lifeStage: this.vallisneriaLifeStage(placement.plant),
-        structuralScale: placement.plant.structuralScale,
-        health: this.vallisneriaHealth(placement, cell),
-        runnerProgress: clamp01(placement.plant.runnerProgress),
-        reproductionCount: placement.plant.reproductionCount,
-      }];
-    });
+      const snapshot = snapshots[snapshotIndex] ?? {} as PlantRametSnapshot;
+      snapshot.id = placement.id;
+      snapshot.speciesId = 'vallisneria';
+      snapshot.cellId = placement.cellId;
+      snapshot.x = point.x;
+      snapshot.y = point.y;
+      snapshot.origin = placement.origin;
+      snapshot.parentId = placement.plant.parentId;
+      snapshot.connectedToParent = placement.plant.connectedToParent;
+      snapshot.ageSeconds = placement.plant.ageSeconds;
+      snapshot.lifespanSeconds = placement.plant.lifespanSeconds;
+      snapshot.lifeStage = this.vallisneriaLifeStage(placement.plant);
+      snapshot.structuralScale = placement.plant.structuralScale;
+      snapshot.health = this.vallisneriaHealth(placement, cell);
+      snapshot.runnerProgress = clamp01(placement.plant.runnerProgress);
+      snapshot.reproductionCount = placement.plant.reproductionCount;
+      snapshots[snapshotIndex] = snapshot;
+      snapshotIndex += 1;
+    }
+    snapshots.length = snapshotIndex;
+    return snapshots;
   }
 
   private holdingSnapshot(): HoldingSnapshot | null {

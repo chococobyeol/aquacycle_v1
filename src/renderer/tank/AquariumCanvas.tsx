@@ -83,6 +83,7 @@ import {
   createReusableMotionInterpolator,
   reconcileMotionWithSnapshot,
 } from './motionInterpolation';
+import { BoundedReusePool } from './boundedReusePool';
 import {
   normalizeWaterQualityForDisplay,
   normalizePelagicForDisplay,
@@ -325,11 +326,28 @@ interface AnimalCarcassDisplay {
   phaseOffset: number;
 }
 
+type AnimalDisplayPool = BoundedReusePool<string, AnimalDisplay>;
+type AnimalCarcassDisplayPool = BoundedReusePool<string, AnimalCarcassDisplay>;
+
+const ANIMAL_DISPLAY_POOL_LIMIT_PER_KEY = 256;
+const ANIMAL_CARCASS_POOL_LIMIT_PER_KEY = 128;
+
+const animalDisplayPoolKey = (
+  speciesId: AnimalSnapshot['speciesId'],
+  lifeStage: AnimalSnapshot['lifeStage'],
+): string => speciesId === 'japanese-ricefish' && lifeStage === 'egg'
+  ? `${speciesId}:egg`
+  : `${speciesId}:body`;
+
+const animalCarcassDisplayPoolKey = (
+  speciesId: AnimalCarcassSnapshot['speciesId'],
+): string => speciesId;
+
 interface AquariumLayers {
   lamp: Graphics;
   base: Graphics;
   light: Sprite;
-  plankton: Graphics;
+  plankton: Sprite;
   substrateAlgae: Container;
   foreground: Graphics;
   structures: Container;
@@ -1914,6 +1932,75 @@ const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisp
   };
 };
 
+const resetAnimalDisplay = (
+  display: AnimalDisplay,
+  id: string,
+  target: AnimalRenderTarget,
+): void => {
+  display.lifeStage = target.lifeStage;
+  display.target = target;
+  display.renderX = target.x;
+  display.renderY = target.y;
+  display.renderFacing = target.facing;
+  display.renderPoseAngle = target.poseAngle;
+  display.renderBodyLength = target.bodyLength;
+  Object.assign(display.renderMotion, ANIMAL_MOTION_PROFILES[target.behavior]);
+  display.grazingWeight = target.behavior === 'grazing' ? 1 : 0;
+  display.phase = 0;
+  display.phaseOffset = animalHash(id) * Math.PI * 2;
+  display.container.position.set(target.x, target.y);
+  display.container.visible = true;
+  display.selection.visible = false;
+  display.placement.visible = false;
+  display.art.position.set(0, 0);
+  display.art.rotation = 0;
+  display.art.alpha = 1;
+  display.art.tint = 0xffffff;
+  display.head.position.set(0, 0);
+  display.head.rotation = 0;
+  display.tail.position.set(
+    display.speciesId === 'cherry-shrimp'
+      ? -21
+      : display.speciesId === 'japanese-ricefish'
+        ? -23
+        : 0,
+    0,
+  );
+  display.tail.rotation = 0;
+  display.legs.position.set(0, 0);
+  display.legs.rotation = 0;
+  display.legs.alpha = 1;
+  display.antennae.position.set(0, 0);
+  display.antennae.rotation = 0;
+  display.eggs.visible = false;
+  display.grazingFeedback.visible = false;
+};
+
+const acquireAnimalDisplay = (
+  pool: AnimalDisplayPool | undefined,
+  id: string,
+  target: AnimalRenderTarget,
+): AnimalDisplay => {
+  const display = pool?.take(animalDisplayPoolKey(target.speciesId, target.lifeStage));
+  if (!display) return createAnimalDisplay(id, target);
+  resetAnimalDisplay(display, id, target);
+  return display;
+};
+
+const releaseAnimalDisplay = (
+  layer: Container,
+  pool: AnimalDisplayPool | undefined,
+  display: AnimalDisplay,
+): void => {
+  layer.removeChild(display.container);
+  display.container.visible = false;
+  if (pool?.release(
+    animalDisplayPoolKey(display.speciesId, display.lifeStage),
+    display,
+  )) return;
+  destroyDisplayTree(display.container);
+};
+
 const createAnimalCarcassDisplay = (
   target: AnimalCarcassSnapshot,
 ): AnimalCarcassDisplay => {
@@ -2027,24 +2114,69 @@ const createAnimalCarcassDisplay = (
   };
 };
 
+const resetAnimalCarcassDisplay = (
+  display: AnimalCarcassDisplay,
+  target: AnimalCarcassSnapshot,
+): void => {
+  display.target = target;
+  display.renderX = target.x;
+  display.renderY = target.y;
+  display.renderFacing = target.facing;
+  display.renderBodyLength = target.bodyLength;
+  display.phaseOffset = animalHash(target.id) * Math.PI * 2;
+  display.container.position.set(target.x, target.y);
+  display.container.visible = true;
+  display.art.position.set(0, 0);
+  display.art.alpha = 0.86;
+  display.head.position.set(0, 0);
+  display.head.rotation = 0;
+  display.tail.rotation = 0;
+  display.legs.position.set(0, 0);
+  display.legs.rotation = 0;
+  display.legs.alpha = 1;
+  display.antennae.position.set(0, 0);
+  display.antennae.rotation = 0;
+};
+
+const acquireAnimalCarcassDisplay = (
+  pool: AnimalCarcassDisplayPool | undefined,
+  target: AnimalCarcassSnapshot,
+): AnimalCarcassDisplay => {
+  const display = pool?.take(animalCarcassDisplayPoolKey(target.speciesId));
+  if (!display) return createAnimalCarcassDisplay(target);
+  resetAnimalCarcassDisplay(display, target);
+  return display;
+};
+
+const releaseAnimalCarcassDisplay = (
+  layer: Container,
+  pool: AnimalCarcassDisplayPool | undefined,
+  display: AnimalCarcassDisplay,
+): void => {
+  layer.removeChild(display.container);
+  display.container.visible = false;
+  if (pool?.release(animalCarcassDisplayPoolKey(display.speciesId), display)) return;
+  destroyDisplayTree(display.container);
+};
+
 const syncAnimalCarcasses = (
   layer: Container,
   snapshot: SimulationSnapshot,
   displays: Map<string, AnimalCarcassDisplay>,
   livingDisplays?: Map<string, AnimalDisplay>,
+  pool?: AnimalCarcassDisplayPool,
 ): void => {
   const carcasses = snapshot.carcasses;
   const currentIds = new Set(carcasses.map((carcass) => carcass.id));
   for (const [id, display] of displays) {
     if (currentIds.has(id)) continue;
-    layer.removeChild(display.container);
-    destroyDisplayTree(display.container);
+    releaseAnimalCarcassDisplay(layer, pool, display);
     displays.delete(id);
   }
   for (const carcass of carcasses) {
     let display = displays.get(carcass.id);
     if (!display) {
-      display = createAnimalCarcassDisplay(carcass);
+      display = acquireAnimalCarcassDisplay(pool, carcass);
       const living = livingDisplays?.get(carcass.sourceAnimalId);
       if (living) {
         // A full ecology snapshot can replace a living, interpolated animal
@@ -2075,22 +2207,40 @@ const animalTarget = (
   animal: AnimalSnapshot,
   selected: boolean,
   interpolatedPosition: boolean,
-): AnimalRenderTarget => ({
-  speciesId: animal.speciesId,
-  lifeStage: animal.lifeStage,
-  x: animal.x,
-  y: animal.y,
-  facing: animal.facing,
-  poseAngle: animal.poseAngle,
-  bodyLength: animal.bodyLength,
-  behavior: animal.behavior,
-  health: animal.health,
-  selected,
-  held: false,
-  placementValid: true,
-  reproductiveState: animal.reproductiveState,
-  interpolatedPosition,
-});
+  reuse?: AnimalRenderTarget,
+): AnimalRenderTarget => {
+  const target = reuse ?? {
+    speciesId: animal.speciesId,
+    lifeStage: animal.lifeStage,
+    x: animal.x,
+    y: animal.y,
+    facing: animal.facing,
+    poseAngle: animal.poseAngle,
+    bodyLength: animal.bodyLength,
+    behavior: animal.behavior,
+    health: animal.health,
+    selected,
+    held: false,
+    placementValid: true,
+    reproductiveState: animal.reproductiveState,
+    interpolatedPosition,
+  };
+  target.speciesId = animal.speciesId;
+  target.lifeStage = animal.lifeStage;
+  target.x = animal.x;
+  target.y = animal.y;
+  target.facing = animal.facing;
+  target.poseAngle = animal.poseAngle;
+  target.bodyLength = animal.bodyLength;
+  target.behavior = animal.behavior;
+  target.health = animal.health;
+  target.selected = selected;
+  target.held = false;
+  target.placementValid = true;
+  target.reproductiveState = animal.reproductiveState;
+  target.interpolatedPosition = interpolatedPosition;
+  return target;
+};
 
 const syncAnimals = (
   layer: Container,
@@ -2101,6 +2251,7 @@ const syncAnimals = (
   interpolatedPosition = false,
   removeMissing = true,
   suppressInventoryHolding = false,
+  pool?: AnimalDisplayPool,
 ): void => {
   const held = holding?.kind === 'animal' ? holding : null;
   const heldId = held?.animalId ?? null;
@@ -2110,8 +2261,7 @@ const syncAnimals = (
   if (removeMissing) {
     for (const [id, display] of displays) {
       if (currentIds.has(id)) continue;
-      layer.removeChild(display.container);
-      destroyDisplayTree(display.container);
+      releaseAnimalDisplay(layer, pool, display);
       displays.delete(id);
     }
   }
@@ -2124,7 +2274,6 @@ const syncAnimals = (
   }
 
   for (const animal of animals) {
-    const target = animalTarget(animal, selectedIds.has(animal.id), interpolatedPosition);
     let display = displays.get(animal.id);
     if (
       display &&
@@ -2133,13 +2282,18 @@ const syncAnimals = (
         (display.lifeStage === 'egg') !== (animal.lifeStage === 'egg')
       )
     ) {
-      layer.removeChild(display.container);
-      destroyDisplayTree(display.container);
+      releaseAnimalDisplay(layer, pool, display);
       displays.delete(animal.id);
       display = undefined;
     }
+    const target = animalTarget(
+      animal,
+      selectedIds.has(animal.id),
+      interpolatedPosition,
+      display?.target,
+    );
     if (!display) {
-      display = createAnimalDisplay(animal.id, target);
+      display = acquireAnimalDisplay(pool, animal.id, target);
       displays.set(animal.id, display);
       layer.addChild(display.container);
     }
@@ -2174,7 +2328,7 @@ const syncAnimals = (
       interpolatedPosition,
     };
     if (!display) {
-      display = createAnimalDisplay(heldId, target);
+      display = acquireAnimalDisplay(pool, heldId, target);
       displays.set(heldId, display);
       layer.addChild(display.container);
     }
@@ -2417,20 +2571,21 @@ const animateAnimalCarcasses = (
     const fade = 1 - lastMoments * lastMoments * (3 - 2 * lastMoments);
     const artScale = shrimpVisualScale(display.renderBodyLength);
     const facingSign = display.renderFacing < 0 ? -1 : 1;
-    const settlingRock = Math.sin(age * 2.2 + display.phaseOffset) * 0.045 * Math.exp(-age * 0.75);
 
     display.container.position.set(display.renderX, display.renderY + drop);
     display.container.zIndex = display.renderY + drop - 0.5;
     display.art.scale.set(facingSign * artScale, artScale * 0.9);
-    display.art.rotation = facingSign * 0.24 + settlingRock;
+    // A carcass may sink, but it must not keep playing a periodic living pose.
+    // At 64x the old age-based sine was sampled in large jumps and read as a
+    // dead animal vibrating forever when the renderer became busy.
+    display.art.rotation = facingSign * 0.24;
     display.art.alpha = Math.max(0, fade) * 0.86;
 
     if (display.speciesId === 'japanese-ricefish') {
       const fishScale = Math.max(0.2, display.renderBodyLength / RICEFISH_DRAW_LENGTH);
       display.art.scale.set(facingSign * fishScale, fishScale * 0.92);
-      display.art.rotation = facingSign * (0.42 + settle * 0.42) + settlingRock;
-      display.tail.rotation = Math.sin(age * 1.4 + display.phaseOffset) *
-        0.06 * Math.exp(-age * 0.8);
+      display.art.rotation = facingSign * (0.42 + settle * 0.42);
+      display.tail.rotation = 0;
       display.legs.alpha = 0.48;
       continue;
     }
@@ -2438,7 +2593,7 @@ const animateAnimalCarcasses = (
     if (display.speciesId === 'daphnia') {
       const daphniaScale = daphniaVisualScale(display.renderBodyLength);
       display.art.scale.set(facingSign * daphniaScale, daphniaScale * 0.92);
-      display.art.rotation = facingSign * 0.46 + settlingRock;
+      display.art.rotation = facingSign * 0.46;
       display.antennae.rotation = 0.18;
       display.legs.rotation = -0.2;
       display.tail.rotation = 0.12;
@@ -3385,23 +3540,67 @@ const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void =
     .fill({ color: 0x173349, alpha: darkness * 0.34 });
 };
 
-const drawPhytoplankton = (layer: Graphics, snapshot: SimulationSnapshot): void => {
-  layer.clear();
+const PHYTOPLANKTON_RASTER_SCALE = 0.5;
+
+const drawPhytoplankton = (layer: Sprite, snapshot: SimulationSnapshot): void => {
   const water = snapshot.biogeochemistry.water;
-  if (!water.columns || !water.rows) return;
+  if (!water.columns || !water.rows) {
+    layer.visible = false;
+    return;
+  }
   const plan = createPhytoplanktonVisualPlan(
     water.phytoplankton,
     water.columns,
     water.rows,
   );
+  const rasterWidth = Math.ceil(TANK_WIDTH * PHYTOPLANKTON_RASTER_SCALE);
+  const rasterHeight = Math.ceil(
+    (GROUND_Y - WATER_TOP) * PHYTOPLANKTON_RASTER_SCALE,
+  );
+  const surface = getRasterSurface(layer, rasterWidth, rasterHeight);
+  if (!surface) return;
+  const { context, texture } = surface;
+  context.setTransform(
+    PHYTOPLANKTON_RASTER_SCALE,
+    0,
+    0,
+    PHYTOPLANKTON_RASTER_SCALE,
+    0,
+    -WATER_TOP * PHYTOPLANKTON_RASTER_SCALE,
+  );
+  context.clearRect(
+    0,
+    WATER_TOP,
+    TANK_WIDTH,
+    GROUND_Y - WATER_TOP,
+  );
   for (const haze of plan.haze) {
-    layer.ellipse(haze.x, haze.y, haze.radiusX, haze.radiusY)
-      .fill({ color: 0x729f5a, alpha: haze.alpha });
+    context.beginPath();
+    context.ellipse(
+      haze.x,
+      haze.y,
+      haze.radiusX,
+      haze.radiusY,
+      0,
+      0,
+      Math.PI * 2,
+    );
+    context.fillStyle = '#729f5a';
+    context.globalAlpha = haze.alpha;
+    context.fill();
   }
   for (const speck of plan.specks) {
-    layer.circle(speck.x, speck.y, speck.radius)
-      .fill({ color: speck.color, alpha: speck.alpha });
+    context.beginPath();
+    context.arc(speck.x, speck.y, speck.radius, 0, Math.PI * 2);
+    context.fillStyle = `#${speck.color.toString(16).padStart(6, '0')}`;
+    context.globalAlpha = speck.alpha;
+    context.fill();
   }
+  context.globalAlpha = 1;
+  texture.source.update();
+  layer.position.set(0, WATER_TOP);
+  layer.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+  layer.visible = plan.haze.length > 0 || plan.specks.length > 0;
 };
 
 const drawInteraction = (
@@ -3713,6 +3912,8 @@ export function AquariumCanvas({
   const structureDisplaysRef = useRef(new Map<string, StructureDisplay>());
   const animalDisplaysRef = useRef(new Map<string, AnimalDisplay>());
   const animalCarcassDisplaysRef = useRef(new Map<string, AnimalCarcassDisplay>());
+  const animalDisplayPoolRef = useRef<AnimalDisplayPool | null>(null);
+  const animalCarcassDisplayPoolRef = useRef<AnimalCarcassDisplayPool | null>(null);
   const effectGenerationRef = useRef(0);
   const lastLightDrawRef = useRef('');
   const lastAnalysisDrawRef = useRef('');
@@ -3927,12 +4128,21 @@ export function AquariumCanvas({
     const ownedDisplays = new Map<string, StructureDisplay>();
     const ownedAnimalDisplays = new Map<string, AnimalDisplay>();
     const ownedAnimalCarcassDisplays = new Map<string, AnimalCarcassDisplay>();
+    const ownedAnimalDisplayPool = new BoundedReusePool<string, AnimalDisplay>(
+      ANIMAL_DISPLAY_POOL_LIMIT_PER_KEY,
+    );
+    const ownedAnimalCarcassDisplayPool =
+      new BoundedReusePool<string, AnimalCarcassDisplay>(
+        ANIMAL_CARCASS_POOL_LIMIT_PER_KEY,
+      );
     let animalTicker: ((ticker: Ticker) => void) | null = null;
     let renderTicker: (() => void) | null = null;
     texturesRef.current = ownedTextures;
     structureDisplaysRef.current = ownedDisplays;
     animalDisplaysRef.current = ownedAnimalDisplays;
     animalCarcassDisplaysRef.current = ownedAnimalCarcassDisplays;
+    animalDisplayPoolRef.current = ownedAnimalDisplayPool;
+    animalCarcassDisplayPoolRef.current = ownedAnimalCarcassDisplayPool;
     lastLightDrawRef.current = '';
     lastAnalysisDrawRef.current = '';
     lastAlgaeRevisionRef.current = -1;
@@ -3957,6 +4167,7 @@ export function AquariumCanvas({
     const releaseOwnedRasterSurfaces = (): void => {
       if (!ownedLayers) return;
       releaseRasterSurface(ownedLayers.light);
+      releaseRasterSurface(ownedLayers.plankton);
       releaseRasterSurface(ownedLayers.analysis);
       releaseAnalysisGridSurface(ownedLayers.analysis);
       releaseAlgaeParticleLayer(ownedLayers.substrateAlgae);
@@ -4055,7 +4266,7 @@ export function AquariumCanvas({
         lamp: new Graphics(),
         base: new Graphics(),
         light: new Sprite(Texture.EMPTY),
-        plankton: new Graphics(),
+        plankton: new Sprite(Texture.EMPTY),
         substrateAlgae: createAlgaeParticleLayer('substrate'),
         foreground: new Graphics(),
         structures: new Container(),
@@ -4159,12 +4370,14 @@ export function AquariumCanvas({
         initialMotion?.interpolated ?? false,
         true,
         isPendingInventoryHandoff(),
+        ownedAnimalDisplayPool,
       );
       syncAnimalCarcasses(
         layers.animals,
         initialSnapshot,
         ownedAnimalCarcassDisplays,
         ownedAnimalDisplays,
+        ownedAnimalCarcassDisplayPool,
       );
       drawAquaticPlants(layers.plantsBack, initialSnapshot, 'back');
       drawAquaticPlants(layers.plantsFront, initialSnapshot, 'front');
@@ -4409,9 +4622,18 @@ export function AquariumCanvas({
       if (animalCarcassDisplaysRef.current === ownedAnimalCarcassDisplays) {
         animalCarcassDisplaysRef.current = new Map<string, AnimalCarcassDisplay>();
       }
+      if (animalDisplayPoolRef.current === ownedAnimalDisplayPool) {
+        animalDisplayPoolRef.current = null;
+      }
+      if (animalCarcassDisplayPoolRef.current === ownedAnimalCarcassDisplayPool) {
+        animalCarcassDisplayPoolRef.current = null;
+      }
       ownedDisplays.clear();
       ownedAnimalDisplays.clear();
       ownedAnimalCarcassDisplays.clear();
+      ownedAnimalDisplayPool.drain((display) => destroyDisplayTree(display.container));
+      ownedAnimalCarcassDisplayPool.drain((display) =>
+        destroyDisplayTree(display.container));
       if (layersRef.current === ownedLayers) layersRef.current = null;
       if (appRef.current === app) appRef.current = null;
       if (texturesRef.current === ownedTextures) {
@@ -4454,6 +4676,7 @@ export function AquariumCanvas({
       snapshot,
       animalCarcassDisplaysRef.current,
       animalDisplaysRef.current,
+      animalCarcassDisplayPoolRef.current ?? undefined,
     );
     syncAnimals(
       layers.animals,
@@ -4464,6 +4687,7 @@ export function AquariumCanvas({
       motion?.interpolated ?? false,
       true,
       isPendingInventoryHandoff(),
+      animalDisplayPoolRef.current ?? undefined,
     );
     const plantsKey = vallisneriaVisualKey(snapshot);
     if (lastPlantsDrawRef.current !== plantsKey) {

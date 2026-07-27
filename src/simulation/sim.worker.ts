@@ -11,6 +11,7 @@ import {
 } from './sharedMotionTelemetry';
 import type {
   SimulationCommand,
+  SimulationSnapshot,
   WorkerMotionMessage,
   WorkerSaveMessage,
   WorkerSnapshotMessage,
@@ -32,6 +33,7 @@ let snapshotTelemetry: SharedTelemetryWriter | null = null;
 let motionTelemetry: SharedTelemetryWriter | null = null;
 let binaryMotionTelemetry: SharedMotionWriter | null = null;
 let reusableMotion = world.motionSnapshot();
+let reusableSnapshot: SimulationSnapshot | undefined;
 
 interface ConnectTelemetryCommand {
   type: 'connect-telemetry';
@@ -43,9 +45,10 @@ interface ConnectTelemetryCommand {
 type WorkerCommand = SimulationCommand | ConnectTelemetryCommand;
 
 const publish = (): void => {
+  reusableSnapshot = world.snapshot(reusableSnapshot);
   const message: WorkerSnapshotMessage = {
     type: 'snapshot',
-    snapshot: world.snapshot(),
+    snapshot: reusableSnapshot,
   };
   if (snapshotTelemetry) snapshotTelemetry.publish(message);
   else scope.postMessage(message);

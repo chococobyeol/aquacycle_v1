@@ -172,6 +172,13 @@ class SharedValueWriter {
 class SharedValueReader {
   private readonly bytes: Uint8Array;
   private readonly view: DataView;
+  /**
+   * A full simulation snapshot contains thousands of small objects. Rebuilding
+   * that graph once per second makes Chromium reserve another set of V8 heap
+   * regions even after the prior graph is collected. Remembering each reusable
+   * object's stable key order lets subsequent generations update it in place.
+   */
+  private readonly objectShapes = new WeakMap<object, readonly string[]>();
   private offset = 0;
   private limit = 0;
 
@@ -180,10 +187,10 @@ class SharedValueReader {
     this.view = new DataView(buffer);
   }
 
-  public decode(byteLength: number): unknown {
+  public decode(byteLength: number, reuse?: unknown): unknown {
     this.offset = 0;
     this.limit = byteLength;
-    const value = this.readValue();
+    const value = this.readValue(reuse);
     if (this.offset !== this.limit) {
       throw new RangeError('Trailing shared telemetry bytes.');
     }
@@ -217,10 +224,29 @@ class SharedValueReader {
     return value;
   }
 
-  private readString(): string {
+  private readString(reuse?: unknown): string {
     const byteLength = this.readUint32();
     this.reserve(byteLength);
     const end = this.offset + byteLength;
+
+    // Snapshot property names, identifiers, and enum values are overwhelmingly
+    // ASCII and stable. Return the existing string without constructing a new
+    // one when its UTF-8 bytes already match the next encoded value.
+    if (typeof reuse === 'string' && reuse.length === byteLength) {
+      let matches = true;
+      for (let index = 0; index < byteLength; index += 1) {
+        const code = reuse.charCodeAt(index);
+        if (code > 0x7f || code !== this.bytes[this.offset + index]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        this.offset = end;
+        return reuse;
+      }
+    }
+
     let value = '';
     while (this.offset < end) {
       const first = this.bytes[this.offset];
@@ -270,14 +296,14 @@ class SharedValueReader {
     return value;
   }
 
-  private readValue(): unknown {
+  private readValue(reuse?: unknown): unknown {
     const tag = this.readByte();
     switch (tag) {
       case ValueTag.Null: return null;
       case ValueTag.False: return false;
       case ValueTag.True: return true;
       case ValueTag.Number: return this.readNumber();
-      case ValueTag.String: return this.readString();
+      case ValueTag.String: return this.readString(reuse);
       case ValueTag.Undefined: return undefined;
       case ValueTag.Array: {
         const length = this.readUint32();
@@ -287,10 +313,13 @@ class SharedValueReader {
         if (length > this.limit - this.offset) {
           throw new RangeError('Invalid shared telemetry array length.');
         }
-        const values = new Array<unknown>(length);
+        const values = Array.isArray(reuse)
+          ? reuse
+          : new Array<unknown>(length);
         for (let index = 0; index < length; index += 1) {
-          values[index] = this.readValue();
+          values[index] = this.readValue(values[index]);
         }
+        values.length = length;
         return values;
       }
       case ValueTag.Object: {
@@ -301,18 +330,35 @@ class SharedValueReader {
         if (keyCount > Math.floor((this.limit - this.offset) / 6)) {
           throw new RangeError('Invalid shared telemetry object length.');
         }
-        const value: Record<string, unknown> = {};
+        const value: Record<string, unknown> =
+          reuse !== null && typeof reuse === 'object' && !Array.isArray(reuse)
+            ? reuse as Record<string, unknown>
+            : {};
+        const previousShape = this.objectShapes.get(value);
+        let nextShape: string[] | null =
+          previousShape?.length === keyCount ? null : new Array<string>(keyCount);
+
         for (let index = 0; index < keyCount; index += 1) {
           if (this.readByte() !== ValueTag.String) {
             throw new TypeError('Invalid shared telemetry object key.');
           }
-          const key = this.readString();
-          Object.defineProperty(value, key, {
-            value: this.readValue(),
-            enumerable: true,
-            configurable: true,
-            writable: true,
-          });
+          const expectedKey = nextShape ? undefined : previousShape?.[index];
+          const key = this.readString(expectedKey);
+          if (!nextShape && key !== expectedKey) {
+            nextShape = previousShape ? [...previousShape] : new Array<string>(keyCount);
+          }
+          if (nextShape) nextShape[index] = key;
+          value[key] = this.readValue(value[key]);
+        }
+
+        if (nextShape) {
+          // Union-shaped records such as `holding` can change fields while
+          // keeping the same property count. Remove keys that are not present
+          // in the new shape so reused snapshots remain semantically exact.
+          for (const existingKey in value) {
+            if (!nextShape.includes(existingKey)) delete value[existingKey];
+          }
+          this.objectShapes.set(value, nextShape);
         }
         return value;
       }
@@ -373,6 +419,16 @@ export class SharedTelemetryReader<T> {
   private readonly control: Int32Array;
   private readonly payloadByteLength: number;
   private readonly decoder: SharedValueReader;
+  /**
+   * React may still be committing the previous snapshot while the next one is
+   * decoded. Two alternating graphs keep both references valid while bounding
+   * the lifetime allocation count.
+   */
+  private readonly decodedValues: [T | undefined, T | undefined] = [
+    undefined,
+    undefined,
+  ];
+  private nextValueIndex: 0 | 1 = 0;
   private lastSequence = 0;
 
   public constructor(channel: SharedTelemetryChannel) {
@@ -389,13 +445,18 @@ export class SharedTelemetryReader<T> {
     if (byteLength <= 0 || byteLength > this.payloadByteLength) return null;
 
     try {
-      const decoded = this.decoder.decode(byteLength) as T;
+      const decoded = this.decoder.decode(
+        byteLength,
+        this.decodedValues[this.nextValueIndex],
+      ) as T;
       const sequenceAfter = Atomics.load(this.control, CONTROL_SEQUENCE);
       if (sequenceBefore !== sequenceAfter || sequenceAfter % 2 !== 0) return null;
       // Check once more after decoding. A writer can begin while the object
       // graph is being rebuilt; that mixed-generation value must be ignored.
       if (Atomics.load(this.control, CONTROL_SEQUENCE) !== sequenceAfter) return null;
       this.lastSequence = sequenceAfter;
+      this.decodedValues[this.nextValueIndex] = decoded;
+      this.nextValueIndex = this.nextValueIndex === 0 ? 1 : 0;
       return decoded;
     } catch {
       // A concurrent write can make the transient packet invalid. The completed
