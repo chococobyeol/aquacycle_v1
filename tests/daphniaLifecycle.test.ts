@@ -31,7 +31,6 @@ interface DaphniaMotionInternals {
     velocity: Vec2;
   }>;
   biogeochemistry: BiogeochemistryLedger;
-  daphniaDephasedIds: Set<string>;
   stepAnimalMotion(deltaSeconds: number): void;
 }
 
@@ -153,6 +152,23 @@ describe('individual Daphnia life cycle', () => {
     expect(founderTraits(afterShrimp)).toEqual(founderTraits(direct));
   });
 
+  it('gives separate Daphnia inocula independent founder traits', () => {
+    const world = new SimulationWorld('mission-7');
+    inoculateDaphnia(world);
+    inoculateDaphnia(world);
+    inoculateDaphnia(world);
+
+    const founders = world.exportSaveData().animals.filter(
+      (animal) => animal.speciesId === 'daphnia',
+    );
+
+    expect(founders).toHaveLength(3);
+    expect(new Set(founders.map((animal) => animal.randomSeed)).size).toBe(3);
+    expect(new Set(founders.map((animal) => animal.ageSeconds)).size).toBe(3);
+    expect(new Set(founders.map((animal) => animal.lifespanSeconds)).size)
+      .toBe(3);
+  });
+
   it('freezes individual motion while paused and resumes from the same positions', () => {
     const world = new SimulationWorld('mission-7');
     inoculateDaphnia(world);
@@ -181,7 +197,7 @@ describe('individual Daphnia life cycle', () => {
     )).toBe(true);
   });
 
-  it('breaks an exact two-animal trajectory lock without enforcing personal space', () => {
+  it('does not let duplicate legacy traits create a shared trajectory', () => {
     const world = new SimulationWorld('mission-7');
     inoculateDaphnia(world);
     inoculateDaphnia(world);
@@ -231,7 +247,14 @@ describe('individual Daphnia life cycle', () => {
     const internals = daphniaMotionInternals(world);
     internals.stepAnimalMotion(0.1);
 
-    expect(internals.daphniaDephasedIds.size).toBe(0);
+    const moved = internals.animals.filter(
+      (animal) => animal.speciesId === 'daphnia',
+    );
+    const separation = Math.hypot(
+      moved[0].position.x - moved[1].position.x,
+      moved[0].position.y - moved[1].position.y,
+    );
+    expect(separation).toBeLessThan(4);
   });
 
   it('turns back into the water instead of remaining pinned to the glass', () => {

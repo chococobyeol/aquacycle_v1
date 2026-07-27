@@ -345,9 +345,6 @@ interface LightEmitter {
 const SNAPSHOT_INTERVAL_SECONDS = 1;
 const PHYSICS_STEP_MS = 1000 / 60;
 const MAX_PHYSICS_STEPS = 4;
-const DAPHNIA_TRAJECTORY_LOCK_DISTANCE = 1.5;
-const DAPHNIA_TRAJECTORY_LOCK_RELATIVE_SPEED = 0.75;
-const DAPHNIA_TRAJECTORY_LOCK_SECONDS = 1.5;
 const GROWTH_STEP_SECONDS = 0.25;
 const ANIMAL_MOTION_STEP_SECONDS = 1 / 30;
 const MAX_ANIMAL_MOTION_STEPS = 48;
@@ -577,6 +574,9 @@ const deterministicStringSeed = (value: string): number => {
   return hash >>> 0;
 };
 
+const daphniaMotionSeed = (animalId: string): number =>
+  deterministicStringSeed(`daphnia-motion-${animalId}`) * 0.001;
+
 const seededRange = (
   seed: number,
   minimum: number,
@@ -687,8 +687,6 @@ export class SimulationWorld {
   private animalPopulationEvents: AnimalPopulationEventSnapshot[] = [];
   private animalPopulationEventTotals = emptyAnimalPopulationEventTotals();
   private animalPopulationEventSequence = 0;
-  private daphniaTrajectoryLockSeconds = new Map<string, number>();
-  private daphniaDephasedIds = new Set<string>();
   private totalAlgaeConsumed = 0;
   private animalInventoryUsed: Record<AnimalSpeciesId, number> = {
     'cherry-shrimp': 0,
@@ -776,8 +774,6 @@ export class SimulationWorld {
     this.animalPopulationEvents = [];
     this.animalPopulationEventTotals = emptyAnimalPopulationEventTotals();
     this.animalPopulationEventSequence = 0;
-    this.daphniaTrajectoryLockSeconds.clear();
-    this.daphniaDephasedIds.clear();
     this.totalAlgaeConsumed = 0;
     this.animalInventoryUsed = {
       'cherry-shrimp': 0,
@@ -1561,6 +1557,7 @@ export class SimulationWorld {
             ? 0
             : 1,
           null,
+          index,
         );
         const individualMass = totalBiomass / count;
         animal.structuralBiomass = Math.min(
@@ -2423,6 +2420,8 @@ export class SimulationWorld {
             'supplied',
             0,
             null,
+            this.planktonInventoryUsed.daphnia *
+              rules.foundersPerInoculum + index,
           );
           founders.push(founder);
           added += founder.structuralBiomass + founder.storedBiomass;
@@ -3560,80 +3559,8 @@ export class SimulationWorld {
     this.crossConnectionsDirty = false;
   }
 
-  private updateDaphniaTrajectoryLocks(deltaSeconds: number): void {
-    const daphnia = this.animals.filter(
-      (animal) => animal.speciesId === 'daphnia',
-    );
-    const activeIds = new Set(daphnia.map((animal) => animal.id));
-    for (const id of this.daphniaDephasedIds) {
-      if (!activeIds.has(id)) this.daphniaDephasedIds.delete(id);
-    }
-    if (daphnia.length < 2) {
-      this.daphniaTrajectoryLockSeconds.clear();
-      return;
-    }
-
-    // Ordinary overlap is allowed. Only two centres that remain nearly
-    // identical in both position and velocity accumulate lock time. A small
-    // spatial hash keeps this linear for the usual sparse plankton field.
-    const buckets = new Map<string, AnimalState[]>();
-    const observedPairs = new Set<string>();
-    const bucketSize = DAPHNIA_TRAJECTORY_LOCK_DISTANCE;
-    const maximumDistanceSquared =
-      DAPHNIA_TRAJECTORY_LOCK_DISTANCE ** 2;
-    const maximumRelativeSpeedSquared =
-      DAPHNIA_TRAJECTORY_LOCK_RELATIVE_SPEED ** 2;
-
-    for (const animal of daphnia) {
-      const bucketX = Math.floor(animal.position.x / bucketSize);
-      const bucketY = Math.floor(animal.position.y / bucketSize);
-      for (let yOffset = -1; yOffset <= 1; yOffset += 1) {
-        for (let xOffset = -1; xOffset <= 1; xOffset += 1) {
-          const nearby = buckets.get(
-            `${bucketX + xOffset}:${bucketY + yOffset}`,
-          ) ?? [];
-          for (const other of nearby) {
-            if (
-              distanceSquared(animal.position, other.position) >
-                maximumDistanceSquared
-            ) continue;
-            const relativeVelocitySquared =
-              (animal.velocity.x - other.velocity.x) ** 2 +
-              (animal.velocity.y - other.velocity.y) ** 2;
-            if (relativeVelocitySquared > maximumRelativeSpeedSquared) {
-              continue;
-            }
-            const pairKey = animal.id < other.id
-              ? `${animal.id}\0${other.id}`
-              : `${other.id}\0${animal.id}`;
-            observedPairs.add(pairKey);
-            const lockSeconds =
-              (this.daphniaTrajectoryLockSeconds.get(pairKey) ?? 0) +
-              deltaSeconds;
-            this.daphniaTrajectoryLockSeconds.set(pairKey, lockSeconds);
-            if (lockSeconds >= DAPHNIA_TRAJECTORY_LOCK_SECONDS) {
-              this.daphniaDephasedIds.add(animal.id);
-              this.daphniaDephasedIds.add(other.id);
-            }
-          }
-        }
-      }
-      const ownBucketKey = `${bucketX}:${bucketY}`;
-      const ownBucket = buckets.get(ownBucketKey);
-      if (ownBucket) ownBucket.push(animal);
-      else buckets.set(ownBucketKey, [animal]);
-    }
-
-    for (const pairKey of this.daphniaTrajectoryLockSeconds.keys()) {
-      if (!observedPairs.has(pairKey)) {
-        this.daphniaTrajectoryLockSeconds.delete(pairKey);
-      }
-    }
-  }
-
   private stepAnimalMotion(deltaSeconds: number): void {
     if (!this.animals.length) return;
-    this.updateDaphniaTrajectoryLocks(deltaSeconds);
     for (const animal of this.animals) {
       animal.nextTargetEvaluation -= deltaSeconds;
       animal.behaviorTimer = Math.max(0, animal.behaviorTimer - deltaSeconds);
@@ -3642,11 +3569,7 @@ export class SimulationWorld {
         continue;
       }
       if (animal.speciesId === 'daphnia') {
-        this.stepDaphniaMotion(
-          animal,
-          deltaSeconds,
-          this.daphniaDephasedIds.has(animal.id),
-        );
+        this.stepDaphniaMotion(animal, deltaSeconds);
         continue;
       }
       const waterEscape = this.shrimpLocalWaterEscape(animal);
@@ -3949,7 +3872,6 @@ export class SimulationWorld {
   private stepDaphniaMotion(
     animal: AnimalState,
     deltaSeconds: number,
-    breakTrajectoryLock: boolean,
   ): void {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
     const localFood = this.biogeochemistry.planktonAt(animal.position);
@@ -3962,25 +3884,27 @@ export class SimulationWorld {
     // distant cells and steer toward the richest one. A correlated random walk
     // plus current and boundary response still lets them cross the tank
     // without granting an invisible food-direction sensor.
-    const roamingTime = animal.ageSeconds / rules.roamingDirectionSeconds;
+    // Locomotion has its own per-individual identity. Demographic traits can
+    // legitimately match within a cohort (and old saves may contain duplicate
+    // seeds), but that must never make multiple animals share one swimming
+    // clock. Independent period, phase and headings produce an asynchronous
+    // correlated random walk without separation pressure or schooling.
+    const motionSeed = daphniaMotionSeed(animal.id);
+    const roamingPeriod = rules.roamingDirectionSeconds * seededRange(
+      motionSeed * 0.037 + 7.1,
+      0.76,
+      1.24,
+    );
+    const roamingPhase = deterministicNoise(
+      motionSeed * 0.043 + 11.9,
+    );
+    const roamingTime = animal.ageSeconds / roamingPeriod + roamingPhase;
     const roamingSegment = Math.floor(roamingTime);
     const roamingBlend = roamingTime - roamingSegment;
-    const headingAt = (segment: number): number => {
-      const baseHeading =
-        deterministicNoise(
-          animal.randomSeed * 0.071 + segment * 7.193 + 3.17,
-        ) * Math.PI * 2;
-      if (!breakTrajectoryLock) return baseHeading;
-      // This is a symmetry breaker, not separation pressure: once an actual
-      // trajectory lock has persisted, rotate only those animals' stochastic
-      // headings by a few degrees. No minimum distance is enforced.
-      const individualMotionSeed =
-        deterministicStringSeed(`daphnia-motion-${animal.id}`) * 0.001;
-      const individualOffset = (
-        deterministicNoise(individualMotionSeed + segment * 1.619) - 0.5
-      ) * 0.16;
-      return baseHeading + individualOffset;
-    };
+    const headingAt = (segment: number): number =>
+      deterministicNoise(
+        motionSeed * 0.071 + segment * 7.193 + 3.17,
+      ) * Math.PI * 2;
     const firstHeading = headingAt(roamingSegment);
     const nextHeading = headingAt(roamingSegment + 1);
     const firstX = Math.cos(firstHeading);
@@ -3994,7 +3918,15 @@ export class SimulationWorld {
     // A power stroke followed by passive sinking produces the characteristic
     // hop, but subtracting its cycle mean prevents the old permanent upward
     // drift that pinned the whole population to the surface.
-    const phase = animal.ageSeconds * 3.4 + animal.randomSeed * 11.7;
+    const strokeRate = seededRange(
+      motionSeed * 0.089 + 17.3,
+      3.05,
+      3.78,
+    );
+    const strokePhase = deterministicNoise(
+      motionSeed * 0.097 + 19.7,
+    ) * Math.PI * 2;
+    const phase = animal.ageSeconds * strokeRate + strokePhase;
     const hop = Math.max(0, Math.sin(phase));
     const balancedHop = -(hop - 1 / Math.PI) * 0.34;
     const localFoodResponse = centerFood <= 0
@@ -6582,9 +6514,20 @@ export class SimulationWorld {
     // In the flat centre of a plume, retain one local escape heading for a
     // few seconds rather than jittering in place. This is ordinary correlated
     // motion and contains no sample from outside the local cue radius.
-    const phase = Math.floor(animal.ageSeconds / 5);
+    const motionSeed = daphniaMotionSeed(animal.id);
+    const escapePeriod = seededRange(
+      motionSeed * 0.103 + 29.3,
+      4.2,
+      5.8,
+    );
+    const escapePhase = deterministicNoise(
+      motionSeed * 0.107 + 31.7,
+    );
+    const phase = Math.floor(
+      animal.ageSeconds / escapePeriod + escapePhase,
+    );
     const angle = deterministicNoise(
-      animal.randomSeed * 2.17 + phase * 13.9,
+      motionSeed * 2.17 + phase * 13.9,
     ) * Math.PI * 2;
     return {
       x: Math.cos(angle),
@@ -8054,7 +7997,14 @@ export class SimulationWorld {
       return this.createAdultRicefishState(id, point, origin);
     }
     if (speciesId === 'daphnia') {
-      return this.createAdultDaphniaState(id, point, origin, 0, null);
+      return this.createAdultDaphniaState(
+        id,
+        point,
+        origin,
+        0,
+        null,
+        this.animalInventoryUsed.daphnia,
+      );
     }
     // Inventory usage is the species-specific introduction sequence. Unlike
     // counting currently living founders, it does not restart after a supplied
@@ -8136,15 +8086,18 @@ export class SimulationWorld {
     origin: 'supplied' | 'born',
     generation: number,
     parentId: string | null,
+    suppliedSequence: number,
   ): AnimalState {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
-    const suppliedIndex = this.animalInventoryUsed.daphnia;
     // Founder traits belong to the Daphnia inoculation sequence, not the
     // global animal ID. Otherwise an unrelated shrimp birth just before an
-    // inoculation changes the founder's lifespan and molt schedule.
+    // inoculation changes the founder's lifespan and molt schedule. Daphnia
+    // are stocked through the plankton inventory, so using animalInventoryUsed
+    // here made every separate inoculum sequence zero and cloned its age,
+    // lifespan, reproduction and movement traits.
     const seed = deterministicStringSeed(
       origin === 'supplied'
-        ? `daphnia-supplied-${suppliedIndex}`
+        ? `daphnia-supplied-${suppliedSequence}`
         : `${id}:daphnia`,
     );
     const lifespanNoise = deterministicNoise(seed * 0.019 + 13.7);
