@@ -25,10 +25,13 @@ const inoculateDaphnia = (world: SimulationWorld): void => {
 
 interface DaphniaMotionInternals {
   animals: Array<{
+    id: string;
     speciesId: string;
     position: Vec2;
+    velocity: Vec2;
   }>;
   biogeochemistry: BiogeochemistryLedger;
+  daphniaDephasedIds: Set<string>;
   stepAnimalMotion(deltaSeconds: number): void;
 }
 
@@ -176,6 +179,59 @@ describe('individual Daphnia life cycle', () => {
         animal.y - Number(before[index][2]),
       ) > 0.2,
     )).toBe(true);
+  });
+
+  it('breaks an exact two-animal trajectory lock without enforcing personal space', () => {
+    const world = new SimulationWorld('mission-7');
+    inoculateDaphnia(world);
+    inoculateDaphnia(world);
+    const save = world.exportSaveData();
+    const daphnia = save.animals.filter(
+      (animal) => animal.speciesId === 'daphnia',
+    );
+    expect(daphnia).toHaveLength(2);
+    const [first, second] = daphnia;
+    second.position = { ...first.position };
+    second.velocity = { ...first.velocity };
+    second.ageSeconds = first.ageSeconds;
+    second.randomSeed = first.randomSeed;
+    second.energy = first.energy;
+    second.health = first.health;
+    world.loadSaveData(save);
+
+    const internals = daphniaMotionInternals(world);
+    for (let index = 0; index < 80; index += 1) {
+      internals.stepAnimalMotion(0.1);
+    }
+    const moved = internals.animals.filter(
+      (animal) => animal.speciesId === 'daphnia',
+    );
+    const separation = Math.hypot(
+      moved[0].position.x - moved[1].position.x,
+      moved[0].position.y - moved[1].position.y,
+    );
+
+    expect(separation).toBeGreaterThan(4);
+  });
+
+  it('allows a momentary overlap when the animals are already crossing', () => {
+    const world = new SimulationWorld('mission-7');
+    inoculateDaphnia(world);
+    inoculateDaphnia(world);
+    const save = world.exportSaveData();
+    const daphnia = save.animals.filter(
+      (animal) => animal.speciesId === 'daphnia',
+    );
+    expect(daphnia).toHaveLength(2);
+    daphnia[1].position = { ...daphnia[0].position };
+    daphnia[0].velocity = { x: -12, y: 0 };
+    daphnia[1].velocity = { x: 12, y: 0 };
+    world.loadSaveData(save);
+
+    const internals = daphniaMotionInternals(world);
+    internals.stepAnimalMotion(0.1);
+
+    expect(internals.daphniaDephasedIds.size).toBe(0);
   });
 
   it('turns back into the water instead of remaining pinned to the glass', () => {

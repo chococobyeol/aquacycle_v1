@@ -1273,6 +1273,18 @@ const drawAnalysisOverlay = (
 const polygonPoints = (points: Vec2[]): number[] =>
   points.flatMap((point) => [point.x, point.y]);
 
+/**
+ * Pixi only destroys an owned GraphicsContext by default when destroy() is
+ * called without an options object. Passing `{ children: true }` down a
+ * display tree therefore destroys each Graphics wrapper but retains its
+ * vector instructions and renderer GPU data. Animals and carcasses turn over
+ * thousands of times in a long run, so those retained contexts eventually
+ * exhaust the Electron renderer heap.
+ */
+export const destroyDisplayTree = (container: Container): void => {
+  container.destroy({ children: true, context: true });
+};
+
 const usableStructureTexture = (textures: Map<string, Texture>, path: string): Texture | undefined => {
   const texture = textures.get(path);
   return texture && !texture.destroyed && !texture.source.destroyed ? texture : undefined;
@@ -1398,7 +1410,7 @@ const syncStructures = (
   for (const [id, display] of displays) {
     if (currentIds.has(id)) continue;
     layer.removeChild(display.container);
-    display.container.destroy({ children: true });
+    destroyDisplayTree(display.container);
     displays.delete(id);
   }
   for (const structure of structures) {
@@ -1411,7 +1423,7 @@ const syncStructures = (
     const textureBecameAvailable = Boolean(display && !display.sprite && texture);
     if (display && (spriteInvalid || textureBecameAvailable)) {
       layer.removeChild(display.container);
-      display.container.destroy({ children: true });
+      destroyDisplayTree(display.container);
       displays.delete(structure.id);
       display = undefined;
     }
@@ -2026,7 +2038,7 @@ const syncAnimalCarcasses = (
   for (const [id, display] of displays) {
     if (currentIds.has(id)) continue;
     layer.removeChild(display.container);
-    display.container.destroy({ children: true });
+    destroyDisplayTree(display.container);
     displays.delete(id);
   }
   for (const carcass of carcasses) {
@@ -2099,7 +2111,7 @@ const syncAnimals = (
     for (const [id, display] of displays) {
       if (currentIds.has(id)) continue;
       layer.removeChild(display.container);
-      display.container.destroy({ children: true });
+      destroyDisplayTree(display.container);
       displays.delete(id);
     }
   }
@@ -2122,7 +2134,7 @@ const syncAnimals = (
       )
     ) {
       layer.removeChild(display.container);
-      display.container.destroy({ children: true });
+      destroyDisplayTree(display.container);
       displays.delete(animal.id);
       display = undefined;
     }
@@ -3958,7 +3970,7 @@ export function AquariumCanvas({
       // invalidate textures owned by a newer React effect generation.
       app.destroy(
         { removeView: true, releaseGlobalResources: releaseGlobalResourcesOnDestroy },
-        { children: true },
+        { children: true, context: true },
       );
     };
 
@@ -4266,7 +4278,7 @@ export function AquariumCanvas({
         return;
       }
       for (const display of ownedDisplays.values()) {
-        display.container.destroy({ children: true });
+        destroyDisplayTree(display.container);
       }
       ownedDisplays.clear();
       layers.structures.removeChildren();
