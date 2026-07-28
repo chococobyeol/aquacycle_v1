@@ -15,6 +15,7 @@ import {
 import {
   continuousBodyMassMaintenance,
   daphniaSuspendedFoodResponse,
+  type DaphniaSuspendedFoodResponse,
   MICROBE_ECOLOGY_RULES,
   PLANKTON_ECOLOGY_RULES,
   WATER_CYCLE_RULES,
@@ -183,6 +184,12 @@ export class BiogeochemistryLedger {
     growthBiomass: 0,
     fixedCarbon: 0,
     oxygenDemand: 0,
+  };
+  private readonly daphniaFoodResponseScratch: DaphniaSuspendedFoodResponse = {
+    phytoplanktonPotential: 0,
+    bacterioplanktonPotential: 0,
+    combinedResponse: 0,
+    bacteriaShare: 0,
   };
   private readonly waterCellPoints = Array.from(
     { length: CELL_COUNT },
@@ -805,17 +812,21 @@ export class BiogeochemistryLedger {
       WATER_TRANSPORT_RULES.localDiffusionPerSecond.phytoplankton,
     );
     if (!this.individualDaphniaManaged) {
-      for (const field of [
+      this.transport.disperseConservativeField(
         this.daphniaJuveniles,
+        dt,
+        WATER_TRANSPORT_RULES.localDiffusionPerSecond.daphnia,
+      );
+      this.transport.disperseConservativeField(
         this.daphniaFounderAdults,
+        dt,
+        WATER_TRANSPORT_RULES.localDiffusionPerSecond.daphnia,
+      );
+      this.transport.disperseConservativeField(
         this.daphniaBornAdults,
-      ]) {
-        this.transport.disperseConservativeField(
-          field,
-          dt,
-          WATER_TRANSPORT_RULES.localDiffusionPerSecond.daphnia,
-        );
-      }
+        dt,
+        WATER_TRANSPORT_RULES.localDiffusionPerSecond.daphnia,
+      );
     }
     this.dissolvedAdvectionAccumulator += dt;
     if (this.dissolvedAdvectionAccumulator + 1e-9 >= 1) {
@@ -1447,12 +1458,12 @@ export class BiogeochemistryLedger {
           1,
         );
       const point = this.pointAtIndex(index);
-      const quality = this.sampleAt(point);
-      const mineralNitrogen = quality.toxicWaste + quality.nutrients;
+      const mineralNitrogen =
+        this.toxicWaste[index] + this.nutrients[index];
       const carbon = this.dissolvedInorganicCarbon[index];
       const waterClarity = Math.exp(
         -WATER_CYCLE_RULES.algae.organicLightAttenuation *
-          quality.organicMatter,
+          this.organicMatter[index],
       );
       const resource = Math.min(
         saturation(mineralNitrogen, rules.mineralNitrogenHalfSaturation),
@@ -1523,8 +1534,68 @@ export class BiogeochemistryLedger {
     }
   }
 
+  private maintainDaphniaField(
+    field: Float64Array,
+    index: number,
+    rate: number,
+    metabolicFactor: number,
+    deltaSeconds: number,
+  ): void {
+    const available = field[index] / CELL_COUNT;
+    const requested = Math.min(
+      available,
+      available * rate * metabolicFactor * deltaSeconds,
+    );
+    const respired = this.releaseRespiredBiomass(index, requested);
+    field[index] = finiteConcentration(field[index] - respired * CELL_COUNT);
+    this.stepDaphniaRespiration += respired;
+  }
+
+  private reproduceDaphniaField(
+    field: Float64Array,
+    index: number,
+    foodQuality: number,
+    deltaSeconds: number,
+    secondGeneration: boolean,
+  ): void {
+    const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+    const currentAdults = field[index] / CELL_COUNT;
+    const birth = currentAdults *
+      (1 - Math.exp(
+        -rules.reproductionAllocationPerSecond * foodQuality * deltaSeconds,
+      ));
+    if (birth <= 0) return;
+    field[index] -= birth * CELL_COUNT;
+    this.daphniaJuveniles[index] = finiteConcentration(
+      this.daphniaJuveniles[index] + birth * CELL_COUNT,
+    );
+    this.cumulativeDaphniaBirths += birth;
+    if (secondGeneration) this.cumulativeSecondGenerationBirths += birth;
+  }
+
+  private applyDaphniaFieldMortality(
+    field: Float64Array,
+    index: number,
+    mortalityRate: number,
+    deltaSeconds: number,
+  ): void {
+    const available = field[index] / CELL_COUNT;
+    const death = available * (1 - Math.exp(-mortalityRate * deltaSeconds));
+    if (death <= 0) return;
+    field[index] = finiteConcentration(field[index] - death * CELL_COUNT);
+    this.detritus[index] += death;
+    this.stepDaphniaMortality += death;
+    this.cumulativeDaphniaDeaths += death;
+  }
+
   private applyDaphniaReactions(deltaSeconds: number): void {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
+    const juvenileMaintenanceRate = continuousBodyMassMaintenance(
+      rules.representativeJuvenileBiomass,
+      rules.representativeAdultBiomass,
+      rules.adultMaintenancePerSecond,
+      rules.maintenanceMassExponent,
+    ) / rules.representativeJuvenileBiomass;
     for (let index = 0; index < CELL_COUNT; index += 1) {
       const juvenileMass = this.daphniaJuveniles[index] / CELL_COUNT;
       const founderMass = this.daphniaFounderAdults[index] / CELL_COUNT;
@@ -1544,16 +1615,14 @@ export class BiogeochemistryLedger {
 
       const phytoAvailable = this.phytoplankton[index] / CELL_COUNT;
       const bacteriaAvailable = this.planktonicDecomposer[index] / CELL_COUNT;
-      const {
-        combinedResponse,
-        bacteriaShare,
-      } = daphniaSuspendedFoodResponse(
+      const foodResponse = daphniaSuspendedFoodResponse(
         this.phytoplankton[index],
         this.planktonicDecomposer[index],
+        this.daphniaFoodResponseScratch,
       );
       const requestedFood = totalMass * rules.maximumFiltrationPerBiomassSecond *
-        combinedResponse * deltaSeconds;
-      const phytoRequested = requestedFood * (1 - bacteriaShare);
+        foodResponse.combinedResponse * deltaSeconds;
+      const phytoRequested = requestedFood * (1 - foodResponse.bacteriaShare);
       const bacteriaRequested = requestedFood - phytoRequested;
       const phytoConsumed = Math.min(phytoAvailable, phytoRequested);
       const bacteriaConsumed = Math.min(bacteriaAvailable, bacteriaRequested);
@@ -1602,29 +1671,27 @@ export class BiogeochemistryLedger {
 
       const temperature = this.temperatureAt(this.pointAtIndex(index));
       const metabolicFactor = thetaTemperatureFactor(temperature, 22, 1.07, 0.5, 1.7);
-      const maintenanceByField: Array<[Float64Array, number]> = [
-        [
-          this.daphniaJuveniles,
-          continuousBodyMassMaintenance(
-            rules.representativeJuvenileBiomass,
-            rules.representativeAdultBiomass,
-            rules.adultMaintenancePerSecond,
-            rules.maintenanceMassExponent,
-          ) / rules.representativeJuvenileBiomass,
-        ],
-        [this.daphniaFounderAdults, rules.adultMaintenancePerSecond],
-        [this.daphniaBornAdults, rules.adultMaintenancePerSecond],
-      ];
-      for (const [field, rate] of maintenanceByField) {
-        const available = field[index] / CELL_COUNT;
-        const requested = Math.min(
-          available,
-          available * rate * metabolicFactor * deltaSeconds,
-        );
-        const respired = this.releaseRespiredBiomass(index, requested);
-        field[index] = finiteConcentration(field[index] - respired * CELL_COUNT);
-        this.stepDaphniaRespiration += respired;
-      }
+      this.maintainDaphniaField(
+        this.daphniaJuveniles,
+        index,
+        juvenileMaintenanceRate,
+        metabolicFactor,
+        deltaSeconds,
+      );
+      this.maintainDaphniaField(
+        this.daphniaFounderAdults,
+        index,
+        rules.adultMaintenancePerSecond,
+        metabolicFactor,
+        deltaSeconds,
+      );
+      this.maintainDaphniaField(
+        this.daphniaBornAdults,
+        index,
+        rules.adultMaintenancePerSecond,
+        metabolicFactor,
+        deltaSeconds,
+      );
 
       const fullRation = totalMass * rules.maximumFiltrationPerBiomassSecond *
         deltaSeconds;
@@ -1655,33 +1722,30 @@ export class BiogeochemistryLedger {
       }
 
       if (foodQuality >= rules.minimumFoodQualityForReproduction) {
-        for (const [adultField, secondGeneration] of [
-          [this.daphniaFounderAdults, false],
-          [this.daphniaBornAdults, true],
-        ] as const) {
-          const currentAdults = adultField[index] / CELL_COUNT;
-          const birth = currentAdults *
-            (1 - Math.exp(
-              -rules.reproductionAllocationPerSecond * foodQuality * deltaSeconds,
-            ));
-          if (birth <= 0) continue;
-          adultField[index] -= birth * CELL_COUNT;
-          this.daphniaJuveniles[index] = finiteConcentration(
-            this.daphniaJuveniles[index] + birth * CELL_COUNT,
-          );
-          this.cumulativeDaphniaBirths += birth;
-          if (secondGeneration) this.cumulativeSecondGenerationBirths += birth;
-        }
+        this.reproduceDaphniaField(
+          this.daphniaFounderAdults,
+          index,
+          foodQuality,
+          deltaSeconds,
+          false,
+        );
+        this.reproduceDaphniaField(
+          this.daphniaBornAdults,
+          index,
+          foodQuality,
+          deltaSeconds,
+          true,
+        );
       }
 
-      const quality = this.sampleAt(this.pointAtIndex(index));
       const oxygenStress = clamp(
-        (rules.oxygenStressStart - quality.oxygen) / rules.oxygenStressStart,
+        (rules.oxygenStressStart - this.oxygen[index]) /
+          rules.oxygenStressStart,
         0,
         1,
       );
       const toxicityStress = clamp(
-        (quality.toxicWaste - rules.toxicWasteStressStart) /
+        (this.toxicWaste[index] - rules.toxicWasteStressStart) /
           Math.max(1, 24 - rules.toxicWasteStressStart),
         0,
         1,
@@ -1691,19 +1755,24 @@ export class BiogeochemistryLedger {
         rules.starvationMortalityPerSecond * starvation * starvation +
         0.008 * oxygenStress * oxygenStress +
         0.006 * toxicityStress * toxicityStress;
-      for (const field of [
+      this.applyDaphniaFieldMortality(
         this.daphniaJuveniles,
+        index,
+        mortalityRate,
+        deltaSeconds,
+      );
+      this.applyDaphniaFieldMortality(
         this.daphniaFounderAdults,
+        index,
+        mortalityRate,
+        deltaSeconds,
+      );
+      this.applyDaphniaFieldMortality(
         this.daphniaBornAdults,
-      ]) {
-        const available = field[index] / CELL_COUNT;
-        const death = available * (1 - Math.exp(-mortalityRate * deltaSeconds));
-        if (death <= 0) continue;
-        field[index] = finiteConcentration(field[index] - death * CELL_COUNT);
-        this.detritus[index] += death;
-        this.stepDaphniaMortality += death;
-        this.cumulativeDaphniaDeaths += death;
-      }
+        index,
+        mortalityRate,
+        deltaSeconds,
+      );
     }
   }
 
@@ -1754,7 +1823,10 @@ export class BiogeochemistryLedger {
       site.biofilm.nitrifier = clamp(site.biofilm.nitrifier, 0, 1);
       const index = this.indexAt(site.point);
 
-      for (const guildId of ['decomposer', 'nitrifier'] as const) {
+      for (let guildIndex = 0; guildIndex < 2; guildIndex += 1) {
+        const guildId: MicrobeGuildId = guildIndex === 0
+          ? 'decomposer'
+          : 'nitrifier';
         const biomass = site.biofilm[guildId];
         if (biomass <= 0) continue;
         const kinetics = MICROBE_ECOLOGY_RULES[guildId];

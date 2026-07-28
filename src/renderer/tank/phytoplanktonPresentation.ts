@@ -5,12 +5,6 @@ import {
   type Vec2,
 } from '../../simulation/types';
 
-export interface PhytoplanktonHazeMark extends Vec2 {
-  radiusX: number;
-  radiusY: number;
-  alpha: number;
-}
-
 export interface PhytoplanktonSpeckMark extends Vec2 {
   radius: number;
   alpha: number;
@@ -18,13 +12,12 @@ export interface PhytoplanktonSpeckMark extends Vec2 {
 }
 
 export interface PhytoplanktonVisualPlan {
-  haze: PhytoplanktonHazeMark[];
   specks: PhytoplanktonSpeckMark[];
 }
 
 const PARTICLE_CANDIDATES = 560;
-const HAZE_CANDIDATES = 96;
 const DISPLAY_CONCENTRATION = 8;
+export const PHYTOPLANKTON_BLOOM_COLOR = 0x67ad4c;
 
 const clamp = (value: number, minimum: number, maximum: number): number =>
   Math.max(minimum, Math.min(maximum, value));
@@ -77,32 +70,75 @@ const candidatePoint = (index: number, offset: number): Vec2 => ({
     hash01(index * 3.719 + offset * 1.37) * (GROUND_Y - WATER_TOP),
 });
 
+/**
+ * A single cell is microscopic and should not become a visible "organism".
+ * Dense populations instead tint the water as one continuous concentration
+ * field. The renderer linearly interpolates these per-cell alpha values.
+ */
+export const phytoplanktonBloomAlpha = (concentration: number): number => {
+  if (!Number.isFinite(concentration) || concentration < 0.04) return 0;
+  const strength = clamp(concentration / DISPLAY_CONCENTRATION, 0, 1);
+  return Math.pow(strength, 0.72) * 0.22;
+};
+
+export const smoothPhytoplanktonConcentration = (
+  values: readonly number[],
+  columns: number,
+  rows: number,
+  horizontal: Float64Array,
+  output: Float64Array,
+): void => {
+  const valueAt = (column: number, row: number): number =>
+    Math.max(0, values[row * columns + column] ?? 0);
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const left = Math.max(0, column - 1);
+      const right = Math.min(columns - 1, column + 1);
+      horizontal[row * columns + column] = (
+        valueAt(left, row) +
+        valueAt(column, row) * 2 +
+        valueAt(right, row)
+      ) / 4;
+    }
+  }
+  for (let row = 0; row < rows; row += 1) {
+    const top = Math.max(0, row - 1);
+    const bottom = Math.min(rows - 1, row + 1);
+    for (let column = 0; column < columns; column += 1) {
+      output[row * columns + column] = (
+        horizontal[top * columns + column] +
+        horizontal[row * columns + column] * 2 +
+        horizontal[bottom * columns + column]
+      ) / 4;
+    }
+  }
+};
+
+export const writePhytoplanktonBloomPixels = (
+  values: ArrayLike<number>,
+  pixels: Uint8Array,
+): boolean => {
+  const cellCount = Math.floor(pixels.length / 4);
+  let visible = false;
+  for (let index = 0; index < cellCount; index += 1) {
+    const alpha = phytoplanktonBloomAlpha(values[index] ?? 0);
+    const offset = index * 4;
+    pixels[offset] = (PHYTOPLANKTON_BLOOM_COLOR >> 16) & 0xff;
+    pixels[offset + 1] = (PHYTOPLANKTON_BLOOM_COLOR >> 8) & 0xff;
+    pixels[offset + 2] = PHYTOPLANKTON_BLOOM_COLOR & 0xff;
+    pixels[offset + 3] = Math.round(alpha * 255);
+    if (alpha > 0) visible = true;
+  }
+  return visible;
+};
+
 export const createPhytoplanktonVisualPlan = (
   values: readonly number[],
   columns: number,
   rows: number,
 ): PhytoplanktonVisualPlan => {
   if (columns <= 0 || rows <= 0 || values.length === 0) {
-    return { haze: [], specks: [] };
-  }
-
-  const haze: PhytoplanktonHazeMark[] = [];
-  for (let index = 0; index < HAZE_CANDIDATES; index += 1) {
-    const point = candidatePoint(index, 17.3);
-    const concentration = samplePhytoplanktonConcentration(
-      values,
-      columns,
-      rows,
-      point,
-    );
-    if (concentration < 0.04) continue;
-    const strength = clamp(concentration / DISPLAY_CONCENTRATION, 0, 1);
-    haze.push({
-      ...point,
-      radiusX: 32 + hash01(index * 5.13 + 41) * 54,
-      radiusY: 20 + hash01(index * 7.91 + 53) * 38,
-      alpha: 0.0015 + strength * 0.0045,
-    });
+    return { specks: [] };
   }
 
   const specks: PhytoplanktonSpeckMark[] = [];
@@ -129,5 +165,5 @@ export const createPhytoplanktonVisualPlan = (
     });
   }
 
-  return { haze, specks };
+  return { specks };
 };

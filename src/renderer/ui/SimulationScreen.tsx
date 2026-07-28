@@ -41,6 +41,7 @@ import type {
   SelectionFilter,
   ScenarioId,
   SimulationCommand,
+  SimulationSaveData,
   SimulationSnapshot,
   SpeciesId,
   StructureDefinitionId,
@@ -55,6 +56,10 @@ import {
   readFrozenAquariums,
   type FrozenAquariumRecord,
 } from '../storage/aquariumSaves';
+import {
+  PREPARE_MEMORY_RESTART_EVENT,
+  stageWarmRestartUiState,
+} from '../storage/warmRestart';
 import { AquariumCanvas, type AquariumCameraTransform } from '../tank/AquariumCanvas';
 import { createReusableMotionInterpolator } from '../tank/motionInterpolation';
 import {
@@ -87,6 +92,8 @@ import {
 
 interface SimulationScreenProps {
   scenarioId: ScenarioId;
+  initialSaveData?: SimulationSaveData;
+  initialUiState?: SimulationUiRestartState;
   onBack: () => void;
   onMissionComplete: (scenarioId: ScenarioId) => void;
 }
@@ -142,6 +149,31 @@ interface EcologyHistoryPoint {
   dissolvedInorganicCarbon: number;
   headspaceCarbonDioxide: number;
   headspaceOxygen: number;
+}
+
+export interface SimulationUiRestartState extends Record<string, unknown> {
+  activeTool: InteractionTool;
+  inventoryCategory: InventoryCategory;
+  catalogSpecies: SpeciesId | null;
+  catalogAnimal: AnimalSpeciesId | null;
+  waterQualityLayers: WaterQualityLayer[];
+  waterQualityMapVisible: boolean;
+  waterQualityLegendCollapsed: boolean;
+  openHudPanels: Record<HudPanelId, boolean>;
+  observationView: ObservationView;
+  openObservationSections: ObservationSection[];
+  detachedObservationSections: ObservationSection[];
+  detachedPanelLayouts: Partial<
+    Record<ObservationSection, DetachedPanelLayout>
+  >;
+  activeDetachedSection: ObservationSection | null;
+  rightPanelHeight: number | null;
+  saveVaultOpen: boolean;
+  saveName: string;
+  showGoalGuide: boolean;
+  cameraTransform: AquariumCameraTransform | null;
+  ecologyHistory: EcologyHistoryPoint[];
+  ecologyHistoryWindowSeconds: number;
 }
 
 type HudPanelId = 'menu' | 'inventory' | 'quest' | 'observation';
@@ -719,37 +751,80 @@ function StructureEditControls({
 
 export function SimulationScreen({
   scenarioId,
+  initialSaveData,
+  initialUiState,
   onBack,
   onMissionComplete,
 }: SimulationScreenProps) {
-  const { snapshot, motionSource, send, requestSave, loadSave } = useSimulation(scenarioId);
+  const { snapshot, motionSource, send, requestSave, loadSave } = useSimulation(
+    scenarioId,
+    initialSaveData,
+  );
   const scenario = SCENARIOS[scenarioId];
-  const [activeTool, setActiveTool] = useState<InteractionTool>('select');
-  const [inventoryCategory, setInventoryCategory] = useState<InventoryCategory>('structures');
-  const [catalogSpecies, setCatalogSpecies] = useState<SpeciesId | null>(null);
-  const [catalogAnimal, setCatalogAnimal] = useState<AnimalSpeciesId | null>(null);
+  const [activeTool, setActiveTool] = useState<InteractionTool>(
+    initialUiState?.activeTool ?? 'select',
+  );
+  const [inventoryCategory, setInventoryCategory] = useState<InventoryCategory>(
+    initialUiState?.inventoryCategory ?? 'structures',
+  );
+  const [catalogSpecies, setCatalogSpecies] = useState<SpeciesId | null>(
+    initialUiState?.catalogSpecies ?? null,
+  );
+  const [catalogAnimal, setCatalogAnimal] = useState<AnimalSpeciesId | null>(
+    initialUiState?.catalogAnimal ?? null,
+  );
   const [pendingInventory, setPendingInventory] = useState<PendingInventoryItem | null>(null);
-  const [waterQualityLayers, setWaterQualityLayers] = useState<WaterQualityLayer[]>(['organicMatter']);
-  const [waterQualityMapVisible, setWaterQualityMapVisible] = useState(false);
-  const [waterQualityLegendCollapsed, setWaterQualityLegendCollapsed] = useState(false);
+  const [waterQualityLayers, setWaterQualityLayers] = useState<WaterQualityLayer[]>(
+    initialUiState?.waterQualityLayers ?? ['organicMatter'],
+  );
+  const [waterQualityMapVisible, setWaterQualityMapVisible] = useState(
+    initialUiState?.waterQualityMapVisible ?? false,
+  );
+  const [waterQualityLegendCollapsed, setWaterQualityLegendCollapsed] = useState(
+    initialUiState?.waterQualityLegendCollapsed ?? false,
+  );
   const waterQualityLayer = waterQualityLayers[0] ?? null;
-  const [showMissionBriefing, setShowMissionBriefing] = useState(scenario.mode === 'challenge');
-  const [openHudPanels, setOpenHudPanels] = useState<Record<HudPanelId, boolean>>(closedHudPanels);
-  const [observationView, setObservationView] = useState<ObservationView>('overview');
-  const [openObservationSections, setOpenObservationSections] = useState<ObservationSection[]>(['ecology']);
-  const [detachedObservationSections, setDetachedObservationSections] = useState<ObservationSection[]>([]);
-  const [detachedPanelLayouts, setDetachedPanelLayouts] = useState<Partial<Record<ObservationSection, DetachedPanelLayout>>>({});
-  const [activeDetachedSection, setActiveDetachedSection] = useState<ObservationSection | null>(null);
+  const [showMissionBriefing, setShowMissionBriefing] = useState(
+    scenario.mode === 'challenge' && !initialSaveData,
+  );
+  const [openHudPanels, setOpenHudPanels] = useState<Record<HudPanelId, boolean>>(
+    initialUiState?.openHudPanels ?? closedHudPanels,
+  );
+  const [observationView, setObservationView] = useState<ObservationView>(
+    initialUiState?.observationView ?? 'overview',
+  );
+  const [openObservationSections, setOpenObservationSections] = useState<
+    ObservationSection[]
+  >(initialUiState?.openObservationSections ?? ['ecology']);
+  const [detachedObservationSections, setDetachedObservationSections] = useState<
+    ObservationSection[]
+  >(initialUiState?.detachedObservationSections ?? []);
+  const [detachedPanelLayouts, setDetachedPanelLayouts] = useState<
+    Partial<Record<ObservationSection, DetachedPanelLayout>>
+  >(initialUiState?.detachedPanelLayouts ?? {});
+  const [activeDetachedSection, setActiveDetachedSection] =
+    useState<ObservationSection | null>(
+      initialUiState?.activeDetachedSection ?? null,
+    );
   const [detachedPanelInteraction, setDetachedPanelInteraction] = useState<'move' | 'resize' | null>(null);
-  const [rightPanelHeight, setRightPanelHeight] = useState<number | null>(null);
+  const [rightPanelHeight, setRightPanelHeight] = useState<number | null>(
+    initialUiState?.rightPanelHeight ?? null,
+  );
   const [rightPanelResizing, setRightPanelResizing] = useState(false);
-  const [saveVaultOpen, setSaveVaultOpen] = useState(false);
+  const [saveVaultOpen, setSaveVaultOpen] = useState(
+    initialUiState?.saveVaultOpen ?? false,
+  );
   const [frozenAquariums, setFrozenAquariums] = useState<FrozenAquariumRecord[]>(readFrozenAquariums);
-  const [saveName, setSaveName] = useState('');
+  const [saveName, setSaveName] = useState(initialUiState?.saveName ?? '');
   const [saveBusy, setSaveBusy] = useState(false);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
-  const [showGoalGuide, setShowGoalGuide] = useState(false);
-  const [cameraTransform, setCameraTransform] = useState<AquariumCameraTransform | null>(null);
+  const [showGoalGuide, setShowGoalGuide] = useState(
+    initialUiState?.showGoalGuide ?? false,
+  );
+  const [cameraTransform, setCameraTransform] =
+    useState<AquariumCameraTransform | null>(
+      initialUiState?.cameraTransform ?? null,
+    );
   const [cameraResetToken, setCameraResetToken] = useState(0);
   const [pointer, setPointer] = useState({ x: 0, y: 0 });
   const completionReported = useRef(false);
@@ -772,9 +847,12 @@ export function SimulationScreen({
   const floatingInfoStackRef = useRef<HTMLElement | null>(null);
   const detachedPanelInteractionRef = useRef<DetachedPanelInteractionState | null>(null);
   const rightPanelResizeRef = useRef<RightPanelResizeState | null>(null);
-  const [ecologyHistory, setEcologyHistory] = useState<EcologyHistoryPoint[]>([]);
+  const [ecologyHistory, setEcologyHistory] = useState<EcologyHistoryPoint[]>(
+    initialUiState?.ecologyHistory ?? [],
+  );
   const [ecologyHistoryWindowSeconds, setEcologyHistoryWindowSeconds] = useState(
-    ECOLOGY_HISTORY_WINDOW_SECONDS,
+    initialUiState?.ecologyHistoryWindowSeconds ??
+      ECOLOGY_HISTORY_WINDOW_SECONDS,
   );
   pendingInventoryRef.current = pendingInventory;
 
@@ -829,40 +907,111 @@ export function SimulationScreen({
     completionReported.current = false;
     biofilmOverlayRestoreRef.current = null;
     biofilmPlacementWasActiveRef.current = false;
-    setActiveTool('select');
-    setInventoryCategory('structures');
-    setCatalogSpecies(null);
-    setCatalogAnimal(null);
+    setActiveTool(initialUiState?.activeTool ?? 'select');
+    setInventoryCategory(initialUiState?.inventoryCategory ?? 'structures');
+    setCatalogSpecies(initialUiState?.catalogSpecies ?? null);
+    setCatalogAnimal(initialUiState?.catalogAnimal ?? null);
     setPendingInventory(null);
-    setWaterQualityLayers(['organicMatter']);
-    setWaterQualityMapVisible(false);
-    setWaterQualityLegendCollapsed(false);
-    setOpenHudPanels(closedHudPanels());
-    setObservationView('overview');
+    setWaterQualityLayers(
+      initialUiState?.waterQualityLayers ?? ['organicMatter'],
+    );
+    setWaterQualityMapVisible(
+      initialUiState?.waterQualityMapVisible ?? false,
+    );
+    setWaterQualityLegendCollapsed(
+      initialUiState?.waterQualityLegendCollapsed ?? false,
+    );
+    setOpenHudPanels(initialUiState?.openHudPanels ?? closedHudPanels());
+    setObservationView(initialUiState?.observationView ?? 'overview');
     pinnedObservationView.current = null;
     observationScrollPositionRef.current = createObservationScrollPosition();
-    setOpenObservationSections(['ecology']);
-    setDetachedObservationSections([]);
-    setDetachedPanelLayouts({});
-    setActiveDetachedSection(null);
+    setOpenObservationSections(
+      initialUiState?.openObservationSections ?? ['ecology'],
+    );
+    setDetachedObservationSections(
+      initialUiState?.detachedObservationSections ?? [],
+    );
+    setDetachedPanelLayouts(initialUiState?.detachedPanelLayouts ?? {});
+    setActiveDetachedSection(initialUiState?.activeDetachedSection ?? null);
     setDetachedPanelInteraction(null);
-    setRightPanelHeight(null);
+    setRightPanelHeight(initialUiState?.rightPanelHeight ?? null);
     setRightPanelResizing(false);
     rightPanelResizeRef.current = null;
-    setSaveVaultOpen(false);
+    setSaveVaultOpen(initialUiState?.saveVaultOpen ?? false);
     setFrozenAquariums(readFrozenAquariums());
-    setSaveName('');
+    setSaveName(initialUiState?.saveName ?? '');
     setSaveBusy(false);
     setSaveNotice(null);
-    setShowGoalGuide(false);
-    setCameraTransform(null);
+    setShowGoalGuide(initialUiState?.showGoalGuide ?? false);
+    setCameraTransform(initialUiState?.cameraTransform ?? null);
     setCameraResetToken((current) => current + 1);
     resumeAfterBriefing.current = false;
-    setShowMissionBriefing(SCENARIOS[scenarioId].mode === 'challenge');
-    lastEcologySampleAt.current = Number.NEGATIVE_INFINITY;
-    setEcologyHistory([]);
-    setEcologyHistoryWindowSeconds(ECOLOGY_HISTORY_WINDOW_SECONDS);
-  }, [scenarioId]);
+    setShowMissionBriefing(
+      SCENARIOS[scenarioId].mode === 'challenge' && !initialSaveData,
+    );
+    const restoredHistory = initialUiState?.ecologyHistory ?? [];
+    lastEcologySampleAt.current =
+      restoredHistory.at(-1)?.elapsedSeconds ?? Number.NEGATIVE_INFINITY;
+    setEcologyHistory(restoredHistory);
+    setEcologyHistoryWindowSeconds(
+      initialUiState?.ecologyHistoryWindowSeconds ??
+        ECOLOGY_HISTORY_WINDOW_SECONDS,
+    );
+  }, [initialSaveData, initialUiState, scenarioId]);
+
+  useEffect(() => {
+    const stageCurrentUi = (): void => {
+      stageWarmRestartUiState({
+        activeTool,
+        inventoryCategory,
+        catalogSpecies,
+        catalogAnimal,
+        waterQualityLayers,
+        waterQualityMapVisible,
+        waterQualityLegendCollapsed,
+        openHudPanels,
+        observationView,
+        openObservationSections,
+        detachedObservationSections,
+        detachedPanelLayouts,
+        activeDetachedSection,
+        rightPanelHeight,
+        saveVaultOpen,
+        saveName,
+        showGoalGuide,
+        cameraTransform,
+        ecologyHistory,
+        ecologyHistoryWindowSeconds,
+      } satisfies SimulationUiRestartState);
+    };
+    window.addEventListener(PREPARE_MEMORY_RESTART_EVENT, stageCurrentUi);
+    return () =>
+      window.removeEventListener(
+        PREPARE_MEMORY_RESTART_EVENT,
+        stageCurrentUi,
+      );
+  }, [
+    activeDetachedSection,
+    activeTool,
+    cameraTransform,
+    catalogAnimal,
+    catalogSpecies,
+    detachedObservationSections,
+    detachedPanelLayouts,
+    ecologyHistory,
+    ecologyHistoryWindowSeconds,
+    inventoryCategory,
+    observationView,
+    openHudPanels,
+    openObservationSections,
+    rightPanelHeight,
+    saveName,
+    saveVaultOpen,
+    showGoalGuide,
+    waterQualityLayers,
+    waterQualityLegendCollapsed,
+    waterQualityMapVisible,
+  ]);
 
   useEffect(() => {
     const workspace = tankWorkspaceRef.current;

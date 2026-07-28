@@ -7,6 +7,8 @@ declare const MAIN_WINDOW_VITE_NAME: string;
 
 const RENDER_SAFETY_REPAINT_INTERVAL_MS = 15_000;
 const RUNTIME_LOG_MAX_BYTES = 256 * 1024;
+const SIMULATION_WORKER_RECYCLE_PRIVATE_MB = 320;
+const SIMULATION_WORKER_RECYCLE_COOLDOWN_MS = 2 * 60_000;
 
 interface RendererMemoryReport {
   privateKb: number;
@@ -97,17 +99,33 @@ const createMainWindow = (): BrowserWindow => {
     notifyRenderingVisibility(true);
     requestWindowRepaint(reason);
   };
+  let lastSimulationWorkerRecycleAt = Number.NEGATIVE_INFINITY;
   const recordRendererMemory = (
     event: Electron.IpcMainEvent,
     report: unknown,
   ): void => {
     if (event.sender !== window.webContents || !isRendererMemoryReport(report)) return;
+    const privateMb = report.privateKb / 1024;
     appendRuntimeDiagnostic(
       `renderer memory: pid=${window.webContents.getOSProcessId()} ` +
-      `privateMb=${(report.privateKb / 1024).toFixed(1)} ` +
+      `privateMb=${privateMb.toFixed(1)} ` +
       `heapUsedMb=${(report.heapUsedKb / 1024).toFixed(1)} ` +
       `heapTotalMb=${(report.heapTotalKb / 1024).toFixed(1)}`,
     );
+    if (
+      privateMb >= SIMULATION_WORKER_RECYCLE_PRIVATE_MB &&
+      Date.now() - lastSimulationWorkerRecycleAt >=
+        SIMULATION_WORKER_RECYCLE_COOLDOWN_MS
+    ) {
+      lastSimulationWorkerRecycleAt = Date.now();
+      appendRuntimeDiagnostic(
+        `simulation worker recycle requested: privateMb=${privateMb.toFixed(1)}`,
+      );
+      window.webContents.send(
+        'aquacycle:simulation-memory-pressure',
+        privateMb,
+      );
+    }
   };
   ipcMain.on('aquacycle:renderer-memory', recordRendererMemory);
 

@@ -585,15 +585,18 @@ export const PLANKTON_ECOLOGY_RULES = {
  * multiplying the bacterial response once for total intake and again for diet
  * share.
  */
-export const daphniaSuspendedFoodResponse = (
-  phytoplankton: number,
-  bacterioplankton: number,
-): {
+export interface DaphniaSuspendedFoodResponse {
   phytoplanktonPotential: number;
   bacterioplanktonPotential: number;
   combinedResponse: number;
   bacteriaShare: number;
-} => {
+}
+
+export const daphniaSuspendedFoodResponse = (
+  phytoplankton: number,
+  bacterioplankton: number,
+  reuse?: DaphniaSuspendedFoodResponse,
+): DaphniaSuspendedFoodResponse => {
   const rules = PLANKTON_ECOLOGY_RULES.daphnia;
   const safePhytoplankton = Math.max(0, phytoplankton);
   const safeBacterioplankton = Math.max(0, bacterioplankton);
@@ -621,14 +624,19 @@ export const daphniaSuspendedFoodResponse = (
     ) * rules.maximumBacteriaDietFraction;
   const totalPotential =
     phytoplanktonPotential + bacterioplanktonPotential;
-  return {
-    phytoplanktonPotential,
-    bacterioplanktonPotential,
-    combinedResponse: Math.min(1, totalPotential),
-    bacteriaShare: totalPotential <= 0
-      ? 0
-      : bacterioplanktonPotential / totalPotential,
+  const response = reuse ?? {
+    phytoplanktonPotential: 0,
+    bacterioplanktonPotential: 0,
+    combinedResponse: 0,
+    bacteriaShare: 0,
   };
+  response.phytoplanktonPotential = phytoplanktonPotential;
+  response.bacterioplanktonPotential = bacterioplanktonPotential;
+  response.combinedResponse = Math.min(1, totalPotential);
+  response.bacteriaShare = totalPotential <= 0
+    ? 0
+    : bacterioplanktonPotential / totalPotential;
+  return response;
 };
 
 /**

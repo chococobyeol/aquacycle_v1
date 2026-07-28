@@ -100,9 +100,13 @@ describe('renderer performance contracts', () => {
     const world = new SimulationWorld('laboratory');
     populateShrimp(world, 4);
     const ledger = (world as unknown as {
-      biogeochemistry: { sampleAt(point: Vec2): unknown };
+      biogeochemistry: {
+        oxygenAt(point: Vec2): number;
+        toxicWasteAt(point: Vec2): number;
+      };
     }).biogeochemistry;
-    const sampleAt = vi.spyOn(ledger, 'sampleAt');
+    const oxygenAt = vi.spyOn(ledger, 'oxygenAt');
+    const toxicWasteAt = vi.spyOn(ledger, 'toxicWasteAt');
 
     const first = world.motionTransportSnapshot();
     const animals = [...first.animals];
@@ -116,9 +120,11 @@ describe('renderer performance contracts', () => {
         expectCompleteMotionPose(animal);
       });
     }
-    expect(sampleAt).not.toHaveBeenCalled();
+    expect(oxygenAt).not.toHaveBeenCalled();
+    expect(toxicWasteAt).not.toHaveBeenCalled();
 
     world.motionSnapshot();
-    expect(sampleAt).toHaveBeenCalledTimes(4);
+    expect(oxygenAt).toHaveBeenCalledTimes(4);
+    expect(toxicWasteAt).toHaveBeenCalledTimes(4);
   });
 });

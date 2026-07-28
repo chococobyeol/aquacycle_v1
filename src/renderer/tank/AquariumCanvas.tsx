@@ -1,6 +1,7 @@
 import 'pixi.js/unsafe-eval';
 import {
   Application,
+  BufferImageSource,
   Container,
   Graphics,
   GraphicsContext,
@@ -101,7 +102,11 @@ import {
   type PelagicLayer,
   type WaterQualityLayer,
 } from './waterQualityOverlay';
-import { createPhytoplanktonVisualPlan } from './phytoplanktonPresentation';
+import {
+  createPhytoplanktonVisualPlan,
+  smoothPhytoplanktonConcentration,
+  writePhytoplanktonBloomPixels,
+} from './phytoplanktonPresentation';
 
 interface AquariumCanvasProps {
   snapshot: SimulationSnapshot;
@@ -361,7 +366,7 @@ interface AquariumLayers {
   foreground: Graphics;
   structures: Container;
   algae: Container;
-  analysis: Sprite;
+  analysis: Container;
   animals: Container;
   plantsBack: Graphics;
   plantsFront: Graphics;
@@ -379,15 +384,23 @@ interface AquariumLayers {
 interface RasterSurface {
   canvas: HTMLCanvasElement;
   context: CanvasRenderingContext2D;
+  pixels: Uint8Array;
+  source: BufferImageSource;
   texture: Texture;
 }
 
 const rasterSurfaces = new WeakMap<Sprite, RasterSurface>();
 
 interface PhytoplanktonSurface {
-  hazeTexture: Texture;
+  hazeSprite: Sprite;
+  hazePixels: Uint8Array;
+  hazeSource: BufferImageSource | null;
+  hazeTexture: Texture | null;
+  hazeColumns: number;
+  hazeRows: number;
+  hazeHorizontal: Float64Array;
+  hazeSmoothed: Float64Array;
   speckTexture: Texture;
-  hazeSprites: Sprite[];
   speckSprites: Sprite[];
 }
 
@@ -430,13 +443,56 @@ const createPhytoplanktonMarkTexture = (
 
 const createPhytoplanktonLayer = (): Container => {
   const layer = new Container();
+  const hazeSprite = new Sprite(Texture.EMPTY);
+  layer.addChild(hazeSprite);
   phytoplanktonSurfaces.set(layer, {
-    hazeTexture: createPhytoplanktonMarkTexture(64, true),
+    hazeSprite,
+    hazePixels: new Uint8Array(0),
+    hazeSource: null,
+    hazeTexture: null,
+    hazeColumns: 0,
+    hazeRows: 0,
+    hazeHorizontal: new Float64Array(0),
+    hazeSmoothed: new Float64Array(0),
     speckTexture: createPhytoplanktonMarkTexture(8, false),
-    hazeSprites: [],
     speckSprites: [],
   });
   return layer;
+};
+
+const ensurePhytoplanktonHazeSurface = (
+  surface: PhytoplanktonSurface,
+  columns: number,
+  rows: number,
+): void => {
+  if (
+    surface.hazeColumns === columns &&
+    surface.hazeRows === rows &&
+    surface.hazeSource &&
+    !surface.hazeSource.destroyed
+  ) return;
+
+  if (surface.hazeTexture && !surface.hazeTexture.destroyed) {
+    surface.hazeTexture.destroy(true);
+  }
+  surface.hazeColumns = columns;
+  surface.hazeRows = rows;
+  surface.hazePixels = new Uint8Array(columns * rows * 4);
+  surface.hazeHorizontal = new Float64Array(columns * rows);
+  surface.hazeSmoothed = new Float64Array(columns * rows);
+  surface.hazeSource = new BufferImageSource({
+    resource: surface.hazePixels,
+    width: columns,
+    height: rows,
+    format: 'rgba8unorm',
+    alphaMode: 'premultiply-alpha-on-upload',
+    autoGarbageCollect: false,
+  });
+  surface.hazeSource.scaleMode = 'linear';
+  surface.hazeTexture = new Texture({ source: surface.hazeSource });
+  surface.hazeSprite.texture = surface.hazeTexture;
+  surface.hazeSprite.position.set(0, WATER_TOP);
+  surface.hazeSprite.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
 };
 
 const releasePhytoplanktonLayer = (layer: Container): void => {
@@ -446,19 +502,18 @@ const releasePhytoplanktonLayer = (layer: Container): void => {
   for (const sprite of sprites) {
     sprite.destroy();
   }
-  if (!surface.hazeTexture.destroyed) surface.hazeTexture.destroy(true);
+  if (surface.hazeTexture && !surface.hazeTexture.destroyed) {
+    surface.hazeTexture.destroy(true);
+  }
   if (!surface.speckTexture.destroyed) surface.speckTexture.destroy(true);
-  surface.hazeSprites.length = 0;
+  surface.hazePixels = new Uint8Array(0);
+  surface.hazeHorizontal = new Float64Array(0);
+  surface.hazeSmoothed = new Float64Array(0);
+  surface.hazeSource = null;
   surface.speckSprites.length = 0;
   phytoplanktonSurfaces.delete(layer);
 };
 
-interface AnalysisGridSurface {
-  canvas: HTMLCanvasElement;
-  context: CanvasRenderingContext2D;
-}
-
-const analysisGridSurfaces = new WeakMap<Sprite, AnalysisGridSurface>();
 const reusableImageData = new WeakMap<CanvasRenderingContext2D, ImageData>();
 
 const getReusableImageData = (
@@ -476,7 +531,7 @@ const getReusableImageData = (
 const getRasterSurface = (layer: Sprite, width: number, height: number): RasterSurface | null => {
   const existing = rasterSurfaces.get(layer);
   if (existing && existing.canvas.width === width && existing.canvas.height === height &&
-    !existing.texture.destroyed && !existing.texture.source.destroyed) {
+    !existing.texture.destroyed && !existing.source.destroyed) {
     return existing;
   }
   if (existing && !existing.texture.destroyed) existing.texture.destroy(true);
@@ -484,14 +539,35 @@ const getRasterSurface = (layer: Sprite, width: number, height: number): RasterS
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
-  const context = canvas.getContext('2d');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
   if (!context) return null;
-  const texture = Texture.from(canvas);
-  texture.source.scaleMode = 'linear';
-  const surface = { canvas, context, texture };
+  const pixels = new Uint8Array(width * height * 4);
+  const source = new BufferImageSource({
+    resource: pixels,
+    width,
+    height,
+    format: 'rgba8unorm',
+    alphaMode: 'premultiply-alpha-on-upload',
+    autoGarbageCollect: false,
+  });
+  source.scaleMode = 'linear';
+  const texture = new Texture({ source });
+  const surface = { canvas, context, pixels, source, texture };
   rasterSurfaces.set(layer, surface);
   layer.texture = texture;
   return surface;
+};
+
+/**
+ * Uploads through Pixi's typed-buffer path, which uses texSubImage2D for an
+ * existing WebGL texture. Uploading the HTML canvas itself made Chromium keep
+ * one native backing-store generation per ecology snapshot on macOS.
+ */
+const uploadRasterSurface = (surface: RasterSurface): void => {
+  const { canvas, context, pixels, source } = surface;
+  const frame = context.getImageData(0, 0, canvas.width, canvas.height);
+  pixels.set(frame.data);
+  source.update();
 };
 
 const releaseRasterSurface = (layer: Sprite): void => {
@@ -500,27 +576,96 @@ const releaseRasterSurface = (layer: Sprite): void => {
   rasterSurfaces.delete(layer);
 };
 
-const getAnalysisGridSurface = (
-  layer: Sprite,
-  width: number,
-  height: number,
-): AnalysisGridSurface | null => {
-  const existing = analysisGridSurfaces.get(layer);
-  if (existing && existing.canvas.width === width && existing.canvas.height === height) {
-    return existing;
-  }
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext('2d');
-  if (!context) return null;
-  const surface = { canvas, context };
-  analysisGridSurfaces.set(layer, surface);
-  return surface;
+interface AnalysisSurface {
+  primary: Sprite;
+  details: Graphics;
+  pixels: Uint8Array;
+  source: BufferImageSource | null;
+  texture: Texture | null;
+  columns: number;
+  rows: number;
+}
+
+const analysisSurfaces = new WeakMap<Container, AnalysisSurface>();
+
+const createAnalysisLayer = (): Container => {
+  const layer = new Container();
+  const primary = new Sprite(Texture.EMPTY);
+  const details = new Graphics();
+  layer.addChild(primary, details);
+  analysisSurfaces.set(layer, {
+    primary,
+    details,
+    pixels: new Uint8Array(0),
+    source: null,
+    texture: null,
+    columns: 0,
+    rows: 0,
+  });
+  return layer;
 };
 
-const releaseAnalysisGridSurface = (layer: Sprite): void => {
-  analysisGridSurfaces.delete(layer);
+const ensureAnalysisPrimary = (
+  surface: AnalysisSurface,
+  columns: number,
+  rows: number,
+): void => {
+  if (
+    surface.columns === columns &&
+    surface.rows === rows &&
+    surface.source &&
+    !surface.source.destroyed
+  ) return;
+
+  if (surface.texture && !surface.texture.destroyed) {
+    surface.texture.destroy(true);
+  }
+  surface.columns = columns;
+  surface.rows = rows;
+  surface.pixels = new Uint8Array(columns * rows * 4);
+  surface.source = new BufferImageSource({
+    resource: surface.pixels,
+    width: columns,
+    height: rows,
+    format: 'rgba8unorm',
+    alphaMode: 'premultiply-alpha-on-upload',
+    autoGarbageCollect: false,
+  });
+  surface.source.scaleMode = 'linear';
+  surface.texture = new Texture({ source: surface.source });
+  surface.primary.texture = surface.texture;
+  surface.primary.position.set(0, 0);
+  surface.primary.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+};
+
+const writeAnalysisPixel = (
+  surface: AnalysisSurface,
+  index: number,
+  color: number,
+  alpha: number,
+): void => {
+  const offset = index * 4;
+  surface.pixels[offset] = (color >> 16) & 0xff;
+  surface.pixels[offset + 1] = (color >> 8) & 0xff;
+  surface.pixels[offset + 2] = color & 0xff;
+  surface.pixels[offset + 3] = Math.round(Math.max(0, Math.min(1, alpha)) * 255);
+};
+
+const publishAnalysisPrimary = (surface: AnalysisSurface): void => {
+  surface.source?.update();
+  surface.primary.visible = true;
+};
+
+const releaseAnalysisLayer = (layer: Container): void => {
+  const surface = analysisSurfaces.get(layer);
+  if (!surface) return;
+  if (surface.texture && !surface.texture.destroyed) {
+    surface.texture.destroy(true);
+  }
+  surface.primary.destroy();
+  surface.details.destroy({ context: true });
+  layer.removeChildren();
+  analysisSurfaces.delete(layer);
 };
 
 const rasterizeStructureTexture = async (
@@ -710,7 +855,7 @@ const drawLightField = (
   const { columns, rows, values } = snapshot.lightField;
   const surface = getRasterSurface(layer, columns, rows);
   if (!surface) return;
-  const { context, texture } = surface;
+  const { context } = surface;
   const pixels = getReusableImageData(context, columns, rows);
   for (let row = 0; row < rows; row += 1) {
     for (let column = 0; column < columns; column += 1) {
@@ -728,12 +873,10 @@ const drawLightField = (
     }
   }
   context.putImageData(pixels, 0, 0);
-  texture.source.update();
+  uploadRasterSurface(surface);
   layer.position.set(0, WATER_TOP);
   layer.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
 };
-
-const ANALYSIS_RASTER_SCALE = 0.5;
 
 const WATER_QUALITY_PALETTES: Record<WaterQualityVariable, {
   low: number;
@@ -751,9 +894,9 @@ const isMicrobeLayer = (
 
 const isPelagicLayer = (layer: WaterQualityLayer): layer is PelagicLayer =>
   layer === 'planktonicDecomposer' || layer === 'phytoplankton';
-const PELAGIC_PALETTES: Record<PelagicLayer, { low: number; high: number; contour: string }> = {
-  planktonicDecomposer: { low: 0xe2d8bd, high: 0x9b7449, contour: '#8a633f' },
-  phytoplankton: { low: 0xdce9c4, high: 0x4c8a4f, contour: '#3f7f48' },
+const PELAGIC_PALETTES: Record<PelagicLayer, { low: number; high: number; contour: number }> = {
+  planktonicDecomposer: { low: 0xe2d8bd, high: 0x9b7449, contour: 0x8a633f },
+  phytoplankton: { low: 0xdce9c4, high: 0x4c8a4f, contour: 0x3f7f48 },
 };
 
 const pelagicValues = (
@@ -763,11 +906,11 @@ const pelagicValues = (
   ? snapshot.biogeochemistry.water.planktonicDecomposer
   : snapshot.biogeochemistry.water.phytoplankton;
 
-const SECONDARY_WATER_COLORS: Record<WaterQualityVariable, string> = {
-  organicMatter: '#6f4c2f',
-  toxicWaste: '#c64358',
-  nutrients: '#5c914c',
-  oxygen: '#49a9c1',
+const SECONDARY_WATER_COLORS: Record<WaterQualityVariable, number> = {
+  organicMatter: 0x6f4c2f,
+  toxicWaste: 0xc64358,
+  nutrients: 0x5c914c,
+  oxygen: 0x49a9c1,
 };
 
 const WATER_QUALITY_DRAW_ORDER: readonly WaterQualityVariable[] = [
@@ -828,11 +971,11 @@ const contourCrossing = (
  * and avoids implying that a hatch direction is a biological property.
  */
 const drawWaterQualityContours = (
-  context: CanvasRenderingContext2D,
+  layer: Graphics,
   snapshot: SimulationSnapshot,
   selectedLayer: WaterQualityVariable,
-  rasterWidth: number,
-  rasterHeight: number,
+  width: number,
+  height: number,
 ): void => {
   const water = snapshot.biogeochemistry.water;
   if (water.columns < 2 || water.rows < 2) return;
@@ -841,25 +984,17 @@ const drawWaterQualityContours = (
   const normalizedValues = values.map((value) =>
     normalizeWaterQualityForDisplay(selectedLayer, value, visualRange));
   const pointAt = (column: number, row: number): ContourPoint => ({
-    x: ((column + 0.5) / water.columns) * rasterWidth,
-    y: ((row + 0.5) / water.rows) * rasterHeight,
+    x: ((column + 0.5) / water.columns) * width,
+    y: ((row + 0.5) / water.rows) * height,
   });
   const valueAt = (column: number, row: number): number =>
     normalizedValues[row * water.columns + column] ?? 0;
   const drawSegment = (first: ContourPoint, second: ContourPoint): void => {
-    context.moveTo(first.x, first.y);
-    context.lineTo(second.x, second.y);
+    layer.moveTo(first.x, first.y);
+    layer.lineTo(second.x, second.y);
   };
 
-  context.save();
-  context.strokeStyle = SECONDARY_WATER_COLORS[selectedLayer];
-  context.lineWidth = 1.15;
-  context.lineCap = 'round';
-  context.lineJoin = 'round';
   for (const [thresholdIndex, threshold] of [0.28, 0.52, 0.76].entries()) {
-    context.globalAlpha = 0.48 + thresholdIndex * 0.12;
-    context.setLineDash(thresholdIndex === 0 ? [3.5, 2.5] : []);
-    context.beginPath();
     for (let row = 0; row < water.rows - 1; row += 1) {
       for (let column = 0; column < water.columns - 1; column += 1) {
         const points = [
@@ -896,9 +1031,14 @@ const drawWaterQualityContours = (
         }
       }
     }
-    context.stroke();
+    layer.stroke({
+      color: SECONDARY_WATER_COLORS[selectedLayer],
+      width: 2.3,
+      alpha: 0.48 + thresholdIndex * 0.12,
+      cap: 'round',
+      join: 'round',
+    });
   }
-  context.restore();
 };
 
 /**
@@ -908,11 +1048,11 @@ const drawWaterQualityContours = (
  * every occupied cell into a cloud of particles.
  */
 const drawPelagicContours = (
-  context: CanvasRenderingContext2D,
+  layer: Graphics,
   snapshot: SimulationSnapshot,
   selectedLayer: PelagicLayer,
-  rasterWidth: number,
-  rasterHeight: number,
+  width: number,
+  height: number,
 ): void => {
   const water = snapshot.biogeochemistry.water;
   if (water.columns < 2 || water.rows < 2) return;
@@ -921,25 +1061,17 @@ const drawPelagicContours = (
   const normalizedValues = values.map((value) =>
     normalizePelagicForDisplay(value, displayMaximum));
   const pointAt = (column: number, row: number): ContourPoint => ({
-    x: ((column + 0.5) / water.columns) * rasterWidth,
-    y: ((row + 0.5) / water.rows) * rasterHeight,
+    x: ((column + 0.5) / water.columns) * width,
+    y: ((row + 0.5) / water.rows) * height,
   });
   const valueAt = (column: number, row: number): number =>
     normalizedValues[row * water.columns + column] ?? 0;
   const drawSegment = (first: ContourPoint, second: ContourPoint): void => {
-    context.moveTo(first.x, first.y);
-    context.lineTo(second.x, second.y);
+    layer.moveTo(first.x, first.y);
+    layer.lineTo(second.x, second.y);
   };
 
-  context.save();
-  context.strokeStyle = PELAGIC_PALETTES[selectedLayer].contour;
-  context.lineWidth = 1.35;
-  context.lineCap = 'round';
-  context.lineJoin = 'round';
   for (const [thresholdIndex, threshold] of [0.3, 0.58, 0.84].entries()) {
-    context.globalAlpha = 0.58 + thresholdIndex * 0.12;
-    context.setLineDash(thresholdIndex === 0 ? [4, 2.5] : []);
-    context.beginPath();
     for (let row = 0; row < water.rows - 1; row += 1) {
       for (let column = 0; column < water.columns - 1; column += 1) {
         const points = [
@@ -974,7 +1106,13 @@ const drawPelagicContours = (
         }
       }
     }
-    context.stroke();
+    layer.stroke({
+      color: PELAGIC_PALETTES[selectedLayer].contour,
+      width: 2.7,
+      alpha: 0.58 + thresholdIndex * 0.12,
+      cap: 'round',
+      join: 'round',
+    });
   }
 
   const peakCandidates: Array<{ column: number; row: number; value: number }> = [];
@@ -1016,23 +1154,21 @@ const drawPelagicContours = (
       Math.hypot(peak.column - candidate.column, peak.row - candidate.row) < 3.5)) continue;
     peaks.push(candidate);
   }
-  context.setLineDash([]);
-  context.globalAlpha = 0.82;
-  context.lineWidth = 1.15;
   for (const peak of peaks) {
     const point = pointAt(peak.column, peak.row);
-    context.beginPath();
-    context.arc(point.x, point.y, 1.4 + peak.value * 1.1, 0, Math.PI * 2);
-    context.stroke();
+    layer.circle(point.x, point.y, 2.8 + peak.value * 2.2).stroke({
+      color: PELAGIC_PALETTES[selectedLayer].contour,
+      width: 2.3,
+      alpha: 0.82,
+    });
   }
-  context.restore();
 };
 
 const drawTemperatureContours = (
-  context: CanvasRenderingContext2D,
+  layer: Graphics,
   snapshot: SimulationSnapshot,
-  rasterWidth: number,
-  rasterHeight: number,
+  width: number,
+  height: number,
 ): void => {
   const transport = snapshot.biogeochemistry.transport;
   if (transport.columns < 2 || transport.rows < 2) return;
@@ -1040,19 +1176,13 @@ const drawTemperatureContours = (
   const normalized = transport.temperature.map((value) =>
     Math.max(0, Math.min(1, (value - transport.minimumTemperature) / span)));
   const pointAt = (column: number, row: number): ContourPoint => ({
-    x: ((column + 0.5) / transport.columns) * rasterWidth,
-    y: ((row + 0.5) / transport.rows) * rasterHeight,
+    x: ((column + 0.5) / transport.columns) * width,
+    y: ((row + 0.5) / transport.rows) * height,
   });
   const valueAt = (column: number, row: number): number =>
     normalized[row * transport.columns + column] ?? 0;
 
-  context.save();
-  context.strokeStyle = '#d47c4d';
-  context.lineWidth = 1.25;
-  context.lineCap = 'round';
   for (const [thresholdIndex, threshold] of [0.3, 0.55, 0.8].entries()) {
-    context.globalAlpha = 0.52 + thresholdIndex * 0.13;
-    context.beginPath();
     for (let row = 0; row < transport.rows - 1; row += 1) {
       for (let column = 0; column < transport.columns - 1; column += 1) {
         const points = [
@@ -1074,35 +1204,33 @@ const drawTemperatureContours = (
           contourCrossing(points[3], points[0], samples[3], samples[0], threshold),
         ].filter((point): point is ContourPoint => Boolean(point));
         if (crossings.length === 2) {
-          context.moveTo(crossings[0].x, crossings[0].y);
-          context.lineTo(crossings[1].x, crossings[1].y);
+          layer.moveTo(crossings[0].x, crossings[0].y);
+          layer.lineTo(crossings[1].x, crossings[1].y);
         } else if (crossings.length === 4) {
-          context.moveTo(crossings[0].x, crossings[0].y);
-          context.lineTo(crossings[1].x, crossings[1].y);
-          context.moveTo(crossings[2].x, crossings[2].y);
-          context.lineTo(crossings[3].x, crossings[3].y);
+          layer.moveTo(crossings[0].x, crossings[0].y);
+          layer.lineTo(crossings[1].x, crossings[1].y);
+          layer.moveTo(crossings[2].x, crossings[2].y);
+          layer.lineTo(crossings[3].x, crossings[3].y);
         }
       }
     }
-    context.stroke();
+    layer.stroke({
+      color: 0xd47c4d,
+      width: 2.5,
+      alpha: 0.52 + thresholdIndex * 0.13,
+      cap: 'round',
+    });
   }
-  context.restore();
 };
 
 const drawFlowArrows = (
-  context: CanvasRenderingContext2D,
+  layer: Graphics,
   snapshot: SimulationSnapshot,
-  rasterWidth: number,
-  rasterHeight: number,
+  width: number,
+  height: number,
 ): void => {
   const transport = snapshot.biogeochemistry.transport;
   const maximumSpeed = Math.max(0.0001, transport.maximumSpeed);
-  context.save();
-  context.strokeStyle = '#d8f0e3';
-  context.fillStyle = '#d8f0e3';
-  context.lineWidth = 1.2;
-  context.lineCap = 'round';
-  context.globalAlpha = 0.76;
   // A 36×20 arrow at every other cell overwhelms the hand-drawn tank.  The
   // coarser visual sampling leaves the underlying temperature and organisms
   // readable while still exposing the circulation topology.
@@ -1114,44 +1242,40 @@ const drawFlowArrows = (
       const speed = Math.hypot(velocityX, velocityY);
       if (speed < maximumSpeed * 0.045 || speed < 0.0002) continue;
       const normalized = Math.min(1, speed / maximumSpeed);
-      const length = 2.8 + normalized * 7.5;
+      const length = 5.6 + normalized * 15;
       const directionX = velocityX / speed;
       const directionY = velocityY / speed;
-      const centerX = ((column + 0.5) / transport.columns) * rasterWidth;
-      const centerY = ((row + 0.5) / transport.rows) * rasterHeight;
+      const centerX = ((column + 0.5) / transport.columns) * width;
+      const centerY = ((row + 0.5) / transport.rows) * height;
       const endX = centerX + directionX * length;
       const endY = centerY + directionY * length;
-      context.beginPath();
-      context.moveTo(centerX - directionX * length * 0.34, centerY - directionY * length * 0.34);
-      context.lineTo(endX, endY);
-      context.stroke();
+      layer
+        .moveTo(
+          centerX - directionX * length * 0.34,
+          centerY - directionY * length * 0.34,
+        )
+        .lineTo(endX, endY)
+        .stroke({ color: 0xd8f0e3, width: 2.4, alpha: 0.76, cap: 'round' });
       const sideX = -directionY;
       const sideY = directionX;
-      context.beginPath();
-      context.moveTo(endX, endY);
-      context.lineTo(
-        endX - directionX * 2.8 + sideX * 1.8,
-        endY - directionY * 2.8 + sideY * 1.8,
-      );
-      context.lineTo(
-        endX - directionX * 2.8 - sideX * 1.8,
-        endY - directionY * 2.8 - sideY * 1.8,
-      );
-      context.closePath();
-      context.fill();
+      layer.poly([
+        endX,
+        endY,
+        endX - directionX * 5.6 + sideX * 3.6,
+        endY - directionY * 5.6 + sideY * 3.6,
+        endX - directionX * 5.6 - sideX * 3.6,
+        endY - directionY * 5.6 - sideY * 3.6,
+      ]).fill({ color: 0xd8f0e3, alpha: 0.76 });
     }
   }
-  context.restore();
 };
 
 const drawBiofilmStain = (
-  context: CanvasRenderingContext2D,
+  layer: Graphics,
   cell: SurfaceCellSnapshot,
   guildId: MicrobeGuildId,
   biomass: number,
   selected: boolean,
-  scaleX: number,
-  scaleY: number,
 ): void => {
   if (!Number.isFinite(biomass) || biomass < 0.001) return;
   // Observation mode must reveal a sparse film without making 1% coverage
@@ -1159,17 +1283,16 @@ const drawBiofilmStain = (
   // while preserving a truthful difference between 1%, 10% and 100%.
   const amount = Math.pow(Math.max(0, Math.min(1, biomass)), 0.68);
   const seed = stringHash(`${cell.id}:${guildId}`);
-  const centerX = cell.x * scaleX;
+  const centerX = cell.x;
   // Substrate cells sit exactly on the sediment boundary. Pull the stain a
   // little into the water so a newly inoculated film is not clipped or lost
   // among the gravel dots.
   const surfaceLift = cell.surfaceKind === 'substrate' ? cell.cellSize * 0.22 : 0;
-  const centerY = (cell.y - WATER_TOP - surfaceLift) * scaleY;
+  const centerY = cell.y - WATER_TOP - surfaceLift;
   const radius = cell.cellSize * (0.34 + amount * 0.52) * (selected ? 1.28 : 1);
   const color = selected
     ? guildId === 'decomposer' ? 0xc98246 : 0x49a49c
     : MICROBES[guildId].color;
-  context.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
 
   // Several overlapping, seeded washes read as a continuous natural stain.
   // Their centres deliberately cross cell boundaries so the ecology grid is
@@ -1180,31 +1303,26 @@ const drawBiofilmStain = (
     const offsetY = (hash01(seed + index * 61 + 23) - 0.5) * cell.cellSize * 0.72;
     const radiusX = radius * (0.58 + hash01(seed + index * 73 + 31) * 0.48);
     const radiusY = radius * (0.42 + hash01(seed + index * 89 + 43) * 0.44);
-    context.globalAlpha = selected
+    const alpha = selected
       ? 0.08 + amount * 0.72
       : 0.006 + amount * 0.017;
-    context.beginPath();
-    context.ellipse(
-      centerX + offsetX * scaleX,
-      centerY + offsetY * scaleY,
-      Math.max(0.5, radiusX * scaleX),
-      Math.max(0.4, radiusY * scaleY),
-      hash01(seed + index * 101 + 59) * Math.PI,
-      0,
-      Math.PI * 2,
-    );
-    context.fill();
+    layer.ellipse(
+      centerX + offsetX,
+      centerY + offsetY,
+      Math.max(1, radiusX),
+      Math.max(0.8, radiusY),
+    ).fill({ color, alpha });
   }
-  context.globalAlpha = 1;
 };
 
 /**
- * Draws the selected 36 x 20 dissolved field and both surface-attached films
- * into one independent raster. The light texture remains untouched, so
- * switching observation channels cannot disturb normal tank shading.
+ * Draws the selected 36 x 20 dissolved field through one tiny typed texture
+ * and uses retained Pixi geometry for contours, flow, and attached films.
+ * No full-tank canvas or ImageData generation is created while the simulation
+ * runs, so Chromium cannot retain one native raster backing store per sample.
  */
 export const drawAnalysisOverlay = (
-  layer: Sprite,
+  layer: Container,
   snapshot: SimulationSnapshot,
   selectedLayers: readonly WaterQualityLayer[],
 ): void => {
@@ -1212,13 +1330,12 @@ export const drawAnalysisOverlay = (
     layer.visible = false;
     return;
   }
-  const rasterWidth = Math.round(TANK_WIDTH * ANALYSIS_RASTER_SCALE);
-  const rasterHeight = Math.round((GROUND_Y - WATER_TOP) * ANALYSIS_RASTER_SCALE);
-  const surface = getRasterSurface(layer, rasterWidth, rasterHeight);
+  const surface = analysisSurfaces.get(layer);
   if (!surface) return;
-  const { context, texture } = surface;
-  context.setTransform(1, 0, 0, 1, 0, 0);
-  context.clearRect(0, 0, rasterWidth, rasterHeight);
+  const width = TANK_WIDTH;
+  const height = GROUND_Y - WATER_TOP;
+  surface.primary.visible = false;
+  surface.details.clear();
 
   const selectedWaterLayerSet = new Set(selectedLayers.filter(isDissolvedLayer));
   const selectedWaterLayers = WATER_QUALITY_DRAW_ORDER.filter((layerId) =>
@@ -1237,114 +1354,93 @@ export const drawAnalysisOverlay = (
   const flowSelected = selectedLayers.includes('flow');
   if (primaryWaterLayer) {
     const water = snapshot.biogeochemistry.water;
-    const grid = getAnalysisGridSurface(layer, water.columns, water.rows);
-    if (grid) {
-      const values = water[primaryWaterLayer];
-      const palette = WATER_QUALITY_PALETTES[primaryWaterLayer];
-      const visualRange = waterQualityVisualRange(primaryWaterLayer, values);
-      const pixels = getReusableImageData(grid.context, water.columns, water.rows);
-      for (let index = 0; index < water.columns * water.rows; index += 1) {
-        const value = values[index] ?? 0;
-        const normalized = normalizeWaterQualityForDisplay(
-          primaryWaterLayer,
-          value,
-          visualRange,
-        );
-        const color = primaryWaterLayer === 'oxygen' && value < 30
-          ? mixColor(0xc54b50, palette.low, value / 30)
-          : mixColor(palette.low, palette.high, normalized);
-        const offset = index * 4;
-        pixels.data[offset] = (color >> 16) & 0xff;
-        pixels.data[offset + 1] = (color >> 8) & 0xff;
-        pixels.data[offset + 2] = color & 0xff;
-        pixels.data[offset + 3] = Math.round(
-          waterQualityOverlayAlpha(primaryWaterLayer, value, normalized) * 255,
-        );
-      }
-      grid.context.putImageData(pixels, 0, 0);
-      context.imageSmoothingEnabled = true;
-      context.imageSmoothingQuality = 'high';
-      context.drawImage(grid.canvas, 0, 0, rasterWidth, rasterHeight);
+    ensureAnalysisPrimary(surface, water.columns, water.rows);
+    const values = water[primaryWaterLayer];
+    const palette = WATER_QUALITY_PALETTES[primaryWaterLayer];
+    const visualRange = waterQualityVisualRange(primaryWaterLayer, values);
+    for (let index = 0; index < water.columns * water.rows; index += 1) {
+      const value = values[index] ?? 0;
+      const normalized = normalizeWaterQualityForDisplay(
+        primaryWaterLayer,
+        value,
+        visualRange,
+      );
+      const color = primaryWaterLayer === 'oxygen' && value < 30
+        ? mixColor(0xc54b50, palette.low, value / 30)
+        : mixColor(palette.low, palette.high, normalized);
+      writeAnalysisPixel(
+        surface,
+        index,
+        color,
+        waterQualityOverlayAlpha(primaryWaterLayer, value, normalized),
+      );
     }
+    publishAnalysisPrimary(surface);
   }
 
   if (primaryPelagicLayer) {
     const water = snapshot.biogeochemistry.water;
-    const grid = getAnalysisGridSurface(layer, water.columns, water.rows);
-    if (grid) {
-      const values = pelagicValues(snapshot, primaryPelagicLayer);
-      const palette = PELAGIC_PALETTES[primaryPelagicLayer];
-      const displayMaximum = pelagicVisualMaximum(primaryPelagicLayer, values);
-      const pixels = getReusableImageData(grid.context, water.columns, water.rows);
-      for (let index = 0; index < water.columns * water.rows; index += 1) {
-        const value = Math.max(0, values[index] ?? 0);
-        const normalized = normalizePelagicForDisplay(value, displayMaximum);
-        const color = mixColor(palette.low, palette.high, normalized);
-        const offset = index * 4;
-        pixels.data[offset] = (color >> 16) & 0xff;
-        pixels.data[offset + 1] = (color >> 8) & 0xff;
-        pixels.data[offset + 2] = color & 0xff;
-        pixels.data[offset + 3] = Math.round(pelagicOverlayAlpha(normalized) * 255);
-      }
-      grid.context.putImageData(pixels, 0, 0);
-      context.imageSmoothingEnabled = true;
-      context.imageSmoothingQuality = 'high';
-      context.drawImage(grid.canvas, 0, 0, rasterWidth, rasterHeight);
+    ensureAnalysisPrimary(surface, water.columns, water.rows);
+    const values = pelagicValues(snapshot, primaryPelagicLayer);
+    const palette = PELAGIC_PALETTES[primaryPelagicLayer];
+    const displayMaximum = pelagicVisualMaximum(primaryPelagicLayer, values);
+    for (let index = 0; index < water.columns * water.rows; index += 1) {
+      const value = Math.max(0, values[index] ?? 0);
+      const normalized = normalizePelagicForDisplay(value, displayMaximum);
+      writeAnalysisPixel(
+        surface,
+        index,
+        mixColor(palette.low, palette.high, normalized),
+        pelagicOverlayAlpha(normalized),
+      );
     }
+    publishAnalysisPrimary(surface);
   }
 
   if (scalarLayerCount === 1 && temperatureSelected) {
     const transport = snapshot.biogeochemistry.transport;
-    const grid = getAnalysisGridSurface(layer, transport.columns, transport.rows);
-    if (grid) {
-      const span = Math.max(0.08, transport.maximumTemperature - transport.minimumTemperature);
-      const pixels = getReusableImageData(grid.context, transport.columns, transport.rows);
-      for (let index = 0; index < transport.columns * transport.rows; index += 1) {
-        const value = transport.temperature[index] ?? transport.averageTemperature;
-        const normalized = Math.max(
-          0,
-          Math.min(1, (value - transport.minimumTemperature) / span),
-        );
-        const color = mixColor(0x416f84, 0xd88852, normalized);
-        const offset = index * 4;
-        pixels.data[offset] = (color >> 16) & 0xff;
-        pixels.data[offset + 1] = (color >> 8) & 0xff;
-        pixels.data[offset + 2] = color & 0xff;
-        pixels.data[offset + 3] = Math.round((0.4 + normalized * 0.24) * 255);
-      }
-      grid.context.putImageData(pixels, 0, 0);
-      context.imageSmoothingEnabled = true;
-      context.imageSmoothingQuality = 'high';
-      context.drawImage(grid.canvas, 0, 0, rasterWidth, rasterHeight);
+    ensureAnalysisPrimary(surface, transport.columns, transport.rows);
+    const span = Math.max(0.08, transport.maximumTemperature - transport.minimumTemperature);
+    for (let index = 0; index < transport.columns * transport.rows; index += 1) {
+      const value = transport.temperature[index] ?? transport.averageTemperature;
+      const normalized = Math.max(
+        0,
+        Math.min(1, (value - transport.minimumTemperature) / span),
+      );
+      writeAnalysisPixel(
+        surface,
+        index,
+        mixColor(0x416f84, 0xd88852, normalized),
+        0.4 + normalized * 0.24,
+      );
     }
+    publishAnalysisPrimary(surface);
   }
 
   for (const contourLayer of scalarLayerCount > 1 ? selectedWaterLayers : []) {
     drawWaterQualityContours(
-      context,
+      surface.details,
       snapshot,
       contourLayer,
-      rasterWidth,
-      rasterHeight,
+      width,
+      height,
     );
   }
   for (const contourLayer of pelagicPlan.secondary) {
     drawPelagicContours(
-      context,
+      surface.details,
       snapshot,
       contourLayer,
-      rasterWidth,
-      rasterHeight,
+      width,
+      height,
     );
   }
   if (scalarLayerCount > 1 && temperatureSelected) {
-    drawTemperatureContours(context, snapshot, rasterWidth, rasterHeight);
+    drawTemperatureContours(surface.details, snapshot, width, height);
   }
-  if (flowSelected) drawFlowArrows(context, snapshot, rasterWidth, rasterHeight);
+  if (flowSelected) drawFlowArrows(surface.details, snapshot, width, height);
 
   const selectedGuilds = new Set(selectedLayers.filter(isMicrobeLayer));
-  const scaleX = rasterWidth / TANK_WIDTH;
-  const scaleY = rasterHeight / (GROUND_Y - WATER_TOP);
   let hasVisibleBiofilm = false;
   for (const cell of snapshot.cells) {
     if (cell.y < WATER_TOP - cell.cellSize || cell.y > GROUND_Y + cell.cellSize) continue;
@@ -1352,20 +1448,16 @@ export const drawAnalysisOverlay = (
       const biomass = cell.biofilm[guildId];
       if (biomass >= 0.001) hasVisibleBiofilm = true;
       drawBiofilmStain(
-        context,
+        surface.details,
         cell,
         guildId,
         biomass,
         selectedGuilds.has(guildId),
-        scaleX,
-        scaleY,
       );
     }
   }
 
-  texture.source.update();
   layer.position.set(0, WATER_TOP);
-  layer.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
   layer.visible = selectedLayers.length > 0 || hasVisibleBiofilm;
 };
 
@@ -2961,8 +3053,9 @@ const styleAlgaeDetailContext = (context: GraphicsContext): void => {
   context.batchMode = 'no-batch';
 };
 
-export const ALGAE_BRUSH_TEXTURE_SIZE = 64;
-export const ALGAE_BRUSH_SOFT_EDGE_PIXELS = 4;
+export const ALGAE_BRUSH_TEXTURE_SIZE = 96;
+export const ALGAE_BRUSH_MEMBRANE_RADIUS = 27;
+export const ALGAE_BRUSH_SOFT_EDGE_PIXELS = 10;
 
 const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement => {
   const size = ALGAE_BRUSH_TEXTURE_SIZE;
@@ -2984,7 +3077,8 @@ const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement =>
   // a much smaller footprint, so a colony looked like separated dark dots.
   const membranePoints = Array.from({ length: 18 }, (_, index) => {
     const angle = (index / 18) * Math.PI * 2;
-    const radius = 24 + hash01(index * 29 + (speciesId === 'oedogonium' ? 5 : 41)) * 3;
+    const radius = ALGAE_BRUSH_MEMBRANE_RADIUS - 3 +
+      hash01(index * 29 + (speciesId === 'oedogonium' ? 5 : 41)) * 3;
     return {
       x: center + Math.cos(angle) * radius,
       y: center + Math.sin(angle) * radius,
@@ -3148,8 +3242,10 @@ const syncAlgaeCellBrushSprite = (
   const jitterX = localJitterX * cosine - localJitterY * sine;
   const jitterY = localJitterX * sine + localJitterY * cosine;
   const radius = cell.cellSize * algaeParticleRadiusRatio(visualLevel);
-  const scaleX = radius / 27 * (0.94 + hash01(cellSeed + speciesOffset + 23) * 0.12);
-  const scaleY = radius / 27 * (0.94 + hash01(cellSeed + speciesOffset + 41) * 0.12);
+  const scaleX = radius / ALGAE_BRUSH_MEMBRANE_RADIUS *
+    (0.94 + hash01(cellSeed + speciesOffset + 23) * 0.12);
+  const scaleY = radius / ALGAE_BRUSH_MEMBRANE_RADIUS *
+    (0.94 + hash01(cellSeed + speciesOffset + 41) * 0.12);
 
   let sprite = layer.brushSprites.get(cell.id);
   if (!sprite) {
@@ -3634,30 +3730,26 @@ const drawPhytoplankton = (layer: Container, snapshot: SimulationSnapshot): void
     layer.visible = false;
     return;
   }
+  ensurePhytoplanktonHazeSurface(surface, water.columns, water.rows);
+  smoothPhytoplanktonConcentration(
+    water.phytoplankton,
+    water.columns,
+    water.rows,
+    surface.hazeHorizontal,
+    surface.hazeSmoothed,
+  );
+  const hazeVisible = writePhytoplanktonBloomPixels(
+    surface.hazeSmoothed,
+    surface.hazePixels,
+  );
+  surface.hazeSource?.update();
+  surface.hazeSprite.visible = hazeVisible;
+
   const plan = createPhytoplanktonVisualPlan(
     water.phytoplankton,
     water.columns,
     water.rows,
   );
-
-  for (let index = 0; index < plan.haze.length; index += 1) {
-    const mark = plan.haze[index];
-    const sprite = surface.hazeSprites[index] ?? new Sprite(surface.hazeTexture);
-    if (!surface.hazeSprites[index]) {
-      sprite.anchor.set(0.5);
-      sprite.tint = 0x729f5a;
-      surface.hazeSprites[index] = sprite;
-      layer.addChild(sprite);
-    }
-    sprite.position.set(mark.x, mark.y);
-    sprite.width = mark.radiusX * 2;
-    sprite.height = mark.radiusY * 2;
-    sprite.alpha = mark.alpha;
-    sprite.visible = true;
-  }
-  for (let index = plan.haze.length; index < surface.hazeSprites.length; index += 1) {
-    surface.hazeSprites[index].visible = false;
-  }
 
   for (let index = 0; index < plan.specks.length; index += 1) {
     const mark = plan.specks[index];
@@ -3678,7 +3770,7 @@ const drawPhytoplankton = (layer: Container, snapshot: SimulationSnapshot): void
     surface.speckSprites[index].visible = false;
   }
 
-  layer.visible = plan.haze.length > 0 || plan.specks.length > 0;
+  layer.visible = hazeVisible || plan.specks.length > 0;
 };
 
 const drawInteraction = (
@@ -4246,8 +4338,7 @@ export function AquariumCanvas({
       if (!ownedLayers) return;
       releaseRasterSurface(ownedLayers.light);
       releasePhytoplanktonLayer(ownedLayers.plankton);
-      releaseRasterSurface(ownedLayers.analysis);
-      releaseAnalysisGridSurface(ownedLayers.analysis);
+      releaseAnalysisLayer(ownedLayers.analysis);
       releaseAlgaeParticleLayer(ownedLayers.substrateAlgae);
       releaseAlgaeParticleLayer(ownedLayers.algae);
     };
@@ -4349,7 +4440,7 @@ export function AquariumCanvas({
         foreground: new Graphics(),
         structures: new Container(),
         algae: createAlgaeParticleLayer('structure-face'),
-        analysis: new Sprite(Texture.EMPTY),
+        analysis: createAnalysisLayer(),
         animals: new Container(),
         plantsBack: new Graphics(),
         plantsFront: new Graphics(),

@@ -2,7 +2,10 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   createPhytoplanktonVisualPlan,
+  phytoplanktonBloomAlpha,
   samplePhytoplanktonConcentration,
+  smoothPhytoplanktonConcentration,
+  writePhytoplanktonBloomPixels,
 } from '../src/renderer/tank/phytoplanktonPresentation';
 import {
   GROUND_Y,
@@ -64,7 +67,48 @@ describe('phytoplankton presentation', () => {
     expect(high.specks.length).toBeGreaterThan(low.specks.length * 2);
   });
 
-  it('updates pooled static marks without uploading a new canvas texture per snapshot', () => {
+  it('maps dense blooms to a stronger continuous water tint', () => {
+    const lowAlpha = phytoplanktonBloomAlpha(0.2);
+    const bloomAlpha = phytoplanktonBloomAlpha(8);
+    const bloom = createPhytoplanktonVisualPlan(
+      new Array(36 * 20).fill(8),
+      36,
+      20,
+    );
+
+    expect(phytoplanktonBloomAlpha(0.03)).toBe(0);
+    expect(bloomAlpha).toBeGreaterThan(0.2);
+    expect(bloomAlpha).toBeGreaterThan(lowAlpha * 10);
+    expect(Math.max(...bloom.specks.map((speck) => speck.radius)))
+      .toBeLessThan(1);
+  });
+
+  it('keeps the strongest haze at the concentration peak and only softens nearby cells', () => {
+    const columns = 5;
+    const rows = 5;
+    const values = new Array(columns * rows).fill(0);
+    const centre = 2 * columns + 2;
+    values[centre] = 16;
+    const horizontal = new Float64Array(values.length);
+    const smoothed = new Float64Array(values.length);
+    const pixels = new Uint8Array(values.length * 4);
+    smoothPhytoplanktonConcentration(
+      values,
+      columns,
+      rows,
+      horizontal,
+      smoothed,
+    );
+
+    expect(writePhytoplanktonBloomPixels(smoothed, pixels)).toBe(true);
+    expect(pixels[centre * 4 + 3])
+      .toBeGreaterThan(pixels[(centre - 1) * 4 + 3]);
+    expect(pixels[(centre - 1) * 4 + 3]).toBeGreaterThan(0);
+    expect(pixels[0 * 4 + 3]).toBe(0);
+    expect(pixels[(values.length - 1) * 4 + 3]).toBe(0);
+  });
+
+  it('updates one interpolated grid texture instead of stamping haze sprites', () => {
     const canvasSource = readFileSync(
       new URL('../src/renderer/tank/AquariumCanvas.tsx', import.meta.url),
       'utf8',
@@ -75,8 +119,9 @@ describe('phytoplankton presentation', () => {
     );
 
     expect(phytoplanktonBlock).toContain('surface.speckSprites');
-    expect(phytoplanktonBlock).toContain('surface.hazeSprites');
-    expect(phytoplanktonBlock).not.toContain('source.update()');
+    expect(phytoplanktonBlock).toContain('surface.hazePixels');
+    expect(phytoplanktonBlock).toContain('surface.hazeSource?.update()');
+    expect(phytoplanktonBlock).not.toContain('surface.hazeSprites');
     expect(phytoplanktonBlock).not.toContain('getRasterSurface');
   });
 });

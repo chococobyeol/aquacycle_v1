@@ -32,4 +32,15 @@ contextBridge.exposeInMainWorld('aquacycleDesktop', {
     ipcRenderer.on('aquacycle:rendering-visibility', handler);
     return () => ipcRenderer.removeListener('aquacycle:rendering-visibility', handler);
   },
+  onSimulationMemoryPressure: (listener: (privateMb: number) => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      privateMb: number,
+    ): void => {
+      listener(privateMb);
+    };
+    ipcRenderer.on('aquacycle:simulation-memory-pressure', handler);
+    return () =>
+      ipcRenderer.removeListener('aquacycle:simulation-memory-pressure', handler);
+  },
 });

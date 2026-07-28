@@ -49,7 +49,12 @@ describe('scalable observation panel layout', () => {
     expect(screenSource).toContain("waterQualityMapVisible ? '색 지도 끄기' : '색 지도 켜기'");
     expect(screenSource).toContain('aria-label="색 지도 닫기"');
     expect(styles).toContain('.tank-first-screen .tank-analysis-toolbar.is-collapsed');
-    expect(screenSource).toContain("useState<WaterQualityLayer[]>(['organicMatter'])");
+    expect(screenSource).toContain(
+      "initialUiState?.waterQualityLayers ?? ['organicMatter']",
+    );
+    expect(screenSource).toContain(
+      'initialUiState?.waterQualityMapVisible ?? false',
+    );
     expect(screenSource).not.toContain("setWaterQualityLayers((current) => current.length ? current : ['organicMatter'])");
     expect(observationToggleSource).not.toContain('setWaterQualityMapVisible(true)');
   });

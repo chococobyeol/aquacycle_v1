@@ -111,6 +111,7 @@ const publishMotionOverlay = (message: WorkerMotionMessage): void => {
     type: 'motion-overlay',
     sequence: message.sequence,
     sampledAtMs: message.sampledAtMs,
+    snapshotRevision: message.snapshotRevision,
     holding: message.holding,
     probe: message.probe,
   };
@@ -128,6 +129,7 @@ const flushPendingOversizedMotionFallback = (): void => {
     // `motionSnapshot` reads the pose now, not when the rejected binary sample
     // originally queued this trailing fallback.
     sampledAtMs: performance.now(),
+    snapshotRevision: reusableSnapshot?.revision ?? 0,
     ...reusableMotion,
   };
   pendingOversizedMotionSequence = 0;
@@ -172,6 +174,7 @@ const publishMotion = (): void => {
     type: 'motion',
     sequence: motionSequence += 1,
     sampledAtMs,
+    snapshotRevision: reusableSnapshot?.revision ?? 0,
     ...motion,
   };
   if (!binaryMotionTelemetry) {

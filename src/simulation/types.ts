@@ -782,6 +782,8 @@ export interface WorkerMotionMessage {
   sequence: number;
   /** `performance.now()` when the worker sampled the motion state. */
   sampledAtMs: number;
+  /** Full-snapshot revision that was authoritative for this motion sample. */
+  snapshotRevision: number;
   structures: StructureSnapshot[];
   animals: AnimalSnapshot[];
   holding: HoldingSnapshot | null;
@@ -793,6 +795,12 @@ export interface WorkerMotionOverlayMessage {
   /** Matches the binary motion sample whose pointer metadata this accompanies. */
   sequence: number;
   sampledAtMs: number;
+  /**
+   * Full-snapshot revision that was authoritative when this overlay was sampled.
+   * Separate shared channels may be polled in a different order, so the renderer
+   * uses this barrier to reject an old held-item pose after a newer drop snapshot.
+   */
+  snapshotRevision: number;
   holding: HoldingSnapshot | null;
   probe: ProbeSnapshot | null;
 }

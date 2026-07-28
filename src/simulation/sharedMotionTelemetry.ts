@@ -16,7 +16,8 @@ const CONTROL_MESSAGE_SEQUENCE = 3;
 const CONTROL_WORDS = 4;
 
 const HEADER_SAMPLED_AT_MS = 0;
-const HEADER_WORDS = 1;
+const HEADER_SNAPSHOT_REVISION = 1;
+const HEADER_WORDS = 2;
 const STRUCTURE_WORDS = 7;
 const ANIMAL_WORDS = 20;
 
@@ -108,6 +109,7 @@ export class SharedMotionWriter {
 
     Atomics.add(this.control, CONTROL_GENERATION, 1);
     this.payload[HEADER_SAMPLED_AT_MS] = message.sampledAtMs;
+    this.payload[HEADER_SNAPSHOT_REVISION] = message.snapshotRevision;
 
     let offset = HEADER_WORDS;
     for (let index = 0; index < message.structures.length; index += 1) {
@@ -203,6 +205,7 @@ const emptyMessage = (): WorkerMotionMessage => ({
   type: 'motion',
   sequence: 0,
   sampledAtMs: 0,
+  snapshotRevision: 0,
   structures: [],
   animals: [],
   holding: null,
@@ -257,6 +260,7 @@ export class SharedMotionReader {
     const animalIds = this.animalNumericIds[this.nextMessageIndex];
     target.sequence = Atomics.load(this.control, CONTROL_MESSAGE_SEQUENCE);
     target.sampledAtMs = this.payload[HEADER_SAMPLED_AT_MS];
+    target.snapshotRevision = this.payload[HEADER_SNAPSHOT_REVISION];
     target.holding = null;
     target.probe = null;
 

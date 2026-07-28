@@ -10,6 +10,7 @@ const motionMessage = (sequence: number, x: number): WorkerMotionMessage => ({
   type: 'motion',
   sequence,
   sampledAtMs: sequence * 33,
+  snapshotRevision: sequence + 100,
   structures: [{
     id: 'structure-7',
     definitionId: 'flat-stone',
@@ -64,6 +65,7 @@ describe('shared binary motion telemetry', () => {
     expect(writer.publish(motionMessage(1, 120))).toBe(true);
     const first = reader.readLatest();
     expect(first?.sequence).toBe(1);
+    expect(first?.snapshotRevision).toBe(101);
     expect(first?.structures[0]).toMatchObject({ id: 'structure-7', x: 130, y: 500 });
     expect(first?.animals[0]).toMatchObject({
       id: 'animal-23',

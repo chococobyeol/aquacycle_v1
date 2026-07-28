@@ -8,6 +8,7 @@ vi.hoisted(() => {
 });
 
 import {
+  ALGAE_BRUSH_MEMBRANE_RADIUS,
   ALGAE_BRUSH_SOFT_EDGE_PIXELS,
   ALGAE_BRUSH_TEXTURE_SIZE,
   ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL,
@@ -93,12 +94,20 @@ describe('algae visual refresh decisions', () => {
       .toBe(0);
   });
 
-  it('uses one immutable soft brush whose neighboring marks overlap the ecology grid', () => {
-    expect(ALGAE_BRUSH_TEXTURE_SIZE).toBeGreaterThanOrEqual(64);
-    expect(ALGAE_BRUSH_SOFT_EDGE_PIXELS).toBeGreaterThanOrEqual(4);
-    expect(
-      ALGAE_BRUSH_SOFT_EDGE_PIXELS / ALGAE_BRUSH_TEXTURE_SIZE,
-    ).toBeGreaterThanOrEqual(0.06);
+  it('keeps the immutable brush soft enough to bridge diagonal ecology-cell corners', () => {
+    const minimumVisibleRadius = algaeParticleRadiusRatio(1);
+    const worstDiagonalCenterDistance =
+      Math.SQRT2 * (1 + ALGAE_PARTICLE_JITTER_SPAN);
+    const softenedBrushDiameter = minimumVisibleRadius * 2 * (
+      1 + ALGAE_BRUSH_SOFT_EDGE_PIXELS / ALGAE_BRUSH_MEMBRANE_RADIUS
+    );
+    const transparentTextureMargin =
+      ALGAE_BRUSH_TEXTURE_SIZE / 2 - ALGAE_BRUSH_MEMBRANE_RADIUS;
+
+    expect(softenedBrushDiameter).toBeGreaterThan(worstDiagonalCenterDistance);
+    expect(transparentTextureMargin).toBeGreaterThan(
+      ALGAE_BRUSH_SOFT_EDGE_PIXELS,
+    );
   });
 
   it('regenerates species detail after extinction without flickering while alive', () => {

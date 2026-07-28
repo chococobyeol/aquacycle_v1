@@ -313,6 +313,21 @@ interface AnimalState {
   parentId?: string | null;
 }
 
+type ShrimpEnvironmentalDeathCause =
+  | 'hypoxia'
+  | 'toxicity'
+  | 'temperature'
+  | 'starvation';
+
+interface GrazingRequest {
+  animal: AnimalState;
+  cell: SurfaceCellState;
+  nitzschia: number;
+  oedogonium: number;
+  decomposer: number;
+  nitrifier: number;
+}
+
 interface AnimalCarcassState {
   id: string;
   sourceAnimalId: string;
@@ -637,6 +652,15 @@ const MAX_CROSS_SURFACE_NEIGHBORS = 4;
 const clamp = (value: number, min: number, max: number): number =>
   Math.max(min, Math.min(max, value));
 
+const continuousDepletionScale = (
+  available: number,
+  requested: number,
+): number => {
+  if (available <= 0 || requested <= 0) return 0;
+  const removed = available * -Math.expm1(-requested / available);
+  return removed / requested;
+};
+
 const distanceSquared = (a: Vec2, b: Vec2): number => {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
@@ -700,6 +724,14 @@ const deterministicStringSeed = (value: string): number => {
 
 const daphniaMotionSeed = (animalId: string): number =>
   deterministicStringSeed(`daphnia-motion-${animalId}`) * 0.001;
+
+const daphniaRoamingHeading = (
+  motionSeed: number,
+  segment: number,
+): number =>
+  deterministicNoise(
+    motionSeed * 0.071 + segment * 7.193 + 3.17,
+  ) * Math.PI * 2;
 
 const seededRange = (
   seed: number,
@@ -894,6 +926,13 @@ export class SimulationWorld {
   private readonly ecologyLivingAnimalsScratch: AnimalState[] = [];
   private readonly ecologyNewbornAnimalsScratch: AnimalState[] = [];
   private readonly ecologyEatenAnimalIdsScratch = new Set<string>();
+  private readonly shrimpMaintenanceRequestsScratch: number[] = [];
+  private readonly shrimpEnvironmentalDeathCausesScratch: Array<
+    ShrimpEnvironmentalDeathCause | null
+  > = [];
+  private readonly shrimpGrazingRequestsScratch: GrazingRequest[] = [];
+  private readonly shrimpGrazingRequestsByCellScratch =
+    new Map<string, GrazingRequest[]>();
   private readonly biofilmCellIndexByIdScratch = new Map<string, number>();
   private biofilmTransferSourceScratch = new Int32Array(0);
   private biofilmTransferReceiverScratch = new Int32Array(0);
@@ -4391,12 +4430,11 @@ export class SimulationWorld {
     const roamingTime = animal.ageSeconds / roamingPeriod + roamingPhase;
     const roamingSegment = Math.floor(roamingTime);
     const roamingBlend = roamingTime - roamingSegment;
-    const headingAt = (segment: number): number =>
-      deterministicNoise(
-        motionSeed * 0.071 + segment * 7.193 + 3.17,
-      ) * Math.PI * 2;
-    const firstHeading = headingAt(roamingSegment);
-    const nextHeading = headingAt(roamingSegment + 1);
+    const firstHeading = daphniaRoamingHeading(motionSeed, roamingSegment);
+    const nextHeading = daphniaRoamingHeading(
+      motionSeed,
+      roamingSegment + 1,
+    );
     const firstX = Math.cos(firstHeading);
     const firstY = Math.sin(firstHeading);
     const nextX = Math.cos(nextHeading);
@@ -5090,22 +5128,21 @@ export class SimulationWorld {
     if (!this.animals.length) return;
     const shrimpAnimals = this.collectAnimalSpecies('cherry-shrimp');
     if (!shrimpAnimals.length) return;
-    interface GrazingRequest {
-      animal: AnimalState;
-      cell: SurfaceCellState;
-      nitzschia: number;
-      oedogonium: number;
-      decomposer: number;
-      nitrifier: number;
-    }
-    const requestsByCell = new Map<string, GrazingRequest[]>();
-    const environmentalDeathCauses = new Map<
-      string,
-      'hypoxia' | 'toxicity' | 'temperature' | 'starvation'
-    >();
-    const maintenanceRequests = new Map<string, number>();
+    const requestsByCell = this.shrimpGrazingRequestsByCellScratch;
+    for (const requests of requestsByCell.values()) requests.length = 0;
+    const environmentalDeathCauses =
+      this.shrimpEnvironmentalDeathCausesScratch;
+    const maintenanceRequests = this.shrimpMaintenanceRequestsScratch;
+    environmentalDeathCauses.length = shrimpAnimals.length;
+    maintenanceRequests.length = shrimpAnimals.length;
 
-    for (const animal of shrimpAnimals) {
+    for (
+      let shrimpIndex = 0;
+      shrimpIndex < shrimpAnimals.length;
+      shrimpIndex += 1
+    ) {
+      const animal = shrimpAnimals[shrimpIndex];
+      environmentalDeathCauses[shrimpIndex] = null;
       animal.ageSeconds += deltaSeconds;
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
@@ -5150,27 +5187,28 @@ export class SimulationWorld {
       // Convert the former abstract energy cost into real animal biomass. The
       // conversion preserves the established food requirement because a bite's
       // assimilated fraction replenishes the same reserve that pays this cost.
-      maintenanceRequests.set(
-        animal.id,
-        (baseCost + activityCost) *
-          this.animalEnergyCapacity(animal) *
-          metabolicTemperatureFactor *
-          deltaSeconds,
-      );
+      maintenanceRequests[shrimpIndex] = (baseCost + activityCost) *
+        this.animalEnergyCapacity(animal) *
+        metabolicTemperatureFactor *
+        deltaSeconds;
 
-      const water = this.biogeochemistry.effectsEnabled
-        ? this.biogeochemistry.sampleAt(animal.position)
+      const localOxygen = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.oxygenAt(animal.position)
         : null;
-      const oxygenStress = water
+      const localToxicWaste = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.toxicWasteAt(animal.position)
+        : null;
+      const oxygenStress = localOxygen !== null
         ? clamp(
-          (SHRIMP_OXYGEN_STRESS_START - water.oxygen) / SHRIMP_OXYGEN_STRESS_START,
+          (SHRIMP_OXYGEN_STRESS_START - localOxygen) /
+            SHRIMP_OXYGEN_STRESS_START,
           0,
           1,
         )
         : 0;
-      const toxicStress = water
+      const toxicStress = localToxicWaste !== null
         ? clamp(
-          (water.toxicWaste - SHRIMP_TOXIC_STRESS_START) /
+          (localToxicWaste - SHRIMP_TOXIC_STRESS_START) /
             (SHRIMP_TOXIC_STRESS_FULL - SHRIMP_TOXIC_STRESS_START),
           0,
           1,
@@ -5223,16 +5261,14 @@ export class SimulationWorld {
           thermalStress,
           starvationStress,
         );
-        environmentalDeathCauses.set(
-          animal.id,
+        environmentalDeathCauses[shrimpIndex] =
           highestStress === thermalStress
             ? 'temperature'
             : highestStress === oxygenStress
               ? 'hypoxia'
               : highestStress === toxicStress
                 ? 'toxicity'
-                : 'starvation',
-        );
+                : 'starvation';
       }
 
       const target = animal.targetCellId ? this.cellById(animal.targetCellId) : undefined;
@@ -5270,52 +5306,55 @@ export class SimulationWorld {
                 ? 1
                 : algaeWeight / totalWeight;
             const biofilmShare = 1 - algaeShare;
-            const request: GrazingRequest = {
-              animal,
-              cell: target,
-              nitzschia: algaeWeight > 0
-                ? requested * algaeShare * (nitzschiaWeight / algaeWeight)
-                : 0,
-              oedogonium: algaeWeight > 0
-                ? requested * algaeShare * (oedogoniumWeight / algaeWeight)
-                : 0,
-              decomposer: biofilmWeight > 0
-                ? requested * biofilmShare *
-                  (decomposerWeight / biofilmWeight)
-                : 0,
-              nitrifier: biofilmWeight > 0
-                ? requested * biofilmShare *
-                  (nitrifierWeight / biofilmWeight)
-                : 0,
-            };
+            const request = this.shrimpGrazingRequestsScratch[shrimpIndex] ??
+              {} as GrazingRequest;
+            this.shrimpGrazingRequestsScratch[shrimpIndex] = request;
+            request.animal = animal;
+            request.cell = target;
+            request.nitzschia = algaeWeight > 0
+              ? requested * algaeShare * (nitzschiaWeight / algaeWeight)
+              : 0;
+            request.oedogonium = algaeWeight > 0
+              ? requested * algaeShare * (oedogoniumWeight / algaeWeight)
+              : 0;
+            request.decomposer = biofilmWeight > 0
+              ? requested * biofilmShare *
+                (decomposerWeight / biofilmWeight)
+              : 0;
+            request.nitrifier = biofilmWeight > 0
+              ? requested * biofilmShare *
+                (nitrifierWeight / biofilmWeight)
+              : 0;
             const requests = requestsByCell.get(target.id) ?? [];
             requests.push(request);
-            requestsByCell.set(target.id, requests);
+            if (!requestsByCell.has(target.id)) {
+              requestsByCell.set(target.id, requests);
+            }
           }
         }
       }
     }
 
     for (const requests of requestsByCell.values()) {
+      if (requests.length === 0) continue;
       const cell = requests[0].cell;
-      const totalNitzschia = requests.reduce((sum, request) => sum + request.nitzschia, 0);
-      const totalOedogonium = requests.reduce((sum, request) => sum + request.oedogonium, 0);
-      const totalDecomposer = requests.reduce((sum, request) => sum + request.decomposer, 0);
-      const totalNitrifier = requests.reduce((sum, request) => sum + request.nitrifier, 0);
+      let totalNitzschia = 0;
+      let totalOedogonium = 0;
+      let totalDecomposer = 0;
+      let totalNitrifier = 0;
+      for (let index = 0; index < requests.length; index += 1) {
+        const request = requests[index];
+        totalNitzschia += request.nitzschia;
+        totalOedogonium += request.oedogonium;
+        totalDecomposer += request.decomposer;
+        totalNitrifier += request.nitrifier;
+      }
       // Integrate simultaneous grazing as continuous depletion over the step.
       // `min(available, requested)` is an explicit-Euler clip: once several
       // consumers request more than a sparse patch contains it snaps the
       // producer to exact zero. B * (1 - exp(-R/B)) preserves the same demand
       // at small R, shares it proportionally, and lets density approach zero
       // continuously without inventing an inaccessible biomass refuge.
-      const continuousDepletionScale = (
-        available: number,
-        requested: number,
-      ): number => {
-        if (available <= 0 || requested <= 0) return 0;
-        const removed = available * -Math.expm1(-requested / available);
-        return removed / requested;
-      };
       const nitzschiaScale = totalNitzschia > 0
         ? continuousDepletionScale(
           Math.max(0, cell.biomass.nitzschia),
@@ -5400,14 +5439,19 @@ export class SimulationWorld {
     const living = this.ecologyLivingAnimalsScratch;
     newborns.length = 0;
     living.length = 0;
-    for (const animal of shrimpAnimals) {
+    for (
+      let shrimpIndex = 0;
+      shrimpIndex < shrimpAnimals.length;
+      shrimpIndex += 1
+    ) {
+      const animal = shrimpAnimals[shrimpIndex];
       const temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
       const reproductionTemperatureFactor = interpolateTemperatureResponse(
         temperatureProfile.reproductionCurve,
         temperature,
       );
-      const maintenanceRequest = maintenanceRequests.get(animal.id) ?? 0;
+      const maintenanceRequest = maintenanceRequests[shrimpIndex] ?? 0;
       const minimumStructure = this.animalMinimumViableStructure(animal);
       const availableForRespiration = animal.storedBiomass +
         Math.max(0, animal.structuralBiomass - minimumStructure);
@@ -5424,7 +5468,8 @@ export class SimulationWorld {
       animal.structuralBiomass -= structuralLoss;
       this.synchroniseAnimalEnergy(animal);
 
-      const environmentalDeathCause = environmentalDeathCauses.get(animal.id);
+      const environmentalDeathCause =
+        environmentalDeathCauses[shrimpIndex];
       if (environmentalDeathCause) {
         this.killAnimal(animal, environmentalDeathCause);
         continue;
@@ -6125,15 +6170,18 @@ export class SimulationWorld {
         );
       }
 
-      const quality = this.biogeochemistry.effectsEnabled
-        ? this.biogeochemistry.sampleAt(animal.position)
+      const localOxygen = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.oxygenAt(animal.position)
         : null;
-      const oxygenStress = quality
-        ? clamp((rules.oxygenStressStart - quality.oxygen) /
+      const localToxicWaste = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.toxicWasteAt(animal.position)
+        : null;
+      const oxygenStress = localOxygen !== null
+        ? clamp((rules.oxygenStressStart - localOxygen) /
           rules.oxygenStressStart, 0, 1)
         : 0;
-      const toxicityStress = quality
-        ? clamp((quality.toxicWaste - rules.toxicWasteStressStart) /
+      const toxicityStress = localToxicWaste !== null
+        ? clamp((localToxicWaste - rules.toxicWasteStressStart) /
           Math.max(1, 24 - rules.toxicWasteStressStart), 0, 1)
         : 0;
       const thermalSuitability = interpolateTemperatureResponse(
@@ -6242,19 +6290,23 @@ export class SimulationWorld {
         fish.reproductionCooldown - deltaSeconds * reproductionTemperatureFactor,
       );
 
-      const water = this.biogeochemistry.effectsEnabled
-        ? this.biogeochemistry.sampleAt(fish.position)
+      const localOxygen = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.oxygenAt(fish.position)
         : null;
-      const oxygenStress = water
+      const localToxicWaste = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.toxicWasteAt(fish.position)
+        : null;
+      const oxygenStress = localOxygen !== null
         ? clamp(
-          (rules.oxygenStressStart - water.oxygen) / rules.oxygenStressStart,
+          (rules.oxygenStressStart - localOxygen) /
+            rules.oxygenStressStart,
           0,
           1,
         )
         : 0;
-      const toxicStress = water
+      const toxicStress = localToxicWaste !== null
         ? clamp(
-          (water.toxicWaste - rules.toxicWasteStressStart) /
+          (localToxicWaste - rules.toxicWasteStressStart) /
             (rules.toxicWasteFullStress - rules.toxicWasteStressStart),
           0,
           1,
@@ -6322,8 +6374,12 @@ export class SimulationWorld {
 
       if (fish.lifeStage === 'egg') {
         const developmentFactor = reproductionTemperatureFactor *
-          (water ? clamp((water.oxygen - 12) / 28, 0, 1) : 1) *
-          (water ? clamp((14 - water.toxicWaste) / 10, 0, 1) : 1);
+          (localOxygen !== null
+            ? clamp((localOxygen - 12) / 28, 0, 1)
+            : 1) *
+          (localToxicWaste !== null
+            ? clamp((14 - localToxicWaste) / 10, 0, 1)
+            : 1);
         fish.incubationRemaining = Math.max(
           0,
           (fish.incubationRemaining ?? rules.eggIncubationSecondsAt25C) -
@@ -8626,11 +8682,12 @@ export class SimulationWorld {
             RICEFISH_ECOLOGY_RULES.eggIncubationSecondsAt25C,
         )
         : null;
-      const localWater = this.biogeochemistry.effectsEnabled
-        ? this.biogeochemistry.sampleAt(animal.position)
+      snapshot.oxygen = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.oxygenAt(animal.position)
         : null;
-      snapshot.oxygen = localWater?.oxygen ?? null;
-      snapshot.toxicWaste = localWater?.toxicWaste ?? null;
+      snapshot.toxicWaste = this.biogeochemistry.effectsEnabled
+        ? this.biogeochemistry.toxicWasteAt(animal.position)
+        : null;
       snapshot.temperature = this.biogeochemistry.temperatureAt(animal.position);
       const temperatureProfile = ANIMALS[animal.speciesId].temperature;
       snapshot.metabolicTemperatureFactor = thetaTemperatureFactor(

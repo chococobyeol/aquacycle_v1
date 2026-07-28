@@ -60,6 +60,25 @@ const materialTotals = (ledger: BiogeochemistryLedger) => {
 };
 
 describe('plankton food web', () => {
+  it('can reuse its high-frequency suspended-food response record', () => {
+    const reuse = {
+      phytoplanktonPotential: 0,
+      bacterioplanktonPotential: 0,
+      combinedResponse: 0,
+      bacteriaShare: 0,
+    };
+
+    expect(daphniaSuspendedFoodResponse(12, 4, reuse)).toBe(reuse);
+    expect(reuse.combinedResponse).toBeGreaterThan(0);
+    expect(daphniaSuspendedFoodResponse(0, 0, reuse)).toBe(reuse);
+    expect(reuse).toEqual({
+      phytoplanktonPotential: 0,
+      bacterioplanktonPotential: 0,
+      combinedResponse: 0,
+      bacteriaShare: 0,
+    });
+  });
+
   it('keeps both suspended-food requests first order at low density', () => {
     const componentRequests = (
       phytoplankton: number,

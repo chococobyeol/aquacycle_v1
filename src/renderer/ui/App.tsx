@@ -1,7 +1,14 @@
 import { useCallback, useState } from 'react';
 import type { ScenarioId } from '../../simulation/types';
+import {
+  takeWarmRestart,
+  takeWarmRestartUiState,
+} from '../storage/warmRestart';
 import { MISSION_IDS, MissionMenu } from './MissionMenu';
-import { SimulationScreen } from './SimulationScreen';
+import {
+  SimulationScreen,
+  type SimulationUiRestartState,
+} from './SimulationScreen';
 
 const LEGACY_PROGRESS_KEY = 'aquacycle.highest-unlocked-mission';
 const COMPLETED_MISSIONS_KEY = 'aquacycle.completed-missions';
@@ -33,7 +40,13 @@ const readCompletedMissions = (): MissionId[] => {
 };
 
 export function App() {
-  const [scenarioId, setScenarioId] = useState<ScenarioId | null>(null);
+  const [warmRestart] = useState(takeWarmRestart);
+  const [warmRestartUi] = useState(
+    takeWarmRestartUiState<SimulationUiRestartState>,
+  );
+  const [scenarioId, setScenarioId] = useState<ScenarioId | null>(
+    warmRestart?.scenarioId ?? null,
+  );
   const [completedMissions, setCompletedMissions] = useState<MissionId[]>(readCompletedMissions);
 
   const handleMissionComplete = useCallback((completedScenarioId: ScenarioId): void => {
@@ -55,6 +68,14 @@ export function App() {
     return (
       <SimulationScreen
         scenarioId={scenarioId}
+        initialSaveData={
+          warmRestart?.scenarioId === scenarioId ? warmRestart : undefined
+        }
+        initialUiState={
+          warmRestart?.scenarioId === scenarioId
+            ? warmRestartUi ?? undefined
+            : undefined
+        }
         onBack={() => setScenarioId(null)}
         onMissionComplete={handleMissionComplete}
       />

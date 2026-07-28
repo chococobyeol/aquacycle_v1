@@ -11,6 +11,10 @@
  * currently decoding.
  */
 
+// Full ecology snapshots can legitimately become large during population
+// blooms. Keep that growth inside a reusable fixed transport instead of
+// overflowing into once-per-second structured clones that make Chromium retain
+// additional V8 backing regions for the lifetime of the renderer.
 export const SHARED_TELEMETRY_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
 const CONTROL_SEQUENCE = 0;

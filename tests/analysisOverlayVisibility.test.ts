@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.hoisted(() => {
@@ -62,5 +63,30 @@ describe('analysis overlay visibility', () => {
 
     expect(layer.visible).toBe(false);
     expect(createElement).not.toHaveBeenCalled();
+  });
+
+  it('uses a tiny stable texture and retained geometry without full-tank canvas generations', () => {
+    const canvasSource = readFileSync(
+      new URL('../src/renderer/tank/AquariumCanvas.tsx', import.meta.url),
+      'utf8',
+    );
+    const analysisSurfaceBlock = canvasSource.slice(
+      canvasSource.indexOf('interface AnalysisSurface'),
+      canvasSource.indexOf('const rasterizeStructureTexture'),
+    );
+    const analysisDrawBlock = canvasSource.slice(
+      canvasSource.indexOf('export const drawAnalysisOverlay'),
+      canvasSource.indexOf('const polygonPoints'),
+    );
+
+    expect(analysisSurfaceBlock).toContain('new BufferImageSource');
+    expect(analysisSurfaceBlock).toContain('new Uint8Array(columns * rows * 4)');
+    expect(analysisSurfaceBlock).toContain('surface.details');
+    expect(analysisSurfaceBlock).not.toContain("document.createElement('canvas')");
+    expect(analysisDrawBlock).toContain('ensureAnalysisPrimary(surface');
+    expect(analysisDrawBlock).toContain('surface.details.clear()');
+    expect(analysisDrawBlock).not.toContain('getRasterSurface');
+    expect(analysisDrawBlock).not.toContain('getImageData');
+    expect(analysisDrawBlock).not.toContain('texture.source.update()');
   });
 });

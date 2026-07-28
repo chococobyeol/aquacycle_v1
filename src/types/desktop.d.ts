@@ -11,6 +11,9 @@ declare global {
       onRenderingVisibilityChange?: (
         listener: (visible: boolean) => void,
       ) => () => void;
+      onSimulationMemoryPressure?: (
+        listener: (privateMb: number) => void,
+      ) => () => void;
     };
   }
 }

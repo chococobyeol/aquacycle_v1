@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
   createSharedTelemetryChannel,
+  SHARED_TELEMETRY_PAYLOAD_BYTES,
   SharedTelemetryReader,
   SharedTelemetryWriter,
 } from '../src/simulation/sharedTelemetry';
 
 describe('bounded shared worker telemetry', () => {
+  it('reserves enough fixed space for legitimate population-bloom snapshots', () => {
+    expect(SHARED_TELEMETRY_PAYLOAD_BYTES).toBe(8 * 1024 * 1024);
+  });
+
   it('reuses three fixed publication slots while delivering the newest complete packet', () => {
     const channel = createSharedTelemetryChannel(4096);
     const writer = new SharedTelemetryWriter(channel);

@@ -91,4 +91,21 @@ describe('background simulation continuity', () => {
     expect(preloadSource).toContain('process.getProcessMemoryInfo()');
     expect(preloadSource).toContain('process.getHeapStatistics()');
   });
+
+  it('recycles only the simulation worker when memory is high', () => {
+    const mainSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/main.ts'),
+      'utf8',
+    );
+    const hookSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/renderer/hooks/useSimulation.ts'),
+      'utf8',
+    );
+    expect(mainSource).toContain('aquacycle:simulation-memory-pressure');
+    expect(mainSource).toContain('simulation worker recycle requested');
+    expect(mainSource).not.toContain('createMainWindow({ replacementFor: window })');
+    expect(mainSource).not.toContain('replacementFor.hide()');
+    expect(hookSource).toContain('previousWorker.terminate()');
+    expect(hookSource).toContain("type: 'load-save'");
+  });
 });

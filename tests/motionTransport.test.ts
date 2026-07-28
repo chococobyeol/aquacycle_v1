@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   commandRebasesMotion,
   createSimulationMotionStore,
+  shouldApplyInteractiveMotionOverlay,
 } from '../src/renderer/hooks/useSimulation';
 import {
   MOTION_SAMPLE_INTERVAL_MS,
@@ -24,6 +25,7 @@ const motionMessage = (sequence: number): WorkerMotionMessage => ({
   type: 'motion',
   sequence,
   sampledAtMs: sequence * MOTION_SAMPLE_INTERVAL_MS,
+  snapshotRevision: sequence,
   structures: [],
   animals: [],
   holding: null,
@@ -62,6 +64,12 @@ describe('simulation motion store', () => {
     expect(commandRebasesMotion({ type: 'cancel-held' })).toBe(false);
     expect(commandRebasesMotion({ type: 'retrieve-held' })).toBe(false);
     expect(commandRebasesMotion({ type: 'remove-held-structure' })).toBe(false);
+  });
+
+  it('rejects a held-item overlay older than the completed placement snapshot', () => {
+    expect(shouldApplyInteractiveMotionOverlay(41, 42)).toBe(false);
+    expect(shouldApplyInteractiveMotionOverlay(42, 42)).toBe(true);
+    expect(shouldApplyInteractiveMotionOverlay(43, 42)).toBe(true);
   });
 });
 
@@ -152,6 +160,7 @@ describe('simulation worker motion cadence', () => {
     const overlay = messages.find((message) => message.type === 'motion-overlay');
     expect(overlay).toMatchObject({
       type: 'motion-overlay',
+      snapshotRevision: expect.any(Number),
       holding: { kind: 'animal' },
     });
     expect(overlay).not.toHaveProperty('animals');

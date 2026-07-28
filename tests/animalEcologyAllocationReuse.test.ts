@@ -38,14 +38,34 @@ describe('animal ecology allocation reuse', () => {
       ecologyLivingAnimalsScratch: unknown[];
       ecologyNewbornAnimalsScratch: unknown[];
       ecologyEatenAnimalIdsScratch: Set<string>;
+      shrimpMaintenanceRequestsScratch: number[];
+      shrimpEnvironmentalDeathCausesScratch: Array<string | null>;
+      shrimpGrazingRequestsScratch: unknown[];
+      shrimpGrazingRequestsByCellScratch: Map<string, unknown[]>;
     };
     const ownedPopulation = internals.animals;
+    const ownedMaintenance = internals.shrimpMaintenanceRequestsScratch;
+    const ownedDeathCauses = internals.shrimpEnvironmentalDeathCausesScratch;
+    const ownedGrazingRequests = internals.shrimpGrazingRequestsScratch;
+    const ownedRequestsByCell = internals.shrimpGrazingRequestsByCellScratch;
 
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 64 });
     for (let tick = 0; tick < 80; tick += 1) {
       world.tick(0.1);
       expect(internals.animals).toBe(ownedPopulation);
+      expect(internals.shrimpMaintenanceRequestsScratch).toBe(
+        ownedMaintenance,
+      );
+      expect(internals.shrimpEnvironmentalDeathCausesScratch).toBe(
+        ownedDeathCauses,
+      );
+      expect(internals.shrimpGrazingRequestsScratch).toBe(
+        ownedGrazingRequests,
+      );
+      expect(internals.shrimpGrazingRequestsByCellScratch).toBe(
+        ownedRequestsByCell,
+      );
     }
 
     expect(world.snapshot().elapsedSeconds).toBeGreaterThan(400);
