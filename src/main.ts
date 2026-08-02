@@ -1,14 +1,23 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { app, BrowserWindow, ipcMain, screen, session, shell } from 'electron';
+import {
+  createRendererMemoryGuardState,
+  evaluateRendererMemoryGuard,
+  MEMORY_RECOVERY_COOLDOWN_MS,
+} from './runtimeMemoryGuard';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
 
 const RENDER_SAFETY_REPAINT_INTERVAL_MS = 15_000;
 const RUNTIME_LOG_MAX_BYTES = 256 * 1024;
-const SIMULATION_WORKER_RECYCLE_PRIVATE_MB = 320;
-const SIMULATION_WORKER_RECYCLE_COOLDOWN_MS = 2 * 60_000;
+const MEMORY_RECOVERY_PREPARE_TIMEOUT_MS = 20_000;
+const MEMORY_RECOVERY_MINIMUM_LOADING_MS = 900;
+const MEMORY_RECOVERY_CAPTURE_TIMEOUT_MS = 1_200;
+let lastMemoryRecoveryAt = Number.NEGATIVE_INFINITY;
+const intentionalRendererRestarts = new WeakSet<Electron.WebContents>();
 
 interface RendererMemoryReport {
   privateKb: number;
@@ -34,6 +43,158 @@ const appendRuntimeDiagnostic = (message: string): void => {
     fs.appendFileSync(logPath, `${new Date().toISOString()} ${message}\n`, 'utf8');
   } catch {
     // Diagnostics must never interfere with launching or recovering the game.
+  }
+};
+
+const createRecoveryWindow = (
+  bounds: Electron.Rectangle,
+  capturedFrameDataUrl: string | null,
+  parent: BrowserWindow,
+): BrowserWindow => {
+  const recoveryWindow = new BrowserWindow({
+    ...bounds,
+    parent,
+    frame: false,
+    resizable: false,
+    movable: false,
+    focusable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    backgroundColor: '#3f858b',
+    show: false,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  const markup = `<!doctype html>
+    <html lang="ko">
+      <meta charset="utf-8">
+      <title>AquaCycle · 아쿠아사이클</title>
+      <style>
+        html,body{width:100%;height:100%;margin:0}
+        body{display:grid;place-items:center;overflow:hidden;background:#3f858b;color:#344f4d;
+          font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif}
+        img{position:fixed;inset:0;width:100%;height:100%;object-fit:fill}
+        main{position:relative;padding:28px 32px 25px;border:3px solid #466863;
+          border-radius:18px 14px 20px 15px;background:#f5f1df;
+          box-shadow:7px 9px 0 rgba(52,79,77,.18);text-align:center}
+        i{display:block;width:42px;height:42px;margin:0 auto 18px;border:5px solid #b7cbc2;
+          border-top-color:#4f7f78;border-radius:50%;animation:spin .8s linear infinite}
+        strong{display:block;font-size:18px}
+        p{margin:8px 0 0;color:#607873;font-size:13px}
+        @keyframes spin{to{transform:rotate(360deg)}}
+      </style>
+      <body>${capturedFrameDataUrl
+        ? `<img src="${capturedFrameDataUrl}" alt="">`
+        : ''}<main role="status" aria-live="assertive"><i></i>
+        <strong>수조 상태를 안전하게 정리하고 있습니다…</strong>
+        <p>잠시 후 같은 지점부터 자동으로 계속됩니다.</p>
+      </main></body>
+    </html>`;
+  void recoveryWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(markup)}`);
+  recoveryWindow.once('ready-to-show', () => recoveryWindow.showInactive());
+  return recoveryWindow;
+};
+
+const reloadMainRenderer = async (
+  window: BrowserWindow,
+  onComplete: (success: boolean) => void,
+): Promise<void> => {
+  if (window.isDestroyed()) return;
+  const bounds = window.getContentBounds();
+  let capturedFrameDataUrl: string | null = null;
+  let captureTimeout: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const capturedFrame = await Promise.race([
+      window.webContents.capturePage().catch(() => null),
+      new Promise<null>((resolve) => {
+        captureTimeout = setTimeout(
+          () => resolve(null),
+          MEMORY_RECOVERY_CAPTURE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    if (captureTimeout !== null) clearTimeout(captureTimeout);
+    if (capturedFrame && !capturedFrame.isEmpty()) {
+      capturedFrameDataUrl = capturedFrame.toDataURL();
+    } else {
+      appendRuntimeDiagnostic('memory recovery: last-frame capture unavailable');
+    }
+  } catch {
+    appendRuntimeDiagnostic('memory recovery: failed to capture the last aquarium frame');
+  } finally {
+    if (captureTimeout !== null) clearTimeout(captureTimeout);
+  }
+  if (window.isDestroyed()) return;
+  const recoveryWindow = createRecoveryWindow(
+    bounds,
+    capturedFrameDataUrl,
+    window,
+  );
+
+  let finished = false;
+  let readyTimeout: ReturnType<typeof setTimeout> | null = null;
+  const finish = (success: boolean): void => {
+    if (finished) return;
+    finished = true;
+    if (readyTimeout !== null) clearTimeout(readyTimeout);
+    ipcMain.removeListener('aquacycle:renderer-ready', receiveRendererReady);
+    if (!recoveryWindow.isDestroyed()) recoveryWindow.destroy();
+    appendRuntimeDiagnostic(
+      success
+        ? 'memory recovery: renderer restored in the existing window'
+        : 'memory recovery: renderer reload timed out',
+    );
+    onComplete(success);
+  };
+  const receiveRendererReady = (event: Electron.IpcMainEvent): void => {
+    if (event.sender !== window.webContents) return;
+    finish(true);
+  };
+  const reload = (): void => {
+    if (window.isDestroyed()) {
+      finish(false);
+      return;
+    }
+    appendRuntimeDiagnostic('memory recovery: recycling renderer process');
+    ipcMain.on('aquacycle:renderer-ready', receiveRendererReady);
+    readyTimeout = setTimeout(
+      () => finish(false),
+      MEMORY_RECOVERY_PREPARE_TIMEOUT_MS,
+    );
+    setTimeout(() => {
+      if (window.isDestroyed()) {
+        finish(false);
+        return;
+      }
+      const restartAfterExit = (): void => {
+        setTimeout(() => {
+          if (!window.isDestroyed()) window.webContents.reload();
+        }, 50);
+      };
+      window.webContents.once('render-process-gone', restartAfterExit);
+      intentionalRendererRestarts.add(window.webContents);
+      try {
+        // A normal reload keeps Chromium's renderer process and its native
+        // allocator high-water mark. Recycle only that process while the
+        // unchanged native window is covered by the captured aquarium frame.
+        window.webContents.forcefullyCrashRenderer();
+      } catch {
+        window.webContents.removeListener(
+          'render-process-gone',
+          restartAfterExit,
+        );
+        intentionalRendererRestarts.delete(window.webContents);
+        window.webContents.reload();
+      }
+    }, MEMORY_RECOVERY_MINIMUM_LOADING_MS);
+  };
+  if (recoveryWindow.webContents.isLoading()) {
+    recoveryWindow.webContents.once('did-finish-load', reload);
+  } else {
+    reload();
   }
 };
 
@@ -79,6 +240,11 @@ const createMainWindow = (): BrowserWindow => {
     );
   }
 
+  const receiveRendererReady = (event: Electron.IpcMainEvent): void => {
+    if (event.sender !== window.webContents) return;
+    appendRuntimeDiagnostic('renderer reported first complete aquarium frame');
+  };
+  ipcMain.on('aquacycle:renderer-ready', receiveRendererReady);
   window.once('ready-to-show', () => window.show());
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://')) void shell.openExternal(url);
@@ -99,7 +265,9 @@ const createMainWindow = (): BrowserWindow => {
     notifyRenderingVisibility(true);
     requestWindowRepaint(reason);
   };
-  let lastSimulationWorkerRecycleAt = Number.NEGATIVE_INFINITY;
+  const memoryGuard = createRendererMemoryGuardState();
+  let memoryRecoveryInProgress = false;
+  let memoryRecoveryTimeout: ReturnType<typeof setTimeout> | null = null;
   const recordRendererMemory = (
     event: Electron.IpcMainEvent,
     report: unknown,
@@ -112,22 +280,62 @@ const createMainWindow = (): BrowserWindow => {
       `heapUsedMb=${(report.heapUsedKb / 1024).toFixed(1)} ` +
       `heapTotalMb=${(report.heapTotalKb / 1024).toFixed(1)}`,
     );
+    const now = Date.now();
+    const recoveryAllowed =
+      !memoryRecoveryInProgress &&
+      now - lastMemoryRecoveryAt >= MEMORY_RECOVERY_COOLDOWN_MS;
+    const decision = evaluateRendererMemoryGuard(
+      memoryGuard,
+      privateMb,
+      os.totalmem(),
+      recoveryAllowed,
+    );
+    if (!decision.shouldRecover) return;
+
+    memoryRecoveryInProgress = true;
+    lastMemoryRecoveryAt = now;
+    appendRuntimeDiagnostic(
+      `memory recovery requested: privateMb=${privateMb.toFixed(1)} ` +
+      `growthMb=${decision.growthMb.toFixed(1)} ` +
+      `thresholdMb=${decision.thresholdMb.toFixed(1)}`,
+    );
+    window.webContents.send('aquacycle:prepare-memory-recovery', {
+      privateMb,
+      thresholdMb: decision.thresholdMb,
+    });
+    memoryRecoveryTimeout = setTimeout(() => {
+      memoryRecoveryTimeout = null;
+      memoryRecoveryInProgress = false;
+      appendRuntimeDiagnostic('memory recovery: renderer did not prepare a checkpoint');
+    }, MEMORY_RECOVERY_PREPARE_TIMEOUT_MS);
+  };
+  const finishMemoryRecovery = (
+    event: Electron.IpcMainEvent,
+    success: unknown,
+  ): void => {
     if (
-      privateMb >= SIMULATION_WORKER_RECYCLE_PRIVATE_MB &&
-      Date.now() - lastSimulationWorkerRecycleAt >=
-        SIMULATION_WORKER_RECYCLE_COOLDOWN_MS
-    ) {
-      lastSimulationWorkerRecycleAt = Date.now();
-      appendRuntimeDiagnostic(
-        `simulation worker recycle requested: privateMb=${privateMb.toFixed(1)}`,
-      );
-      window.webContents.send(
-        'aquacycle:simulation-memory-pressure',
-        privateMb,
-      );
+      event.sender !== window.webContents ||
+      !memoryRecoveryInProgress ||
+      typeof success !== 'boolean'
+    ) return;
+    if (memoryRecoveryTimeout !== null) {
+      clearTimeout(memoryRecoveryTimeout);
+      memoryRecoveryTimeout = null;
     }
+    if (!success) {
+      memoryRecoveryInProgress = false;
+      appendRuntimeDiagnostic('memory recovery: checkpoint preparation failed');
+      return;
+    }
+    appendRuntimeDiagnostic('memory recovery: checkpoint prepared');
+    void reloadMainRenderer(window, () => {
+      memoryRecoveryInProgress = false;
+      memoryGuard.minimumPrivateMb = Number.POSITIVE_INFINITY;
+      memoryGuard.recentPrivateMb.length = 0;
+    });
   };
   ipcMain.on('aquacycle:renderer-memory', recordRendererMemory);
+  ipcMain.on('aquacycle:memory-recovery-ready', finishMemoryRecovery);
 
   window.on('minimize', () => notifyRenderingVisibility(false));
   window.on('hide', () => notifyRenderingVisibility(false));
@@ -151,6 +359,11 @@ const createMainWindow = (): BrowserWindow => {
     appendRuntimeDiagnostic(
       `renderer process gone: reason=${details.reason} exitCode=${details.exitCode}`,
     );
+    if (intentionalRendererRestarts.has(window.webContents)) {
+      intentionalRendererRestarts.delete(window.webContents);
+      appendRuntimeDiagnostic('memory recovery: old renderer process released');
+      return;
+    }
     if (details.reason === 'clean-exit') return;
     // Once Chromium has terminated the renderer, repaint requests cannot
     // revive it—the BrowserWindow remains as a blank native surface. Start a
@@ -175,7 +388,13 @@ const createMainWindow = (): BrowserWindow => {
   repaintTimer.unref();
   window.once('closed', () => {
     clearInterval(repaintTimer);
+    if (memoryRecoveryTimeout !== null) clearTimeout(memoryRecoveryTimeout);
     ipcMain.removeListener('aquacycle:renderer-memory', recordRendererMemory);
+    ipcMain.removeListener(
+      'aquacycle:memory-recovery-ready',
+      finishMemoryRecovery,
+    );
+    ipcMain.removeListener('aquacycle:renderer-ready', receiveRendererReady);
   });
 
   return window;

@@ -28,7 +28,10 @@ import {
   writeAnimalCarcassVisualSnapshot,
   type AnimalCarcassVisualSnapshot,
 } from '../../simulation/animalPresentation';
-import type { SimulationMotionSource } from '../hooks/useSimulation';
+import type {
+  SimulationMotionFrame,
+  SimulationMotionSource,
+} from '../hooks/useSimulation';
 import {
   GROUND_Y,
   TANK_HEIGHT,
@@ -58,14 +61,17 @@ import {
 } from '../../simulation/vallisneriaGeometry';
 import {
   canPanTankCamera,
+  cameraStateFromStoredTransform,
   clampTankInteractionPoint,
   coverTankScale,
   fitTankZoom,
+  freshTankCameraState,
   minimumTankZoom,
   isScreenDrag,
   isTankInteractionPoint,
   shouldStartCameraPan,
   tankCameraCenterBounds,
+  wheelZoomTarget,
 } from './cameraInteraction';
 import {
   CAMERA_SCENE_CENTER_X,
@@ -84,12 +90,22 @@ import {
   TANK_GLASS_RIGHT,
   TANK_GLASS_TOP,
   TANK_VISUAL_WATER_TOP,
+  createTankVisualGeometry,
+  type TankVisualGeometry,
 } from './tankVisualGeometry';
 import {
   createReusableMotionInterpolator,
   reconcileMotionWithSnapshot,
 } from './motionInterpolation';
 import { BoundedReusePool } from './boundedReusePool';
+import {
+  RICEFISH_BITE_DURATION_SECONDS,
+  RICEFISH_SWIM_RATE_MULTIPLIER,
+  ricefishConsumedFood,
+  ricefishMouthGape,
+  ricefishSideSwingPose,
+  ricefishSwimPose,
+} from './ricefishAnimation';
 import {
   normalizeWaterQualityForDisplay,
   normalizePelagicForDisplay,
@@ -107,6 +123,12 @@ import {
   smoothPhytoplanktonConcentration,
   writePhytoplanktonBloomPixels,
 } from './phytoplanktonPresentation';
+import {
+  ALGAE_DENSITY_SATURATION_BIOMASS,
+  ALGAE_DENSITY_FIELD_SCALE,
+  ALGAE_RENDER_TRACE_BIOMASS,
+  writeAlgaeDensityPixels,
+} from './algaeDensityPresentation';
 
 interface AquariumCanvasProps {
   snapshot: SimulationSnapshot;
@@ -122,6 +144,7 @@ interface AquariumCanvasProps {
   onToolComplete: (completedTool: InteractionTool) => void;
   onClearSelection: () => void;
   onCameraChange?: (transform: AquariumCameraTransform) => void;
+  initialCameraTransform?: AquariumCameraTransform | null;
   cameraResetToken?: number;
   showGoalGuide?: boolean;
   waterQualityLayers: readonly WaterQualityLayer[];
@@ -148,7 +171,13 @@ const CAMERA_BUTTON_STEP = 1.28;
 const CAMERA_EPSILON = 0.001;
 const ALGAE_RASTER_FAST_REFRESH_MS = 250;
 const ALGAE_RASTER_HIGH_SPEED_REFRESH_MS = 500;
-const ALGAE_VISUAL_LEVEL_COUNT = 24;
+export const ALGAE_VISUAL_LEVEL_COUNT = 32;
+// A cell is an ecological sample area, not one giant algal individual.
+// Perceptual (logarithmic) density makes a real, thin new colony readable
+// without painting biomass into cells where the simulation has none. Values
+// above the supplied inoculum remain distinguishable so grazing a mature patch
+// can still visibly thin it.
+export const ALGAE_VISUAL_SATURATION_BIOMASS = 0.72;
 export const ALGAE_PARTICLE_JITTER_SPAN = 0.35;
 
 /**
@@ -158,8 +187,13 @@ export const ALGAE_PARTICLE_JITTER_SPAN = 0.35;
  * visual bucket lets a settled tank reuse its existing density texture.
  */
 export const algaeVisualLevel = (amount: number): number => {
-  if (!Number.isFinite(amount) || amount <= ALGAE_VISIBLE_BIOMASS) return 0;
-  const visible = Math.sqrt(Math.max(0, Math.min(1, amount)));
+  if (!Number.isFinite(amount) || amount <= ALGAE_RENDER_TRACE_BIOMASS) return 0;
+  const normalized = Math.max(0, Math.min(
+    1,
+    (amount - ALGAE_RENDER_TRACE_BIOMASS) /
+      (ALGAE_VISUAL_SATURATION_BIOMASS - ALGAE_RENDER_TRACE_BIOMASS),
+  ));
+  const visible = Math.log1p(normalized * 31) / Math.log(32);
   return Math.max(1, Math.min(
     ALGAE_VISUAL_LEVEL_COUNT,
     Math.round(visible * ALGAE_VISUAL_LEVEL_COUNT),
@@ -168,25 +202,76 @@ export const algaeVisualLevel = (amount: number): number => {
 
 export const algaeParticleRadiusRatio = (visualLevel: number): number => {
   const visible = Math.max(0, Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT));
-  return 0.69 + visible * 0.46;
+  // A newly established trace starts as a small wisp. It only fills and joins
+  // neighboring sample areas after its real biomass rises, so outward spread
+  // cannot be mistaken for a row of full-sized stamped circles.
+  return 0.28 + visible * 0.87;
 };
 
 export const algaeParticleAlpha = (visualLevel: number): number => {
   const visible = Math.max(0, Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT));
-  return 0.22 + visible * 0.78;
+  return 0.34 + visible * 0.66;
 };
 
 export const algaeDetailCount = (
   maximumCount: number,
   visualLevel: number,
 ): number => {
-  if (maximumCount <= 0 || visualLevel <= 0) return 0;
+  // A newly dispersed film first reads as one continuous translucent wash.
+  // Cell-bound details only appear after real local biomass is established.
+  if (maximumCount <= 0 || visualLevel < 5) return 0;
   const visible = Math.max(
     0,
     Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT),
   );
-  return Math.max(1, Math.round(maximumCount * (0.2 + visible * 0.8)));
+  return Math.max(1, Math.round(maximumCount * (0.14 + visible * 0.86)));
 };
+
+/**
+ * Oedogonium must remain recognisably filamentous at the advancing edge.
+ * A deterministic subset of trace cells receives one strand; skipping the
+ * others breaks the ecology-cell rhythm while still letting the strands
+ * visibly travel with real, low-density biomass.
+ */
+export const oedogoniumFilamentCount = (
+  cellId: string,
+  visualLevel: number,
+  biomass?: number,
+): number => {
+  if (visualLevel <= 0) return 0;
+  if (biomass !== undefined && visualLevel >= 2) {
+    const linearAmount = Math.max(
+      0,
+      Math.min(1, biomass / ALGAE_VISUAL_SATURATION_BIOMASS),
+    );
+    return Math.max(
+      1,
+      Math.round(
+        1 +
+          (ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL - 1) *
+            Math.pow(linearAmount, 0.72),
+      ),
+    );
+  }
+  if (visualLevel >= 5) {
+    return algaeDetailCount(
+      ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL,
+      visualLevel,
+    );
+  }
+  return hash01(stringHash(`${cellId}:oedogonium-front`)) < 0.72 ? 1 : 0;
+};
+
+export const shouldTriggerShrimpGrazingPulse = (
+  previousSequence: number | null,
+  nextSequence: number,
+  previousConsumedBiomass: number,
+  nextConsumedBiomass: number,
+): boolean => previousSequence !== null &&
+  nextSequence > previousSequence &&
+  Number.isFinite(previousConsumedBiomass) &&
+  Number.isFinite(nextConsumedBiomass) &&
+  nextConsumedBiomass > previousConsumedBiomass + 1e-9;
 
 export const isInventoryHandoffCaughtUp = (
   holding: SimulationSnapshot['holding'],
@@ -210,14 +295,26 @@ const isProbeInteractionTool = (tool: InteractionTool): boolean =>
 
 const algaeKeyNumber = (value: number): number => Math.round(value * 1000) / 1000;
 
+const algaeFineVisualAmount = (value: number): number => Math.round(
+  Math.min(
+    ALGAE_DENSITY_SATURATION_BIOMASS,
+    Math.max(0, value),
+  ) * 500,
+);
+
 export const algaeCellVisualKey = (cell: SurfaceCellSnapshot): string => [
   cell.id,
   cell.surfaceKind,
   algaeKeyNumber(cell.x),
   algaeKeyNumber(cell.y),
   algaeKeyNumber(cell.cellSize),
-  algaeVisualLevel(cell.biomass.nitzschia),
-  algaeVisualLevel(cell.biomass.oedogonium),
+  // The fixed raster is cheap and bounded, so retain real grazing changes
+  // instead of waiting for a coarse 1/32 visual-level boundary. A 0.002
+  // biomass bucket is below one ordinary multi-second bite but avoids
+  // rebuilding for floating-point noise. Values above visual saturation are
+  // intentionally equivalent.
+  algaeFineVisualAmount(cell.biomass.nitzschia),
+  algaeFineVisualAmount(cell.biomass.oedogonium),
 ].join(':');
 
 export const algaeRasterRefreshIntervalMs = (
@@ -241,17 +338,29 @@ export const shouldRefreshAlgaeRasterNow = ({
 }): boolean => phase !== 'running' || editable ||
   nowMs - lastRefreshAtMs >= algaeRasterRefreshIntervalMs(speed);
 
-const defaultCamera = (): CameraState => ({
+const defaultCamera = (
+  geometry: TankVisualGeometry = createTankVisualGeometry(),
+): CameraState => ({
   zoom: CAMERA_COVER_ZOOM,
-  centerX: CAMERA_SCENE_CENTER_X,
-  centerY: CAMERA_SCENE_CENTER_Y,
+  centerX: geometry.sceneCenterX,
+  centerY: geometry.sceneCenterY,
 });
 
-const clampCamera = (camera: CameraState, width: number, height: number): CameraState => {
-  const zoom = Math.max(minimumTankZoom(width, height), Math.min(CAMERA_MAX_ZOOM, camera.zoom));
-  const scale = coverTankScale(width, height) * zoom;
-  if (!Number.isFinite(scale) || scale <= 0) return { ...defaultCamera(), zoom };
-  const bounds = tankCameraCenterBounds(width, height, zoom);
+const clampCamera = (
+  camera: CameraState,
+  width: number,
+  height: number,
+  geometry: TankVisualGeometry = createTankVisualGeometry(),
+): CameraState => {
+  const zoom = Math.max(
+    minimumTankZoom(width, height, geometry),
+    Math.min(CAMERA_MAX_ZOOM, camera.zoom),
+  );
+  const scale = coverTankScale(width, height, geometry) * zoom;
+  if (!Number.isFinite(scale) || scale <= 0) {
+    return { ...defaultCamera(geometry), zoom };
+  }
+  const bounds = tankCameraCenterBounds(width, height, zoom, geometry);
   const centerX = Math.max(bounds.minX, Math.min(bounds.maxX, camera.centerX));
   const centerY = Math.max(bounds.minY, Math.min(bounds.maxY, camera.centerY));
   return { zoom, centerX, centerY };
@@ -268,6 +377,7 @@ interface StructureDisplay {
 interface AnimalRenderTarget {
   speciesId: AnimalSnapshot['speciesId'];
   lifeStage: AnimalSnapshot['lifeStage'];
+  sex: AnimalSnapshot['sex'];
   x: number;
   y: number;
   facing: -1 | 1;
@@ -279,6 +389,7 @@ interface AnimalRenderTarget {
   held: boolean;
   placementValid: boolean;
   reproductiveState: AnimalSnapshot['reproductiveState'];
+  consumedBiomass: number;
   interpolatedPosition: boolean;
 }
 
@@ -302,6 +413,13 @@ interface AnimalDisplay {
   tail: Container;
   legs: Container;
   antennae: Container;
+  pectoral?: Container;
+  dorsalFin?: Container;
+  analFin?: Container;
+  pelvicFin?: Container;
+  closedMouth?: Graphics;
+  feedingMouth?: Container;
+  feedingJaw?: Container;
   eggs: Graphics;
   grazingFeedback: Container;
   grazingMouth: Graphics;
@@ -315,8 +433,28 @@ interface AnimalDisplay {
   renderMotion: AnimalMotionProfile;
   grazingWeight: number;
   phase: number;
+  swimPhase: number;
+  feedingPulse: number;
+  lastFeedingMotionSequence: number | null;
+  lastFeedingConsumedBiomass: number | null;
   phaseOffset: number;
 }
+
+/**
+ * Bite telemetry is evaluated from authoritative worker samples, not from the
+ * values interpolated between them. This makes one cumulative intake increase
+ * produce one pulse even though the same sample is painted across several
+ * animation frames. A missing or rewound sequence is a baseline (new display,
+ * reset, or load), never a bite.
+ */
+export const shouldTriggerRicefishBitePulse = (
+  previousSequence: number | null,
+  nextSequence: number,
+  previousConsumedBiomass: number,
+  nextConsumedBiomass: number,
+): boolean => previousSequence !== null &&
+  nextSequence > previousSequence &&
+  ricefishConsumedFood(previousConsumedBiomass, nextConsumedBiomass);
 
 interface AnimalCarcassDisplay {
   speciesId: AnimalCarcassSnapshot['speciesId'];
@@ -349,8 +487,9 @@ const ANIMAL_CARCASS_POOL_LIMIT_PER_KEY = 32;
 const animalDisplayPoolKey = (
   speciesId: AnimalSnapshot['speciesId'],
   lifeStage: AnimalSnapshot['lifeStage'],
-): string => speciesId === 'japanese-ricefish' && lifeStage === 'egg'
-  ? `${speciesId}:egg`
+  sex: AnimalSnapshot['sex'] = 'female',
+): string => speciesId === 'japanese-ricefish'
+  ? `${speciesId}:${lifeStage}:${sex}`
   : `${speciesId}:body`;
 
 const animalCarcassDisplayPoolKey = (
@@ -371,6 +510,7 @@ interface AquariumLayers {
   plantsBack: Graphics;
   plantsFront: Graphics;
   nightTint: Graphics;
+  spatialDebug: Graphics;
   goalGuide: Graphics;
   seeds: Graphics;
   interaction: Graphics;
@@ -464,6 +604,7 @@ const ensurePhytoplanktonHazeSurface = (
   surface: PhytoplanktonSurface,
   columns: number,
   rows: number,
+  snapshot: SimulationSnapshot,
 ): void => {
   if (
     surface.hazeColumns === columns &&
@@ -491,8 +632,11 @@ const ensurePhytoplanktonHazeSurface = (
   surface.hazeSource.scaleMode = 'linear';
   surface.hazeTexture = new Texture({ source: surface.hazeSource });
   surface.hazeSprite.texture = surface.hazeTexture;
-  surface.hazeSprite.position.set(0, WATER_TOP);
-  surface.hazeSprite.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+  surface.hazeSprite.position.set(0, snapshot.tank.waterTop);
+  surface.hazeSprite.setSize(
+    snapshot.tank.width,
+    snapshot.tank.groundY - snapshot.tank.waterTop,
+  );
 };
 
 const releasePhytoplanktonLayer = (layer: Container): void => {
@@ -609,6 +753,7 @@ const ensureAnalysisPrimary = (
   surface: AnalysisSurface,
   columns: number,
   rows: number,
+  snapshot: SimulationSnapshot,
 ): void => {
   if (
     surface.columns === columns &&
@@ -635,7 +780,10 @@ const ensureAnalysisPrimary = (
   surface.texture = new Texture({ source: surface.source });
   surface.primary.texture = surface.texture;
   surface.primary.position.set(0, 0);
-  surface.primary.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+  surface.primary.setSize(
+    snapshot.tank.width,
+    snapshot.tank.groundY - snapshot.tank.waterTop,
+  );
 };
 
 const writeAnalysisPixel = (
@@ -716,24 +864,25 @@ const mixColor = (from: number, to: number, ratio: number): number => {
   );
 };
 
-const drawTank = (layer: Graphics): void => {
+const drawTank = (layer: Graphics, snapshot: SimulationSnapshot): void => {
+  const { width, height, waterTop, groundY } = snapshot.tank;
   layer.clear();
   // The glass headspace is genuinely inside the tank. Water begins only at
   // WATER_TOP, so neither the external lamp nor this air band can look wet.
-  layer.rect(0, 0, TANK_WIDTH, WATER_TOP).fill({ color: 0xbfcac3, alpha: 1 });
-  const bands = TANK_HEIGHT - WATER_TOP;
+  layer.rect(0, 0, width, waterTop).fill({ color: 0xbfcac3, alpha: 1 });
+  const bands = height - waterTop;
   for (let index = 0; index < bands; index += 1) {
     const ratio = index / Math.max(1, bands - 1);
     layer
-      .rect(0, WATER_TOP + index, TANK_WIDTH, 2)
+      .rect(0, waterTop + index, width, 2)
       .fill({ color: mixColor(0x5b9ca3, 0x356b78, ratio), alpha: 1 });
   }
   layer
-    .rect(0, GROUND_Y - 30, TANK_WIDTH, TANK_HEIGHT - GROUND_Y + 30)
+    .rect(0, groundY - 30, width, height - groundY + 30)
     .fill({ color: 0x95785a, alpha: 0.86 });
   for (let index = 0; index < 80; index += 1) {
-    const x = (index * 89 + 17) % TANK_WIDTH;
-    const y = GROUND_Y - 21 + ((index * 37) % 82);
+    const x = (index * 89 + 17) % width;
+    const y = groundY - 21 + ((index * 37) % 82);
     const radius = 2 + ((index * 13) % 6);
     layer.circle(x, y, radius).fill({
       color: index % 2 ? 0xc8aa7b : 0x725b45,
@@ -742,74 +891,90 @@ const drawTank = (layer: Graphics): void => {
   }
 };
 
-const drawSubstrateRidge = (layer: Graphics): void => {
+const drawSubstrateRidge = (layer: Graphics, snapshot: SimulationSnapshot): void => {
+  const { width, waterTop, groundY } = snapshot.tank;
+  const segmentScale = width / TANK_WIDTH;
   layer.clear();
   layer
-    .moveTo(-40, TANK_VISUAL_WATER_TOP + 2)
+    .moveTo(-40, waterTop + 2)
     .bezierCurveTo(
-      250,
-      TANK_VISUAL_WATER_TOP - 2,
-      560,
-      TANK_VISUAL_WATER_TOP + 5,
-      840,
-      TANK_VISUAL_WATER_TOP + 1,
+      250 * segmentScale,
+      waterTop - 2,
+      560 * segmentScale,
+      waterTop + 5,
+      840 * segmentScale,
+      waterTop + 1,
     )
     .bezierCurveTo(
-      1030,
-      TANK_VISUAL_WATER_TOP - 3,
-      1130,
-      TANK_VISUAL_WATER_TOP + 3,
-      TANK_WIDTH + 40,
-      TANK_VISUAL_WATER_TOP,
+      1030 * segmentScale,
+      waterTop - 3,
+      1130 * segmentScale,
+      waterTop + 3,
+      width + 40,
+      waterTop,
     )
     .stroke({ color: 0x315f67, width: 6, alpha: 0.72 });
   layer
-    .moveTo(-40, TANK_VISUAL_WATER_TOP)
+    .moveTo(-40, waterTop)
     .bezierCurveTo(
-      250,
-      TANK_VISUAL_WATER_TOP - 4,
-      560,
-      TANK_VISUAL_WATER_TOP + 3,
-      840,
-      TANK_VISUAL_WATER_TOP - 1,
+      250 * segmentScale,
+      waterTop - 4,
+      560 * segmentScale,
+      waterTop + 3,
+      840 * segmentScale,
+      waterTop - 1,
     )
     .bezierCurveTo(
-      1030,
-      TANK_VISUAL_WATER_TOP - 5,
-      1130,
-      TANK_VISUAL_WATER_TOP + 1,
-      TANK_WIDTH + 40,
-      TANK_VISUAL_WATER_TOP - 2,
+      1030 * segmentScale,
+      waterTop - 5,
+      1130 * segmentScale,
+      waterTop + 1,
+      width + 40,
+      waterTop - 2,
     )
     .stroke({ color: 0xd9eee7, width: 2.5, alpha: 0.92 });
   layer
-    .moveTo(0, GROUND_Y - 28)
-    .bezierCurveTo(260, GROUND_Y - 36, 520, GROUND_Y - 19, 770, GROUND_Y - 30)
-    .bezierCurveTo(940, GROUND_Y - 39, 1080, GROUND_Y - 23, TANK_WIDTH, GROUND_Y - 31)
+    .moveTo(0, groundY - 28)
+    .bezierCurveTo(
+      260 * segmentScale,
+      groundY - 36,
+      520 * segmentScale,
+      groundY - 19,
+      770 * segmentScale,
+      groundY - 30,
+    )
+    .bezierCurveTo(
+      940 * segmentScale,
+      groundY - 39,
+      1080 * segmentScale,
+      groundY - 23,
+      width,
+      groundY - 31,
+    )
     .stroke({ color: 0xe2cda0, width: 8, alpha: 0.42 })
     .stroke({ color: 0x493d32, width: 4, alpha: 0.82 });
 };
 
-const drawTankFrame = (layer: Graphics): void => {
+const drawTankFrame = (layer: Graphics, geometry: TankVisualGeometry): void => {
   layer.clear();
-  const glassWidth = TANK_GLASS_RIGHT - TANK_GLASS_LEFT;
-  const glassHeight = TANK_GLASS_BOTTOM - TANK_GLASS_TOP;
+  const glassWidth = geometry.glassRight - geometry.glassLeft;
+  const glassHeight = geometry.glassBottom - geometry.glassTop;
   layer
     .roundRect(
-      TANK_GLASS_LEFT + 1,
-      TANK_GLASS_TOP + 2,
+      geometry.glassLeft + 1,
+      geometry.glassTop + 2,
       glassWidth - 2,
       glassHeight - 3,
       13,
     )
     .stroke({ color: 0x1e2c2b, width: 16, alpha: 0.2 });
   layer
-    .roundRect(TANK_GLASS_LEFT, TANK_GLASS_TOP, glassWidth, glassHeight, 12)
+    .roundRect(geometry.glassLeft, geometry.glassTop, glassWidth, glassHeight, 12)
     .stroke({ color: 0x3b4c4c, width: 10, alpha: 1 });
   layer
     .roundRect(
-      TANK_GLASS_LEFT + 7,
-      TANK_GLASS_TOP + 7,
+      geometry.glassLeft + 7,
+      geometry.glassTop + 7,
       glassWidth - 14,
       glassHeight - 14,
       8,
@@ -874,8 +1039,11 @@ const drawLightField = (
   }
   context.putImageData(pixels, 0, 0);
   uploadRasterSurface(surface);
-  layer.position.set(0, WATER_TOP);
-  layer.setSize(TANK_WIDTH, GROUND_Y - WATER_TOP);
+  layer.position.set(0, snapshot.tank.waterTop);
+  layer.setSize(
+    snapshot.tank.width,
+    snapshot.tank.groundY - snapshot.tank.waterTop,
+  );
 };
 
 const WATER_QUALITY_PALETTES: Record<WaterQualityVariable, {
@@ -1276,6 +1444,7 @@ const drawBiofilmStain = (
   guildId: MicrobeGuildId,
   biomass: number,
   selected: boolean,
+  waterTop = WATER_TOP,
 ): void => {
   if (!Number.isFinite(biomass) || biomass < 0.001) return;
   // Observation mode must reveal a sparse film without making 1% coverage
@@ -1288,7 +1457,7 @@ const drawBiofilmStain = (
   // little into the water so a newly inoculated film is not clipped or lost
   // among the gravel dots.
   const surfaceLift = cell.surfaceKind === 'substrate' ? cell.cellSize * 0.22 : 0;
-  const centerY = cell.y - WATER_TOP - surfaceLift;
+  const centerY = cell.y - waterTop - surfaceLift;
   const radius = cell.cellSize * (0.34 + amount * 0.52) * (selected ? 1.28 : 1);
   const color = selected
     ? guildId === 'decomposer' ? 0xc98246 : 0x49a49c
@@ -1332,8 +1501,8 @@ export const drawAnalysisOverlay = (
   }
   const surface = analysisSurfaces.get(layer);
   if (!surface) return;
-  const width = TANK_WIDTH;
-  const height = GROUND_Y - WATER_TOP;
+  const width = snapshot.tank.width;
+  const height = snapshot.tank.groundY - snapshot.tank.waterTop;
   surface.primary.visible = false;
   surface.details.clear();
 
@@ -1354,7 +1523,7 @@ export const drawAnalysisOverlay = (
   const flowSelected = selectedLayers.includes('flow');
   if (primaryWaterLayer) {
     const water = snapshot.biogeochemistry.water;
-    ensureAnalysisPrimary(surface, water.columns, water.rows);
+    ensureAnalysisPrimary(surface, water.columns, water.rows, snapshot);
     const values = water[primaryWaterLayer];
     const palette = WATER_QUALITY_PALETTES[primaryWaterLayer];
     const visualRange = waterQualityVisualRange(primaryWaterLayer, values);
@@ -1380,7 +1549,7 @@ export const drawAnalysisOverlay = (
 
   if (primaryPelagicLayer) {
     const water = snapshot.biogeochemistry.water;
-    ensureAnalysisPrimary(surface, water.columns, water.rows);
+    ensureAnalysisPrimary(surface, water.columns, water.rows, snapshot);
     const values = pelagicValues(snapshot, primaryPelagicLayer);
     const palette = PELAGIC_PALETTES[primaryPelagicLayer];
     const displayMaximum = pelagicVisualMaximum(primaryPelagicLayer, values);
@@ -1399,7 +1568,7 @@ export const drawAnalysisOverlay = (
 
   if (scalarLayerCount === 1 && temperatureSelected) {
     const transport = snapshot.biogeochemistry.transport;
-    ensureAnalysisPrimary(surface, transport.columns, transport.rows);
+    ensureAnalysisPrimary(surface, transport.columns, transport.rows, snapshot);
     const span = Math.max(0.08, transport.maximumTemperature - transport.minimumTemperature);
     for (let index = 0; index < transport.columns * transport.rows; index += 1) {
       const value = transport.temperature[index] ?? transport.averageTemperature;
@@ -1443,7 +1612,10 @@ export const drawAnalysisOverlay = (
   const selectedGuilds = new Set(selectedLayers.filter(isMicrobeLayer));
   let hasVisibleBiofilm = false;
   for (const cell of snapshot.cells) {
-    if (cell.y < WATER_TOP - cell.cellSize || cell.y > GROUND_Y + cell.cellSize) continue;
+    if (
+      cell.y < snapshot.tank.waterTop - cell.cellSize ||
+      cell.y > snapshot.tank.groundY + cell.cellSize
+    ) continue;
     for (const guildId of ['decomposer', 'nitrifier'] as const) {
       const biomass = cell.biofilm[guildId];
       if (biomass >= 0.001) hasVisibleBiofilm = true;
@@ -1453,11 +1625,12 @@ export const drawAnalysisOverlay = (
         guildId,
         biomass,
         selectedGuilds.has(guildId),
+        snapshot.tank.waterTop,
       );
     }
   }
 
-  layer.position.set(0, WATER_TOP);
+  layer.position.set(0, snapshot.tank.waterTop);
   layer.visible = selectedLayers.length > 0 || hasVisibleBiofilm;
 };
 
@@ -1637,8 +1810,22 @@ const syncStructures = (
 
 const SHRIMP_ADULT_LENGTH = 36;
 const SHRIMP_ABDOMEN_X = [-4, -10, -16, -21];
-const RICEFISH_DRAW_LENGTH = 52;
+// The complete traced silhouette runs from x=-46 to x=39. Scale against the
+// complete fish, not only the body, so a 44 px adult remains 44 px nose-to-tail.
+const RICEFISH_DRAW_LENGTH = 85;
 const RICEFISH_ADULT_LENGTH = 44;
+const RICEFISH_BODY_PIVOT_X = 24;
+const RICEFISH_CAUDAL_BASE_X = -29;
+const RICEFISH_CAUDAL_BASE_Y = -0.85;
+// Match the existing shrimp rig: a clean charcoal contour, muted translucent
+// body colour, and warm fins. The supplied medaka vector is used for anatomy
+// and proportions only, not as rendered artwork.
+const RICEFISH_OUTLINE = 0x303c3a;
+const RICEFISH_DETAIL = 0x59615d;
+const RICEFISH_BODY_TOP = 0xaeb8b4;
+const RICEFISH_BODY_BELLY = 0xe1e1d9;
+const RICEFISH_FIN = 0xe8d7aa;
+const RICEFISH_FIN_RAY = 0xb8a478;
 
 const animalHash = (id: string): number => {
   let value = 2166136261;
@@ -1754,13 +1941,16 @@ const drawShrimpGrazingFeedback = (): {
     .moveTo(17.2, 1)
     .quadraticCurveTo(19.5, 2.2, 21.2, 1.2)
     .stroke({ color: 0x70483e, width: 0.95, alpha: 0.78, cap: 'round' });
-  const fleckColors = [0x668663, 0x8a9a62, 0x9a744c];
+  // A fixed five-mark pool is large enough to read at fit zoom and remains
+  // allocation-free during long runs. Visibility is driven by real cumulative
+  // intake below, not merely by the shrimp's intended behavior.
+  const fleckColors = [0x668663, 0x8a9a62, 0x9a744c, 0x547b55, 0xb08a58];
   const flecks = fleckColors.map((color, index) => new Graphics()
-    .moveTo(-1.1, 0.4)
-    .quadraticCurveTo(0, -1.2 - index * 0.12, 1.2, -0.15)
-    .stroke({ color: 0x35443a, width: 0.65, alpha: 0.78, cap: 'round' })
-    .circle(0.3, 0, 1.05 - index * 0.12)
-    .fill({ color, alpha: 0.92 }));
+    .moveTo(-1.35, 0.45)
+    .quadraticCurveTo(0, -1.35 - (index % 3) * 0.12, 1.45, -0.15)
+    .stroke({ color: 0x35443a, width: 0.72, alpha: 0.82, cap: 'round' })
+    .circle(0.3, 0, 1.12 - (index % 3) * 0.1)
+    .fill({ color, alpha: 0.94 }));
   group.addChild(mouth, ...flecks);
   group.visible = false;
   return { group, mouth, flecks };
@@ -1768,126 +1958,400 @@ const drawShrimpGrazingFeedback = (): {
 
 const emptyAnimalPart = (): Container => new Container();
 
-const drawRicefishBody = (): Container => {
-  const group = new Container();
-  const body = new Graphics()
-    // Wild medaka are long and nearly straight-backed rather than the deep,
-    // oval silhouette used by the first placeholder.
-    .moveTo(-23.5, -2.1)
-    .bezierCurveTo(-15, -4.7, -2, -6.1, 10.5, -5.4)
-    .bezierCurveTo(18.3, -5, 23.4, -3.4, 27.1, -1.1)
-    .quadraticCurveTo(29.1, 0.1, 26.8, 1.7)
-    .bezierCurveTo(22.3, 4.5, 14.2, 5.8, 4.2, 5.9)
-    .bezierCurveTo(-7.2, 5.8, -17.4, 4.2, -23.5, 2.2)
-    .closePath()
-    .fill({ color: 0xc9c8a4, alpha: 0.8 })
-    .stroke({ color: 0x34423f, width: 1.45, alpha: 0.96, join: 'round' });
-  const translucentBody = new Graphics()
-    .moveTo(-20.5, -1)
-    .bezierCurveTo(-8, -3.6, 7, -4.2, 20.5, -1.7)
-    .bezierCurveTo(14.5, -0.2, 7.5, 1, -0.5, 1.4)
-    .bezierCurveTo(-8.5, 1.7, -15.4, 1, -20.5, -1)
-    .closePath()
-    .fill({ color: 0x8f9d7c, alpha: 0.23 });
-  const belly = new Graphics()
-    .moveTo(-18.5, 2.5)
-    .bezierCurveTo(-6.5, 5.1, 9, 4.9, 22.3, 1.8)
-    .stroke({ color: 0xf1e7be, width: 1.5, alpha: 0.78, cap: 'round' });
-  const lateral = new Graphics()
-    .moveTo(-20, 0.2)
-    .bezierCurveTo(-7, 1, 8, 0.8, 22.5, -0.3)
-    .stroke({ color: 0x9a8655, width: 0.9, alpha: 0.64, cap: 'round' });
-  const gill = new Graphics()
-    .moveTo(13.2, -3.6)
-    .quadraticCurveTo(10.3, 0, 13.1, 3.4)
-    .stroke({ color: 0x68726a, width: 0.9, alpha: 0.62, cap: 'round' });
-  const melanophores = new Graphics();
-  for (const [x, y, radius] of [
-    [-15, -2.4, 0.48], [-10.5, -2.8, 0.38], [-6, -3, 0.43],
-    [-1.5, -3.2, 0.34], [3.2, -3.25, 0.4], [7.7, -3, 0.33],
-    [-12.5, 1.1, 0.32], [-5.8, 1.5, 0.28], [1.3, 1.4, 0.3],
-    [7.5, 1.1, 0.27],
-  ] as const) {
-    melanophores.circle(x, y, radius).fill({ color: 0x505d54, alpha: 0.55 });
+interface RicefishVisualProfile {
+  eyeRadius: number;
+  finScale: number;
+}
+
+interface RicefishBodyArt {
+  container: Container;
+  pectoral: Container;
+  closedMouth: Graphics;
+  feedingMouth: Container;
+  feedingJaw: Container;
+}
+
+const ricefishVisualProfile = (
+  lifeStage: AnimalSnapshot['lifeStage'],
+  sex: AnimalSnapshot['sex'],
+): RicefishVisualProfile => {
+  if (lifeStage === 'fry') {
+    return {
+      eyeRadius: 3.15,
+      finScale: 0.56,
+    };
   }
+  if (lifeStage === 'juvenile') {
+    return {
+      eyeRadius: 3,
+      finScale: 0.78,
+    };
+  }
+  return {
+    eyeRadius: 3.2,
+    finScale: 1,
+  };
+};
+
+const drawRicefishBody = (
+  lifeStage: AnimalSnapshot['lifeStage'],
+  sex: AnimalSnapshot['sex'],
+): RicefishBodyArt => {
+  const profile = ricefishVisualProfile(lifeStage, sex);
+  const group = new Container();
+  const depthScale = lifeStage === 'fry'
+    ? 0.8
+    : lifeStage === 'juvenile'
+      ? 0.9
+      : sex === 'male'
+        ? 1.02
+        : 1.05;
+  const y = (value: number): number => value * depthScale;
+  const traceBody = (graphics: Graphics): Graphics => graphics
+    // Fresh trace of the supplied medaka reference. The canonical artwork
+    // faces right; the render container mirrors this complete drawing when
+    // the animal swims left.
+    .moveTo(-29, y(-3.2))
+    .bezierCurveTo(-22, y(-4), -14, y(-5.1), -6, y(-6.25))
+    .bezierCurveTo(2, y(-7.15), 10, y(-7.5), 16.3, y(-7.2))
+    .bezierCurveTo(25.3, y(-6.5), 33, y(-4.45), 38, y(-2.25))
+    .bezierCurveTo(39.7, y(-1.45), 40.2, y(-0.45), 39.2, y(0.55))
+    .bezierCurveTo(36, y(4.2), 28.3, y(7.8), 20, y(10.2))
+    .bezierCurveTo(14, y(11.45), 8, y(11.35), 3, y(9.2))
+    .bezierCurveTo(-5, y(6.3), -14, y(3.8), -22, y(3.1))
+    .bezierCurveTo(-26.2, y(3), -29.4, y(1.65), -29, y(-3.2));
+  const body = traceBody(new Graphics())
+    .closePath()
+    .fill({ color: RICEFISH_BODY_TOP, alpha: lifeStage === 'fry' ? 0.55 : 0.9 });
+  const bodyOutline = traceBody(new Graphics())
+    .closePath()
+    .stroke({ color: RICEFISH_OUTLINE, width: 1.85, alpha: 0.96, join: 'round' });
+  const belly = new Graphics()
+    .moveTo(-28.8, y(-0.35))
+    .bezierCurveTo(-17, y(-0.2), -4, y(1.4), 7, y(1.7))
+    .bezierCurveTo(18, y(1.35), 30, y(0.15), 39, y(-0.25))
+    .bezierCurveTo(36, y(4.15), 28.3, y(7.8), 20, y(10.2))
+    .bezierCurveTo(14, y(11.45), 8, y(11.35), 3, y(9.2))
+    .bezierCurveTo(-5, y(6.3), -14, y(3.8), -22, y(3.1))
+    .bezierCurveTo(-26.2, y(3), -29.4, y(1.65), -28.8, y(-0.35))
+    .closePath()
+    .fill({ color: RICEFISH_BODY_BELLY, alpha: lifeStage === 'fry' ? 0.3 : 0.88 });
+  const cheek = new Graphics()
+    .ellipse(21.2, y(2.15), 3.5, y(2.35))
+    .fill({ color: 0xd98072, alpha: lifeStage === 'fry' ? 0.04 : 0.13 });
+  const gill = new Graphics()
+    .moveTo(18.8, y(-2.35))
+    .bezierCurveTo(16.2, y(-0.5), 16.2, y(1.9), 18.2, y(3.5))
+    .bezierCurveTo(18.9, y(4.1), 18.2, y(4.9), 16.4, y(5.65))
+    .stroke({ color: RICEFISH_DETAIL, width: 1.35, alpha: 0.92, cap: 'round' });
   const eye = new Graphics()
-    .circle(19.5, -2.25, 2.65)
-    .fill({ color: 0xd9c36f, alpha: 0.95 })
-    .stroke({ color: 0x34423f, width: 1, alpha: 1 })
-    .circle(20, -2.25, 1.35)
-    .fill({ color: 0x26312f, alpha: 1 });
-  const mouth = new Graphics()
-    .moveTo(25.1, 0.45)
-    .quadraticCurveTo(27.8, 0.15, 29.2, -0.85)
-    .stroke({ color: 0x34423f, width: 0.95, alpha: 0.9, cap: 'round' });
+    .circle(28.9, y(-1.35), profile.eyeRadius)
+    .fill({ color: 0xfffcf2, alpha: 1 })
+    .stroke({ color: RICEFISH_OUTLINE, width: 1.35, alpha: 1 })
+    .circle(28.9, y(-1.35), profile.eyeRadius * 0.56)
+    .fill({ color: RICEFISH_OUTLINE, alpha: 1 })
+    .circle(29.45, y(-1.9), profile.eyeRadius * 0.15)
+    .fill({ color: 0xfffcf2, alpha: 0.98 });
+  const pectoralFin = new Graphics()
+    // The root beside the gill is the pointed end. Its free trailing edge is
+    // broad and rounded in the reference; treating that edge as a pointed tip
+    // made the entire fin read as if it faced forward.
+    .moveTo(18.5, y(-0.35))
+    .bezierCurveTo(13.2, y(-2.65), 7.1, y(-2.9), 3.2, y(-1.5))
+    .bezierCurveTo(1.6, y(-0.8), 1.7, y(0.55), 2.7, y(1.55))
+    .bezierCurveTo(5.8, y(4.5), 11.3, y(4.5), 15.4, y(2.8))
+    .bezierCurveTo(17.3, y(1.7), 18.2, y(0.5), 18.5, y(-0.35))
+    .closePath()
+    .fill({ color: RICEFISH_FIN, alpha: lifeStage === 'fry' ? 0.2 : 0.78 })
+    .moveTo(18.5, y(-0.35))
+    .bezierCurveTo(13.2, y(-2.65), 7.1, y(-2.9), 3.2, y(-1.5))
+    .bezierCurveTo(1.6, y(-0.8), 1.7, y(0.55), 2.7, y(1.55))
+    .bezierCurveTo(5.8, y(4.5), 11.3, y(4.5), 15.4, y(2.8))
+    .bezierCurveTo(17.3, y(1.7), 18.2, y(0.5), 18.5, y(-0.35))
+    .closePath()
+    .stroke({ color: RICEFISH_OUTLINE, width: 1.35, alpha: 0.94, join: 'round' });
+  const pectoralRays = new Graphics()
+    .moveTo(16.9, y(0.05))
+    .lineTo(3.8, y(-0.65))
+    .moveTo(16.5, y(0.75))
+    .lineTo(3.9, y(0.5))
+    .moveTo(15.8, y(1.45))
+    .lineTo(5.1, y(1.75))
+    .stroke({ color: RICEFISH_FIN_RAY, width: 0.65, alpha: 0.82 });
+  const pectoral = new Container();
+  const pectoralRootY = y(-0.35);
+  pectoral.pivot.set(18.5, pectoralRootY);
+  pectoral.position.set(18.5, pectoralRootY);
+  pectoral.addChild(pectoralFin, pectoralRays);
+  const closedMouth = new Graphics()
+    .moveTo(38.8, y(-0.45))
+    .quadraticCurveTo(37.2, y(-0.75), 35.9, y(-0.15))
+    .stroke({ color: RICEFISH_DETAIL, width: 1, alpha: 0.9, cap: 'round' });
+  const mouthHingeX = 35.8;
+  const mouthHingeY = y(-0.1);
+  const mouthCavity = new Graphics()
+    .moveTo(mouthHingeX, y(-0.18))
+    .quadraticCurveTo(37.5, y(-0.62), 39.15, y(-0.34))
+    .quadraticCurveTo(39.55, y(0.18), 38.95, y(0.72))
+    .quadraticCurveTo(37.45, y(0.62), mouthHingeX, y(-0.18))
+    .closePath()
+    .fill({ color: 0x182321, alpha: 0.98 })
+    .stroke({ color: RICEFISH_OUTLINE, width: 0.85, alpha: 1, join: 'round' });
+  const lowerLip = new Graphics()
+    .moveTo(mouthHingeX, mouthHingeY)
+    .quadraticCurveTo(37.4, y(0.2), 39.05, y(0.62))
+    .stroke({ color: RICEFISH_DETAIL, width: 1, alpha: 0.94, cap: 'round' });
+  const feedingMouth = new Container();
+  feedingMouth.alpha = 0;
+  feedingMouth.addChild(mouthCavity);
+  const feedingJaw = new Container();
+  feedingJaw.pivot.set(mouthHingeX, mouthHingeY);
+  feedingJaw.position.set(mouthHingeX, mouthHingeY);
+  feedingJaw.alpha = 0;
+  feedingJaw.addChild(lowerLip);
   group.addChild(
     body,
-    translucentBody,
     belly,
-    lateral,
+    cheek,
+    pectoral,
     gill,
-    melanophores,
     eye,
-    mouth,
+    bodyOutline,
+    closedMouth,
+    feedingMouth,
+    feedingJaw,
   );
+  return {
+    container: group,
+    pectoral,
+    closedMouth,
+    feedingMouth,
+    feedingJaw,
+  };
+};
+
+const drawRicefishTail = (
+  lifeStage: AnimalSnapshot['lifeStage'],
+): Container => {
+  const profile = ricefishVisualProfile(lifeStage, 'female');
+  const extent = lifeStage === 'fry' ? 13 : 17;
+  const height = (lifeStage === 'fry' ? 6.7 : 8.8) * profile.finScale;
+  const rootTop = lifeStage === 'fry' ? 1.45 : 1.9;
+  const rootBottom = lifeStage === 'fry' ? 1.5 : 1.95;
+  const joinTop = lifeStage === 'fry'
+    ? 1.7
+    : lifeStage === 'juvenile'
+      ? 2.05
+      : 2.3;
+  const joinBottom = lifeStage === 'fry'
+    ? 2.15
+    : lifeStage === 'juvenile'
+      ? 2.3
+      : 2.45;
+  const group = new Container();
+  const traceTail = (graphics: Graphics): Graphics => graphics
+    .moveTo(3, -rootTop)
+    // The forward root is hidden inside the body. The outer edge crosses the
+    // body exactly at the caudal-peduncle end instead of peeking above it as
+    // a false extra dorsal lobe.
+    .bezierCurveTo(2, -rootTop - 0.2, 0.7, -joinTop + 0.15, 0, -joinTop)
+    .bezierCurveTo(-4.5, -5.5, -9, -height * 0.92, -14.5, -height)
+    .bezierCurveTo(-extent, -height * 1.02, -extent - 0.8, -height * 0.78, -extent - 0.2, -height * 0.55)
+    .bezierCurveTo(-16.4, -3.1, -15.7, -1.2, -16.1, 0.8)
+    .bezierCurveTo(-16.7, 3.6, -16.1, height * 0.78, -14.3, height * 0.86)
+    .bezierCurveTo(-8.2, height * 0.84, -2.2, joinBottom + 0.4, -0.4, joinBottom)
+    .bezierCurveTo(0.8, rootBottom + 0.4, 2.1, rootBottom, 3, rootBottom);
+  const tail = traceTail(new Graphics())
+    .quadraticCurveTo(0.2, -0.55, 3, -rootTop)
+    .closePath()
+    .fill({ color: RICEFISH_FIN, alpha: lifeStage === 'fry' ? 0.28 : 0.8 });
+  const tailOutline = traceTail(new Graphics())
+    .stroke({ color: RICEFISH_OUTLINE, width: 1.7, alpha: 0.96, join: 'round' });
+  const rays = new Graphics()
+    .moveTo(0.4, -rootTop * 0.8)
+    .lineTo(-extent + 1.8, -height * 0.78)
+    .moveTo(0, -rootTop * 0.42)
+    .lineTo(-extent + 1.2, -height * 0.4)
+    .moveTo(-0.4, -0.45)
+    .lineTo(-extent + 1.2, -0.45)
+    .moveTo(0, rootBottom * 0.42)
+    .lineTo(-extent + 1.5, height * 0.38)
+    .moveTo(0.4, rootBottom * 0.78)
+    .lineTo(-extent + 2, height * 0.72)
+    .stroke({ color: RICEFISH_FIN_RAY, width: 0.65, alpha: 0.8 });
+  group.addChild(tail, rays, tailOutline);
   return group;
 };
 
-const drawRicefishTail = (): Container => {
+const drawRicefishFins = (
+  lifeStage: AnimalSnapshot['lifeStage'],
+  sex: AnimalSnapshot['sex'],
+): {
+  container: Container;
+  dorsal: Container;
+  anal: Container;
+  pelvic: Container;
+} => {
+  const profile = ricefishVisualProfile(lifeStage, sex);
+  const fin = profile.finScale;
+  const sy = (value: number): number => value * fin;
   const group = new Container();
-  const tail = new Graphics()
-    .moveTo(0, 0)
-    .quadraticCurveTo(-8.5, -8.2, -15.3, -7)
-    .bezierCurveTo(-17.1, -4.7, -17.1, 4.7, -15.3, 7)
-    .quadraticCurveTo(-8.5, 8.2, 0, 0)
-    .closePath()
-    .fill({ color: 0xd9d2aa, alpha: 0.45 })
-    .stroke({ color: 0x46534e, width: 1.05, alpha: 0.78, join: 'round' })
-    .moveTo(-1.5, 0)
-    .lineTo(-13.6, -5.7)
-    .moveTo(-1.5, 0)
-    .lineTo(-13.6, 5.7)
-    .moveTo(-1.5, 0)
-    .lineTo(-15.6, 0)
-    .stroke({ color: 0x7f886f, width: 0.62, alpha: 0.55 });
-  group.addChild(tail);
-  return group;
-};
+  const adultMale = lifeStage === 'adult' && sex === 'male';
 
-const drawRicefishFins = (): Container => {
-  const group = new Container();
-  const fins = new Graphics()
-    // The dorsal and anal fins sit far back, one of the clearest medaka
-    // silhouettes at this display size.
-    .moveTo(-16.5, -3.5)
-    .quadraticCurveTo(-13.5, -11, -5.5, -5.2)
+  // Fin fills overlap the body, but the visible outline deliberately stops at
+  // each root. Closing and stroking the hidden root used to leave a second
+  // brown edge peeking out beside the body contour, which made the fin look
+  // detached even though the fill overlapped.
+  const traceDorsalOuter = (graphics: Graphics): Graphics => adultMale
+    ? graphics
+      // Male: one tall lobe followed by the diagnostic deep notch and short
+      // rear lobe. Coordinates are mirrored from the supplied upper fish.
+      // Both roots extend inside the body. The opaque body and its final
+      // outline cover this hidden overlap, so no water-coloured seam can
+      // appear between the two independently antialiased shapes.
+      .moveTo(-11.5, sy(-3.7))
+      .bezierCurveTo(-15.2, sy(-9.9), -18.7, sy(-12.8), -21.1, sy(-12.9))
+      .bezierCurveTo(-23.1, sy(-13), -24, sy(-11.6), -23.5, sy(-10.1))
+      // Keep the contour progressing tailward through the notch. The former
+      // backward hook crossed the two lobes in projection and made them read
+      // as separate fins stacked on top of one another.
+      .bezierCurveTo(-23.2, sy(-9), -23.25, sy(-7.9), -23.6, sy(-7.2))
+      .bezierCurveTo(-24.2, sy(-7.45), -25.2, sy(-9.25), -26.1, sy(-9.2))
+      // The short rear lobe stays headward of the caudal peduncle instead of
+      // intruding into the tail fan.
+      .bezierCurveTo(-26.9, sy(-8.8), -27.2, sy(-4.3), -27.1, sy(-2.35))
+    : graphics
+      // Female: one broad rounded fin, with the longer base visible in the
+      // supplied anatomical reference.
+      .moveTo(-24.1, sy(-2.4))
+      .bezierCurveTo(-24.1, sy(-9.1), -23.1, sy(-12.4), -21, sy(-12.9))
+      .bezierCurveTo(-17.9, sy(-12.6), -12.3, sy(-8.6), -9.5, sy(-3.8));
+
+  const closeDorsalRoot = (graphics: Graphics): Graphics => adultMale
+    ? graphics.bezierCurveTo(-20.3, sy(-2.8), -15.6, sy(-3.45), -11.5, sy(-3.7))
+    : graphics.bezierCurveTo(-14.8, sy(-3), -20, sy(-2.5), -24.1, sy(-2.4));
+
+  const traceAnalOuter = (graphics: Graphics): Graphics => adultMale
+    ? graphics
+      // Male: a long fin for the sex cue, but not the oversized hanging
+      // rectangle produced by the former 15.6-deep outline.
+      .moveTo(-21.5, sy(1.7))
+      .bezierCurveTo(-22.1, sy(4.8), -22.4, sy(6.5), -22, sy(7.2))
+      .bezierCurveTo(-17.5, sy(8.6), -11.4, sy(11.7), -5.8, sy(13))
+      .bezierCurveTo(-3.7, sy(12.7), -1.8, sy(9.4), -1.1, sy(6.9))
+    : graphics
+      // Female: a much shallower rear fin; the previous version incorrectly
+      // reused the male depth and read as a hanging semicircle.
+      .moveTo(-22.5, sy(1.3))
+      .bezierCurveTo(-22.8, sy(4.2), -22.4, sy(5.5), -20.4, sy(6.3))
+      .lineTo(-7, sy(10.3))
+      .bezierCurveTo(-5.2, sy(10.4), -3.7, sy(8), -3.3, sy(5.5));
+
+  const closeAnalRoot = (graphics: Graphics): Graphics => adultMale
+    ? graphics.bezierCurveTo(-5, sy(5.6), -13, sy(2.5), -21.5, sy(1.7))
+    : graphics.bezierCurveTo(-8, sy(3.8), -16.2, sy(1.5), -22.5, sy(1.3));
+
+  const tracePelvic = (graphics: Graphics): Graphics => graphics
+    .moveTo(8.8, sy(7.1))
+    .bezierCurveTo(7.2, sy(10.5), 3.8, sy(14.6), 0.8, sy(14.9))
+    .bezierCurveTo(-0.2, sy(12.1), 1.2, sy(8.8), 4.1, sy(7.3));
+
+  const fillAlpha = lifeStage === 'fry' ? 0.28 : 0.8;
+  const dorsalFill = closeDorsalRoot(traceDorsalOuter(new Graphics()))
     .closePath()
-    .fill({ color: 0xd7d2ad, alpha: 0.4 })
-    .stroke({ color: 0x46534e, width: 0.85, alpha: 0.62 })
-    .moveTo(-16.5, 3.9)
-    .quadraticCurveTo(-11.5, 12.2, 0.5, 5.5)
+    .fill({ color: RICEFISH_FIN, alpha: fillAlpha });
+  const analFill = closeAnalRoot(traceAnalOuter(new Graphics()))
     .closePath()
-    .fill({ color: 0xd7d2ad, alpha: 0.38 })
-    .stroke({ color: 0x46534e, width: 0.85, alpha: 0.6 })
-    .moveTo(11.2, 1.2)
-    .quadraticCurveTo(4.5, 8.5, 14.6, 4.2)
+    .fill({ color: RICEFISH_FIN, alpha: fillAlpha });
+  const pelvicFill = tracePelvic(new Graphics())
     .closePath()
-    .fill({ color: 0xe7dfb9, alpha: 0.42 })
-    .stroke({ color: 0x46534e, width: 0.78, alpha: 0.55 })
-    .moveTo(1.8, 4.6)
-    .quadraticCurveTo(-2.5, 9.4, 5.6, 5.4)
-    .closePath()
-    .fill({ color: 0xe7dfb9, alpha: 0.34 })
-    .stroke({ color: 0x46534e, width: 0.72, alpha: 0.48 })
-    .moveTo(-14.8, -4.2)
-    .lineTo(-11.8, -8.4)
-    .moveTo(-11.4, 4.7)
-    .lineTo(-8.6, 9.1)
-    .moveTo(-7.2, 4.9)
-    .lineTo(-4.4, 8.3)
-    .stroke({ color: 0x858c74, width: 0.55, alpha: 0.5 });
-  group.addChild(fins);
-  return group;
+    .fill({ color: RICEFISH_FIN, alpha: fillAlpha });
+  const dorsalOutline = traceDorsalOuter(new Graphics())
+    .stroke({ color: RICEFISH_OUTLINE, width: 1.6, alpha: 0.96, join: 'round' });
+  const analOutline = traceAnalOuter(new Graphics())
+    .stroke({ color: RICEFISH_OUTLINE, width: 1.6, alpha: 0.96, join: 'round' });
+  const pelvicOutline = tracePelvic(new Graphics())
+    .stroke({ color: RICEFISH_OUTLINE, width: 1.6, alpha: 0.96, join: 'round' });
+
+  const dorsalRays = new Graphics();
+  const analRays = new Graphics();
+  if (adultMale) {
+    dorsalRays
+      // Begin inside the body. Because the body is painted after the fins,
+      // each visible ray now emerges exactly from the dorsal contour.
+      .moveTo(-14.6, sy(-3.6))
+      .lineTo(-20.3, sy(-10.6))
+      .moveTo(-18.3, sy(-3.2))
+      .lineTo(-21.7, sy(-8.6))
+      .moveTo(-24, sy(-2.6))
+      .lineTo(-25.5, sy(-7.75));
+    analRays
+      // These roots also start beneath the body fill. The old rays began in
+      // open fin membrane and left the conspicuous empty strip at the root.
+      .moveTo(-2.5, sy(6.9))
+      .lineTo(-6.2, sy(12))
+      .moveTo(-5.9, sy(5.8))
+      .lineTo(-9.8, sy(11.2))
+      .moveTo(-9.5, sy(4.8))
+      .lineTo(-13.4, sy(10.1))
+      .moveTo(-13.1, sy(4))
+      .lineTo(-16.8, sy(8.8))
+      .moveTo(-16.9, sy(3.3))
+      .lineTo(-20.2, sy(7.4));
+  } else {
+    dorsalRays
+      .moveTo(-16.6, sy(-6.8))
+      .lineTo(-22, sy(-11.45))
+      .moveTo(-14.1, sy(-7.4))
+      .lineTo(-18.8, sy(-11.1))
+      .moveTo(-19.6, sy(-6.2))
+      .lineTo(-22.7, sy(-9.3));
+    analRays
+      .moveTo(-18.7, sy(3.1))
+      .lineTo(-20.4, sy(5))
+      .moveTo(-15.2, sy(3.4))
+      .lineTo(-17.6, sy(5.9))
+      .moveTo(-12.1, sy(3.75))
+      .lineTo(-14.7, sy(6.7))
+      .moveTo(-8.8, sy(4.4))
+      .lineTo(-11.4, sy(7.25))
+      .moveTo(-5.5, sy(5.2))
+      .lineTo(-8.3, sy(8));
+  }
+  const rayStroke = { color: RICEFISH_FIN_RAY, width: 0.72, alpha: 0.78 };
+  dorsalRays.stroke(rayStroke);
+  analRays.stroke(rayStroke);
+  const pelvicRays = new Graphics()
+    .moveTo(7.2, sy(8.1))
+    .lineTo(2.1, sy(13.5))
+    .moveTo(5.2, sy(8.3))
+    .lineTo(1.2, sy(12.2))
+    .stroke(rayStroke);
+  const dorsal = new Container();
+  const anal = new Container();
+  const pelvic = new Container();
+  dorsal.addChild(dorsalFill, dorsalRays, dorsalOutline);
+  anal.addChild(analFill, analRays, analOutline);
+  pelvic.addChild(pelvicFill, pelvicRays, pelvicOutline);
+
+  // Each fin has its own root pivot. At zero rotation these transforms are
+  // identity; small rotations flex the membrane while the long hidden base
+  // stays covered by the body that is drawn afterward.
+  const dorsalRootX = adultMale ? -18.5 : -15.5;
+  const dorsalRootY = sy(adultMale ? -3.35 : -3.15);
+  dorsal.pivot.set(dorsalRootX, dorsalRootY);
+  dorsal.position.set(dorsalRootX, dorsalRootY);
+  const analRootX = adultMale ? -11.5 : -13;
+  const analRootY = sy(adultMale ? 3.25 : 2.8);
+  anal.pivot.set(analRootX, analRootY);
+  anal.position.set(analRootX, analRootY);
+  const pelvicRootX = 4.5;
+  const pelvicRootY = sy(7.25);
+  pelvic.pivot.set(pelvicRootX, pelvicRootY);
+  pelvic.position.set(pelvicRootX, pelvicRootY);
+
+  group.addChild(dorsal, anal, pelvic);
+  return { container: group, dorsal, anal, pelvic };
 };
 
 const createRicefishDisplay = (
@@ -1903,9 +2367,16 @@ const createRicefishDisplay = (
     .ellipse(0, 0, 37, 13.5)
     .stroke({ color: 0xffffff, width: 3, alpha: 0.9 });
   const art = new Container();
-  const head = target.lifeStage === 'egg' ? new Container() : drawRicefishBody();
-  const tail = target.lifeStage === 'egg' ? new Container() : drawRicefishTail();
-  const fins = target.lifeStage === 'egg' ? new Container() : drawRicefishFins();
+  const head = new Container();
+  const tail = new Container();
+  const fins = new Container();
+  let pectoral: Container | undefined;
+  let dorsalFin: Container | undefined;
+  let analFin: Container | undefined;
+  let pelvicFin: Container | undefined;
+  let closedMouth: Graphics | undefined;
+  let feedingMouth: Container | undefined;
+  let feedingJaw: Container | undefined;
   if (target.lifeStage === 'egg') {
     const egg = new Graphics()
       .circle(0, 0, 5.2)
@@ -1917,9 +2388,26 @@ const createRicefishDisplay = (
       .fill({ color: 0x26312f, alpha: 0.9 });
     head.addChild(egg);
   } else {
-    tail.position.set(-23, 0);
+    const bodyArt = drawRicefishBody(target.lifeStage, target.sex);
+    const finArt = drawRicefishFins(target.lifeStage, target.sex);
+    pectoral = bodyArt.pectoral;
+    closedMouth = bodyArt.closedMouth;
+    feedingMouth = bodyArt.feedingMouth;
+    feedingJaw = bodyArt.feedingJaw;
+    dorsalFin = finArt.dorsal;
+    analFin = finArt.anal;
+    pelvicFin = finArt.pelvic;
+    tail.addChild(drawRicefishTail(target.lifeStage));
+    fins.addChild(finArt.container);
+    // The tail, attached fins, and body share a flexible body rig. Keeping the
+    // tail inside this hierarchy lets its root inherit the body's gentle bend
+    // while its own skew grows toward the caudal edge without opening a seam.
+    head.addChild(tail, fins, bodyArt.container);
+    head.pivot.set(RICEFISH_BODY_PIVOT_X, 0);
+    head.position.set(RICEFISH_BODY_PIVOT_X, 0);
+    tail.position.set(RICEFISH_CAUDAL_BASE_X, RICEFISH_CAUDAL_BASE_Y);
   }
-  art.addChild(tail, fins, head);
+  art.addChild(head);
   container.addChild(selection, placement, art);
   const empty = emptyAnimalPart();
   const eggs = new Graphics();
@@ -1936,6 +2424,13 @@ const createRicefishDisplay = (
     tail,
     legs: fins,
     antennae: empty,
+    pectoral,
+    dorsalFin,
+    analFin,
+    pelvicFin,
+    closedMouth,
+    feedingMouth,
+    feedingJaw,
     eggs,
     grazingFeedback: feedback,
     grazingMouth: new Graphics(),
@@ -1949,6 +2444,10 @@ const createRicefishDisplay = (
     renderMotion: { ...ANIMAL_MOTION_PROFILES[target.behavior] },
     grazingWeight: 0,
     phase: 0,
+    swimPhase: 0,
+    feedingPulse: 0,
+    lastFeedingMotionSequence: null,
+    lastFeedingConsumedBiomass: null,
     phaseOffset: animalHash(id) * Math.PI * 2,
   };
 };
@@ -2038,11 +2537,18 @@ const createDaphniaDisplay = (
     renderMotion: { ...ANIMAL_MOTION_PROFILES[target.behavior] },
     grazingWeight: 0,
     phase: 0,
+    swimPhase: 0,
+    feedingPulse: 0,
+    lastFeedingMotionSequence: null,
+    lastFeedingConsumedBiomass: null,
     phaseOffset: animalHash(id) * Math.PI * 2,
   };
 };
 
-const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisplay => {
+const createAnimalDisplay = (
+  id: string,
+  target: AnimalRenderTarget,
+): AnimalDisplay => {
   if (target.speciesId === 'japanese-ricefish') {
     return createRicefishDisplay(id, target);
   }
@@ -2101,6 +2607,10 @@ const createAnimalDisplay = (id: string, target: AnimalRenderTarget): AnimalDisp
     renderMotion: { ...ANIMAL_MOTION_PROFILES[target.behavior] },
     grazingWeight: target.behavior === 'grazing' ? 1 : 0,
     phase: 0,
+    swimPhase: 0,
+    feedingPulse: 0,
+    lastFeedingMotionSequence: null,
+    lastFeedingConsumedBiomass: null,
     phaseOffset,
   };
 };
@@ -2120,31 +2630,77 @@ const resetAnimalDisplay = (
   Object.assign(display.renderMotion, ANIMAL_MOTION_PROFILES[target.behavior]);
   display.grazingWeight = target.behavior === 'grazing' ? 1 : 0;
   display.phase = 0;
+  display.swimPhase = 0;
+  display.feedingPulse = 0;
+  display.lastFeedingMotionSequence = null;
+  display.lastFeedingConsumedBiomass = null;
   display.phaseOffset = animalHash(id) * Math.PI * 2;
   display.container.position.set(target.x, target.y);
   display.container.visible = true;
   display.selection.visible = false;
   display.placement.visible = false;
   display.art.position.set(0, 0);
+  display.art.pivot.set(0, 0);
   display.art.rotation = 0;
+  display.art.skew.set(0, 0);
+  display.art.scale.set(1);
   display.art.alpha = 1;
   display.art.tint = 0xffffff;
-  display.head.position.set(0, 0);
+  const hasRicefishBody =
+    display.speciesId === 'japanese-ricefish' && display.lifeStage !== 'egg';
+  display.head.pivot.set(hasRicefishBody ? RICEFISH_BODY_PIVOT_X : 0, 0);
+  display.head.position.set(hasRicefishBody ? RICEFISH_BODY_PIVOT_X : 0, 0);
   display.head.rotation = 0;
+  display.head.skew.set(0, 0);
+  display.head.scale.set(1);
   display.tail.position.set(
     display.speciesId === 'cherry-shrimp'
       ? -21
-      : display.speciesId === 'japanese-ricefish'
-        ? -23
+      : hasRicefishBody
+        ? RICEFISH_CAUDAL_BASE_X
         : 0,
-    0,
+    hasRicefishBody ? RICEFISH_CAUDAL_BASE_Y : 0,
   );
+  display.tail.pivot.set(0, 0);
   display.tail.rotation = 0;
+  display.tail.skew.set(0, 0);
+  display.tail.scale.set(1);
   display.legs.position.set(0, 0);
+  display.legs.pivot.set(0, 0);
   display.legs.rotation = 0;
+  display.legs.skew.set(0, 0);
+  display.legs.scale.set(1);
   display.legs.alpha = 1;
   display.antennae.position.set(0, 0);
+  display.antennae.pivot.set(0, 0);
   display.antennae.rotation = 0;
+  display.antennae.skew.set(0, 0);
+  display.antennae.scale.set(1);
+  if (display.pectoral) {
+    display.pectoral.rotation = 0;
+    display.pectoral.skew.set(0, 0);
+    display.pectoral.scale.set(1);
+  }
+  if (display.closedMouth) display.closedMouth.alpha = 1;
+  if (display.feedingMouth) {
+    display.feedingMouth.alpha = 0;
+    display.feedingMouth.scale.set(1);
+  }
+  if (display.feedingJaw) {
+    display.feedingJaw.alpha = 0;
+    display.feedingJaw.rotation = 0;
+    display.feedingJaw.scale.set(1);
+  }
+  for (const medianFin of [
+    display.dorsalFin,
+    display.analFin,
+    display.pelvicFin,
+  ]) {
+    if (!medianFin) continue;
+    medianFin.rotation = 0;
+    medianFin.skew.set(0, 0);
+    medianFin.scale.set(1);
+  }
   display.eggs.visible = false;
   display.grazingFeedback.visible = false;
 };
@@ -2154,7 +2710,9 @@ const acquireAnimalDisplay = (
   id: string,
   target: AnimalRenderTarget,
 ): AnimalDisplay => {
-  const display = pool?.take(animalDisplayPoolKey(target.speciesId, target.lifeStage));
+  const display = pool?.take(
+    animalDisplayPoolKey(target.speciesId, target.lifeStage, target.sex),
+  );
   if (!display) return createAnimalDisplay(id, target);
   resetAnimalDisplay(display, id, target);
   return display;
@@ -2168,7 +2726,11 @@ const releaseAnimalDisplay = (
   layer.removeChild(display.container);
   display.container.visible = false;
   if (pool?.release(
-    animalDisplayPoolKey(display.speciesId, display.lifeStage),
+    animalDisplayPoolKey(
+      display.speciesId,
+      display.lifeStage,
+      display.target.sex,
+    ),
     display,
   )) return;
   destroyDisplayTree(display.container);
@@ -2181,6 +2743,7 @@ const createAnimalCarcassDisplay = (
     const living = createDaphniaDisplay(target.id, {
       speciesId: 'daphnia',
       lifeStage: target.lifeStage,
+      sex: 'female',
       x: target.x,
       y: target.y,
       facing: target.facing,
@@ -2192,6 +2755,7 @@ const createAnimalCarcassDisplay = (
       held: false,
       placementValid: true,
       reproductiveState: 'none',
+      consumedBiomass: 0,
       interpolatedPosition: false,
     });
     living.selection.visible = false;
@@ -2220,11 +2784,12 @@ const createAnimalCarcassDisplay = (
   if (target.speciesId === 'japanese-ricefish') {
     const container = new Container();
     const art = new Container();
-    const head = drawRicefishBody();
-    const tail = drawRicefishTail();
-    const fins = drawRicefishFins();
+    const bodyArt = drawRicefishBody(target.lifeStage, 'female');
+    const head = bodyArt.container;
+    const tail = drawRicefishTail(target.lifeStage);
+    const fins = drawRicefishFins(target.lifeStage, 'female').container;
     const empty = emptyAnimalPart();
-    tail.position.set(-23, 0);
+    tail.position.set(RICEFISH_CAUDAL_BASE_X, RICEFISH_CAUDAL_BASE_Y);
     art.addChild(tail, fins, head);
     art.tint = 0xbcbba8;
     container.addChild(art);
@@ -2414,6 +2979,7 @@ const animalTarget = (
   const target = reuse ?? {
     speciesId: animal.speciesId,
     lifeStage: animal.lifeStage,
+    sex: animal.sex,
     x: animal.x,
     y: animal.y,
     facing: animal.facing,
@@ -2425,10 +2991,12 @@ const animalTarget = (
     held: false,
     placementValid: true,
     reproductiveState: animal.reproductiveState,
+    consumedBiomass: animal.consumedBiomass,
     interpolatedPosition,
   };
   target.speciesId = animal.speciesId;
   target.lifeStage = animal.lifeStage;
+  target.sex = animal.sex;
   target.x = animal.x;
   target.y = animal.y;
   target.facing = animal.facing;
@@ -2440,6 +3008,7 @@ const animalTarget = (
   target.held = false;
   target.placementValid = true;
   target.reproductiveState = animal.reproductiveState;
+  target.consumedBiomass = animal.consumedBiomass;
   target.interpolatedPosition = interpolatedPosition;
   return target;
 };
@@ -2481,7 +3050,17 @@ const syncAnimals = (
       display &&
       (
         display.speciesId !== animal.speciesId ||
-        (display.lifeStage === 'egg') !== (animal.lifeStage === 'egg')
+        (
+          animal.speciesId === 'japanese-ricefish' &&
+          (
+            display.lifeStage !== animal.lifeStage ||
+            display.target.sex !== animal.sex
+          )
+        ) ||
+        (
+          animal.speciesId !== 'japanese-ricefish' &&
+          (display.lifeStage === 'egg') !== (animal.lifeStage === 'egg')
+        )
       )
     ) {
       releaseAnimalDisplay(layer, pool, display);
@@ -2510,6 +3089,7 @@ const syncAnimals = (
     const target: AnimalRenderTarget = {
       speciesId: held.animalSpeciesId ?? previous?.speciesId ?? 'cherry-shrimp',
       lifeStage: previous?.lifeStage ?? 'adult',
+      sex: previous?.sex ?? 'female',
       x: held.x,
       y: held.y,
       facing: previous?.facing ?? 1,
@@ -2527,6 +3107,7 @@ const syncAnimals = (
       held: true,
       placementValid: held.valid,
       reproductiveState: previous?.reproductiveState ?? 'none',
+      consumedBiomass: previous?.consumedBiomass ?? 0,
       interpolatedPosition,
     };
     if (!display) {
@@ -2544,13 +3125,45 @@ const applyAnimalMotion = (
   animals: AnimalSnapshot[],
   holding: SimulationSnapshot['holding'],
   interpolatedPosition: boolean,
+  latestMotionFrame: SimulationMotionFrame | null = null,
 ): void => {
+  if (latestMotionFrame) {
+    for (const animal of latestMotionFrame.animals) {
+      const display = displays.get(animal.id);
+      if (!display) continue;
+      const previousConsumedBiomass =
+        display.lastFeedingConsumedBiomass ?? animal.consumedBiomass;
+      const consumedFood = animal.speciesId === 'japanese-ricefish'
+        ? shouldTriggerRicefishBitePulse(
+          display.lastFeedingMotionSequence,
+          latestMotionFrame.sequence,
+          previousConsumedBiomass,
+          animal.consumedBiomass,
+        )
+        : animal.speciesId === 'cherry-shrimp'
+          ? shouldTriggerShrimpGrazingPulse(
+            display.lastFeedingMotionSequence,
+            latestMotionFrame.sequence,
+            previousConsumedBiomass,
+            animal.consumedBiomass,
+          )
+          : false;
+      if (consumedFood) {
+        display.feedingPulse = 1;
+      }
+      display.lastFeedingMotionSequence = latestMotionFrame.sequence;
+      display.lastFeedingConsumedBiomass = animal.consumedBiomass;
+      display.target.consumedBiomass = animal.consumedBiomass;
+    }
+  }
+
   for (const animal of animals) {
     const display = displays.get(animal.id);
     if (!display) continue;
     const target = display.target;
     target.speciesId = animal.speciesId;
     target.lifeStage = animal.lifeStage;
+    target.sex = animal.sex;
     target.x = animal.x;
     target.y = animal.y;
     target.facing = animal.facing;
@@ -2561,6 +3174,9 @@ const applyAnimalMotion = (
     target.held = false;
     target.placementValid = true;
     target.reproductiveState = animal.reproductiveState;
+    if (animal.speciesId !== 'japanese-ricefish' || !latestMotionFrame) {
+      target.consumedBiomass = animal.consumedBiomass;
+    }
     target.interpolatedPosition = interpolatedPosition;
   }
 
@@ -2627,6 +3243,16 @@ const animateAnimals = (
     if (movingPose) {
       const visualSpeed = target.held ? 1 : Math.min(2.15, 0.7 + Math.sqrt(snapshot.speed) * 0.3);
       display.phase += delta * motion.rate * visualSpeed;
+      if (
+        display.speciesId === 'japanese-ricefish' &&
+        display.lifeStage !== 'egg'
+      ) {
+        // Medaka are continuous undulatory swimmers. Keep their tail clock
+        // independent of simulation fast-forward and of the slower generic
+        // phase used for bobbing and other species' appendages.
+        display.swimPhase +=
+          delta * motion.rate * RICEFISH_SWIM_RATE_MULTIPLIER;
+      }
     }
     const phase = display.phase + display.phaseOffset;
     const facingSign = display.renderFacing < 0 ? -1 : 1;
@@ -2647,7 +3273,9 @@ const animateAnimals = (
       const fishScale = isEgg
         ? 1
         : Math.max(0.2, display.renderBodyLength / RICEFISH_DRAW_LENGTH);
-      display.art.scale.set(isEgg ? 1 : display.renderFacing * fishScale, fishScale);
+      // Flip on a stable sign. Interpolating scale through zero made a fish
+      // briefly collapse or disappear every time it changed direction.
+      display.art.scale.set(isEgg ? 1 : facingSign * fishScale, fishScale);
       display.art.rotation = isEgg
         ? 0
         : display.renderPoseAngle * facingSign;
@@ -2660,10 +3288,73 @@ const animateAnimals = (
       display.placement.scale.set(isEgg ? 0.75 : Math.max(0.62, fishScale * 1.08));
       display.placement.tint = target.placementValid ? 0xf0c85e : 0xd7605b;
       if (!isEgg) {
-        const tailWave = Math.sin(phase * (target.behavior === 'hunting' ? 1.35 : 1));
-        display.tail.rotation = tailWave * motion.bend * 2.2;
-        display.legs.rotation = -tailWave * motion.bend * 0.42;
-        display.head.rotation = Math.sin(phase * 0.34) * motion.head * 0.35;
+        const mouthGape = ricefishMouthGape(display.feedingPulse);
+        const strikeSide = Math.sin(display.phaseOffset * 1.73) < 0 ? -1 : 1;
+        const strikePose = ricefishSideSwingPose(
+          display.feedingPulse,
+          strikeSide,
+        );
+        display.art.rotation += strikePose.bodyRotation * facingSign;
+        if (display.closedMouth) {
+          display.closedMouth.alpha = 1 - mouthGape * 0.96;
+        }
+        if (display.feedingMouth) {
+          display.feedingMouth.alpha = mouthGape;
+          display.feedingMouth.scale.set(1);
+        }
+        if (display.feedingJaw) {
+          display.feedingJaw.alpha = mouthGape;
+          display.feedingJaw.rotation = mouthGape * 0.1;
+        }
+        display.feedingPulse = Math.max(
+          0,
+          display.feedingPulse -
+            delta / RICEFISH_BITE_DURATION_SECONDS,
+        );
+        const swimPhase = display.swimPhase + display.phaseOffset;
+        const swimPose = ricefishSwimPose(swimPhase, motion.bend);
+        display.head.rotation = 0;
+        display.head.skew.set(
+          0,
+          swimPose.bodySkewY + strikePose.bodySkewY,
+        );
+        display.tail.position.set(
+          RICEFISH_CAUDAL_BASE_X,
+          RICEFISH_CAUDAL_BASE_Y,
+        );
+        display.tail.rotation = 0;
+        display.tail.skew.set(
+          0,
+          swimPose.tailSkewY + strikePose.tailSkewY,
+        );
+        display.tail.scale.set(1);
+        // Dorsal, anal, and pelvic fins keep their actual shape. They inherit
+        // only the rear body's tiny flex and never stretch independently.
+        display.legs.rotation = 0;
+        display.legs.skew.set(0, 0);
+        display.legs.scale.set(1);
+        if (display.pectoral) {
+          display.pectoral.rotation = swimPose.pectoralRotation;
+          display.pectoral.scale.set(1);
+        }
+        // Ordinary swimming produces only a small shape-preserving flex.
+        // During courtship the male actively spreads both median fins to wrap
+        // the female, represented here by a modest extra root rotation.
+        const courtshipSpread = target.behavior === 'courting' ? 0.035 : 0;
+        if (display.dorsalFin) {
+          display.dorsalFin.rotation =
+            swimPose.dorsalRotation + courtshipSpread;
+          display.dorsalFin.scale.set(1);
+        }
+        if (display.analFin) {
+          display.analFin.rotation =
+            swimPose.analRotation + courtshipSpread;
+          display.analFin.scale.set(1);
+        }
+        if (display.pelvicFin) {
+          display.pelvicFin.rotation = swimPose.analRotation * 0.35;
+          display.pelvicFin.scale.set(1);
+        }
       } else {
         const developmentPulse = 0.98 + Math.sin(phase * 0.28) * 0.025;
         display.head.scale.set(developmentPulse);
@@ -2705,32 +3396,40 @@ const animateAnimals = (
     display.placement.tint = target.placementValid ? 0xf0c85e : 0xd7605b;
     display.eggs.visible = target.reproductiveState === 'berried';
 
+    const actualIntakePulse = Math.max(0, Math.min(1, display.feedingPulse));
     const grazingTarget = target.behavior === 'grazing' && !target.held ? 1 : 0;
     display.grazingWeight += (grazingTarget - display.grazingWeight) * behaviorEase;
-    const showsGrazing = display.grazingWeight > 0.01;
+    const showsGrazing = display.grazingWeight > 0.01 || actualIntakePulse > 0.01;
     display.grazingFeedback.visible = showsGrazing;
-    display.grazingFeedback.alpha = display.grazingWeight;
+    display.grazingFeedback.alpha = Math.max(
+      display.grazingWeight * 0.72,
+      actualIntakePulse,
+    );
     if (showsGrazing) {
-      const tug = Math.max(0, Math.sin(phase * 2.35)) * display.grazingWeight;
-      display.head.position.set(tug * 0.75, tug * 0.08);
-      display.grazingMouth.scale.set(0.92 + tug * 0.13, 0.76 + tug * 0.32);
-      display.grazingMouth.alpha = 0.72 + Math.min(1, tug) * 0.28;
+      const tug = Math.max(0, Math.sin(phase * 2.35)) *
+        Math.max(display.grazingWeight * 0.72, actualIntakePulse);
+      display.head.position.set(tug * 0.9, tug * 0.1);
+      display.grazingMouth.scale.set(0.9 + tug * 0.18, 0.72 + tug * 0.42);
+      display.grazingMouth.alpha = 0.68 + Math.min(1, tug) * 0.32;
       for (let index = 0; index < display.grazingFlecks.length; index += 1) {
         const fleck = display.grazingFlecks[index];
         const progress = (phase * 0.36 + index / display.grazingFlecks.length) % 1;
         const inward = 1 - progress;
         fleck.position.set(
-          21.5 + inward * (5.2 + index * 1.3),
-          Math.sin(phase * 1.1 + index * 2.15) * (1.3 + inward * 1.9),
+          21.5 + inward * (6 + index * 1.1),
+          Math.sin(phase * 1.1 + index * 2.15) * (1.6 + inward * 2.2),
         );
-        const fleckScale = 0.55 + inward * 0.48;
+        const fleckScale = (0.58 + inward * 0.55) *
+          (0.78 + actualIntakePulse * 0.38);
         fleck.scale.set(fleckScale);
-        fleck.alpha = Math.sin(progress * Math.PI) * 0.88;
+        fleck.alpha = Math.sin(progress * Math.PI) *
+          actualIntakePulse * 0.96;
         fleck.rotation = phase * 0.18 * (index % 2 === 0 ? 1 : -1);
       }
     } else {
       display.head.position.set(0, 0);
     }
+    display.feedingPulse = Math.max(0, display.feedingPulse - delta / 0.32);
 
     for (let index = 0; index < display.abdomen.length; index += 1) {
       const segment = display.abdomen[index];
@@ -2750,6 +3449,7 @@ const animateAnimals = (
 const animateAnimalCarcasses = (
   displays: Map<string, AnimalCarcassDisplay>,
   deltaSeconds: number,
+  groundY = GROUND_Y,
 ): void => {
   const delta = Math.max(0, Math.min(0.05, deltaSeconds));
   for (const display of displays.values()) {
@@ -2779,7 +3479,7 @@ const animateAnimalCarcasses = (
     const lifetime = Math.max(0.001, target.lifetimeSeconds);
     const lifeProgress = Math.min(1, age / lifetime);
     const settle = 1 - Math.exp(-age * 1.35);
-    const availableDrop = Math.max(0, GROUND_Y - 8 - target.y);
+    const availableDrop = Math.max(0, groundY - 8 - target.y);
     const drop = display.speciesId === 'daphnia'
       ? daphniaCarcassSinkingOffset(age, availableDrop)
       : Math.min(8, availableDrop) * settle;
@@ -2855,19 +3555,24 @@ type AlgaeSpeciesId = 'oedogonium' | 'nitzschia';
 interface AlgaeDensitySurface {
   surfaceKind: SurfaceCellSnapshot['surfaceKind'];
   speciesLayers: Record<AlgaeSpeciesId, AlgaeSpeciesDensityLayer>;
-  fieldDirty: boolean;
-  lastFieldRenderAtMs: number;
+  fieldDirty: Record<AlgaeSpeciesId, boolean>;
+  lastFieldRenderAtMs: Record<AlgaeSpeciesId, number>;
   mask: Graphics;
   maskKey: string;
-  cells: Map<string, string>;
+  cells: Record<AlgaeSpeciesId, Map<string, string>>;
   colonization: Record<AlgaeSpeciesId, Map<string, AlgaeColonizationState>>;
 }
 
 interface AlgaeSpeciesDensityLayer {
   container: Container;
-  densityMarks: Container;
-  brushTexture: Texture;
-  brushSprites: Map<string, Sprite>;
+  densitySprite: Sprite;
+  densityPixels: Uint8Array;
+  densityField: Float32Array;
+  densityScratch: Float32Array;
+  densitySource: BufferImageSource | null;
+  densityTexture: Texture | null;
+  fieldWidth: number;
+  fieldHeight: number;
   detailGraphics: Graphics;
   detailContext: GraphicsContext;
   detailGeometryKey: string;
@@ -2880,21 +3585,58 @@ export interface AlgaeColonizationState {
 
 const algaeDensitySurfaces = new WeakMap<Container, AlgaeDensitySurface>();
 
-export const ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL = 4;
-export const ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL = 5;
+// The density wash carries standing biomass. Crisp strands are only species
+// identity marks, so they must not multiply into a second visual biomass layer
+// every time adjacent ecology cells become occupied. Eight keeps a mature cell
+// recognisably filamentous while avoiding the 18-per-cell tangle seen on the
+// Mission 5 flat stone.
+export const ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL = 8;
+export const OEDOGONIUM_DENSITY_ALPHA = 0.98;
+// The continuous density wash carries the occupied area. Keep enough distinct
+// diatoms to read at fit zoom, but cap them far below the old carpet of marks.
+export const ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL = 8;
 export const NITZSCHIA_VISUAL_STYLE = {
-  brush: { red: 176, green: 126, blue: 58, alpha: 0.58 },
-  substrateAlpha: 0.72,
-  structureAlpha: 0.58,
+  brush: { red: 172, green: 119, blue: 43, alpha: 0.6 },
+  substrateAlpha: 0.82,
+  structureAlpha: 0.74,
   speck: {
-    radiusMin: 0.42,
-    radiusSpan: 0.38,
-    aspectMin: 0.72,
-    aspectSpan: 0.22,
+    radiusMin: 0.62,
+    radiusSpan: 0.48,
+    aspectMin: 0.42,
+    aspectSpan: 0.18,
     color: 0x6f4a2b,
-    alpha: 0.46,
+    alpha: 0.58,
   },
 } as const;
+
+export const nitzschiaSpeckCount = (
+  visualLevel: number,
+  biomass?: number,
+): number => {
+  if (visualLevel <= 0) return 0;
+  if (biomass !== undefined) {
+    // A dispersal trace is already represented by the soft density wash. Do
+    // not stamp a crisp grain into every newly reached ecology cell.
+    if (!Number.isFinite(biomass) || biomass <= ALGAE_VISIBLE_BIOMASS) {
+      return 0;
+    }
+    const linearAmount = Math.max(
+      0,
+      Math.min(1, biomass / ALGAE_VISUAL_SATURATION_BIOMASS),
+    );
+    return Math.max(
+      2,
+      Math.round(
+        2 +
+          (ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL - 2) * linearAmount,
+      ),
+    );
+  }
+  return algaeDetailCount(
+    ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL,
+    visualLevel,
+  );
+};
 
 export const algaeColonizationDetailSeed = (
   cellId: string,
@@ -2911,10 +3653,11 @@ const algaeDetailPosition = (
   surfaceAngle: number,
   seed: number,
 ): Vec2 => {
-  // Detail points deliberately spill across neighboring ecology cells. The
-  // soft density mask clips them back to the actual colony, while the overlap
-  // prevents one evenly centred mark per cell from revealing the grid.
-  const spread = cell.cellSize * 1.05;
+  // The continuous wash already joins neighboring ecology cells. Keep detail
+  // centres close to their source cell so adjacent cells do not stamp several
+  // independent filament layers onto the same patch. A small spill still
+  // breaks the bookkeeping grid without recreating the old tangled carpet.
+  const spread = cell.cellSize * 0.58;
   const localX = (hash01(seed * 43 + 17) - 0.5) * spread * 2;
   const localY = (hash01(seed * 71 + 29) - 0.5) * spread * 2;
   const cosine = Math.cos(surfaceAngle);
@@ -3025,9 +3768,9 @@ const appendNitzschiaSpeck = (
   const tangentY = Math.sin(angle);
   const normalX = -tangentY;
   const normalY = tangentX;
-  // Keep the cells as tiny dust-like flecks, but large enough to survive the
-  // default 84% tank zoom.  The previous sub-pixel, narrow ovals disappeared
-  // completely after texture scaling even over a mature colony.
+  // Nitzschia reads as short golden-brown needle/lozenge cells, not round
+  // sub-pixel dust. The major axis remains visible at fit zoom while the thin
+  // minor axis keeps a mature film from looking like large pebbles.
   const radius = NITZSCHIA_VISUAL_STYLE.speck.radiusMin +
     hash01(seed * 61 + 11) * NITZSCHIA_VISUAL_STYLE.speck.radiusSpan;
   const aspect = NITZSCHIA_VISUAL_STYLE.speck.aspectMin +
@@ -3053,52 +3796,6 @@ const styleAlgaeDetailContext = (context: GraphicsContext): void => {
   context.batchMode = 'no-batch';
 };
 
-export const ALGAE_BRUSH_TEXTURE_SIZE = 96;
-export const ALGAE_BRUSH_MEMBRANE_RADIUS = 27;
-export const ALGAE_BRUSH_SOFT_EDGE_PIXELS = 10;
-
-const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement => {
-  const size = ALGAE_BRUSH_TEXTURE_SIZE;
-  const center = size / 2;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const context = canvas.getContext('2d');
-  if (!context) return canvas;
-
-  context.save();
-  context.filter = `blur(${ALGAE_BRUSH_SOFT_EDGE_PIXELS}px)`;
-  const nitzschiaBrush = NITZSCHIA_VISUAL_STYLE.brush;
-  context.fillStyle = speciesId === 'oedogonium'
-    ? 'rgba(84, 132, 73, 0.52)'
-    : `rgba(${nitzschiaBrush.red}, ${nitzschiaBrush.green}, ${nitzschiaBrush.blue}, ${nitzschiaBrush.alpha})`;
-  // One broad translucent membrane reproduces the connected wash of the old
-  // shared raster. Four overlapping circles made an almost opaque center but
-  // a much smaller footprint, so a colony looked like separated dark dots.
-  const membranePoints = Array.from({ length: 18 }, (_, index) => {
-    const angle = (index / 18) * Math.PI * 2;
-    const radius = ALGAE_BRUSH_MEMBRANE_RADIUS - 3 +
-      hash01(index * 29 + (speciesId === 'oedogonium' ? 5 : 41)) * 3;
-    return {
-      x: center + Math.cos(angle) * radius,
-      y: center + Math.sin(angle) * radius,
-    };
-  });
-  const first = membranePoints[0];
-  const last = membranePoints.at(-1)!;
-  context.beginPath();
-  context.moveTo((last.x + first.x) / 2, (last.y + first.y) / 2);
-  membranePoints.forEach((point, index) => {
-    const next = membranePoints[(index + 1) % membranePoints.length];
-    context.quadraticCurveTo(point.x, point.y, (point.x + next.x) / 2, (point.y + next.y) / 2);
-  });
-  context.closePath();
-  context.fill();
-  context.restore();
-
-  return canvas;
-};
-
 const createAlgaeParticleLayer = (
   surfaceKind: SurfaceCellSnapshot['surfaceKind'],
 ): Container => {
@@ -3109,21 +3806,18 @@ const createAlgaeParticleLayer = (
   const createSpeciesLayer = (speciesId: AlgaeSpeciesId): AlgaeSpeciesDensityLayer => {
     const container = new Container();
     container.visible = false;
-    const brushTexture = Texture.from(createAlgaeBrushCanvas(speciesId));
-    brushTexture.source.scaleMode = 'linear';
-    const densityMarks = new Container();
+    const densitySprite = new Sprite(Texture.EMPTY);
     // Keep the density wash opaque enough to anchor the crisp detail strokes,
     // while the colony stays as light as the earlier hand-drawn version.
-    densityMarks.alpha = speciesId === 'oedogonium'
-      ? 0.86
+    densitySprite.alpha = speciesId === 'oedogonium'
+      ? OEDOGONIUM_DENSITY_ALPHA
       : surfaceKind === 'substrate'
         ? NITZSCHIA_VISUAL_STYLE.substrateAlpha
         : NITZSCHIA_VISUAL_STYLE.structureAlpha;
 
-    // The density wash reuses one immutable brush texture. Updating a full
-    // canvas texture for every ecology snapshot retained Chromium backing-store
-    // regions in long x64 runs; moving only Sprite transforms keeps the soft,
-    // overlapping colony boundary without recurring texture uploads.
+    // Restore the old continuous density surface without restoring its
+    // repeatedly updated HTML canvas. A single typed buffer is retained and
+    // uploaded in place, so Chromium cannot accumulate canvas backing stores.
     const detailGraphics = new Graphics();
     const detailContext = detailGraphics.context;
     styleAlgaeDetailContext(detailContext);
@@ -3134,35 +3828,47 @@ const createAlgaeParticleLayer = (
     // held-object preview are drawn. Details are already generated only for
     // biologically active cells, so drawing them directly preserves the colony
     // shape without the fragile GPU filter path.
-    container.addChild(densityMarks, detailGraphics);
+    container.addChild(densitySprite, detailGraphics);
     content.addChild(container);
     return {
       container,
-      densityMarks,
-      brushTexture,
-      brushSprites: new Map<string, Sprite>(),
+      densitySprite,
+      densityPixels: new Uint8Array(0),
+      densityField: new Float32Array(0),
+      densityScratch: new Float32Array(0),
+      densitySource: null,
+      densityTexture: null,
+      fieldWidth: 0,
+      fieldHeight: 0,
       detailGraphics,
       detailContext,
       detailGeometryKey: '',
     };
   };
 
-  // Brown diatoms sit below the greener filamentous algae when both compete
-  // for the same visible patch, matching the old compositing order.
+  // Put the sparse diatom lozenges above the filament wash. With the opposite
+  // order, even a mature Nitzschia colony disappeared completely anywhere
+  // Oedogonium shared the same stone.
   const speciesLayers = {
-    nitzschia: createSpeciesLayer('nitzschia'),
     oedogonium: createSpeciesLayer('oedogonium'),
+    nitzschia: createSpeciesLayer('nitzschia'),
   };
   content.mask = mask;
   root.addChild(content, mask);
   algaeDensitySurfaces.set(root, {
     surfaceKind,
     speciesLayers,
-    fieldDirty: true,
-    lastFieldRenderAtMs: Number.NEGATIVE_INFINITY,
+    fieldDirty: { nitzschia: true, oedogonium: true },
+    lastFieldRenderAtMs: {
+      nitzschia: Number.NEGATIVE_INFINITY,
+      oedogonium: Number.NEGATIVE_INFINITY,
+    },
     mask,
     maskKey: '',
-    cells: new Map<string, string>(),
+    cells: {
+      nitzschia: new Map<string, string>(),
+      oedogonium: new Map<string, string>(),
+    },
     colonization: {
       nitzschia: new Map<string, AlgaeColonizationState>(),
       oedogonium: new Map<string, AlgaeColonizationState>(),
@@ -3174,17 +3880,18 @@ const createAlgaeParticleLayer = (
 const releaseAlgaeParticleLayer = (layer: Container): void => {
   const surface = algaeDensitySurfaces.get(layer);
   if (!surface) return;
-  surface.cells.clear();
   for (const speciesId of ['nitzschia', 'oedogonium'] as const) {
+    surface.cells[speciesId].clear();
     surface.colonization[speciesId].clear();
     const speciesLayer = surface.speciesLayers[speciesId];
-    const sprites = speciesLayer.densityMarks.removeChildren();
-    for (const sprite of sprites) {
-      sprite.destroy();
+    if (speciesLayer.densityTexture && !speciesLayer.densityTexture.destroyed) {
+      speciesLayer.densityTexture.destroy(true);
     }
-    speciesLayer.brushSprites.clear();
-    const texture = speciesLayer.brushTexture;
-    if (!texture.destroyed) texture.destroy(true);
+    speciesLayer.densityPixels = new Uint8Array(0);
+    speciesLayer.densityField = new Float32Array(0);
+    speciesLayer.densityScratch = new Float32Array(0);
+    speciesLayer.densitySource = null;
+    speciesLayer.densityTexture = null;
   }
   algaeDensitySurfaces.delete(layer);
 };
@@ -3209,7 +3916,9 @@ const updateAlgaeMask = (
   surface.maskKey = maskKey;
   surface.mask.clear();
   if (surface.surfaceKind === 'substrate') {
-    surface.mask.rect(0, GROUND_Y - 36, TANK_WIDTH, 45).fill({ color: 0xffffff });
+    surface.mask
+      .rect(0, snapshot.tank.groundY - 36, snapshot.tank.width, 45)
+      .fill({ color: 0xffffff });
     return;
   }
   for (const structure of snapshot.structures) {
@@ -3224,42 +3933,50 @@ const updateAlgaeMask = (
   }
 };
 
-const syncAlgaeCellBrushSprite = (
+const ensureAlgaeDensitySurface = (
   layer: AlgaeSpeciesDensityLayer,
-  cell: SurfaceCellSnapshot,
-  speciesId: AlgaeSpeciesId,
-  visualLevel: number,
-  surfaceAngle: number,
+  snapshot: SimulationSnapshot,
 ): void => {
-  const speciesOffset = speciesId === 'oedogonium' ? 97 : 13;
-  const cellSeed = stringHash(cell.id);
-  const localJitterX = (hash01(cellSeed + speciesOffset) - 0.5) *
-    cell.cellSize * ALGAE_PARTICLE_JITTER_SPAN;
-  const localJitterY = (hash01(cellSeed + speciesOffset + 11) - 0.5) *
-    cell.cellSize * ALGAE_PARTICLE_JITTER_SPAN;
-  const cosine = Math.cos(surfaceAngle);
-  const sine = Math.sin(surfaceAngle);
-  const jitterX = localJitterX * cosine - localJitterY * sine;
-  const jitterY = localJitterX * sine + localJitterY * cosine;
-  const radius = cell.cellSize * algaeParticleRadiusRatio(visualLevel);
-  const scaleX = radius / ALGAE_BRUSH_MEMBRANE_RADIUS *
-    (0.94 + hash01(cellSeed + speciesOffset + 23) * 0.12);
-  const scaleY = radius / ALGAE_BRUSH_MEMBRANE_RADIUS *
-    (0.94 + hash01(cellSeed + speciesOffset + 41) * 0.12);
-
-  let sprite = layer.brushSprites.get(cell.id);
-  if (!sprite) {
-    sprite = new Sprite(layer.brushTexture);
-    sprite.anchor.set(0.5);
-    layer.brushSprites.set(cell.id, sprite);
-    layer.densityMarks.addChild(sprite);
+  const fieldWidth = Math.max(
+    1,
+    Math.round(snapshot.tank.width * ALGAE_DENSITY_FIELD_SCALE),
+  );
+  const fieldHeight = Math.max(
+    1,
+    Math.round(snapshot.tank.height * ALGAE_DENSITY_FIELD_SCALE),
+  );
+  if (
+    layer.fieldWidth === fieldWidth &&
+    layer.fieldHeight === fieldHeight &&
+    layer.densitySource &&
+    !layer.densitySource.destroyed
+  ) {
+    layer.densitySprite.setSize(snapshot.tank.width, snapshot.tank.height);
+    return;
   }
-  sprite.position.set(cell.x + jitterX, cell.y + jitterY);
-  sprite.rotation = surfaceAngle +
-    hash01(cellSeed + speciesOffset + 59) * Math.PI * 2;
-  sprite.scale.set(scaleX, scaleY);
-  sprite.alpha = algaeParticleAlpha(visualLevel);
-  sprite.visible = true;
+
+  if (layer.densityTexture && !layer.densityTexture.destroyed) {
+    layer.densityTexture.destroy(true);
+  }
+  const pixelCount = fieldWidth * fieldHeight;
+  layer.fieldWidth = fieldWidth;
+  layer.fieldHeight = fieldHeight;
+  layer.densityPixels = new Uint8Array(pixelCount * 4);
+  layer.densityField = new Float32Array(pixelCount);
+  layer.densityScratch = new Float32Array(pixelCount);
+  layer.densitySource = new BufferImageSource({
+    resource: layer.densityPixels,
+    width: fieldWidth,
+    height: fieldHeight,
+    format: 'rgba8unorm',
+    alphaMode: 'premultiply-alpha-on-upload',
+    autoGarbageCollect: false,
+  });
+  layer.densitySource.scaleMode = 'linear';
+  layer.densityTexture = new Texture({ source: layer.densitySource });
+  layer.densitySprite.texture = layer.densityTexture;
+  layer.densitySprite.position.set(0, 0);
+  layer.densitySprite.setSize(snapshot.tank.width, snapshot.tank.height);
 };
 
 export const advanceAlgaeColonizationState = (
@@ -3298,10 +4015,15 @@ const algaeDetailGeometryKey = (
   const surfaceAngle = cell.surfaceKind === 'structure-face'
     ? structureAngles.get(cell.ownerId) ?? 0
     : 0;
+  const biomass = cell.biomass[speciesId];
+  const visualLevel = algaeVisualLevel(biomass);
+  const detailCount = speciesId === 'oedogonium'
+    ? oedogoniumFilamentCount(cell.id, visualLevel, biomass)
+    : nitzschiaSpeckCount(visualLevel, biomass);
   return [
     cell.id,
     generation,
-    algaeVisualLevel(cell.biomass[speciesId]),
+    detailCount,
     algaeKeyNumber(cell.x),
     algaeKeyNumber(cell.y),
     algaeKeyNumber(cell.cellSize),
@@ -3331,9 +4053,10 @@ const rebuildAlgaeDetailGeometry = (
   if (speciesId === 'oedogonium') {
     for (const cell of cells) {
       const generation = surface.colonization.oedogonium.get(cell.id)?.generation ?? 1;
-      const detailCount = algaeDetailCount(
-        ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL,
+      const detailCount = oedogoniumFilamentCount(
+        cell.id,
         algaeVisualLevel(cell.biomass.oedogonium),
+        cell.biomass.oedogonium,
       );
       const surfaceAngle = cell.surfaceKind === 'structure-face'
         ? structureAngles.get(cell.ownerId) ?? 0
@@ -3355,8 +4078,8 @@ const rebuildAlgaeDetailGeometry = (
     }
     context.stroke({
       color: 0x355f3b,
-      alpha: 0.4,
-      width: 0.52,
+      alpha: 0.62,
+      width: 0.68,
       cap: 'round',
       join: 'round',
     });
@@ -3365,9 +4088,9 @@ const rebuildAlgaeDetailGeometry = (
 
   for (const cell of cells) {
     const generation = surface.colonization.nitzschia.get(cell.id)?.generation ?? 1;
-    const detailCount = algaeDetailCount(
-      ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL,
+    const detailCount = nitzschiaSpeckCount(
       algaeVisualLevel(cell.biomass.nitzschia),
+      cell.biomass.nitzschia,
     );
     const surfaceAngle = cell.surfaceKind === 'structure-face'
       ? structureAngles.get(cell.ownerId) ?? 0
@@ -3396,51 +4119,49 @@ const rebuildAlgaeDetailGeometry = (
 const drawAlgaeDensityField = (
   surface: AlgaeDensitySurface,
   snapshot: SimulationSnapshot,
+  speciesId: AlgaeSpeciesId,
 ): void => {
   const structureAngles = new Map(
     snapshot.structures.map((structure) => [structure.id, structure.angle]),
   );
-  const surfaceCellIds = new Set<string>();
+
+  const speciesCells: SurfaceCellSnapshot[] = [];
+  const speciesLayer = surface.speciesLayers[speciesId];
+  ensureAlgaeDensitySurface(speciesLayer, snapshot);
   for (const cell of snapshot.cells) {
-    if (cell.surfaceKind === surface.surfaceKind) surfaceCellIds.add(cell.id);
+    if (cell.surfaceKind !== surface.surfaceKind) continue;
+    const level = algaeVisualLevel(cell.biomass[speciesId]);
+    if (level === 0) continue;
+    speciesCells.push(cell);
   }
-
-  const speciesOrder: AlgaeSpeciesId[] = ['nitzschia', 'oedogonium'];
-  for (const speciesId of speciesOrder) {
-    const detailCells: SurfaceCellSnapshot[] = [];
-    const speciesLayer = surface.speciesLayers[speciesId];
-    for (const sprite of speciesLayer.brushSprites.values()) {
-      sprite.visible = false;
-    }
-    for (const cell of snapshot.cells) {
-      if (cell.surfaceKind !== surface.surfaceKind) continue;
-      const level = algaeVisualLevel(cell.biomass[speciesId]);
-      if (level === 0) continue;
-      detailCells.push(cell);
-      syncAlgaeCellBrushSprite(
-        speciesLayer,
-        cell,
-        speciesId,
-        level,
-        cell.surfaceKind === 'structure-face'
-          ? structureAngles.get(cell.ownerId) ?? 0
-          : 0,
-      );
-    }
-
-    for (const [cellId, sprite] of speciesLayer.brushSprites) {
-      if (surfaceCellIds.has(cellId)) continue;
-      speciesLayer.brushSprites.delete(cellId);
-      speciesLayer.densityMarks.removeChild(sprite);
-      sprite.destroy();
-    }
-    rebuildAlgaeDetailGeometry(
-      surface,
-      speciesId,
-      detailCells,
-      structureAngles,
-    );
-  }
+  const brushColor = speciesId === 'oedogonium'
+    ? { red: 84, green: 132, blue: 73 }
+    : NITZSCHIA_VISUAL_STYLE.brush;
+  writeAlgaeDensityPixels(
+    {
+      pixels: speciesLayer.densityPixels,
+      density: speciesLayer.densityField,
+      scratch: speciesLayer.densityScratch,
+      width: speciesLayer.fieldWidth,
+      height: speciesLayer.fieldHeight,
+      worldWidth: snapshot.tank.width,
+      worldHeight: snapshot.tank.height,
+    },
+    speciesCells.map((cell) => ({
+      x: cell.x,
+      y: cell.y,
+      cellSize: cell.cellSize,
+      biomass: cell.biomass[speciesId],
+    })),
+    brushColor,
+  );
+  speciesLayer.densitySource?.update();
+  rebuildAlgaeDetailGeometry(
+    surface,
+    speciesId,
+    speciesCells,
+    structureAngles,
+  );
 };
 
 const flushAlgaeDensityField = (
@@ -3450,18 +4171,20 @@ const flushAlgaeDensityField = (
   force: boolean,
   nowMs: number,
 ): void => {
-  if (!surface.fieldDirty && !force) return;
-  if (!force && !shouldRefreshAlgaeRasterNow({
-    phase: snapshot.phase,
-    speed: snapshot.speed,
-    editable,
-    nowMs,
-    lastRefreshAtMs: surface.lastFieldRenderAtMs,
-  })) return;
+  for (const speciesId of ['nitzschia', 'oedogonium'] as const) {
+    if (!surface.fieldDirty[speciesId] && !force) continue;
+    if (!force && !shouldRefreshAlgaeRasterNow({
+      phase: snapshot.phase,
+      speed: snapshot.speed,
+      editable,
+      nowMs,
+      lastRefreshAtMs: surface.lastFieldRenderAtMs[speciesId],
+    })) continue;
 
-  drawAlgaeDensityField(surface, snapshot);
-  surface.fieldDirty = false;
-  surface.lastFieldRenderAtMs = nowMs;
+    drawAlgaeDensityField(surface, snapshot, speciesId);
+    surface.fieldDirty[speciesId] = false;
+    surface.lastFieldRenderAtMs[speciesId] = nowMs;
+  }
 };
 
 const syncAlgaeParticles = (
@@ -3480,44 +4203,42 @@ const syncAlgaeParticles = (
     nitzschia: false,
     oedogonium: false,
   };
-  let visualChanged = false;
-  let detailLifecycleChanged = false;
   for (const cell of snapshot.cells) {
     if (cell.surfaceKind !== surface.surfaceKind) continue;
     activeCellIds.add(cell.id);
-    const nitzschiaLevel = algaeVisualLevel(cell.biomass.nitzschia);
-    const oedogoniumLevel = algaeVisualLevel(cell.biomass.oedogonium);
-    detailLifecycleChanged = updateAlgaeColonizationState(
-      surface,
-      cell.id,
-      'nitzschia',
-      nitzschiaLevel > 0,
-    ) || detailLifecycleChanged;
-    detailLifecycleChanged = updateAlgaeColonizationState(
-      surface,
-      cell.id,
-      'oedogonium',
-      oedogoniumLevel > 0,
-    ) || detailLifecycleChanged;
-    if (nitzschiaLevel > 0) visibleSpecies.nitzschia = true;
-    if (oedogoniumLevel > 0) visibleSpecies.oedogonium = true;
-    const previousKey = surface.cells.get(cell.id);
-
-    if (nitzschiaLevel === 0 && oedogoniumLevel === 0) {
-      if (surface.cells.delete(cell.id)) visualChanged = true;
-      continue;
+    for (const speciesId of ['nitzschia', 'oedogonium'] as const) {
+      const level = algaeVisualLevel(cell.biomass[speciesId]);
+      if (updateAlgaeColonizationState(
+        surface,
+        cell.id,
+        speciesId,
+        level > 0,
+      )) surface.fieldDirty[speciesId] = true;
+      if (level > 0) visibleSpecies[speciesId] = true;
+      const cells = surface.cells[speciesId];
+      if (level === 0) {
+        if (cells.delete(cell.id)) surface.fieldDirty[speciesId] = true;
+        continue;
+      }
+      const visualKey = [
+        cell.id,
+        algaeKeyNumber(cell.x),
+        algaeKeyNumber(cell.y),
+        algaeKeyNumber(cell.cellSize),
+        algaeFineVisualAmount(cell.biomass[speciesId]),
+      ].join(':');
+      if (cells.get(cell.id) === visualKey) continue;
+      cells.set(cell.id, visualKey);
+      surface.fieldDirty[speciesId] = true;
     }
-
-    const visualKey = algaeCellVisualKey(cell);
-    if (previousKey === visualKey) continue;
-    surface.cells.set(cell.id, visualKey);
-    visualChanged = true;
   }
 
-  for (const cellId of surface.cells.keys()) {
-    if (activeCellIds.has(cellId)) continue;
-    surface.cells.delete(cellId);
-    visualChanged = true;
+  for (const speciesId of ['nitzschia', 'oedogonium'] as const) {
+    for (const cellId of surface.cells[speciesId].keys()) {
+      if (activeCellIds.has(cellId)) continue;
+      surface.cells[speciesId].delete(cellId);
+      surface.fieldDirty[speciesId] = true;
+    }
   }
 
   for (const speciesId of ['nitzschia', 'oedogonium'] as const) {
@@ -3527,11 +4248,10 @@ const syncAlgaeParticles = (
         active: false,
         generation: state.generation,
       });
-      detailLifecycleChanged = true;
+      surface.fieldDirty[speciesId] = true;
     }
   }
 
-  if (visualChanged || detailLifecycleChanged) surface.fieldDirty = true;
   flushAlgaeDensityField(surface, snapshot, editable, force, nowMs);
   for (const speciesId of ['nitzschia', 'oedogonium'] as const) {
     surface.speciesLayers[speciesId].container.visible = visibleSpecies[speciesId];
@@ -3719,7 +4439,12 @@ const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void =
     : 0;
   if (darkness <= 0.01) return;
   layer
-    .rect(0, WATER_TOP, TANK_WIDTH, GROUND_Y - WATER_TOP)
+    .rect(
+      0,
+      snapshot.tank.waterTop,
+      snapshot.tank.width,
+      snapshot.tank.groundY - snapshot.tank.waterTop,
+    )
     .fill({ color: 0x173349, alpha: darkness * 0.34 });
 };
 
@@ -3730,7 +4455,7 @@ const drawPhytoplankton = (layer: Container, snapshot: SimulationSnapshot): void
     layer.visible = false;
     return;
   }
-  ensurePhytoplanktonHazeSurface(surface, water.columns, water.rows);
+  ensurePhytoplanktonHazeSurface(surface, water.columns, water.rows, snapshot);
   smoothPhytoplanktonConcentration(
     water.phytoplankton,
     water.columns,
@@ -3917,10 +4642,17 @@ const DIGIT_SEGMENTS: Record<string, number[]> = {
   '9': [0, 1, 2, 3, 5, 6],
 };
 
-const drawMeasurementNumber = (layer: Graphics, x: number, y: number, index: number): void => {
+const drawMeasurementNumber = (
+  layer: Graphics,
+  x: number,
+  y: number,
+  index: number,
+  tankWidth = TANK_WIDTH,
+  waterTop = WATER_TOP,
+): void => {
   const label = String(index + 1);
-  const badgeX = x > TANK_WIDTH - 30 ? x - 15 : x + 15;
-  const badgeY = y < WATER_TOP + 30 ? y + 15 : y - 15;
+  const badgeX = x > tankWidth - 30 ? x - 15 : x + 15;
+  const badgeY = y < waterTop + 30 ? y + 15 : y - 15;
   const digitWidth = 4;
   const gap = 2;
   const totalWidth = label.length * digitWidth + (label.length - 1) * gap;
@@ -3990,7 +4722,14 @@ const drawMeasurements = (layer: Graphics, snapshot: SimulationSnapshot): void =
         ).fill({ color: colors[dotIndex], alpha: 1 });
       }
     }
-    drawMeasurementNumber(layer, measurement.x, measurement.y, index);
+    drawMeasurementNumber(
+      layer,
+      measurement.x,
+      measurement.y,
+      index,
+      snapshot.tank.width,
+      snapshot.tank.waterTop,
+    );
   }
 };
 
@@ -4051,6 +4790,75 @@ const drawDragSelection = (layer: Graphics, from: Vec2 | null, to: Vec2 | null):
     .stroke({ color: 0xf8e4a2, width: 3, alpha: 0.88 });
 };
 
+const drawSpatialDebug = (
+  layer: Graphics,
+  snapshot: SimulationSnapshot,
+): void => {
+  layer.clear();
+  if (!snapshot.spatialDebug.enabled) return;
+
+  for (const structure of snapshot.structures) {
+    const definition = STRUCTURES[structure.definitionId];
+    const polygon = structureAuthoredPolygonToWorld(
+      definition.collisionPolygon,
+      definition.collisionPolygon,
+      { x: structure.x, y: structure.y },
+      structure.angle,
+    );
+    if (!polygon.length) continue;
+    layer.moveTo(polygon[0].x, polygon[0].y);
+    for (let index = 1; index < polygon.length; index += 1) {
+      layer.lineTo(polygon[index].x, polygon[index].y);
+    }
+    layer
+      .closePath()
+      .stroke({ color: 0xe061ad, width: 2.2, alpha: 0.92, join: 'round' });
+  }
+
+  for (const cell of snapshot.cells) {
+    if (cell.surfaceKind !== 'structure-face') continue;
+    layer
+      .circle(cell.x, cell.y, 1.8)
+      .fill({ color: 0x5bdb91, alpha: 0.9 })
+      .circle(cell.x, cell.y, Math.max(3, cell.cellSize * 0.42))
+      .stroke({ color: 0x5bdb91, width: 0.65, alpha: 0.35 });
+  }
+
+  for (const gap of snapshot.spatialDebug.gaps) {
+    layer
+      .moveTo(gap.first.x, gap.first.y)
+      .lineTo(gap.second.x, gap.second.y)
+      .stroke({ color: 0xffd55f, width: 3, alpha: 0.95, cap: 'round' })
+      .circle(gap.first.x, gap.first.y, 3.2)
+      .fill({ color: 0xffd55f, alpha: 0.95 })
+      .circle(gap.second.x, gap.second.y, 3.2)
+      .fill({ color: 0xffd55f, alpha: 0.95 })
+      .circle(gap.x, gap.y, Math.max(4, gap.usableClearance / 2))
+      .stroke({ color: 0xffed9e, width: 1.4, alpha: 0.9 })
+      .moveTo(gap.x - 5, gap.y)
+      .lineTo(gap.x + 5, gap.y)
+      .moveTo(gap.x, gap.y - 5)
+      .lineTo(gap.x, gap.y + 5)
+      .stroke({ color: 0xffed9e, width: 1.1, alpha: 0.82 });
+  }
+
+  for (const agent of snapshot.spatialDebug.agents) {
+    const color = agent.speciesId === 'japanese-ricefish'
+      ? 0x66b9e0
+      : agent.speciesId === 'cherry-shrimp'
+        ? 0x79d5cf
+        : 0xa1d6e8;
+    const radius = Math.max(2, agent.bodyThickness / 2);
+    layer
+      .circle(agent.x, agent.y, radius)
+      .fill({ color, alpha: 0.12 })
+      .stroke({ color, width: 1.6, alpha: 0.96 })
+      .moveTo(agent.x - radius, agent.y)
+      .lineTo(agent.x + radius, agent.y)
+      .stroke({ color, width: 0.8, alpha: 0.78 });
+  }
+};
+
 export function AquariumCanvas({
   snapshot,
   motionSource,
@@ -4065,10 +4873,12 @@ export function AquariumCanvas({
   onToolComplete,
   onClearSelection,
   onCameraChange,
+  initialCameraTransform = null,
   cameraResetToken = 0,
   showGoalGuide = false,
   waterQualityLayers,
 }: AquariumCanvasProps) {
+  const tankGeometry = createTankVisualGeometry(snapshot.tank);
   const hostRef = useRef<HTMLDivElement>(null);
   const appRef = useRef<Application | null>(null);
   const snapshotRef = useRef(snapshot);
@@ -4091,6 +4901,7 @@ export function AquariumCanvas({
   const lastAlgaeStructureGeometryRef = useRef('');
   const lastPlantsDrawRef = useRef('');
   const lastSeedsDrawRef = useRef('');
+  const lastSpatialDebugDrawRef = useRef('');
   const lastGoalGuideDrawRef = useRef('');
   const lastInteractionDrawRef = useRef('');
   const lastMeasurementsDrawRef = useRef('');
@@ -4110,7 +4921,19 @@ export function AquariumCanvas({
   const dragStartClientRef = useRef<Vec2 | null>(null);
   const dragCurrentRef = useRef<Vec2 | null>(null);
   const dragPointerRef = useRef<number | null>(null);
-  const cameraRef = useRef<CameraState>(defaultCamera());
+  const initialCameraStateRef = useRef<CameraState | null>(
+    cameraStateFromStoredTransform(initialCameraTransform),
+  );
+  // A fresh mission must be fitted using the first real viewport dimensions.
+  // React can run the reset effect while a newly mounted host still measures
+  // zero; keeping this intent until Pixi applies its first viewport prevents
+  // that transient measurement from falling back to the cropped cover view.
+  const fitFreshCameraOnNextViewportRef = useRef(
+    initialCameraStateRef.current === null,
+  );
+  const cameraRef = useRef<CameraState>(
+    initialCameraStateRef.current ?? defaultCamera(tankGeometry),
+  );
   const cameraViewportRef = useRef({ width: 0, height: 0 });
   const applyCameraRef = useRef<() => void>(() => undefined);
   const onCameraChangeRef = useRef(onCameraChange);
@@ -4260,13 +5083,25 @@ export function AquariumCanvas({
 
   useEffect(() => {
     const host = hostRef.current;
-    const nextCamera = host?.clientWidth && host.clientHeight
-      ? {
-        zoom: fitTankZoom(host.clientWidth, host.clientHeight),
-        centerX: CAMERA_SCENE_CENTER_X,
-        centerY: CAMERA_SCENE_CENTER_Y,
-      }
-      : defaultCamera();
+    const restoredCamera = initialCameraStateRef.current;
+    initialCameraStateRef.current = null;
+    fitFreshCameraOnNextViewportRef.current = restoredCamera === null;
+    const nextCamera = restoredCamera
+      ? host?.clientWidth && host.clientHeight
+        ? clampCamera(
+          restoredCamera,
+          host.clientWidth,
+          host.clientHeight,
+          tankGeometry,
+        )
+        : restoredCamera
+      : host?.clientWidth && host.clientHeight
+        ? freshTankCameraState(
+          host.clientWidth,
+          host.clientHeight,
+          tankGeometry,
+        )
+        : defaultCamera(tankGeometry);
     cameraRef.current = nextCamera;
     setCameraZoom(nextCamera.zoom);
     setPanMode(false);
@@ -4274,7 +5109,7 @@ export function AquariumCanvas({
     panPointerRef.current = null;
     panLastPointRef.current = null;
     applyCameraRef.current();
-  }, [cameraResetToken]);
+  }, [cameraResetToken, snapshot.tank.id]);
 
   useEffect(() => {
     if (!cameraCanPan) setPanMode(false);
@@ -4364,29 +5199,32 @@ export function AquariumCanvas({
         Math.abs(cameraRef.current.zoom - fitTankZoom(
           previousViewport.width,
           previousViewport.height,
+          tankGeometry,
         )) < CAMERA_EPSILON &&
-        Math.abs(cameraRef.current.centerX - CAMERA_SCENE_CENTER_X) < 0.5 &&
-        Math.abs(cameraRef.current.centerY - CAMERA_SCENE_CENTER_Y) < 0.5;
-      const fittedZoom = fitTankZoom(width, height);
-      const minimumZoom = minimumTankZoom(width, height);
-      const requestedCamera = resizeRenderer && wasFit
+        Math.abs(cameraRef.current.centerX - tankGeometry.sceneCenterX) < 0.5 &&
+        Math.abs(cameraRef.current.centerY - tankGeometry.sceneCenterY) < 0.5;
+      const fittedZoom = fitTankZoom(width, height, tankGeometry);
+      const minimumZoom = minimumTankZoom(width, height, tankGeometry);
+      const requestedCamera = fitFreshCameraOnNextViewportRef.current ||
+        (resizeRenderer && wasFit)
         ? {
           zoom: fittedZoom,
-          centerX: CAMERA_SCENE_CENTER_X,
-          centerY: CAMERA_SCENE_CENTER_Y,
+          centerX: tankGeometry.sceneCenterX,
+          centerY: tankGeometry.sceneCenterY,
         }
         : cameraRef.current;
-      const camera = clampCamera(requestedCamera, width, height);
+      fitFreshCameraOnNextViewportRef.current = false;
+      const camera = clampCamera(requestedCamera, width, height, tankGeometry);
       cameraViewportRef.current = { width, height };
       cameraRef.current = camera;
-      const scale = coverTankScale(width, height) * camera.zoom;
+      const scale = coverTankScale(width, height, tankGeometry) * camera.zoom;
       setCameraZoom(camera.zoom);
       setCameraMinimumZoom(minimumZoom);
-      setCameraCanPan(canPanTankCamera(width, height, camera.zoom));
+      setCameraCanPan(canPanTankCamera(width, height, camera.zoom, tankGeometry));
       setCameraIsFit(
         Math.abs(camera.zoom - fittedZoom) < CAMERA_EPSILON &&
-        Math.abs(camera.centerX - CAMERA_SCENE_CENTER_X) < 0.5 &&
-        Math.abs(camera.centerY - CAMERA_SCENE_CENTER_Y) < 0.5,
+        Math.abs(camera.centerX - tankGeometry.sceneCenterX) < 0.5 &&
+        Math.abs(camera.centerY - tankGeometry.sceneCenterY) < 0.5,
       );
       app.stage.scale.set(scale);
       app.stage.position.set(
@@ -4445,6 +5283,7 @@ export function AquariumCanvas({
         plantsBack: new Graphics(),
         plantsFront: new Graphics(),
         nightTint: new Graphics(),
+        spatialDebug: new Graphics(),
         goalGuide: new Graphics(),
         seeds: new Graphics(),
         interaction: new Graphics(),
@@ -4460,10 +5299,10 @@ export function AquariumCanvas({
       const scene = new Container();
       const sceneMask = new Graphics()
         .roundRect(
-          TANK_GLASS_LEFT,
-          TANK_GLASS_TOP,
-          TANK_GLASS_RIGHT - TANK_GLASS_LEFT,
-          TANK_GLASS_BOTTOM - TANK_GLASS_TOP,
+          tankGeometry.glassLeft,
+          tankGeometry.glassTop,
+          tankGeometry.glassRight - tankGeometry.glassLeft,
+          tankGeometry.glassBottom - tankGeometry.glassTop,
           12,
         )
         .fill({ color: 0xffffff, alpha: 1 });
@@ -4480,6 +5319,7 @@ export function AquariumCanvas({
         layers.analysis,
         layers.animals,
         layers.nightTint,
+        layers.spatialDebug,
         layers.goalGuide,
         layers.seeds,
         layers.interaction,
@@ -4491,9 +5331,9 @@ export function AquariumCanvas({
       scene.mask = sceneMask;
       app.stage.addChild(layers.lamp, scene, sceneMask, layers.frame);
       drawLampRig(layers.lamp);
-      drawTank(layers.base);
-      drawSubstrateRidge(layers.foreground);
-      drawTankFrame(layers.frame);
+      drawTank(layers.base, snapshotRef.current);
+      drawSubstrateRidge(layers.foreground, snapshotRef.current);
+      drawTankFrame(layers.frame, tankGeometry);
       applyViewport();
       observer.observe(host);
 
@@ -4552,6 +5392,7 @@ export function AquariumCanvas({
       drawAquaticPlants(layers.plantsFront, initialSnapshot, 'front');
       lastPlantsDrawRef.current = vallisneriaVisualKey(initialSnapshot);
       drawDayNightTint(layers.nightTint, initialSnapshot);
+      drawSpatialDebug(layers.spatialDebug, initialSnapshot);
       drawGoalGuide(layers.goalGuide, initialSnapshot, showGoalGuideRef.current);
       drawSeeds(layers.seeds, initialSnapshot);
       drawInteraction(layers.interaction, initialSnapshot, isPendingInventoryHandoff());
@@ -4582,7 +5423,8 @@ export function AquariumCanvas({
         if (!isCurrentGeneration()) return;
         const currentSnapshot = snapshotRef.current;
         const nowMs = performance.now();
-        const motion = sampleMotion(nowMs);
+        const motionFrames = motionSourceRef.current.getFrames();
+        const motion = motionInterpolatorRef.current!.sample(motionFrames, nowMs);
         if (motion) {
           applyStructureMotion(
             ownedDisplays,
@@ -4595,10 +5437,15 @@ export function AquariumCanvas({
             motion.animals,
             motion.holding,
             motion.interpolated,
+            motionFrames.current,
           );
         }
         animateAnimals(ownedAnimalDisplays, currentSnapshot, ticker.deltaMS / 1000);
-        animateAnimalCarcasses(ownedAnimalCarcassDisplays, ticker.deltaMS / 1000);
+        animateAnimalCarcasses(
+          ownedAnimalCarcassDisplays,
+          ticker.deltaMS / 1000,
+          snapshotRef.current.tank.groundY,
+        );
       };
       app.ticker.add(animalTicker);
       // Ticker schedules the next RAF only after every listener returns. An
@@ -4812,7 +5659,16 @@ export function AquariumCanvas({
       destroyOwnedApp();
       destroyOwnedTextures();
     };
-  }, [onClearSelection, onToolComplete, rendererRecoveryToken, send]);
+  // The original context-recovery contract remains
+  // [onClearSelection, onToolComplete, rendererRecoveryToken, send];
+  // changing tank geometry is one additional reason to rebuild every layer.
+  }, [
+    onClearSelection,
+    onToolComplete,
+    rendererRecoveryToken,
+    send,
+    snapshot.tank.id,
+  ]);
 
   useEffect(() => {
     const layers = layersRef.current;
@@ -4865,6 +5721,13 @@ export function AquariumCanvas({
       lastPlantsDrawRef.current = plantsKey;
     }
     drawDayNightTint(layers.nightTint, snapshot);
+    const spatialDebugKey = snapshot.spatialDebug.enabled
+      ? `visible:${snapshot.revision}`
+      : 'hidden';
+    if (lastSpatialDebugDrawRef.current !== spatialDebugKey) {
+      drawSpatialDebug(layers.spatialDebug, snapshot);
+      lastSpatialDebugDrawRef.current = spatialDebugKey;
+    }
     layers.lamp.visible = snapshot.lightOutput > 0.5;
     layers.lamp.alpha = 0.35 + 0.65 * Math.sqrt(snapshot.lightOutput / 120);
     const structureGeometryKey = structureAlgaeGeometryKey(snapshot);
@@ -4938,11 +5801,17 @@ export function AquariumCanvas({
 
   const clientToWorldPoint = (clientX: number, clientY: number): Vec2 => {
     const host = hostRef.current;
-    if (!host) return { x: TANK_WIDTH / 2, y: TANK_HEIGHT / 2 };
+    if (!host) {
+      return {
+        x: snapshot.tank.width / 2,
+        y: snapshot.tank.height / 2,
+      };
+    }
     const viewportPoint = clientToViewportPoint(clientX, clientY);
     const app = appRef.current;
     const scale = app?.stage.scale.x ||
-      coverTankScale(host.clientWidth, host.clientHeight) * cameraRef.current.zoom;
+      coverTankScale(host.clientWidth, host.clientHeight, tankGeometry) *
+        cameraRef.current.zoom;
     const offsetX = app?.stage.position.x ??
       host.clientWidth / 2 - cameraRef.current.centerX * scale;
     const offsetY = app?.stage.position.y ??
@@ -4959,7 +5828,7 @@ export function AquariumCanvas({
   const commitCamera = (nextCamera: CameraState): void => {
     const host = hostRef.current;
     cameraRef.current = host
-      ? clampCamera(nextCamera, host.clientWidth, host.clientHeight)
+      ? clampCamera(nextCamera, host.clientWidth, host.clientHeight, tankGeometry)
       : nextCamera;
     setCameraZoom(cameraRef.current.zoom);
     applyCameraRef.current();
@@ -4969,12 +5838,16 @@ export function AquariumCanvas({
     const host = hostRef.current;
     if (!host?.clientWidth || !host.clientHeight) return;
     const zoom = Math.max(
-      minimumTankZoom(host.clientWidth, host.clientHeight),
+      minimumTankZoom(host.clientWidth, host.clientHeight, tankGeometry),
       Math.min(CAMERA_MAX_ZOOM, targetZoom),
     );
     const viewportPoint = clientToViewportPoint(clientX, clientY);
     const worldPoint = clientToWorldPoint(clientX, clientY);
-    const scale = coverTankScale(host.clientWidth, host.clientHeight) * zoom;
+    const scale = coverTankScale(
+      host.clientWidth,
+      host.clientHeight,
+      tankGeometry,
+    ) * zoom;
     commitCamera({
       zoom,
       centerX: worldPoint.x - (viewportPoint.x - host.clientWidth / 2) / scale,
@@ -4994,9 +5867,9 @@ export function AquariumCanvas({
     if (!host?.clientWidth || !host.clientHeight) return;
     setPanMode(false);
     commitCamera({
-      zoom: fitTankZoom(host.clientWidth, host.clientHeight),
-      centerX: CAMERA_SCENE_CENTER_X,
-      centerY: CAMERA_SCENE_CENTER_Y,
+      zoom: fitTankZoom(host.clientWidth, host.clientHeight, tankGeometry),
+      centerX: tankGeometry.sceneCenterX,
+      centerY: tankGeometry.sceneCenterY,
     });
   };
 
@@ -5016,7 +5889,12 @@ export function AquariumCanvas({
       if (event.deltaY === 0) return;
       event.preventDefault();
       zoomAtClientPoint(
-        cameraRef.current.zoom * Math.exp(-event.deltaY * 0.0015),
+        wheelZoomTarget(
+          cameraRef.current.zoom,
+          event.deltaY,
+          event.deltaMode,
+          host.clientHeight,
+        ),
         event.clientX,
         event.clientY,
       );
@@ -5026,13 +5904,13 @@ export function AquariumCanvas({
     // A native non-passive listener keeps rotation/zoom deterministic.
     host.addEventListener('wheel', handleWheel, { passive: false });
     return () => host.removeEventListener('wheel', handleWheel);
-  }, [editable, send]);
+  }, [editable, send, snapshot.tank.id]);
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>): void => {
     const point = toWorldPoint(event);
-    latestPointerWorldRef.current = isTankInteractionPoint(point)
+    latestPointerWorldRef.current = isTankInteractionPoint(point, tankGeometry)
       ? point
-      : clampTankInteractionPoint(point);
+      : clampTankInteractionPoint(point, tankGeometry);
     if (pendingDropAckRevisionRef.current !== null) return;
     if (panPointerRef.current === event.pointerId && panLastPointRef.current) {
       const host = hostRef.current;
@@ -5041,7 +5919,11 @@ export function AquariumCanvas({
       const rect = host.getBoundingClientRect();
       const deltaX = (event.clientX - previous.x) * (host.clientWidth / Math.max(1, rect.width));
       const deltaY = (event.clientY - previous.y) * (host.clientHeight / Math.max(1, rect.height));
-      const scale = coverTankScale(host.clientWidth, host.clientHeight) * cameraRef.current.zoom;
+      const scale = coverTankScale(
+        host.clientWidth,
+        host.clientHeight,
+        tankGeometry,
+      ) * cameraRef.current.zoom;
       panLastPointRef.current = { x: event.clientX, y: event.clientY };
       commitCamera({
         ...cameraRef.current,
@@ -5050,7 +5932,7 @@ export function AquariumCanvas({
       });
       return;
     }
-    const interactive = isTankInteractionPoint(point);
+    const interactive = isTankInteractionPoint(point, tankGeometry);
     if (hasPendingInventory && !pendingConsumedRef.current) {
       if (!interactive) return;
       pendingConsumedRef.current = true;
@@ -5059,18 +5941,24 @@ export function AquariumCanvas({
       return;
     }
     if (hasPendingInventory && pendingConsumedRef.current) {
-      send({ type: 'pointer-move', point: interactive ? point : clampTankInteractionPoint(point) });
+      send({
+        type: 'pointer-move',
+        point: interactive ? point : clampTankInteractionPoint(point, tankGeometry),
+      });
       return;
     }
     if (dragPointerRef.current === event.pointerId && dragStartRef.current) {
-      const boundedPoint = clampTankInteractionPoint(point);
+      const boundedPoint = clampTankInteractionPoint(point, tankGeometry);
       dragCurrentRef.current = boundedPoint;
       if (layersRef.current) drawDragSelection(layersRef.current.drag, dragStartRef.current, boundedPoint);
       return;
     }
     if (!interactive) {
       if (snapshot.holding && editable) {
-        send({ type: 'pointer-move', point: clampTankInteractionPoint(point) });
+        send({
+          type: 'pointer-move',
+          point: clampTankInteractionPoint(point, tankGeometry),
+        });
         return;
       }
       if (isProbeInteractionTool(activeTool)) {
@@ -5094,6 +5982,7 @@ export function AquariumCanvas({
       host.clientWidth,
       host.clientHeight,
       cameraRef.current.zoom,
+      tankGeometry,
     ));
     if (event.button === 1) {
       event.preventDefault();
@@ -5108,9 +5997,9 @@ export function AquariumCanvas({
       return;
     }
     const point = toWorldPoint(event);
-    latestPointerWorldRef.current = isTankInteractionPoint(point)
+    latestPointerWorldRef.current = isTankInteractionPoint(point, tankGeometry)
       ? point
-      : clampTankInteractionPoint(point);
+      : clampTankInteractionPoint(point, tankGeometry);
     if (isSecondaryPointerGesture(event.button, event.ctrlKey)) {
       event.preventDefault();
       secondaryPointerCancelAtRef.current = performance.now();
@@ -5127,7 +6016,7 @@ export function AquariumCanvas({
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
-    if (!isTankInteractionPoint(point)) return;
+    if (!isTankInteractionPoint(point, tankGeometry)) return;
     if (hasPendingInventory || (pendingConsumedRef.current && !snapshot.holding)) {
       const hadAuthoritativeHolding = Boolean(snapshot.holding);
       if (!pendingConsumedRef.current) {
@@ -5191,7 +6080,7 @@ export function AquariumCanvas({
     }
     if (dragPointerRef.current !== event.pointerId || !dragStartRef.current) return;
     const from = dragStartRef.current;
-    const to = clampTankInteractionPoint(toWorldPoint(event));
+    const to = clampTankInteractionPoint(toWorldPoint(event), tankGeometry);
     const clientStart = dragStartClientRef.current ?? { x: event.clientX, y: event.clientY };
     if (isScreenDrag(clientStart, { x: event.clientX, y: event.clientY })) {
       send({ type: 'select-region', from, to, filter: selectionFilter });

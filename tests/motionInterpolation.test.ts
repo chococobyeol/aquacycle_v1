@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SimulationMotionFrame } from '../src/renderer/hooks/useSimulation';
 import {
+  createReusableMotionInterpolator,
   interpolateMotionFrames,
   reconcileMotionWithSnapshot,
 } from '../src/renderer/tank/motionInterpolation';
@@ -68,6 +69,18 @@ const frame = (
   holding: null,
   probe: null,
 });
+
+const syntheticAnimals = (
+  count: number,
+  xOffset: number,
+): AnimalSnapshot[] => Array.from({ length: count }, (_, index) => ({
+  ...animal(`synthetic-${index}`, xOffset + index, 100 + (index % 37)),
+  speciesId: index % 3 === 0
+    ? 'daphnia'
+    : index % 3 === 1
+      ? 'cherry-shrimp'
+      : 'japanese-ricefish',
+}));
 
 describe('Pixi motion interpolation', () => {
   it('fills one 30 Hz worker interval linearly without changing the rig state', () => {
@@ -257,5 +270,55 @@ describe('Pixi motion interpolation', () => {
     expect(sampled?.structures[0].x).toBe(520);
     expect(sampled?.structures[0].angle).toBe(0.35);
     expect(sampled?.structures[0].isHeld).toBe(false);
+  });
+
+  it('interpolates a 768-animal index-aligned topology in both samplers', () => {
+    const previous = frame(70, 10_000, 20_000, syntheticAnimals(768, 0));
+    const current = frame(71, 10_040, 20_040, syntheticAnimals(768, 400));
+    const frames = { previous, current };
+
+    const sampled = interpolateMotionFrames(frames, 20_060);
+    const reusableSampled = createReusableMotionInterpolator().sample(frames, 20_060);
+
+    for (const result of [sampled, reusableSampled]) {
+      expect(result?.interpolated).toBe(true);
+      expect(result?.animals).toHaveLength(768);
+      expect(result?.animals[0].x).toBeCloseTo(200, 6);
+      expect(result?.animals[383].x).toBeCloseTo(583, 6);
+      expect(result?.animals[767].x).toBeCloseTo(967, 6);
+    }
+  });
+
+  it('rebases a 600-animal frame when entity order changes', () => {
+    const before = syntheticAnimals(600, 0);
+    const reordered = syntheticAnimals(600, 300);
+    [reordered[298], reordered[299]] = [reordered[299], reordered[298]];
+    const previous = frame(80, 30_000, 40_000, before);
+    const current = frame(81, 30_040, 40_040, reordered);
+    const frames = { previous, current };
+
+    const sampled = interpolateMotionFrames(frames, 40_060);
+    const reusableSampled = createReusableMotionInterpolator().sample(frames, 40_060);
+
+    expect(sampled?.interpolated).toBe(false);
+    expect(sampled?.animals).toBe(reordered);
+    expect(reusableSampled?.interpolated).toBe(false);
+    expect(reusableSampled?.animals).toBe(reordered);
+  });
+
+  it('rebases a 600-animal frame when an ID or species changes at an index', () => {
+    const previous = frame(90, 50_000, 60_000, syntheticAnimals(600, 0));
+    const changedId = syntheticAnimals(600, 300);
+    changedId[412] = { ...changedId[412], id: 'replacement-412' };
+    const changedSpecies = syntheticAnimals(600, 300);
+    changedSpecies[412] = { ...changedSpecies[412], speciesId: 'daphnia' };
+
+    for (const currentAnimals of [changedId, changedSpecies]) {
+      const current = frame(91, 50_040, 60_040, currentAnimals);
+      const sampled = interpolateMotionFrames({ previous, current }, 60_060);
+
+      expect(sampled?.interpolated).toBe(false);
+      expect(sampled?.animals).toBe(currentAnimals);
+    }
   });
 });

@@ -3,11 +3,21 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   BACKGROUND_TELEMETRY_POLL_INTERVAL_MS,
+  normalizeTelemetryPayloadBytes,
   startTelemetryPolling,
   type TelemetryPollingClock,
 } from '../src/renderer/hooks/useSimulation';
 
 describe('background simulation continuity', () => {
+  it('grows snapshot telemetry by powers of two with a fixed upper bound', () => {
+    expect(normalizeTelemetryPayloadBytes(16 * 1024 * 1024))
+      .toBe(16 * 1024 * 1024);
+    expect(normalizeTelemetryPayloadBytes(16 * 1024 * 1024 + 1))
+      .toBe(32 * 1024 * 1024);
+    expect(normalizeTelemetryPayloadBytes(Number.MAX_SAFE_INTEGER))
+      .toBe(64 * 1024 * 1024);
+  });
+
   it('keeps ecology snapshot collection alive when animation frames stop', () => {
     let frameCallback: FrameRequestCallback | null = null;
     let timerCallback: (() => void) | null = null;
@@ -92,7 +102,7 @@ describe('background simulation continuity', () => {
     expect(preloadSource).toContain('process.getHeapStatistics()');
   });
 
-  it('recycles only the simulation worker when memory is high', () => {
+  it('does not use a memory-pressure restart that can discard commands', () => {
     const mainSource = fs.readFileSync(
       path.resolve(process.cwd(), 'src/main.ts'),
       'utf8',
@@ -101,11 +111,14 @@ describe('background simulation continuity', () => {
       path.resolve(process.cwd(), 'src/renderer/hooks/useSimulation.ts'),
       'utf8',
     );
-    expect(mainSource).toContain('aquacycle:simulation-memory-pressure');
-    expect(mainSource).toContain('simulation worker recycle requested');
+
+    expect(mainSource).not.toContain('createSimulationWorkerRecycleGate');
+    expect(mainSource).not.toContain('simulationWorkerRecycleGate.observe');
+    expect(mainSource).not.toContain('aquacycle:simulation-memory-pressure');
     expect(mainSource).not.toContain('createMainWindow({ replacementFor: window })');
     expect(mainSource).not.toContain('replacementFor.hide()');
-    expect(hookSource).toContain('previousWorker.terminate()');
-    expect(hookSource).toContain("type: 'load-save'");
+    expect(hookSource).not.toContain('rendererRestartPendingRef');
+    expect(hookSource).not.toContain('onSimulationMemoryPressure');
+    expect(hookSource).toContain("message.type === 'telemetry-resize-request'");
   });
 });

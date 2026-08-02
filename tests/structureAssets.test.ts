@@ -36,6 +36,8 @@ describe('structure artwork', () => {
       'flat-stone': { x: -0.114340, y: -0.004550 },
       'round-stone': { x: 0.363195, y: -1.300715 },
       'tall-stone': { x: 2.733856, y: -8.984561 },
+      'small-flat-stone': { x: -0.001068, y: -1.476350 },
+      'small-wedge-stone': { x: -0.426198, y: -4.882418 },
     };
 
     for (const definition of Object.values(STRUCTURES)) {

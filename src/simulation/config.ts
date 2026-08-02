@@ -1,10 +1,12 @@
 import type {
+  AnimalSex,
   AnimalSpeciesId,
   MicrobeGuildId,
   PlanktonKind,
   ScenarioId,
   SpeciesId,
   StructureDefinitionId,
+  TankTypeId,
   Vec2,
   WaterQualityValues,
 } from './types';
@@ -14,6 +16,12 @@ import type { DayNightCycleDefinition } from './dayNight';
 // This is the lowest biomass that is actually drawn as a colony in the tank.
 // Selection and removal use the same value so anything visible can be cleaned.
 export const ALGAE_VISIBLE_BIOMASS = 0.001;
+// A smaller, real propagule trace is rendered so the player can see the
+// advancing footprint before it becomes an ecologically established patch.
+// Mission coverage and rendering share this threshold.
+export const ALGAE_RENDER_TRACE_BIOMASS = ALGAE_VISIBLE_BIOMASS * 0.05;
+/** One surface-algae placement always supplies the same real biomass. */
+export const SURFACE_ALGAE_INOCULUM_BIOMASS = 0.12;
 
 /** Starting temperature of a tank whose configured light was already running. */
 export const initialWaterTemperatureForLight = (
@@ -115,7 +123,7 @@ export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
     description:
       '수면 가까운 물속을 헤엄치며 움직이는 작은 먹이를 찾는 토종 소형어입니다. 가는 수초와 실 모양 조류에 알을 붙입니다.',
     diet:
-      '어린 체리새우 같은 작은 동물성 먹이를 선호하고, 가까운 미세 조류는 생존을 보조하는 낮은 효율의 먹이로 이용합니다.',
+      '큰물벼룩을 주 먹이로 포식하고, 몸집에 맞는 어린 체리새우를 보조 먹이로 삼습니다. 조류와 생물막은 직접 먹지 않습니다.',
     adultLength: '성체 약 3~4cm',
     color: 0xc6b77e,
     accentColor: '#9a8145',
@@ -198,6 +206,20 @@ export const ANIMALS: Record<AnimalSpeciesId, AnimalDefinition> = {
 const OXYGEN_PER_ORGANIC_CARBON = 1.12;
 const OXYGEN_PER_NITRIFIED_NITROGEN =
   OXYGEN_PER_ORGANIC_CARBON * (64 / 14) / (32 / 12);
+
+/**
+ * Shared acceleration of measured ecological fluxes.
+ *
+ * The authored producer curves were converted at 0.03 real hour per game
+ * second, then surface algae alone received a 5x process multiplier. Shrimp
+ * ingestion and respiration remained on the unscaled clock, so a counted
+ * juvenile needed a separate 32x feeding exception to keep up with the
+ * already-accelerated producer world. Apply the same clock to producer and
+ * shrimp matter fluxes instead. Life-stage durations can remain separately
+ * compressed, but one species must not experience a different ecological
+ * second from another.
+ */
+export const ECOLOGY_PROCESS_RATE_SCALE = 5;
 
 /**
  * One physical Daphnia body budget shared by the water ledger and the
@@ -289,7 +311,12 @@ export const WATER_CYCLE_RULES = {
   initialHeadspaceCarbonDioxide: 22,
   initialHeadspaceOxygen: 76,
   carbonHalfSaturation: 8,
-  mineralNutrientHalfSaturation: 3.5,
+  // Surface algae must remain responsive to the 0.5-3 concentration band
+  // produced by ordinary closed-tank remineralisation. The former K=3.5 let
+  // mineral nitrogen accumulate while the producer bed recovered only after
+  // the adult shrimp cohort had disappeared. K=1 changes low-concentration
+  // affinity, not the finite N/C ledger or the maximum light-limited rate.
+  mineralNutrientHalfSaturation: 1,
   detritusSolubilizationRate: 0.009,
   closedGasExchangeRate: 0.018,
   // One shared oxygen-equivalent conversion is used in both directions:
@@ -297,6 +324,11 @@ export const WATER_CYCLE_RULES = {
   // consumes it. The absolute value sets the game's display-unit scale; it is
   // no longer an empirical margin that differs by process.
   oxygenPerOrganicCarbon: OXYGEN_PER_ORGANIC_CARBON,
+  // The closed B ledger currently treats respired reserve as carbohydrate
+  // equivalent (RQ = CO2/O2 = 1). Keeping the quotient explicit makes animal
+  // DIC production derive from measured oxygen demand instead of silently
+  // assuming that every removed B has already specified the CO2 flux.
+  animalRespiratoryQuotient: 1,
   // NH4-N -> NO3-N requires 64/14 g O2 per g N, while CH2O carbon oxidation
   // requires 32/12 g O2 per g C. Deriving this value from the carbon scale
   // keeps carbon and nitrogen redox paths on one auditable unit system.
@@ -312,46 +344,82 @@ export const WATER_CYCLE_RULES = {
     organicLightAttenuation: 0.025,
   },
   shrimp: {
-    assimilationFraction: 0.30,
+    // Ingested matter is split once between retained food and faeces.
+    // Respiration is paid continuously from retained body matter below; an
+    // additional fixed "respired at the bite" share counted metabolism twice.
+    assimilationFraction: 0.58,
     fecesFraction: 0.42,
-    respirationFraction: 0.28,
-    adultMaintenanceBiomassPerSecond: 0.000055,
-    juvenileMaintenanceBiomassPerSecond: 0.000032,
     adultStructuralBiomass: 1,
-    juvenileBirthBiomass: 0.16,
-    suppliedReserveBiomass: 0.08,
+    // Every hatchling object is one individual shrimp. Its complete initial
+    // body matter enters this compartment once, and that same individual must
+    // assimilate the difference on its way to the conserved maturation mass.
+    juvenileBirthBiomass: 0.0175,
+    // A newly stocked adult arrives with a modest gut/lipid buffer, not enough
+    // stored matter to hide a producer collapse for most of a generation.
+    suppliedReserveBiomass: 0.015,
     // Absolute grazing follows continuous body-size allometry instead of a
     // fixed juvenile multiplier and an abrupt jump on maturation.
     feedingMassExponent: 0.75,
+    // Holling-II half-saturation of one contacted surface patch. This changes
+    // how quickly intake falls as a film thins, but never makes a positive
+    // biomass remainder inedible or protects it from exact depletion.
+    grazingHalfSaturationBiomass: 0.07,
     // Adults cannot retain every bite indefinitely. Excess assimilation is
     // returned to detritus, so a well-fed male does not become a permanent
     // carbon/nitrogen sink and an eventual oversized pollution pulse.
-    adultReserveBiomass: 0.72,
-    juvenileReserveBiomass: 1.05,
+    // Six percent of achieved adult structure is a short feeding buffer. This
+    // value is the full 1-B adult reference; tank-born adults use the same 6%
+    // ratio at their achieved size. The former combination of a size-scaled
+    // condition display and this unscaled physical ceiling let a newly mature
+    // 0.20-B shrimp hide 0.06 B above its displayed 100% condition and coast
+    // through a producer decline for most of its remaining lifetime.
+    adultReserveBiomass: 0.06,
   },
   ricefish: {
-    // The former 38% retention was combined with a second 20% digestibility
-    // multiplier for filamentous periphyton.  A descendant consuming the
-    // measured 0.0096 biomass/s therefore retained only 0.00073 biomass/s
-    // against roughly 0.0011 biomass/s of realised maintenance: it starved
-    // while visibly feeding.  Digestibility remains food-specific below, while
-    // this fraction represents the retained share of the digestible ration.
-    assimilationFraction: 0.48,
-    fecesFraction: 0.32,
-    respirationFraction: 0.20,
-    adultStructuralBiomass: 1.8,
-    juvenileStructuralBiomass: 0.72,
-    fryBirthBiomass: 0.18,
-    eggBiomass: 0.075,
-    suppliedReserveBiomass: 0.65,
-    adultReserveBiomass: 1.05,
-    juvenileReserveBiomass: 0.72,
-    fryReserveBiomass: 0.38,
+    // Captured animal matter is split once between retained matter and faeces.
+    // Oxygen-consuming respiration is paid continuously from retained
+    // reserve/body matter; charging a fixed share again at capture would count
+    // the same maintenance twice.
+    assimilationFraction: 0.60,
+    fecesFraction: 0.40,
+    // Rendered length is intentionally independent from these compressed
+    // matter units. Keeping the complete fish budget commensurate with the
+    // visible Daphnia cohort lets two supplied predators coexist with a
+    // six-founder culture after that culture has established.
+    adultStructuralBiomass: 0.12,
+    // Sexual maturity precedes maximum adult somatic mass. These compressed
+    // early-stage compartments remain fully food-funded, but do not require
+    // the whole established Daphnia cohort before first maturation.
+    // Sexual maturity is earlier than maximum adult size. At 0.025 one
+    // sibling from the conserved two-egg cohort commonly died of old age just
+    // short of maturity after both had eaten; 0.020 keeps maturation fully
+    // food-funded while allowing the mixed-sex pair to reach adulthood.
+    juvenileStructuralBiomass: 0.020,
+    // One rendered egg represents several real medaka eggs, but the complete
+    // two-token clutch must still be a plausible fraction of a newly mature
+    // female. The 10 px fry versus 27 px juvenile length ratio implies about
+    // 0.001 of matter at equal density ((10 / 27)^3 * 0.020). Funding each egg
+    // with 0.00125 leaves that amount after nominal incubation, so the pair
+    // costs 12.5% of the maturity compartment instead of the former 100%.
+    fryBirthBiomass: 0.001,
+    eggBiomass: 0.00125,
+    // The former compartments represented several hours of compressed
+    // fasting and let a predator outlive its prey recovery window by multiple
+    // complete simulated lifetimes. Retained meal matter is still conserved,
+    // but these capacities now represent a short feeding buffer comparable to
+    // the compressed starvation windows of Daphnia and shrimp.
+    suppliedReserveBiomass: 0.008,
+    adultReserveBiomass: 0.012,
+    juvenileReserveBiomass: 0.0042,
+    fryReserveBiomass: 0.00125,
   },
   daphnia: {
+    // Phytoplankton and bacterioplankton have different assimilation
+    // efficiencies, so the actual unassimilated remainder is egested in the
+    // feeding ledger. There is no additional bite-time respiration; ongoing
+    // allometric maintenance supplies the oxygen demand.
     assimilationFraction: 0.55,
-    fecesFraction: 0.34,
-    respirationFraction: 0.11,
+    fecesFraction: 0.45,
     adultStructuralBiomass:
       DAPHNIA_BODY_BUDGET.adultStructuralBiomass,
     juvenileBirthBiomass:
@@ -477,7 +545,11 @@ export const PLANKTON_ECOLOGY_RULES = {
     // maintenance but stop provisioning new eggs. This models the observed
     // food dependence of Daphnia clutch formation; it does not make the
     // remaining phytoplankton inaccessible or protect it from grazing.
-    minimumFoodQualityForReproduction: 0.5,
+    // Current assimilated phytoplankton surplus already caps every transfer
+    // to eggs below. Keep this ambient-quality signal as a gradual modifier,
+    // not a second high-ration cliff: in a mature closed tank, a moderate
+    // suspended-food concentration must still permit slow replacement.
+    minimumFoodQualityForReproduction: 0.35,
     // One rendered Daphnia is much lighter than a cherry shrimp. Keeping the
     // former 0.095-unit adult made the consumer guild only about eleven times
     // lighter than a shrimp and forced a three-animal demographic bottleneck.
@@ -551,13 +623,14 @@ export const PLANKTON_ECOLOGY_RULES = {
     // synchronized, resource-exhausting cohort. Its full 0.00075 matter is
     // removed from the mother's phytoplankton-funded egg compartment.
     maximumBroodSize: 1,
-    highFoodBroodResponseThreshold: 0.9,
-    // Egg provisioning already draws from this tick's real phytoplankton
-    // assimilation surplus. Applying a second squared food penalty made
-    // healthy adults at moderate food concentrations replace themselves at
-    // less than one offspring per lifetime. A linear response preserves the
-    // food threshold without double-counting limitation.
-    reproductionFoodResponseExponent: 1,
+    highFoodBroodResponseThreshold: 0.70,
+    // Egg provisioning is already capped by this tick's real phytoplankton
+    // assimilation surplus, maternal reserve and protected soma. Applying an
+    // additional ambient-concentration multiplier counted the same food
+    // limitation twice and stopped replacement while mothers were still
+    // earning a positive algal surplus. Zero explicitly disables only that
+    // duplicate modifier; it does not bypass any conserved-matter cap.
+    reproductionFoodResponseExponent: 0,
     reproductiveReserveFloor:
       DAPHNIA_BODY_BUDGET.reproductiveReserveFloor,
     reproductionStartEnergy: 0.38,
@@ -569,6 +642,32 @@ export const PLANKTON_ECOLOGY_RULES = {
       DAPHNIA_BODY_BUDGET.adultSomaticGrowthPerSecond,
     adultSomaticGrowthAllocationFraction:
       DAPHNIA_BODY_BUDGET.adultSomaticGrowthAllocationFraction,
+    // Fish kairomones are already represented by the bounded local predator
+    // cue field used for escape. D. magna exposed to fish cues can mature
+    // earlier at a smaller size and divert a larger share of net production
+    // toward reproduction. These limits change allocation and timing only:
+    // every offspring still has to be funded by actually assimilated food.
+    predatorCueLifeHistorySaturation: 0.06,
+    predatorCueMaturationInstarReduction: 1,
+    // Four percent is the largest reduction that still reaches the physical
+    // adult survival floor. Earlier values let a cue-exposed juvenile acquire
+    // the adult label with less structure than an adult can maintain.
+    predatorCueMaturationStructureReductionFraction: 0.04,
+    // A local fish cue makes an otherwise viable mother commit reserve above
+    // her protected floor to eggs sooner. This changes allocation only: the
+    // same phytoplankton-funded reserve and neonate matter costs still apply.
+    predatorCueReproductionStartEnergy: 0.26,
+    // Actual assimilated phytoplankton surplus already caps every transfer to
+    // eggs. Under a fish cue, soften the second ambient-concentration gate so
+    // moderate but profitable patches do not force allocation to exactly zero.
+    predatorCueMinimumFoodQualityForReproduction: 0.20,
+    predatorCueHighFoodBroodResponseThreshold: 0.55,
+    predatorCueAdultSomaticGrowthAllocationFraction: 0.08,
+    predatorCueReproductionAllocationMultiplier: 1.40,
+    // A strongly exposed, well-fed mother may release two rendered neonates
+    // instead of one, but only after both complete offspring masses have been
+    // accumulated in her conserved reproductive compartment.
+    predatorCueMaximumBroodSize: 2,
     localSensingRadius: 52,
     hungrySensingRadius: 126,
     roamingDirectionSeconds: 7,
@@ -591,6 +690,33 @@ export interface DaphniaSuspendedFoodResponse {
   combinedResponse: number;
   bacteriaShare: number;
 }
+
+/**
+ * Optional ambient-food modifier for egg provisioning.
+ *
+ * An exponent of zero deliberately disables this second concentration gate.
+ * Egg matter is still limited in `SimulationWorld` by the mother's condition,
+ * protected reserve and the phytoplankton biomass actually assimilated during
+ * the current step. Keeping the zero case explicit avoids relying on
+ * `Math.pow(0, 0)` and makes it clear that no food or matter is created here.
+ */
+export const daphniaReproductionFoodFactor = (
+  phytoplanktonResponse: number,
+  minimumResponse: number,
+  highResponse: number,
+  responseExponent: number,
+): number => {
+  if (responseExponent <= 0) return 1;
+  const normalized = Math.min(
+    1,
+    Math.max(
+      0,
+      (phytoplanktonResponse - minimumResponse) /
+        Math.max(1e-6, highResponse - minimumResponse),
+    ),
+  );
+  return Math.pow(normalized, responseExponent);
+};
 
 export const daphniaSuspendedFoodResponse = (
   phytoplankton: number,
@@ -652,13 +778,18 @@ export const MICROBE_ECOLOGY_RULES = {
     halfSaturation: 4,
     oxygenHalfSaturation: 14,
     // biomass-equivalent organic matter consumed per unit film and second
-    maximumUptake: 0.11,
+    // Heterotrophic biofilm remains the fast microbial guild, but its former
+    // 4.4% net growth per game second represented roughly 35 doublings/day on
+    // the shared ecology clock. This rate corresponds to a fast, substrate-
+    // rich heterotrophic community without making an organic pulse fill every
+    // surface almost instantly.
+    maximumUptake: 0.02,
     biomassYield: 0.42,
-    maintenanceDecayRate: 0.0022,
-    starvationDecayRate: 0.013,
-    surfaceSpreadRate: 0.025,
-    waterborneExportRate: 0.0007,
-    suspendedDecayRate: 0.025,
+    maintenanceDecayRate: 0.0002,
+    starvationDecayRate: 0.0016,
+    surfaceSpreadRate: 0.0035,
+    waterborneExportRate: 0.00012,
+    suspendedDecayRate: 0.0035,
     referenceTemperature: 24,
     temperatureCoefficient: 1.08,
   },
@@ -675,13 +806,28 @@ export const MICROBE_ECOLOGY_RULES = {
     // fraction of processed nitrogen retained in new film. Lowering Vmax while
     // lowering Ks preserves ordinary 0.5–1.5 processing capacity without
     // turning a rare high-ammonium pulse into an instantaneous sink.
-    maximumUptake: 0.008,
-    biomassYield: 0.11,
-    maintenanceDecayRate: 0.0003,
-    starvationDecayRate: 0.0048,
-    surfaceSpreadRate: 0.012,
-    waterborneExportRate: 0.00035,
-    suspendedDecayRate: 0.008,
+    maximumUptake: 0.002,
+    // Aquarium nitrifiers have low biomass yield: most ammonia oxidation
+    // supports maintenance rather than producing an equal-sized film pulse.
+    // Keeping yield below the heterotroph's also preserves their much slower
+    // establishment despite a still-useful ammonia processing capacity.
+    biomassYield: 0.035,
+    maintenanceDecayRate: 0.00006,
+    // Nitrifiers are slow growers but a mature attached community also
+    // persists through low loading. With 0.0005, the configured Monod curve
+    // still had negative net growth around 0.5-0.8 ammonium and lost about
+    // 98% of the inoculum before animal waste arrived. This value makes the
+    // documented crossover real while all removal still pays the full oxygen
+    // and stoichiometric material cost in BiogeochemistryLedger.
+    starvationDecayRate: 0.0002,
+    surfaceSpreadRate: 0.00045,
+    // At 0.00004, even a lossless 0.4-B source could export at most 0.0095 B
+    // over 600 simulated seconds, making the intended >0.01-B colonisation of
+    // disconnected wetted surfaces mathematically impossible before decay or
+    // failed retention were considered. Keep nitrifier export slower than the
+    // decomposer's 0.00012 while allowing a viable minority to disperse.
+    waterborneExportRate: 0.00007,
+    suspendedDecayRate: 0.0007,
     referenceTemperature: 24,
     temperatureCoefficient: 1.08,
   },
@@ -694,86 +840,131 @@ export const MICROBE_ECOLOGY_RULES = {
 } as const;
 
 export const SHRIMP_ECOLOGY_RULES = {
-  // Adult-stage longevity begins when conserved growth reaches maturity.
-  // Food-limited juvenile development therefore cannot consume most of a
-  // fixed birth-to-death timer before the first ovarian cycle even starts.
-  minimumLifespanSeconds: 1_200,
-  // A wider individual adult-life range prevents every offspring cohort from
-  // reaching senescence together. It is not an immortal low-population
-  // exception; juveniles still die from starvation and environmental stress.
-  maximumLifespanSeconds: 2_400,
+  // This is one birth-to-death deadline, not a fresh adult-stage allowance.
+  // The former model added another 20-40 minutes when a food-limited juvenile
+  // finally matured, so an animal that should have lived about 40 gameplay
+  // minutes could suddenly display 70-90 minutes. Food changes growth and
+  // condition; merely reaching maturity later must never manufacture lifespan.
+  // Keep the same 2,400-second mean while representing real individual
+  // survival variation. The former narrow 2,100-2,700 window made whole
+  // hatch cohorts senesce together and left repeated gaps with almost no
+  // adults even when the displayed population was above twenty.
+  minimumLifespanSeconds: 1_800,
+  maximumLifespanSeconds: 3_000,
   // Inventory shrimp arrive as young adults. Their supplied-species sequence
   // seeds variation, so unrelated Daphnia births cannot change these traits.
   suppliedAdultMinimumAgeSeconds: 180,
   suppliedAdultMaximumAgeSeconds: 300,
-  // Calibrated against the realised grazing duty cycle, not the instantaneous
-  // maximum bite. At the former 0.005 baseline, a shrimp consuming the observed
-  // 0.013-0.03 biomass/s still lost matter while actively grazing because only
-  // 30% is assimilated. That made continuous feeding mathematically incapable
-  // of paying maintenance for most movement paths.
-  adultBaseMetabolismPerSecond: 0.0018,
-  juvenileBaseMetabolismPerSecond: 0.0011,
-  restingActivityCostPerSecond: 0.00013,
-  grazingActivityCostPerSecond: 0.00038,
-  travelingActivityCostPerSecond: 0.0009,
-  // A bite that is large enough to fill the physical reserve must also cover
-  // ordinary movement/metabolism. The former 0.08 value let well-fed animals
-  // reach the reserve cap while their abstract hunger meter still hit zero.
-  energyPerConsumedBiomass: 0.18,
-  maximumBiteBiomassPerSecond: 0.375,
+  // One measured allometric maintenance curve spans juveniles and adults.
+  // The reference value is the ordinary grazing metabolism of a supplied
+  // 1.08-B adult on the shared 0.03-real-hour/game-second ecology clock.
+  adultRoutineMaintenanceBiomassPerSecond:
+    0.000060 * ECOLOGY_PROCESS_RATE_SCALE,
+  metabolicMassExponent: 0.898,
+  restingActivityMultiplier: 0.75,
+  grazingActivityMultiplier: 1,
+  // A weak shrimp still makes slow food-search movements. Charging that state
+  // at the resting multiplier made severe nutritional depletion reduce its
+  // matter loss exactly when the shortage should become visible. Keep the
+  // added search cost reflects that weak movement is still active foraging.
+  starvingActivityMultiplier: 1.3,
+  travelingActivityMultiplier: 1.5,
+  // Adult N. davidi consumed about 51% of its dry body mass per real day in a
+  // leaf-litter/biofilm feeding trial. On the shared ecology clock that is
+  // about 0.00069 B/s for a 1.08-B adult. The type-II response realizes that
+  // rate on an ordinary 0.2-0.4-B patch; this higher asymptote is reached only
+  // on a dense surface and still falls continuously toward zero with food.
+  maximumBiteBiomassPerSecond:
+    0.00155 * ECOLOGY_PROCESS_RATE_SCALE,
+  // A rendered shrimp is one tracked shrimp at every life stage. Juvenile
+  // feeding therefore stays on the same continuous body-mass allometry as an
+  // adult. Developmental time compression must not make one counted juvenile
+  // remove several adults' worth of producer biomass.
   oxygenStressStart: 30,
   oxygenMaximumDamagePerSecond: 0.025,
   toxicWasteStressStart: 6,
   toxicWasteFullStress: 24,
   toxicMaximumDamagePerSecond: 0.032,
   healthyWaterRecoveryPerSecond: 0.004,
-  // A newly introduced adult that never establishes feeding suffers acute
-  // acclimation starvation even while some structural matter remains. Once it
-  // has consumed a small real ration, ordinary conserved reserve/body loss
-  // governs later fasting; bite rates are unchanged.
-  starvationGraceSeconds: 55,
-  starvationFullStressSeconds: 90,
-  starvationMaximumDamagePerSecond: 0.032,
-  starvationAcclimationFoodBiomass: 0.02,
-  reproductionEnergy: 0.34,
-  maleReproductionEnergy: 0.34,
-  gestationEnergy: 0.30,
-  // Supplied young-adult females already carry a partly developed ovary, just
-  // as supplied ricefish carry pre-allocated egg matter. It is conserved
-  // biomass, not a free brood: the remainder still has to come from positive
-  // post-maintenance assimilation. Once funded, mating and gestation use that
-  // conserved matter without requiring both animals' short feeding windows to
-  // overlap.
-  suppliedFemaleBroodReserveFraction: 0.75,
-  // Maturity is still paid by conserved somatic growth. This range is an
-  // individual target, not a random delay applied after the animal is grown.
-  // Poor feeding can therefore postpone maturity beyond the target, while
-  // animals born together do not all cross one shared 180-second edge.
-  maturationMinimumSeconds: 150,
-  maturationMaximumSeconds: 240,
+  // Reproduction reads the conserved reserve compartment directly. The UI
+  // energy score also contains a contribution from intact structure, which
+  // made an almost empty female look fit enough to keep maturing ovaries after
+  // producer biomass had already turned downward. These fractions are of the
+  // individual's size-scaled reserve capacity, never of population or tank
+  // food. Ovarian development below has the stricter feeding gate. Once a
+  // clutch is already fully provisioned, mating itself remains possible at a
+  // lower reserve; otherwise maternal matter already committed to eggs would
+  // be stranded merely because the female paid that cost. Male courtship has
+  // the same low somatic gate because it allocates no egg matter.
+  reproductionReserveFraction: 0.18,
+  maleReproductionReserveFraction: 0.15,
+  // Supplied young-adult females can arrive part-way through an ovarian cycle.
+  // Their conserved egg matter is derived from that individual progress in
+  // `createAdultAnimalState`; there is no separate fixed preload shared by
+  // every female.
+  // Maturity is still paid by conserved somatic growth. A well-fed juvenile
+  // reaches it in about 12-20 gameplay minutes; sparse food postpones it.
+  // This leaves a real adult feeding and reproduction phase without resetting
+  // or extending the birth-to-death deadline.
+  // Individual targets distribute a cohort without granting growth from age.
+  maturationMinimumSeconds: 720,
+  maturationMaximumSeconds: 1_200,
+  // Sexual maturity precedes maximum adult size. Requiring 0.30 of the
+  // supplied adult structure made a food-rich tank-born cohort spend
+  // 1,900-2,200 seconds as juveniles even though its individual developmental
+  // target was 720-1,200 seconds. Females then reached adulthood only a few
+  // hundred seconds before their unchanged birth-to-death deadline and could
+  // not complete one food-funded brood. At 0.20 B they still have to acquire
+  // and conserve more than ten times their 0.0175-B birth structure, while
+  // ordinary post-maturity feeding continues somatic growth toward 1.0 B.
+  maturationStructuralBiomass: 0.20,
+  // Shrimp keep adding conserved somatic matter after sexual maturity. This
+  // lets food availability affect adult size and therefore fecundity instead
+  // of freezing every tank-born female at the minimum mature size.
+  adultSomaticGrowthPerSecond: 0.00035,
   // Ovarian readiness replaces the fixed post-brood countdown. It advances
   // continuously from temperature and individual condition while egg matter
   // is funded independently from conserved somatic reserve.
-  ovarianCycleMinimumSeconds: 260,
-  ovarianCycleMaximumSeconds: 500,
-  ovarianProgressEnergyFloor: 0.30,
+  // Females can spawn repeatedly, and ovarian rematuration may overlap the
+  // carried-egg interval. On the compressed birth-to-death clock this range
+  // permits several genuinely food-funded cycles without guaranteeing one:
+  // realised intake and condition still slow or stop progress continuously.
+  ovarianCycleMinimumSeconds: 180,
+  ovarianCycleMaximumSeconds: 320,
+  ovarianProgressReserveFloor: 0.40,
   // The nominal ovarian-cycle range is the realised rate for a healthy,
-  // feeding adult. The former 1.0-energy denominator made an ordinary
-  // 0.45–0.55 adult take three to five times the documented compressed cycle,
-  // so a healthy daughter could die of old age before her first clutch.
-  ovarianFullSpeedEnergy: 0.50,
-  ovarianAllocationPerSecond: 0.0014,
-  suppliedOvarianProgressMinimum: 0.18,
-  suppliedOvarianProgressMaximum: 0.78,
-  newAdultOvarianProgressMaximum: 0.14,
+  // feeding adult. A newly mature tank-born female has a smaller structural
+  // target than an inventory adult, and conserved egg allocation continually
+  // draws down her short-term store. Requiring 0.50 reserve condition made
+  // ovaries advance for 3,000+ seconds even while she was feeding and had
+  // fully funded eggs. The reproductive matter gate remains separate below;
+  // this condition range therefore controls development speed without
+  // creating a clutch.
+  // Full ovarian development belongs to a genuinely replenished somatic
+  // reserve. Between 40% and 80% it slows continuously, so local grazing
+  // competition reduces births before a producer crash; below the floor it
+  // pauses without consulting remote food or the current population count.
+  ovarianFullSpeedReserveFraction: 0.80,
+  // Somatic reserve and egg matter recover concurrently. This is only the
+  // physiological ceiling. The required recent ration is calculated from the
+  // individual's allometric maintenance plus this real egg-matter transfer,
+  // divided by assimilation over the eight-second intake window. Condition
+  // and a lower realised ration reduce the rate continuously, and transferred
+  // matter still comes from conserved somatic reserve above the protected
+  // survival floor.
+  ovarianAllocationPerSecond: 0.00016,
+  suppliedOvarianProgressMinimum: 0.02,
+  suppliedOvarianProgressMaximum: 0.20,
+  newAdultOvarianProgressMaximum: 0.25,
   gestationMinimumSeconds: 68,
   gestationMaximumSeconds: 82,
-  // The visual population represents a compressed colony. Three rendered
-  // juveniles stand in for a real multi-egg brood, and their full conserved
-  // biomass must be funded before mating. Alternating IDs still ensure that a
-  // completed brood contains both sexes without a one-offspring demographic
-  // dead end or a hidden low-population birth rule.
-  minimumClutchSize: 3,
+  // One modelled brood hatches together. Every resulting object is one actual
+  // tracked offspring and every body is paid from conserved maternal matter.
+  // Their sexes are independent draws; a rare single-sex lineage is allowed
+  // to fail rather than being repaired from the current population. Larger
+  // females can fund a third offspring, retaining a size-fecundity relation
+  // without a population-count rule.
+  minimumClutchSize: 2,
   maximumClutchSize: 3,
 } as const;
 
@@ -781,7 +972,7 @@ export const SHRIMP_ECOLOGY_RULES = {
  * One coherent ricefish rule set is shared by challenge and laboratory
  * scenarios. Durations are gameplay-compressed, while the ordering of egg,
  * fry, juvenile and adult stages and the relative temperature/oxygen effects
- * follow the medaka literature recorded in the mission 7 implementation note.
+ * follow the medaka literature recorded in the mission 8 design note.
  */
 export const RICEFISH_ECOLOGY_RULES = {
   minimumLifespanSeconds: 2_400,
@@ -796,21 +987,41 @@ export const RICEFISH_ECOLOGY_RULES = {
   // The world moves matter from structure to reserve at hatching; it does not
   // mint a separate starter-energy pool.
   hatchYolkReserveFraction: 0.40,
+  // Medaka finish absorbing the visible yolk over roughly the first three
+  // post-hatch days, but begin taking exogenous food during that overlap. The
+  // compressed fry stage represents that mixed endogenous/exogenous interval.
+  yolkAbsorptionSeconds: 150,
+  exogenousFeedingOnsetFraction: 0.30,
   adultLength: 44,
   juvenileLength: 27,
   fryLength: 10,
-  // The consumer budget is calibrated against the 25-minute challenge, not
-  // only the first hatch. An unfed fish still declines, but a fish that
-  // intermittently captures juvenile shrimp or grazes periphyton can replace
-  // maintenance instead of losing most of its structure in five minutes.
-  adultBaseMetabolismPerSecond: 0.0013,
-  eggBaseMetabolismPerSecond: 0.0001,
-  // Structural biomass is the mass proxy. Sub-adult maintenance and activity
-  // therefore scale continuously rather than jumping at named life stages.
+  // Calibrated as one complete adult energy budget, rather than choosing
+  // maintenance and locomotion independently. In the immortal,
+  // non-reproductive one-fish fixture an adult assimilated 0.141 matter from
+  // 71 Daphnia over 7,200 seconds, while the former rates respired 0.161 and
+  // forced it to catabolise 0.012 of its own structure despite 400+ available
+  // prey. These rates target roughly 0.12 respiration over the same realised
+  // behaviour mix: enough for an unfed fish to decline, while an ordinarily
+  // feeding adult has a small reserve instead of requiring excess predation.
+  adultBaseMetabolismPerSecond: 0.0000115,
+  // Keep the same 14.25% nominal incubation loss after scaling an egg from
+  // 0.010 to 0.00125 matter units (0.000001875 * 95 seconds).
+  eggBaseMetabolismPerSecond: 0.000001875,
+  // Structural biomass is the mass proxy. The same allometric equation applies
+  // before and after maturity, so smaller fish retain their naturally higher
+  // mass-specific demand instead of receiving a stage-name discount.
   metabolicMassExponent: 0.75,
-  restingActivityCostPerSecond: 0.0001,
-  swimmingActivityCostPerSecond: 0.00038,
-  huntingActivityCostPerSecond: 0.00075,
+  restingActivityCostPerSecond: 0.0000026,
+  swimmingActivityCostPerSecond: 0.0000050,
+  huntingActivityCostPerSecond: 0.0000110,
+  // Sustained pursuit adds real locomotor respiration instead of merely
+  // changing the animation speed. A finite effort budget then makes a fish
+  // abandon an unprofitable long chase and recover at cruise speed.
+  longPursuitActivityCostPerSecond: 0.0000049,
+  maximumContinuousPursuitEffort: 8,
+  pursuitEffortRecoveryPerSecond: 2.4,
+  pursuitRecoverySeconds: 2.2,
+  maximumSomaticGrowthPerSecond: 0.00035,
   oxygenStressStart: 36,
   oxygenSevereStress: 18,
   oxygenMaximumDamagePerSecond: 0.022,
@@ -818,63 +1029,142 @@ export const RICEFISH_ECOLOGY_RULES = {
   toxicWasteFullStress: 20,
   toxicMaximumDamagePerSecond: 0.028,
   healthyWaterRecoveryPerSecond: 0.0035,
-  forageStartEnergy: 0.5,
-  forageStopEnergy: 0.76,
+  // Starvation is a condition process, not an extra omniscient population
+  // rule. A fish first spends its own reserve, then loses health according to
+  // its feeding gap and loss from its own previously achieved body mass.
+  starvationReserveStressStartFraction: 0.18,
+  // Normal medaka feeding is discontinuous and the authored gut signal takes
+  // roughly 1-3 minutes to clear after a suitably sized zooplankton meal.
+  // Health damage must not begin before that ordinary handling interval has
+  // elapsed; a genuinely unfed fish has already exhausted this window by the
+  // time its short-term reserve runs out.
+  starvationFeedingGapGraceSeconds: 90,
+  starvationFeedingGapFullSeconds: 240,
+  starvationStructuralStressStartFraction: 0.82,
+  starvationMinimumStructuralFraction: 0.55,
+  starvationMaximumDamagePerSecond: 0.012,
+  // Gut fullness normally imposes a handling interval, but a severely
+  // depleted growing fish must resume feeding before that non-material signal
+  // can strand it beside abundant edible prey.
+  starvationEmergencyForageEnergy: 0.20,
+  // Begin searching before the reserve crosses the starvation-stress boundary.
+  // The former 0.30 threshold made a fish remain in ordinary exploration
+  // until only about 3% of its reserve remained, even with visible prey all
+  // around it. Hysteresis still stops repeated immediate reacquisition.
+  forageStartEnergy: 0.42,
+  forageStopEnergy: 0.56,
+  // Fry and juveniles keep a real short-term reserve before routing surplus
+  // matter into growth. Without this floor their reserve was permanently
+  // zero, so even a well-fed sub-adult could never satisfy the foraging
+  // hysteresis and kept hunting until the prey guild disappeared.
+  subadultGrowthReserveFraction: 0.24,
   // Adults route repeated feeding surplus into gonads after maintenance.
   // Requiring a nearly full reserve made the small, spatially foraging
   // population depend on one unusually lucky feeding streak and prevented
   // otherwise healthy daughters from ever producing the next generation.
   // The retained floor still covers ordinary fasting between local encounters.
   // Energy is a composite UI condition score whose denominator changes at
-  // maturation. Reproduction is funded by conserved reproductive biomass, so
-  // this threshold only rejects a genuinely emaciated adult; it must not
-  // require a newly matured fish to be almost full adult size.
-  reproductionEnergy: 0.15,
-  reproductionReserveFloor: 0.08,
+  // maturation. Reproductive matter alone is not enough: an adult female must
+  // also have restored her own short-term condition before spawning. Keep this
+  // above the 0.42 forage-start threshold so a food-stressed female feeds
+  // instead of turning an already accumulated clutch into a doomed cohort.
+  // The supplied mission adult starts at 0.48, so this does not require a fish
+  // to reach maximum size or an unusually full reserve before first spawning.
+  reproductionEnergy: 0.48,
+  // Maximum-size-adult fasting buffer. The world scales this by the same
+  // structural-mass allometry as maintenance for smaller newly mature fish.
+  // About 130 seconds of resting maintenance is retained at every body size.
+  // The former 0.008 buffer protected roughly six minutes of maintenance:
+  // repeated small prey meals refilled that compartment but could not finish
+  // even one four-token clutch before an otherwise feeding adult died of old
+  // age. This lower floor changes allocation only. It neither creates matter
+  // nor shortens the gut handling interval, so predators do not receive extra
+  // prey encounters solely because their lineage is small.
+  reproductionReserveFloor: 0.0021,
+  // Optional maximum-adult somatic growth keeps a longer reserve buffer than
+  // ovarian allocation. At maximum adult size, 0.0048 is 40% of reserve
+  // capacity; together with achieved structure this leaves condition at
+  // 0.568, just above the 0.56 foraging-stop threshold. Unlike the ovarian
+  // floor, this value encodes a condition threshold rather than a fixed number
+  // of resting seconds, so it remains unchanged when metabolism is calibrated.
+  adultSomaticGrowthReserveFloor: 0.0048,
+  // Sexual maturity precedes maximum size, but post-maturity somatic growth
+  // decelerates continuously. A squared remaining-growth fraction gives
+  // relative rate ceilings of 1.00, 0.64, 0.25 and 0.04 at 0%, 20%, 50% and
+  // 80% progress through the adult size interval. This is a rate ceiling,
+  // not a loss of matter or a fixed fraction removed from each meal.
+  adultSomaticGrowthTaperExponent: 2,
+  // Fraction of eligible adult-female reserve allocated over one simulated
+  // second. The world converts this to a delta-time-equivalent fraction.
   reproductionAllocationFraction: 0.20,
-  matingEnergy: 0.15,
-  eggClutchMinimum: 2,
-  // A rendered egg/fry represents part of a much larger real clutch. Keeping
-  // each simulated spawn to one mixed-sex pair prevents the first two females
-  // from turning one feeding pulse into eight full-sized competitors at once.
-  eggClutchMaximum: 2,
-  // One rendered fish represents a compressed cohort. This leaves replacement
-  // slightly above one mixed-sex brood per female, enough to survive ordinary
-  // fry loss without recreating real-world daily-clutch exponential growth.
-  postSpawnCooldownSeconds: 1_900,
-  matingEncounterRadius: 180,
-  matingSeconds: 4,
+  // A male below the ordinary forage threshold searches for food instead of
+  // spending its remaining condition on courtship. Female readiness uses the
+  // stricter reproductionEnergy threshold above.
+  matingEnergy: 0.42,
+  eggClutchMinimum: 4,
+  // A rendered egg/fry represents part of a much larger real clutch. Four
+  // food-funded cohort tokens compress the real daily 8–48-egg output while
+  // retaining one demographic spare for each sex. Three tokens still made
+  // one ordinary juvenile failure remove the only member of one sex and end
+  // the lineage in a prey-rich tank.
+  eggClutchMaximum: 4,
+  // Medaka can spawn on successive days in suitable light and food. Gameplay
+  // compresses one real clutch into four visible cohort tokens, but a healthy
+  // female must still be able to produce several cohorts in one adult life.
+  // Egg matter, body reserve and mate/attachment access remain the ecological
+  // gates; this interval is only the minimum ovarian cadence.
+  postSpawnCooldownSeconds: 600,
+  // Males can follow a receptive female before she accepts a particular
+  // suitor. Actual wrapping/spawning requires the smaller contact radius.
+  matingEncounterRadius: 140,
+  matingContactRadius: 58,
+  // Simulation time is compressed, but the sequence remains long enough to
+  // show approach, positioning, quick-circle and close contact.
+  matingSeconds: 6,
   animalPreyDetectionRadius: 360,
-  algaeDetectionRadius: 145,
-  fryAlgaeDetectionRadius: 300,
+  // Larval medaka still hunt moving prey visually, but a strictly
+  // length-proportional radius left each rendered fry inspecting only about
+  // 5% of an adult's search area. That mapping is too sparse for the
+  // compressed Daphnia cohort used by this simulation. Keep a smaller larval
+  // visual patch while giving it enough independent prey encounters to bridge
+  // the food-funded growth stage. Angle, distance falloff, light, occlusion
+  // and canopy shelter still decide whether a candidate is actually seen.
+  fryPreyDetectionRadiusFraction: 0.38,
+  // These speeds also define how quickly a fish can leave one searched
+  // neighbourhood and obtain an independent view of another. Keeping that
+  // geometry in the ecology rules prevents repeated dice rolls over the same
+  // nearly stationary rare prey every rendered second.
+  cruiseSpeed: 54,
+  preyPursuitSpeed: 126,
+  // Medaka keep prey in a lateral monocular field and finish the approach with
+  // a short side-swing strike. This is a momentary attempted-capture velocity,
+  // not a second sustained pursuit speed.
+  strikeBurstSpeed: 164,
   strikeDistance: 32,
-  strikeCooldownSeconds: 2.2,
+  // This is the brief recovery between two visible lunges, not a new visual
+  // search. Multi-second lockout made prey bounce around the mouth while an
+  // otherwise hungry fish was artificially unable to bite.
+  strikeCooldownSeconds: 0.55,
+  // `recentIntake` is only a non-material handling signal. One rendered prey
+  // may represent much more conserved biomass than one literal stomachful, so
+  // every capture is capped at this capacity instead of overfilling the signal
+  // by 10-60 times. Real reserve/energy still determines physiological hunger.
+  gutCapacityStructuralFraction: 0.06,
+  gutEvacuationSeconds: 120,
+  // Fry and juveniles feed in repeated small bouts during the yolk overlap and
+  // have higher mass-specific turnover than adults. One rendered prey is a
+  // compressed feeding encounter, so its non-material handling signal clears
+  // quickly while the captured matter itself remains fully conserved.
+  subadultGutEvacuationSeconds: 12,
+  foragingResumeAppetite: 0.62,
+  // A fry can take small Daphnia regardless of whether an early molt has
+  // already changed the prey's stage label. The limit stays continuous in
+  // conserved structure and excludes genuinely larger adults.
+  fryMaximumDaphniaStructuralBiomass:
+    DAPHNIA_BODY_BUDGET.adultStructuralBiomass *
+    DAPHNIA_BODY_BUDGET.maturationStructuralFraction * 1.15,
   juvenileShrimpPreference: 1,
   adultShrimpPreference: 0,
-  // Adults can opportunistically take algae/periphyton, but medaka are not
-  // modelled as a second shrimp-like surface scraper. Animal prey supplies the
-  // efficient feeding pulses; this low-quality ration bridges encounters.
-  diatomAssimilationMultiplier: 0.28,
-  oedogoniumAssimilationMultiplier: 0.14,
-  // In the compressed food web, a visible periphyton patch also represents
-  // its attached infusoria and other microscopic food. Larvae can use that
-  // fraction more efficiently than adults can digest the algae itself.
-  fryDiatomAssimilationMultiplier: 0.9,
-  fryOedogoniumAssimilationMultiplier: 0.45,
-  fryAlgaeBiteScale: 0.46,
-  juvenileDiatomAssimilationMultiplier: 0.65,
-  juvenileOedogoniumAssimilationMultiplier: 0.30,
-  juvenileAlgaeBiteScale: 0.72,
-  juvenileAlgaeDetectionRadius: 300,
-  fryBiofilmMicrofaunaMultiplier: 0.65,
-  juvenileBiofilmMicrofaunaMultiplier: 0.45,
-  adultBiofilmMicrofaunaMultiplier: 0.12,
-  adultAlgaeBiteScale: 0.50,
-  maximumAlgaeBiteBiomassPerSecond: 0.12,
-  // Holling/Monod-like food-density response. A fish on a rich periphyton mat
-  // can approach the maximum bite rate, while intake continuously approaches
-  // zero with food density. This is not a protected biomass floor.
-  periphytonGrazingHalfSaturation: 0.12,
   technicalPopulationLimit: 512,
 } as const;
 
@@ -942,6 +1232,8 @@ export interface SpeciesDefinition {
   growthForm: 'surface-film' | 'rooted-macrophyte';
   respirationRateAtReference: number;
   respirationTheta: number;
+  temperatureStressTurnoverRate: number;
+  naturalTurnoverPerSecond: number;
   dispersalRate: number;
   maximumPositiveRate: number;
 }
@@ -960,14 +1252,14 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     colonyAppearance: '육안으로는 밝은 녹색의 얇은 솜털이나 부드러운 막처럼 보입니다.',
     niche: '밝은 돌 앞면에서 빠르게 성장하지만 깊은 그늘에서는 서서히 감소합니다.',
     lightCurve: [
-      { light: 0, netRate: -0.004 },
-      { light: 15, netRate: -0.002 },
+      { light: 0, netRate: -0.0000302 },
+      { light: 15, netRate: -0.0000151 },
       { light: 28, netRate: 0 },
-      { light: 45, netRate: 0.042 },
-      { light: 68, netRate: 0.068 },
-      { light: 82, netRate: 0.046 },
-      { light: 94, netRate: 0.006 },
-      { light: 100, netRate: -0.024 },
+      { light: 45, netRate: 0.0003172 },
+      { light: 68, netRate: 0.0005136 },
+      { light: 82, netRate: 0.0003474 },
+      { light: 94, netRate: 0.0000453 },
+      { light: 100, netRate: -0.0001813 },
     ],
     temperatureCurve: [
       { temperature: 8, suitability: 0.12 },
@@ -979,10 +1271,12 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     ],
     temperatureSummary: '이 수조 계통은 20~27°C에서 안정적이며 극단적인 저온·고온에서는 성장이 둔화됩니다.',
     growthForm: 'surface-film',
-    respirationRateAtReference: 0.004,
+    respirationRateAtReference: 0.0000302,
     respirationTheta: 1.065,
-    dispersalRate: 0.19,
-    maximumPositiveRate: 0.068,
+    temperatureStressTurnoverRate: 0.00012,
+    naturalTurnoverPerSecond: 0.0000136,
+    dispersalRate: 0.00018,
+    maximumPositiveRate: 0.0005136,
   },
   nitzschia: {
     id: 'nitzschia',
@@ -997,15 +1291,15 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     colonyAppearance: '육안으로는 황갈색 먼지나 아주 얇은 얼룩막처럼 보입니다.',
     niche: '그늘에서 붓뚜껑말보다 유리하며 밝은 곳에서 즉시 죽지는 않지만 경쟁 우위가 줄어듭니다.',
     lightCurve: [
-      { light: 0, netRate: -0.0035 },
-      { light: 6, netRate: -0.001 },
-      { light: 12, netRate: 0.006 },
-      { light: 25, netRate: 0.055 },
-      { light: 38, netRate: 0.062 },
-      { light: 55, netRate: 0.034 },
-      { light: 72, netRate: 0.01 },
-      { light: 86, netRate: -0.009 },
-      { light: 100, netRate: -0.028 },
+      { light: 0, netRate: -0.0000436 },
+      { light: 6, netRate: -0.0000125 },
+      { light: 12, netRate: 0.0000748 },
+      { light: 25, netRate: 0.0006852 },
+      { light: 38, netRate: 0.0007724 },
+      { light: 55, netRate: 0.0004236 },
+      { light: 72, netRate: 0.0001246 },
+      { light: 86, netRate: -0.0001121 },
+      { light: 100, netRate: -0.0003488 },
     ],
     temperatureCurve: [
       { temperature: 8, suitability: 0.18 },
@@ -1017,10 +1311,12 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     ],
     temperatureSummary: '폭넓은 수온에서 유지되지만 이 게임의 계통은 22~31°C에서 가장 잘 증식합니다.',
     growthForm: 'surface-film',
-    respirationRateAtReference: 0.0035,
+    respirationRateAtReference: 0.0000436,
     respirationTheta: 1.06,
-    dispersalRate: 0.21,
-    maximumPositiveRate: 0.062,
+    temperatureStressTurnoverRate: 0.00012,
+    naturalTurnoverPerSecond: 0.0000224,
+    dispersalRate: 0.00024,
+    maximumPositiveRate: 0.0007724,
   },
   vallisneria: {
     id: 'vallisneria',
@@ -1035,12 +1331,16 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     niche: '바닥에만 심을 수 있지만 잎이 위쪽의 밝은 물층까지 닿아 낮 동안 안정적인 생산자 역할을 합니다.',
     lightCurve: [
       { light: 0, netRate: -0.002 },
-      { light: 10, netRate: -0.001 },
-      { light: 18, netRate: 0 },
-      { light: 35, netRate: 0.018 },
-      { light: 58, netRate: 0.032 },
-      { light: 78, netRate: 0.036 },
-      { light: 100, netRate: 0.031 },
+      // Vallisneria is a low-light-adapted submerged macrophyte. Keep its
+      // compensation point below the attached algae niches, then saturate
+      // rather than continuing to accelerate in the brightest water.
+      { light: 6, netRate: -0.0008 },
+      { light: 10, netRate: 0 },
+      { light: 24, netRate: 0.012 },
+      { light: 42, netRate: 0.023 },
+      { light: 58, netRate: 0.03 },
+      { light: 78, netRate: 0.032 },
+      { light: 100, netRate: 0.03 },
     ],
     temperatureCurve: [
       { temperature: 8, suitability: 0.18 },
@@ -1054,8 +1354,10 @@ export const SPECIES: Record<SpeciesId, SpeciesDefinition> = {
     growthForm: 'rooted-macrophyte',
     respirationRateAtReference: 0.002,
     respirationTheta: 1.055,
+    temperatureStressTurnoverRate: 0.012,
+    naturalTurnoverPerSecond: 0.00018,
     dispersalRate: 0,
-    maximumPositiveRate: 0.036,
+    maximumPositiveRate: 0.032,
   },
 };
 
@@ -1149,11 +1451,59 @@ export const STRUCTURES: Record<StructureDefinitionId, StructureDefinition> = {
     density: 0.0052,
     friction: 0.94,
   },
+  'small-flat-stone': {
+    id: 'small-flat-stone',
+    label: '작은 납작돌',
+    assetPath: './assets/rocks/small-flat-stone-doodle.svg',
+    width: 104,
+    height: 47,
+    material: '작은 거친 돌 · 부착 가능',
+    collisionPolygon: [
+      { x: -49, y: 6 }, { x: -43, y: -8 }, { x: -27, y: -18 },
+      { x: -4, y: -21 }, { x: 25, y: -17 }, { x: 45, y: -7 },
+      { x: 50, y: 7 }, { x: 39, y: 17 }, { x: 12, y: 22 },
+      { x: -20, y: 21 }, { x: -43, y: 15 },
+    ],
+    ecologyPolygon: [
+      { x: -43, y: 4 }, { x: -37, y: -6 }, { x: -24, y: -14 },
+      { x: -3, y: -17 }, { x: 22, y: -13 }, { x: 38, y: -5 },
+      { x: 43, y: 5 }, { x: 34, y: 13 }, { x: 10, y: 18 },
+      { x: -18, y: 17 }, { x: -37, y: 12 },
+    ],
+    ecologyCellSize: 8,
+    density: 0.0046,
+    friction: 0.9,
+  },
+  'small-wedge-stone': {
+    id: 'small-wedge-stone',
+    label: '작은 쐐기돌',
+    assetPath: './assets/rocks/small-wedge-stone-doodle.svg',
+    width: 112,
+    height: 64,
+    material: '작은 층리 돌 · 부착 가능',
+    collisionPolygon: [
+      { x: -52, y: 24 }, { x: -48, y: 5 }, { x: -33, y: -15 },
+      { x: -7, y: -29 }, { x: 18, y: -23 }, { x: 42, y: -8 },
+      { x: 53, y: 11 }, { x: 49, y: 25 }, { x: 15, y: 30 },
+      { x: -23, y: 30 },
+    ],
+    ecologyPolygon: [
+      { x: -45, y: 19 }, { x: -41, y: 5 }, { x: -28, y: -11 },
+      { x: -6, y: -23 }, { x: 16, y: -18 }, { x: 36, y: -6 },
+      { x: 45, y: 10 }, { x: 41, y: 20 }, { x: 13, y: 25 },
+      { x: -20, y: 25 },
+    ],
+    ecologyCellSize: 8,
+    density: 0.0049,
+    friction: 0.93,
+  },
 };
 
 export interface ScenarioDefinition {
   id: ScenarioId;
   mode: 'challenge' | 'laboratory';
+  /** Missions may pin a tank; the laboratory remains user-selectable. */
+  tankType?: TankTypeId;
   title: string;
   subtitle: string;
   instruction: string;
@@ -1179,6 +1529,10 @@ export interface ScenarioDefinition {
   dayNightCycleInitiallyEnabled: boolean;
   seedBudget: Record<SpeciesId, number | null>;
   animalBudget: Record<AnimalSpeciesId, number | null>;
+  /** Optional sex-specific stocking limits. Their sum must fit animalBudget. */
+  animalSexBudget?: Partial<
+    Record<AnimalSpeciesId, Partial<Record<AnimalSex, number | null>>>
+  >;
   planktonBudget: Record<PlanktonKind, number | null>;
   structureBudget: Record<StructureDefinitionId, number | null>;
   requiredStructures: Partial<Record<StructureDefinitionId, number>>;
@@ -1189,12 +1543,19 @@ export interface ScenarioDefinition {
   allowedStructures: StructureDefinitionId[];
   waterCycle: {
     initial: WaterQualityValues;
+    /**
+     * Multiplies the tank's finite starting carbon and nitrogen reservoirs
+     * without changing oxygen, organism physiology, or biological rates.
+     */
+    initialMaterialScale?: number;
     microbeBudget: Record<MicrobeGuildId, number | null>;
     allowedMicrobes: MicrobeGuildId[];
   } | null;
   target:
     | {
         type: 'coverage';
+        speciesId: SpeciesId;
+        minBiomass: number;
         ratio: number;
         holdSeconds: number;
         label: string;
@@ -1231,6 +1592,16 @@ export interface ScenarioDefinition {
       label: string;
     }
     | {
+        type: 'animal-generation';
+        speciesId: AnimalSpeciesId;
+        /** Supplied founders are generation 0, so 2 means their grandchildren. */
+        minimumGeneration: number;
+        generationCount: number;
+        minimumPopulation: number;
+        holdSeconds: number;
+        label: string;
+      }
+    | {
         type: 'born-stage';
         speciesId: AnimalSpeciesId;
         lifeStage: 'fry' | 'juvenile' | 'adult';
@@ -1263,14 +1634,14 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       success: '목표 점유율을 3초 동안 유지하면 성공합니다.',
       supplied: '넓적한 사암 1개 · 붓뚜껑말 접종 1회 · 광량 탐침 · 수온계',
     },
-    timeLimitSeconds: 140,
+    timeLimitSeconds: 360,
     lightOutput: 92,
     naturalLightOutput: 0,
     backgroundProducerCapacity: null,
     seedBudget: { oedogonium: 1, nitzschia: 0, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0, 'japanese-ricefish': 0, daphnia: 0 },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
-    structureBudget: { 'flat-stone': 1, 'round-stone': 0, 'tall-stone': 0 },
+    structureBudget: { 'flat-stone': 1, 'round-stone': 0, 'tall-stone': 0, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: { 'flat-stone': 1 },
     allowedSpecies: ['oedogonium'],
     requiredSeedSpecies: ['oedogonium'],
@@ -1280,7 +1651,14 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     waterCycle: null,
     dayNightCycle: null,
     dayNightCycleInitiallyEnabled: false,
-    target: { type: 'coverage', ratio: 0.32, holdSeconds: 3, label: '붓뚜껑말 표면 점유' },
+    target: {
+      type: 'coverage',
+      speciesId: 'oedogonium',
+      minBiomass: ALGAE_RENDER_TRACE_BIOMASS,
+      ratio: 0.32,
+      holdSeconds: 3,
+      label: '붓뚜껑말 표면 점유',
+    },
     targetIncludesSubstrate: false,
   },
   'mission-2': {
@@ -1289,21 +1667,21 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     title: '두 번째 실험 · 빛의 틈새',
     subtitle: '규조류 군락량',
     instruction:
-      '강한 고정 조명 아래에서 규조류가 자란 양을 220까지 늘리세요.',
+      '강한 고정 조명 아래에서 규조류 실제 생물량을 0.53까지 늘리세요.',
     briefing: {
       question: '밝은 수조에서 저광량을 선호하는 규조류의 서식처를 어떻게 만들 수 있을까요?',
-      goal: '수조 전체에서 규조류가 자란 양을 220 이상으로 늘리고 4초간 유지하세요.',
+      goal: '수조 전체에서 규조류 실제 생물량을 0.53 이상으로 늘리고 4초간 유지하세요.',
       success: '위치나 구조물 개수와 관계없이 수조 안의 규조류를 모두 합산합니다.',
       supplied: '규조류 접종 4회 · 넓적한 사암 3개 · 둥근 강돌 4개 · 세로 판석 3개 · 광량 탐침 · 수온계',
     },
-    timeLimitSeconds: 260,
+    timeLimitSeconds: 360,
     lightOutput: 104,
     naturalLightOutput: 0,
     backgroundProducerCapacity: null,
     seedBudget: { oedogonium: 0, nitzschia: 4, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0, 'japanese-ricefish': 0, daphnia: 0 },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
-    structureBudget: { 'flat-stone': 3, 'round-stone': 4, 'tall-stone': 3 },
+    structureBudget: { 'flat-stone': 3, 'round-stone': 4, 'tall-stone': 3, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: {},
     allowedSpecies: ['nitzschia'],
     requiredSeedSpecies: ['nitzschia'],
@@ -1316,7 +1694,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     target: {
       type: 'biomass',
       speciesId: 'nitzschia',
-      amount: 220,
+      amount: 0.53,
       holdSeconds: 4,
       label: '규조류가 자란 양',
     },
@@ -1331,7 +1709,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       '빛이 약한 수조에서 붓뚜껑말이 자란 양을 목표치까지 늘리세요.',
     briefing: {
       question: '바닥까지 빛이 약한 수조에서 붓뚜껑말을 어떻게 번식시킬 수 있을까요?',
-      goal: '수조 전체에서 붓뚜껑말이 자란 양을 145 이상으로 늘리고 5초간 유지하세요.',
+      goal: '수조 전체에서 붓뚜껑말 실제 생물량을 0.267 이상으로 늘리고 5초간 유지하세요.',
       success: '위치나 방법과 관계없이 수조 안의 붓뚜껑말을 모두 합산합니다.',
       supplied: '붓뚜껑말 접종 2회 · 세 종류의 구조물 무제한 · 광량 탐침 · 수온계',
     },
@@ -1342,7 +1720,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     seedBudget: { oedogonium: 2, nitzschia: 0, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0, 'japanese-ricefish': 0, daphnia: 0 },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
-    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: {},
     allowedSpecies: ['oedogonium'],
     requiredSeedSpecies: ['oedogonium'],
@@ -1355,7 +1733,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     target: {
       type: 'biomass',
       speciesId: 'oedogonium',
-      amount: 145,
+      amount: 0.267,
       holdSeconds: 5,
       label: '붓뚜껑말이 자란 양',
     },
@@ -1385,7 +1763,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0, daphnia: 0 },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
-    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia'],
     requiredSeedSpecies: [],
@@ -1408,22 +1786,25 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     id: 'mission-5',
     mode: 'challenge',
     title: '다섯 번째 실험 · 보이지 않는 순환',
-    subtitle: '체리새우 군집의 장기 생존',
-    instruction: '수조의 변화를 관찰하며 체리새우 군집이 끊기지 않도록 오래 유지하세요.',
+    subtitle: '체리새우 세대의 장기 순환',
+    instruction: '처음 접종한 조류와 균이 스스로 순환하도록 안정시킨 뒤 체리새우를 방류해 20마리 이상의 다세대 군집을 만드세요.',
     briefing: {
       question: '눈에 잘 보이지 않는 분해자들이 수조의 장기 생존을 어떻게 바꿀까요?',
-      goal: '체리새우 군집이 한 번도 사라지지 않은 상태로 35분의 시뮬레이션 시간을 유지하세요.',
-      success: '수질 수치나 접종 방법은 채점하지 않으며, 살아 있는 체리새우가 계속 존재하면 생존 시간이 누적됩니다.',
-      supplied: '체리새우 성체 4마리 · 두 조류 접종 각 4회 · 세 종류의 구조물 무제한 · 두 균 필름 접종 · 수질 탐침',
+      goal: '외부 방류 0세대 이후 세대교체를 거쳐, 3세대 이상 체리새우 20마리가 함께 살아 있는 군집을 만드세요.',
+      success: '처음 접종한 조류가 번식해 먹이를 계속 생산해야 하며, 성공 뒤에도 새우와 조류가 함께 증감해야 합니다.',
+      supplied: '체리새우 성체 암컷 2마리·수컷 2마리 · 두 조류 접종 각 8회 · 세 종류의 구조물 무제한 · 분해균·질산화균 각 4회 · 수질 탐침',
     },
-    timeLimitSeconds: 2_400,
+    timeLimitSeconds: null,
     lightOutput: 88,
     naturalLightOutput: 0,
     backgroundProducerCapacity: null,
-    seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
+    seedBudget: { oedogonium: 8, nitzschia: 8, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0, daphnia: 0 },
+    animalSexBudget: {
+      'cherry-shrimp': { female: 2, male: 2 },
+    },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
-    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia'],
     requiredSeedSpecies: [],
@@ -1431,25 +1812,30 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     allowedPlankton: [],
     allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
     waterCycle: {
+      // Keep the same biological rates but give this closed tank less finite
+      // C/N matter, lowering the population that its biofilm can support.
+      initialMaterialScale: 0.64,
       initial: {
         organicMatter: 1.5,
         toxicWaste: 0.8,
         // The starting reserve supports establishment, but cannot carry the
-        // full 25-minute challenge without microbial recycling.
-        nutrients: 11.8,
+        // full challenge without microbial recycling.
+        nutrients: 6,
         oxygen: 76,
       },
-      microbeBudget: { decomposer: null, nitrifier: null },
+      microbeBudget: { decomposer: 4, nitrifier: 4 },
       allowedMicrobes: ['decomposer', 'nitrifier'],
     },
     dayNightCycle: null,
     dayNightCycleInitiallyEnabled: false,
     target: {
-      type: 'population-survival',
+      type: 'animal-generation',
       speciesId: 'cherry-shrimp',
-      count: 1,
-      holdSeconds: 2_100,
-      label: '체리새우 군집 생존',
+      minimumGeneration: 3,
+      generationCount: 20,
+      minimumPopulation: 20,
+      holdSeconds: 0,
+      label: '3세대 이상 체리새우 군집',
     },
     targetIncludesSubstrate: true,
   },
@@ -1474,7 +1860,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     seedBudget: { oedogonium: 8, nitzschia: 8, vallisneria: 3 },
     animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0, daphnia: 0 },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
-    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
     requiredSeedSpecies: [],
@@ -1535,7 +1921,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 3 },
     animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0, daphnia: 0 },
     planktonBudget: { phytoplankton: 3, daphnia: 3 },
-    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
     requiredSeedSpecies: [],
@@ -1574,6 +1960,76 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     },
     targetIncludesSubstrate: true,
   },
+  'mission-8': {
+    id: 'mission-8',
+    mode: 'challenge',
+    tankType: 'long',
+    title: '여덟 번째 실험 · 긴 수조의 송사리',
+    subtitle: '포식자와 피난 공간',
+    instruction:
+      '먼저 식물플랑크톤과 큰물벼룩을 넣어 먹이망을 키우세요. 물벼룩이 여러 세대로 충분히 늘면 일시정지해 송사리를 방류하고 포식과 회피를 관찰하세요.',
+    briefing: {
+      question: '포식자가 들어온 먹이망에서 공간 구조는 피식자의 생존을 어떻게 바꿀까요?',
+      goal: '물벼룩 군집을 먼저 늘린 뒤 일시정지 상태에서 송사리를 방류하세요. 작은 돌과 기존 돌로 몸집에 따른 틈을 만들고 세 종의 접근과 회피를 관찰하세요.',
+      success:
+        '미션 8의 완료 조건은 아직 확정하지 않았습니다. 현재 구현에서는 성공·실패 판정 없이 큰 수조 생태와 피난 구조를 검증합니다.',
+      supplied:
+        '긴 수조 · 식물플랑크톤 6회 · 큰물벼룩 6마리 · 체리새우 8마리 · 나중에 방류할 송사리 2마리 · 나사말 6포기 · 부착조류 각 8회 · 모든 돌과 두 균 필름 · 수질 탐침',
+    },
+    timeLimitSeconds: null,
+    lightOutput: 0,
+    naturalLightOutput: 105,
+    backgroundProducerCapacity: null,
+    seedBudget: { oedogonium: 8, nitzschia: 8, vallisneria: 6 },
+    animalBudget: {
+      'cherry-shrimp': 8,
+      'japanese-ricefish': 2,
+      daphnia: 0,
+    },
+    planktonBudget: { phytoplankton: 6, daphnia: 6 },
+    structureBudget: {
+      'flat-stone': null,
+      'round-stone': null,
+      'tall-stone': null,
+      'small-flat-stone': null,
+      'small-wedge-stone': null,
+    },
+    requiredStructures: {},
+    allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
+    requiredSeedSpecies: [],
+    allowedAnimals: ['cherry-shrimp', 'japanese-ricefish'],
+    allowedPlankton: ['phytoplankton', 'daphnia'],
+    allowedStructures: [
+      'flat-stone',
+      'round-stone',
+      'tall-stone',
+      'small-flat-stone',
+      'small-wedge-stone',
+    ],
+    waterCycle: {
+      initial: {
+        organicMatter: 1.5,
+        toxicWaste: 0.8,
+        nutrients: 24,
+        oxygen: 82,
+      },
+      microbeBudget: { decomposer: null, nitrifier: null },
+      allowedMicrobes: ['decomposer', 'nitrifier'],
+    },
+    dayNightCycle: {
+      dawnSeconds: 30,
+      daySeconds: 240,
+      duskSeconds: 30,
+      nightSeconds: 60,
+      nightLightMultiplier: 0.045,
+      startingOffsetSeconds: 30,
+    },
+    dayNightCycleInitiallyEnabled: true,
+    // The user explicitly left mission 8's completion condition undecided.
+    // Keep the scenario playable without inventing a provisional score.
+    target: null,
+    targetIncludesSubstrate: true,
+  },
   laboratory: {
     id: 'laboratory',
     mode: 'laboratory',
@@ -1594,13 +2050,13 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     seedBudget: { oedogonium: null, nitzschia: null, vallisneria: null },
     animalBudget: { 'cherry-shrimp': null, 'japanese-ricefish': null, daphnia: null },
     planktonBudget: { phytoplankton: null, daphnia: null },
-    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null },
+    structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null, 'small-flat-stone': null, 'small-wedge-stone': null },
     requiredStructures: {},
     allowedSpecies: ['oedogonium', 'nitzschia', 'vallisneria'],
     requiredSeedSpecies: [],
     allowedAnimals: ['cherry-shrimp', 'japanese-ricefish'],
     allowedPlankton: ['phytoplankton', 'daphnia'],
-    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone'],
+    allowedStructures: ['flat-stone', 'round-stone', 'tall-stone', 'small-flat-stone', 'small-wedge-stone'],
     waterCycle: {
       initial: {
         organicMatter: 3,

@@ -11,8 +11,8 @@ import {
 
 type WorldSnapshot = ReturnType<SimulationWorld['snapshot']>;
 
-const LONG_RUN_SECONDS = 3_600;
-const TAIL_START_SECONDS = 1_800;
+const LONG_RUN_SECONDS = 10_800;
+const TAIL_START_SECONDS = 7_200;
 const REAL_FRAME_SECONDS = 0.1;
 const FULL_SNAPSHOT_REAL_SECONDS = 1;
 const MAX_STABLE_ARRAY_ENTRY_DRIFT = 32;
@@ -51,8 +51,8 @@ const nearestUnusedCell = (
   const cell = cells
     .filter((candidate) => !used.has(candidate.id))
     .sort((left, right) => {
-      const leftScore = Math.abs(left.x - targetX) / 35 + Math.abs(left.light - targetLight);
-      const rightScore = Math.abs(right.x - targetX) / 35 + Math.abs(right.light - targetLight);
+      const leftScore = Math.abs(left.x - targetX) / 25 + Math.abs(left.light - targetLight);
+      const rightScore = Math.abs(right.x - targetX) / 25 + Math.abs(right.light - targetLight);
       return leftScore - rightScore;
     })[0];
   if (!cell) throw new Error('mission 4 long-run fixture needs another substrate cell');
@@ -190,7 +190,7 @@ const assertBoundedMissionFourSnapshot = (
 };
 
 describe('mission 4 long-run performance contract', () => {
-  it('runs 60 simulated minutes at 64x with lineage renewal and bounded state', () => {
+  it('runs 180 simulated minutes at 64x through five generations without extinction or a boom', () => {
     const world = new SimulationWorld('mission-4');
     populateMissionFour(world);
     world.handle({ type: 'start' });
@@ -205,6 +205,8 @@ describe('mission 4 long-run performance contract', () => {
     let realFrames = 0;
     let publishedSnapshots = 0;
     let peakShrimpPopulation = baseline.animalPopulation['cherry-shrimp'].total;
+    let minimumShrimpPopulation =
+      baseline.animalPopulation['cherry-shrimp'].total;
     let peakProducerBiomass =
       baseline.totalBiomass.oedogonium + baseline.totalBiomass.nitzschia;
     let minimumTailShrimpPopulation = Number.POSITIVE_INFINITY;
@@ -218,6 +220,10 @@ describe('mission 4 long-run performance contract', () => {
       publishedSnapshots += 1;
       peakShrimpPopulation = Math.max(
         peakShrimpPopulation,
+        snapshot.animalPopulation['cherry-shrimp'].total,
+      );
+      minimumShrimpPopulation = Math.min(
+        minimumShrimpPopulation,
         snapshot.animalPopulation['cherry-shrimp'].total,
       );
       peakProducerBiomass = Math.max(
@@ -255,22 +261,37 @@ describe('mission 4 long-run performance contract', () => {
     );
     expect(publishedSnapshots).toBeLessThanOrEqual(realFrames);
     expect(snapshot.elapsedSeconds).toBeGreaterThanOrEqual(LONG_RUN_SECONDS);
-    // The mission's 120-second UI target is irrelevant here. The long-run
-    // contract requires population renewal after founder lifespans overlap.
+    // The mission's UI target is irrelevant here. The ecology contract
+    // requires five food-funded descendant generations after founders die.
     const tailEvents = snapshot.animalPopulationEvents.filter(
       (event) =>
         event.speciesId === 'cherry-shrimp' &&
         event.elapsedSeconds >= TAIL_START_SECONDS,
     );
     expect(snapshot.animalPopulationEventTotals.births).toBeGreaterThan(0);
+    expect(snapshot.animalPopulationEventTotals.maturations).toBeGreaterThan(0);
+    const maximumBirthGeneration = Math.max(
+      0,
+      ...snapshot.animalPopulationEvents
+        .filter(
+          (event) =>
+            event.speciesId === 'cherry-shrimp' &&
+            event.kind === 'birth',
+        )
+        .map((event) => event.generation ?? 0),
+    );
+    expect(minimumShrimpPopulation).toBeGreaterThan(0);
     expect(minimumTailShrimpPopulation).toBeGreaterThan(0);
+    expect(maximumBirthGeneration).toBeGreaterThanOrEqual(5);
     expect(tailEvents.some((event) => event.kind === 'birth')).toBe(true);
-    expect(tailEvents.some((event) => event.kind === 'matured')).toBe(true);
     expect(snapshot.animals.some((animal) => !founderIds.has(animal.id)))
       .toBe(true);
-    expect(peakShrimpPopulation).toBeLessThan(
-      SHRIMP_TECHNICAL_POPULATION_LIMIT,
-    );
+    expect(snapshot.animals.some((animal) => animal.sex === 'female')).toBe(true);
+    expect(snapshot.animals.some((animal) => animal.sex === 'male')).toBe(true);
+    // This is an ecological boom guard, deliberately far below the separate
+    // technical safety limit.
+    expect(peakShrimpPopulation).toBeLessThanOrEqual(12);
+    expect(peakShrimpPopulation).toBeLessThan(SHRIMP_TECHNICAL_POPULATION_LIMIT);
     expect(peakProducerBiomass).toBeLessThanOrEqual(65);
     expect(snapshot.waterTemperature).toBeGreaterThan(23);
     expect(snapshot.waterTemperature).toBeLessThan(25);

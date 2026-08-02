@@ -34,6 +34,33 @@ const totals = (
 };
 
 describe('closed material ledger', () => {
+  it('scales finite starting C/N reservoirs without scaling oxygen', () => {
+    const initial = {
+      organicMatter: 9,
+      toxicWaste: 2.5,
+      nutrients: 18,
+      oxygen: 68,
+    };
+    const baseline = new BiogeochemistryLedger({ effectsEnabled: true, initial });
+    const reduced = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial,
+      initialMaterialScale: 0.64,
+    });
+    const baselineState = baseline.materialState();
+    const reducedState = reduced.materialState();
+
+    expect(reducedState.organicMatter).toBeCloseTo(baselineState.organicMatter * 0.64);
+    expect(reducedState.toxicWaste).toBeCloseTo(baselineState.toxicWaste * 0.64);
+    expect(reducedState.nutrients).toBeCloseTo(baselineState.nutrients * 0.64);
+    expect(reducedState.dissolvedInorganicCarbon)
+      .toBeCloseTo(baselineState.dissolvedInorganicCarbon * 0.64);
+    expect(reducedState.headspaceCarbonDioxide)
+      .toBeCloseTo(baselineState.headspaceCarbonDioxide * 0.64);
+    expect(reducedState.dissolvedOxygen).toBeCloseTo(baselineState.dissolvedOxygen);
+    expect(reducedState.headspaceOxygen).toBeCloseTo(baselineState.headspaceOxygen);
+  });
+
   it('conserves finite carbon and nitrogen through reaction, decay and transport', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,

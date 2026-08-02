@@ -8,7 +8,7 @@ import {
 
 describe('bounded shared worker telemetry', () => {
   it('reserves enough fixed space for legitimate population-bloom snapshots', () => {
-    expect(SHARED_TELEMETRY_PAYLOAD_BYTES).toBe(8 * 1024 * 1024);
+    expect(SHARED_TELEMETRY_PAYLOAD_BYTES).toBe(16 * 1024 * 1024);
   });
 
   it('reuses three fixed publication slots while delivering the newest complete packet', () => {
@@ -135,5 +135,33 @@ describe('bounded shared worker telemetry', () => {
     expect(animalArrays.size).toBe(2);
     expect(animals.size).toBe(2);
     expect(traits.size).toBe(2);
+  });
+
+  it('reuses unchanged Korean and supplementary-plane strings without decoding them again', () => {
+    const channel = createSharedTelemetryChannel(16 * 1024);
+    const writer = new SharedTelemetryWriter(channel);
+    const reader = new SharedTelemetryReader<{
+      label: string;
+      cells: Array<{ ownerLabel: string; marker: string }>;
+    }>(channel);
+    const value = {
+      label: '표준 수조',
+      cells: [
+        { ownerLabel: '바닥재', marker: '새우🦐' },
+        { ownerLabel: '바닥재', marker: '새우🦐' },
+      ],
+    };
+
+    for (let index = 0; index < 2; index += 1) {
+      expect(writer.publish(value)).toBe(true);
+      expect(reader.readLatest()).toEqual(value);
+    }
+    const warmedDecodedStrings = reader.decodedStringCount();
+
+    for (let index = 0; index < 200; index += 1) {
+      expect(writer.publish(value)).toBe(true);
+      expect(reader.readLatest()).toEqual(value);
+    }
+    expect(reader.decodedStringCount()).toBe(warmedDecodedStrings);
   });
 });

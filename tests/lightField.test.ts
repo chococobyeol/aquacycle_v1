@@ -63,9 +63,18 @@ describe('aquarium light field', () => {
     }
   });
 
-  it('reuses static light paths throughout mission 6 dawn and dusk', () => {
+  it('rebuilds only quantized daylight paths as the sun crosses mission 6', () => {
     const world = new SimulationWorld('mission-6');
     placeStructure(world, 'tall-stone', { x: 408, y: 280 });
+    const internals = world as unknown as {
+      lightTransportCache: Map<string, unknown>;
+      directDaylightCoefficientCache: Map<number, Map<string, number>>;
+    };
+    const staticTransportCache = internals.lightTransportCache;
+    const cachedEntry = staticTransportCache.entries().next().value as
+      | [string, unknown]
+      | undefined;
+    expect(cachedEntry).toBeTruthy();
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 64 });
     const initialRevision = world.snapshot().lightField.revision;
@@ -78,7 +87,23 @@ describe('aquarium light field', () => {
     const snapshot = world.snapshot();
     expect(snapshot.dayNight?.phase).toBe('dusk');
     expect(snapshot.lightField.revision).toBeGreaterThan(initialRevision);
-    expect(ray).not.toHaveBeenCalled();
+    expect(snapshot.lightField.revision - initialRevision).toBeLessThan(36);
+    expect(ray).toHaveBeenCalled();
+    expect(internals.lightTransportCache).toBe(staticTransportCache);
+    expect(staticTransportCache.get(cachedEntry![0])).toBe(cachedEntry![1]);
+
+    // Finish one 360-second light cycle so every above-horizon 2-degree
+    // direction has been visited, then cross the same directions again.
+    // The repeated day may refresh one reflected-light sample per structure,
+    // but must not recast the full water/surface shadow field.
+    for (let index = 40; index < 58; index += 1) world.tick(0.1);
+    const firstCycleRaycasts = ray.mock.calls.length;
+    ray.mockClear();
+    for (let index = 0; index < 58; index += 1) world.tick(0.1);
+    const repeatedCycleRaycasts = ray.mock.calls.length;
+
+    expect(internals.directDaylightCoefficientCache.size).toBeLessThanOrEqual(47);
+    expect(repeatedCycleRaycasts).toBeLessThan(firstCycleRaycasts * 0.1);
     ray.mockRestore();
   }, 8_000);
 
@@ -128,6 +153,52 @@ describe('aquarium light field', () => {
     expect(daylight.some((value, index) => value > baseline[index] + 1)).toBe(true);
     expect(restored).toEqual(baseline);
     expect(ray).not.toHaveBeenCalled();
+    ray.mockRestore();
+  });
+
+  it('casts angled long-tank daylight as parallel rays instead of a widening fan', () => {
+    const world = new SimulationWorld('mission-8');
+    type LightInternals = {
+      buildLightEmitters(): Array<{
+        id: 'ceiling-lamp' | 'daylight';
+        geometry: 'area-source' | 'parallel-rays';
+      }>;
+      emitterLightCoefficientAt(
+        emitter: unknown,
+        point: Vec2,
+        occluders: Matter.Body[],
+      ): number;
+    };
+    const internals = world as unknown as LightInternals;
+    const daylight = internals.buildLightEmitters()
+      .find((emitter) => emitter.id === 'daylight');
+    expect(daylight?.geometry).toBe('parallel-rays');
+
+    const ray = vi.spyOn(Matter.Query, 'ray');
+    const leftPoint = { x: 180, y: WATER_TOP + 420 };
+    const rightPoint = { x: 2_180, y: WATER_TOP + 420 };
+    const leftCoefficient = internals.emitterLightCoefficientAt(
+      daylight!,
+      leftPoint,
+      [],
+    );
+    const rightCoefficient = internals.emitterLightCoefficientAt(
+      daylight!,
+      rightPoint,
+      [],
+    );
+
+    expect(leftCoefficient).toBeCloseTo(rightCoefficient, 10);
+    expect(ray).toHaveBeenCalledTimes(2);
+    const leftSource = ray.mock.calls[0][1];
+    const leftDestination = ray.mock.calls[0][2];
+    const rightSource = ray.mock.calls[1][1];
+    const rightDestination = ray.mock.calls[1][2];
+    expect(leftSource.x - leftDestination.x).toBeCloseTo(
+      rightSource.x - rightDestination.x,
+      10,
+    );
+    expect(Math.abs(leftSource.x - leftDestination.x)).toBeGreaterThan(10);
     ray.mockRestore();
   });
 });

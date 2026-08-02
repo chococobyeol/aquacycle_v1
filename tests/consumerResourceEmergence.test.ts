@@ -6,8 +6,12 @@ import {
 import {
   initialWaterTemperatureForLight,
   SCENARIOS,
+  SPECIES,
 } from '../src/simulation/config';
-import { netGrowthPotential } from '../src/simulation/growth';
+import {
+  netGrowthPotential,
+  producerProcessRateScale,
+} from '../src/simulation/growth';
 import type {
   AnimalSpeciesId,
   SpeciesBiomass,
@@ -34,6 +38,10 @@ interface DebugAnimal {
 interface DebugWorld {
   allCells(): DebugSurfaceCell[];
   stepGrowth(deltaSeconds: number): void;
+  scenario: { allowedSpecies: SpeciesId[] };
+  biogeochemistry: {
+    commitAlgaeProduction(point: Vec2, requestedBiomass: number): number;
+  };
   animals: DebugAnimal[];
   seedPlacements: Array<{ cellId: string }>;
   snapshotDirty: boolean;
@@ -120,6 +128,46 @@ const placeFourShrimp = (
 };
 
 describe('consumer-resource emergence', () => {
+  it('shares finite producer resources independently of species iteration order', () => {
+    const run = (allowedSpecies: SpeciesId[]) => {
+      const world = new SimulationWorld('mission-5');
+      const internals = debugWorld(world);
+      internals.scenario = { ...internals.scenario, allowedSpecies };
+      const cells = internals.allCells();
+      for (const cell of cells) {
+        cell.light = 45;
+        cell.biomass = { oedogonium: 0, nitzschia: 0, vallisneria: 0 };
+      }
+      const source = cells[Math.floor(cells.length / 2)]!;
+      source.biomass.oedogonium = 0.2;
+      source.biomass.nitzschia = 0.2;
+      let availableProduction = 0.0001;
+      internals.biogeochemistry.commitAlgaeProduction = (
+        _point,
+        requestedBiomass,
+      ) => {
+        const committed = Math.min(availableProduction, requestedBiomass);
+        availableProduction -= committed;
+        return committed;
+      };
+
+      internals.stepGrowth(1);
+      return cells.reduce(
+        (totals, cell) => ({
+          oedogonium: totals.oedogonium + cell.biomass.oedogonium,
+          nitzschia: totals.nitzschia + cell.biomass.nitzschia,
+        }),
+        { oedogonium: 0, nitzschia: 0 },
+      );
+    };
+
+    const forward = run(['oedogonium', 'nitzschia']);
+    const reverse = run(['nitzschia', 'oedogonium']);
+
+    expect(reverse.oedogonium).toBeCloseTo(forward.oedogonium, 10);
+    expect(reverse.nitzschia).toBeCloseTo(forward.nitzschia, 10);
+  });
+
   it('moves propagules without creating algae mass during dispersal', () => {
     const world = new SimulationWorld('mission-1');
     const internals = debugWorld(world);
@@ -138,7 +186,8 @@ describe('consumer-resource emergence', () => {
     const rate = netGrowthPotential('oedogonium', 45, temperature);
     const expectedBiomass = initialBiomass +
       initialBiomass * rate * (1 - initialBiomass) -
-      initialBiomass * 0.0018;
+      initialBiomass * SPECIES.oedogonium.naturalTurnoverPerSecond *
+        producerProcessRateScale('oedogonium');
     const actualBiomass = cells.reduce(
       (sum, cell) => sum + cell.biomass.oedogonium,
       0,
@@ -234,12 +283,13 @@ describe('consumer-resource emergence', () => {
     const inoculationObservations = [...grazingObservations]
       .filter(([cellId]) => inoculationCellIds.has(cellId))
       .reduce((sum, [, count]) => sum + count, 0);
-    // Stronger visible cropping can finish a bout a few samples earlier. The
-    // behavioural contract is that grazing still happens repeatedly, across
-    // many spread cells, without returning mainly to inoculation points.
+    // The inoculation cells still contain most of the real food after only
+    // 300 seconds, so they should remain preferred. The behavioural contract
+    // is that the thin, real spread is also edible and receives a meaningful
+    // share of grazing instead of being a render-only effect.
     expect(totalObservations).toBeGreaterThanOrEqual(45);
     expect(grazingObservations.size).toBeGreaterThan(8);
-    expect(inoculationObservations / totalObservations).toBeLessThan(0.5);
+    expect(inoculationObservations / totalObservations).toBeLessThan(0.8);
   }, 30_000);
 
   it('makes a player-grown food web outperform an otherwise identical empty tank', () => {

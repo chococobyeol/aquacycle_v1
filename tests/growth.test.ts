@@ -15,6 +15,16 @@ describe('species light response', () => {
     expect(growthTrend('nitzschia', 25)).toBe('growing');
   });
 
+  it('keeps Vallisneria low-light tolerant and saturating at bright light', () => {
+    expect(netGrowthPotential('vallisneria', 6)).toBeLessThan(0);
+    // The 24°C temperature response sits just below its 25°C optimum, so the
+    // realized compensation point is fractionally above the authored knot.
+    expect(netGrowthPotential('vallisneria', 10)).toBeGreaterThan(-0.0003);
+    expect(netGrowthPotential('vallisneria', 24)).toBeGreaterThan(0);
+    expect(netGrowthPotential('vallisneria', 78))
+      .toBeGreaterThanOrEqual(netGrowthPotential('vallisneria', 100));
+  });
+
   it('uses the same potential to grow or visibly decline', () => {
     const growing = stepLocalGrowth({
       speciesId: 'oedogonium',

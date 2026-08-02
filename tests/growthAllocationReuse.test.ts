@@ -23,6 +23,10 @@ interface GrowthCell {
 interface GrowthInternals {
   allCells(): GrowthCell[];
   stepGrowth(deltaSeconds: number): void;
+  biogeochemistry: {
+    algaeResourceFactor(point: Vec2): number;
+  };
+  vallisneriaResourceFactor(cell: GrowthCell): number;
   vallisneriaCanopyPhysiology(
     cell: GrowthCell,
     temperature: number,
@@ -111,6 +115,34 @@ describe('growth hot-loop allocation reuse', () => {
     expect(actual.respiration).toBe(expected.respiration);
     expect(actual.lightStressTurnover).toBe(expected.lightStressTurnover);
     expect(actual.netGrowth).toBe(expected.netGrowth);
+  });
+
+  it('averages rooted and leaf resources instead of selecting the richest point', () => {
+    const world = new SimulationWorld('mission-7');
+    const internals = world as unknown as GrowthInternals;
+    const cell = internals.allCells().find((candidate) =>
+      candidate.id.startsWith('substrate:')
+    );
+    expect(cell).toBeDefined();
+    if (!cell) return;
+    cell.biomass.vallisneria = 0.24;
+
+    const original = internals.biogeochemistry.algaeResourceFactor.bind(
+      internals.biogeochemistry,
+    );
+    let samples = 0;
+    internals.biogeochemistry.algaeResourceFactor = (point) => {
+      samples += 1;
+      return point.y < cell.y - 30 ? 0.9 : 0.2;
+    };
+    try {
+      const factor = internals.vallisneriaResourceFactor(cell);
+      expect(samples).toBeGreaterThan(2);
+      expect(factor).toBeGreaterThan(0.2);
+      expect(factor).toBeLessThan(0.9);
+    } finally {
+      internals.biogeochemistry.algaeResourceFactor = original;
+    }
   });
 
   it('keeps cell biomass and growth scratch identities stable across repeated steps', () => {

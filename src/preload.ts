@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
-const RENDERER_MEMORY_REPORT_INTERVAL_MS = 60_000;
+const RENDERER_MEMORY_REPORT_INTERVAL_MS = 10_000;
 
 const reportRendererMemory = async (): Promise<void> => {
   try {
@@ -32,15 +32,21 @@ contextBridge.exposeInMainWorld('aquacycleDesktop', {
     ipcRenderer.on('aquacycle:rendering-visibility', handler);
     return () => ipcRenderer.removeListener('aquacycle:rendering-visibility', handler);
   },
-  onSimulationMemoryPressure: (listener: (privateMb: number) => void) => {
+  onMemoryRecoveryRequested: (
+    listener: (details: { privateMb: number; thresholdMb: number }) => void,
+  ) => {
     const handler = (
       _event: Electron.IpcRendererEvent,
-      privateMb: number,
-    ): void => {
-      listener(privateMb);
-    };
-    ipcRenderer.on('aquacycle:simulation-memory-pressure', handler);
+      details: { privateMb: number; thresholdMb: number },
+    ): void => listener(details);
+    ipcRenderer.on('aquacycle:prepare-memory-recovery', handler);
     return () =>
-      ipcRenderer.removeListener('aquacycle:simulation-memory-pressure', handler);
+      ipcRenderer.removeListener('aquacycle:prepare-memory-recovery', handler);
+  },
+  completeMemoryRecovery: (success: boolean) => {
+    ipcRenderer.send('aquacycle:memory-recovery-ready', success);
+  },
+  notifyRendererReady: () => {
+    ipcRenderer.send('aquacycle:renderer-ready');
   },
 });

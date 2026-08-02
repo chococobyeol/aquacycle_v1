@@ -18,6 +18,7 @@ import {
   type DaphniaSuspendedFoodResponse,
   MICROBE_ECOLOGY_RULES,
   PLANKTON_ECOLOGY_RULES,
+  SHRIMP_ECOLOGY_RULES,
   WATER_CYCLE_RULES,
   WATER_TRANSPORT_RULES,
 } from './config';
@@ -52,6 +53,10 @@ const SHRIMP_MATE_CUE_MIXING_PER_SECOND = 0.04;
 const SHRIMP_MATE_CUE_SOURCE_RESPONSE_PER_SECOND = 1.4;
 const SHRIMP_MATE_CUE_HALF_LIFE_SECONDS = 18;
 const SHRIMP_MATE_CUE_MINIMUM = 1e-9;
+const PREDATOR_DANGER_CUE_MIXING_PER_SECOND = 0.11;
+const PREDATOR_DANGER_CUE_SOURCE_RESPONSE_PER_SECOND = 1.8;
+const PREDATOR_DANGER_CUE_HALF_LIFE_SECONDS = 14;
+const PREDATOR_DANGER_CUE_MINIMUM = 1e-8;
 
 export const emptyBiofilm = (): BiofilmBiomass => ({ decomposer: 0, nitrifier: 0 });
 
@@ -72,6 +77,15 @@ export interface BiofilmReactionSite {
   biofilm: BiofilmBiomass;
 }
 
+const compareBiofilmReactionSites = (
+  left: BiofilmReactionSite,
+  right: BiofilmReactionSite,
+): number =>
+  left.point.y - right.point.y ||
+  left.point.x - right.point.x ||
+  left.biofilm.decomposer - right.biofilm.decomposer ||
+  left.biofilm.nitrifier - right.biofilm.nitrifier;
+
 export interface ShrimpFoodCueSite {
   point: Vec2;
   /** Non-material dissolved cue emitted by edible surface biomass. */
@@ -79,6 +93,11 @@ export interface ShrimpFoodCueSite {
 }
 
 export interface ShrimpMateCueSite {
+  point: Vec2;
+  strength: number;
+}
+
+export interface PredatorDangerCueSite {
   point: Vec2;
   strength: number;
 }
@@ -135,25 +154,33 @@ const finiteBiomassConcentration = (value: number): number =>
 export class BiogeochemistryLedger {
   public readonly effectsEnabled: boolean;
 
-  private readonly detritus = new Float64Array(CELL_COUNT);
+  private readonly columns: number;
+  private readonly rows: number;
+  private readonly cellCount: number;
+  private readonly tankWidth: number;
+  private readonly waterTop: number;
+  private readonly groundY: number;
+  private readonly detritus: Float64Array;
   // Chemistry uses Float64 because these are conserved ledgers, not render
   // buffers. Float32 rounding was small per step but accumulated measurably
   // across tens of thousands of closed day/night reaction steps.
-  private readonly organicMatter = new Float64Array(CELL_COUNT);
-  private readonly toxicWaste = new Float64Array(CELL_COUNT);
-  private readonly nutrients = new Float64Array(CELL_COUNT);
-  private readonly oxygen = new Float64Array(CELL_COUNT);
-  private readonly dissolvedInorganicCarbon = new Float64Array(CELL_COUNT);
-  private readonly planktonicDecomposer = new Float64Array(CELL_COUNT);
-  private readonly phytoplankton = new Float64Array(CELL_COUNT);
-  private readonly daphniaJuveniles = new Float64Array(CELL_COUNT);
-  private readonly daphniaFounderAdults = new Float64Array(CELL_COUNT);
-  private readonly daphniaBornAdults = new Float64Array(CELL_COUNT);
-  private readonly planktonLight = new Float64Array(CELL_COUNT);
-  private readonly shrimpFoodCue = new Float64Array(CELL_COUNT);
-  private readonly shrimpFoodCueSources = new Float64Array(CELL_COUNT);
-  private readonly shrimpMateCue = new Float64Array(CELL_COUNT);
-  private readonly shrimpMateCueSources = new Float64Array(CELL_COUNT);
+  private readonly organicMatter: Float64Array;
+  private readonly toxicWaste: Float64Array;
+  private readonly nutrients: Float64Array;
+  private readonly oxygen: Float64Array;
+  private readonly dissolvedInorganicCarbon: Float64Array;
+  private readonly planktonicDecomposer: Float64Array;
+  private readonly phytoplankton: Float64Array;
+  private readonly daphniaJuveniles: Float64Array;
+  private readonly daphniaFounderAdults: Float64Array;
+  private readonly daphniaBornAdults: Float64Array;
+  private readonly planktonLight: Float64Array;
+  private readonly shrimpFoodCue: Float64Array;
+  private readonly shrimpFoodCueSources: Float64Array;
+  private readonly shrimpMateCue: Float64Array;
+  private readonly shrimpMateCueSources: Float64Array;
+  private readonly predatorDangerCue: Float64Array;
+  private readonly predatorDangerCueSources: Float64Array;
   /**
    * These fields are workspaces, not ecological state.
    *
@@ -163,20 +190,20 @@ export class BiogeochemistryLedger {
    * on macOS even after garbage collection. Keep one fixed set of buffers and
    * overwrite it before each reaction instead.
    */
-  private readonly phytoplanktonDownwardScratch = new Float64Array(CELL_COUNT);
-  private readonly phytoplanktonOpticalDepthScratch = new Float64Array(CELL_COUNT);
-  private readonly initialOrganicMatterScratch = new Float64Array(CELL_COUNT);
-  private readonly initialToxicWasteScratch = new Float64Array(CELL_COUNT);
-  private readonly initialNutrientsScratch = new Float64Array(CELL_COUNT);
-  private readonly initialOxygenScratch = new Float64Array(CELL_COUNT);
-  private readonly initialCarbonScratch = new Float64Array(CELL_COUNT);
-  private readonly organicWithdrawalScratch = new Float64Array(CELL_COUNT);
-  private readonly toxicWasteWithdrawalScratch = new Float64Array(CELL_COUNT);
-  private readonly oxygenWithdrawalScratch = new Float64Array(CELL_COUNT);
-  private readonly carbonWithdrawalScratch = new Float64Array(CELL_COUNT);
-  private readonly toxicWasteProductsScratch = new Float64Array(CELL_COUNT);
-  private readonly nutrientProductsScratch = new Float64Array(CELL_COUNT);
-  private readonly carbonProductsScratch = new Float64Array(CELL_COUNT);
+  private readonly phytoplanktonDownwardScratch: Float64Array;
+  private readonly phytoplanktonOpticalDepthScratch: Float64Array;
+  private readonly initialOrganicMatterScratch: Float64Array;
+  private readonly initialToxicWasteScratch: Float64Array;
+  private readonly initialNutrientsScratch: Float64Array;
+  private readonly initialOxygenScratch: Float64Array;
+  private readonly initialCarbonScratch: Float64Array;
+  private readonly organicWithdrawalScratch: Float64Array;
+  private readonly toxicWasteWithdrawalScratch: Float64Array;
+  private readonly oxygenWithdrawalScratch: Float64Array;
+  private readonly carbonWithdrawalScratch: Float64Array;
+  private readonly toxicWasteProductsScratch: Float64Array;
+  private readonly nutrientProductsScratch: Float64Array;
+  private readonly carbonProductsScratch: Float64Array;
   private readonly nitrifierReactionScratch: NitrifierStoichiometry = {
     processedNitrogen: 0,
     retainedNitrogen: 0,
@@ -191,47 +218,10 @@ export class BiogeochemistryLedger {
     combinedResponse: 0,
     bacteriaShare: 0,
   };
-  private readonly waterCellPoints = Array.from(
-    { length: CELL_COUNT },
-    (_, index): Vec2 => {
-      const row = Math.floor(index / WATER_COLUMNS);
-      const column = index % WATER_COLUMNS;
-      return {
-        x: (column + 0.5) / WATER_COLUMNS * TANK_WIDTH,
-        y: WATER_TOP + (row + 0.5) / WATER_ROWS * (GROUND_Y - WATER_TOP),
-      };
-    },
-  );
-  private readonly reactionNeighborhoods = Array.from(
-    { length: CELL_COUNT },
-    (_, index): number[] => {
-      const centerRow = Math.floor(index / WATER_COLUMNS);
-      const centerColumn = index % WATER_COLUMNS;
-      const indices: number[] = [];
-      for (
-        let row = Math.max(0, centerRow - LOCAL_REACTION_RADIUS);
-        row <= Math.min(WATER_ROWS - 1, centerRow + LOCAL_REACTION_RADIUS);
-        row += 1
-      ) {
-        for (
-          let column = Math.max(0, centerColumn - LOCAL_REACTION_RADIUS);
-          column <= Math.min(WATER_COLUMNS - 1, centerColumn + LOCAL_REACTION_RADIUS);
-          column += 1
-        ) {
-          indices.push(row * WATER_COLUMNS + column);
-        }
-      }
-      return indices;
-    },
-  );
-  private readonly topSurfaceIndices = Array.from(
-    { length: WATER_COLUMNS },
-    (_, column) => column,
-  );
-  private readonly allWaterIndices = Array.from(
-    { length: CELL_COUNT },
-    (_, index) => index,
-  );
+  private readonly waterCellPoints: Vec2[];
+  private readonly reactionNeighborhoods: number[][];
+  private readonly topSurfaceIndices: number[];
+  private readonly allWaterIndices: number[];
   private readonly transport: WaterTransportGrid;
 
   private headspaceCarbonDioxide: number = WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide;
@@ -249,8 +239,10 @@ export class BiogeochemistryLedger {
   private dissolvedAdvectionAccumulator = 0;
   private shrimpFoodCueAdvectionAccumulator = 0;
   private shrimpMateCueAdvectionAccumulator = 0;
+  private predatorDangerCueAdvectionAccumulator = 0;
   private shrimpFoodCueActive = false;
   private shrimpMateCueActive = false;
+  private predatorDangerCueActive = false;
   private biofilmTotals = emptyBiofilm();
   private cumulativeFilteredPhytoplankton = 0;
   private cumulativeFilteredPlanktonicDecomposer = 0;
@@ -279,16 +271,126 @@ export class BiogeochemistryLedger {
   public constructor(options?: {
     effectsEnabled?: boolean;
     initial?: Partial<WaterQualityValues>;
+    /** Scale finite initial C/N reservoirs while leaving oxygen unchanged. */
+    initialMaterialScale?: number;
     initialTemperature?: number;
+    columns?: number;
+    rows?: number;
+    tankWidth?: number;
+    waterTop?: number;
+    groundY?: number;
   }) {
     this.effectsEnabled = options?.effectsEnabled ?? false;
-    this.transport = new WaterTransportGrid(options?.initialTemperature ?? 23.5);
+    this.columns = Math.max(1, Math.floor(options?.columns ?? WATER_COLUMNS));
+    this.rows = Math.max(1, Math.floor(options?.rows ?? WATER_ROWS));
+    this.cellCount = this.columns * this.rows;
+    this.tankWidth = Math.max(1, options?.tankWidth ?? TANK_WIDTH);
+    this.waterTop = options?.waterTop ?? WATER_TOP;
+    this.groundY = options?.groundY ?? GROUND_Y;
+    this.detritus = new Float64Array(this.cellCount);
+    this.organicMatter = new Float64Array(this.cellCount);
+    this.toxicWaste = new Float64Array(this.cellCount);
+    this.nutrients = new Float64Array(this.cellCount);
+    this.oxygen = new Float64Array(this.cellCount);
+    this.dissolvedInorganicCarbon = new Float64Array(this.cellCount);
+    this.planktonicDecomposer = new Float64Array(this.cellCount);
+    this.phytoplankton = new Float64Array(this.cellCount);
+    this.daphniaJuveniles = new Float64Array(this.cellCount);
+    this.daphniaFounderAdults = new Float64Array(this.cellCount);
+    this.daphniaBornAdults = new Float64Array(this.cellCount);
+    this.planktonLight = new Float64Array(this.cellCount);
+    this.shrimpFoodCue = new Float64Array(this.cellCount);
+    this.shrimpFoodCueSources = new Float64Array(this.cellCount);
+    this.shrimpMateCue = new Float64Array(this.cellCount);
+    this.shrimpMateCueSources = new Float64Array(this.cellCount);
+    this.predatorDangerCue = new Float64Array(this.cellCount);
+    this.predatorDangerCueSources = new Float64Array(this.cellCount);
+    this.phytoplanktonDownwardScratch = new Float64Array(this.cellCount);
+    this.phytoplanktonOpticalDepthScratch = new Float64Array(this.cellCount);
+    this.initialOrganicMatterScratch = new Float64Array(this.cellCount);
+    this.initialToxicWasteScratch = new Float64Array(this.cellCount);
+    this.initialNutrientsScratch = new Float64Array(this.cellCount);
+    this.initialOxygenScratch = new Float64Array(this.cellCount);
+    this.initialCarbonScratch = new Float64Array(this.cellCount);
+    this.organicWithdrawalScratch = new Float64Array(this.cellCount);
+    this.toxicWasteWithdrawalScratch = new Float64Array(this.cellCount);
+    this.oxygenWithdrawalScratch = new Float64Array(this.cellCount);
+    this.carbonWithdrawalScratch = new Float64Array(this.cellCount);
+    this.toxicWasteProductsScratch = new Float64Array(this.cellCount);
+    this.nutrientProductsScratch = new Float64Array(this.cellCount);
+    this.carbonProductsScratch = new Float64Array(this.cellCount);
+    this.waterCellPoints = Array.from(
+      { length: this.cellCount },
+      (_, index): Vec2 => {
+        const row = Math.floor(index / this.columns);
+        const column = index % this.columns;
+        return {
+          x: (column + 0.5) / this.columns * this.tankWidth,
+          y: this.waterTop +
+            (row + 0.5) / this.rows * (this.groundY - this.waterTop),
+        };
+      },
+    );
+    this.reactionNeighborhoods = Array.from(
+      { length: this.cellCount },
+      (_, index): number[] => {
+        const centerRow = Math.floor(index / this.columns);
+        const centerColumn = index % this.columns;
+        const indices: number[] = [];
+        for (
+          let row = Math.max(0, centerRow - LOCAL_REACTION_RADIUS);
+          row <= Math.min(this.rows - 1, centerRow + LOCAL_REACTION_RADIUS);
+          row += 1
+        ) {
+          for (
+            let column = Math.max(0, centerColumn - LOCAL_REACTION_RADIUS);
+            column <= Math.min(this.columns - 1, centerColumn + LOCAL_REACTION_RADIUS);
+            column += 1
+          ) {
+            indices.push(row * this.columns + column);
+          }
+        }
+        return indices;
+      },
+    );
+    this.topSurfaceIndices = Array.from(
+      { length: this.columns },
+      (_, column) => column,
+    );
+    this.allWaterIndices = Array.from(
+      { length: this.cellCount },
+      (_, index) => index,
+    );
+    this.transport = new WaterTransportGrid(
+      options?.initialTemperature ?? 23.5,
+      {
+        columns: this.columns,
+        rows: this.rows,
+        tankWidth: this.tankWidth,
+        waterTop: this.waterTop,
+        groundY: this.groundY,
+      },
+    );
     const initial = { ...DEFAULT_WATER, ...options?.initial };
-    this.organicMatter.fill(finiteConcentration(initial.organicMatter));
-    this.toxicWaste.fill(finiteConcentration(initial.toxicWaste));
-    this.nutrients.fill(finiteConcentration(initial.nutrients));
+    const requestedMaterialScale = options?.initialMaterialScale ?? 1;
+    const initialMaterialScale = Number.isFinite(requestedMaterialScale)
+      ? Math.max(0, requestedMaterialScale)
+      : 1;
+    this.organicMatter.fill(finiteConcentration(
+      initial.organicMatter * initialMaterialScale,
+    ));
+    this.toxicWaste.fill(finiteConcentration(
+      initial.toxicWaste * initialMaterialScale,
+    ));
+    this.nutrients.fill(finiteConcentration(
+      initial.nutrients * initialMaterialScale,
+    ));
     this.oxygen.fill(finiteConcentration(initial.oxygen));
-    this.dissolvedInorganicCarbon.fill(WATER_CYCLE_RULES.initialDissolvedInorganicCarbon);
+    this.dissolvedInorganicCarbon.fill(
+      WATER_CYCLE_RULES.initialDissolvedInorganicCarbon * initialMaterialScale,
+    );
+    this.headspaceCarbonDioxide =
+      WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide * initialMaterialScale;
     this.headspaceOxygen = finiteConcentration(initial.oxygen);
   }
 
@@ -325,6 +427,21 @@ export class BiogeochemistryLedger {
   /** Short-range, non-material cue released by a receptive shrimp female. */
   public shrimpMateCueAt(point: Vec2): number {
     return this.shrimpMateCue[this.indexAt(point)];
+  }
+
+  /** Coarse non-material risk information; never an exact predator position. */
+  public predatorDangerCueAt(point: Vec2): number {
+    return this.predatorDangerCue[this.indexAt(point)];
+  }
+
+  /** Adds an attack pulse to the same bounded field used by background risk. */
+  public emitPredatorDangerPulse(point: Vec2, strength = 1): void {
+    const index = this.indexAt(point);
+    this.predatorDangerCue[index] = Math.max(
+      this.predatorDangerCue[index],
+      clamp(strength, 0, 1),
+    );
+    this.predatorDangerCueActive = true;
   }
 
   public averageTemperature(): number {
@@ -379,7 +496,11 @@ export class BiogeochemistryLedger {
    * Ammonium is preferred, then nitrate/other mineral nutrients. The returned
    * amount is the only biomass the caller may add.
    */
-  public commitAlgaeProduction(point: Vec2, requestedBiomass: number): number {
+  public commitAlgaeProduction(
+    point: Vec2,
+    requestedBiomass: number,
+    oxygenReleasePoint: Vec2 = point,
+  ): number {
     const requested = Math.max(0, requestedBiomass);
     if (requested <= 0) return requested;
     if (!this.effectsEnabled) {
@@ -420,7 +541,15 @@ export class BiogeochemistryLedger {
     const fixedCarbon = paidBiomass * carbonPerBiomass;
     this.removeMassAround(this.dissolvedInorganicCarbon, index, fixedCarbon);
     const oxygenProduced = producerOxygenProduction(fixedCarbon, removedNutrients);
-    const dissolved = this.addMassAround(this.oxygen, index, oxygenProduced);
+    // Rooted plants can acquire carbon and mineral nutrients at a different
+    // part of the plant from the illuminated leaf tissue that releases O2.
+    // Surface films keep the default same-point behavior.
+    const oxygenReleaseIndex = this.indexAt(oxygenReleasePoint);
+    const dissolved = this.addMassAround(
+      this.oxygen,
+      oxygenReleaseIndex,
+      oxygenProduced,
+    );
     this.headspaceOxygen += oxygenProduced - dissolved;
     this.cumulativeOxygenProduction += oxygenProduced;
     this.stepGrossAlgaeProduction += paidBiomass;
@@ -496,27 +625,32 @@ export class BiogeochemistryLedger {
   ): void {}
 
   /**
-   * Partitions eaten algae into animal reserve, fecal detritus and respiration.
-   * The assimilated share is returned so SimulationWorld can store it on the
-   * individual animal and later transfer it into growth, offspring or a corpse.
+   * Partitions eaten food into animal reserve and fecal detritus. The
+   * assimilated share is returned so SimulationWorld can store it on the
+   * individual and later pay growth, offspring and continuous respiration.
    */
   public recordAnimalFeeding(
     point: Vec2,
     consumedBiomass: number,
     consumer: 'shrimp' | 'ricefish' = 'shrimp',
+    foodQuality = 1,
   ): number {
     const consumed = Math.max(0, consumedBiomass);
     if (consumed <= 0) return 0;
     const partition = WATER_CYCLE_RULES[consumer];
+    // `consumedBiomass` is the conserved material physically removed from the
+    // food compartment. Food quality only changes how much of that material
+    // reaches animal reserve; the rest remains fecal detritus in the tank.
+    // This prevents a gram of low-quality bacterial film from funding the
+    // same growth and eggs as a gram of diatom while keeping the matter ledger
+    // exactly closed.
+    const assimilated = consumed * partition.assimilationFraction *
+      clamp(foodQuality, 0, 1);
+    // Feeding has exactly two destinations. Using the actual remainder keeps
+    // the ledger closed even if a displayed percentage is rounded.
+    const feces = Math.max(0, consumed - assimilated);
     if (!this.effectsEnabled) {
-      const feces = consumed * partition.fecesFraction;
-      const respired = consumed * partition.respirationFraction;
-      const assimilated = consumed * partition.assimilationFraction;
       this.detritus[this.indexAt(point)] += feces;
-      this.cumulativeOxygenDemand += organicCarbonOxygenDemand(
-        respired * WATER_CYCLE_RULES.biomassCarbon,
-      );
-      this.cumulativeDissolvedWaste += respired * WATER_CYCLE_RULES.biomassNitrogen;
       // Earlier missions do not apply water-quality effects, but the animal's
       // internal budget must still use the same assimilation fraction. Returning
       // the whole bite here used to create reserve mass and made the tutorial
@@ -524,14 +658,7 @@ export class BiogeochemistryLedger {
       return assimilated;
     }
     const index = this.indexAt(point);
-    const assimilated = consumed * partition.assimilationFraction;
-    const feces = consumed * partition.fecesFraction;
-    const respired = consumed - assimilated - feces;
     this.detritus[index] += feces;
-    const actuallyRespired = this.releaseRespiredBiomass(index, respired);
-    // Under oxygen limitation this share was not mineralised. Keeping it as
-    // detritus closes the material and redox ledgers instead of deleting it.
-    this.detritus[index] += Math.max(0, respired - actuallyRespired);
     return assimilated;
   }
 
@@ -541,11 +668,19 @@ export class BiogeochemistryLedger {
    * it and the resulting nitrogen/carbon re-enter the water cycle.
    */
   public recordAnimalAssimilationOverflow(point: Vec2, biomass: number): void {
-    if (!this.effectsEnabled || biomass <= 0) return;
+    if (biomass <= 0) return;
     this.detritus[this.indexAt(point)] += biomass;
   }
 
-  /** Converts a real loss from animal reserve/body into CO2 and ammonium. */
+  /**
+   * Pays continuous animal respiration from reserve/body matter.
+   *
+   * Oxygen is the limiting measured flux. DIC is derived from the oxygen
+   * actually withdrawn and the configured respiratory quotient. Nitrogen
+   * release remains the fixed-composition B-ledger simplification documented
+   * in 09_BIOMASS_AND_METABOLISM.md; it is not a claim that carbon respiration
+   * and nitrogen excretion are physiologically coupled.
+   */
   public recordAnimalRespiration(point: Vec2, metabolizedBiomass: number): number {
     if (metabolizedBiomass <= 0) return 0;
     if (!this.effectsEnabled) {
@@ -572,7 +707,8 @@ export class BiogeochemistryLedger {
     if (deltaSeconds <= 0) return;
     this.recordAnimalFeeding(point, consumedBiomass);
     const maintenance = Math.max(0, bodyScale) *
-      WATER_CYCLE_RULES.shrimp.adultMaintenanceBiomassPerSecond * deltaSeconds;
+      SHRIMP_ECOLOGY_RULES.adultRoutineMaintenanceBiomassPerSecond *
+      deltaSeconds;
     this.recordAnimalRespiration(point, maintenance);
   }
 
@@ -632,19 +768,17 @@ export class BiogeochemistryLedger {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
     const assimilated = phyto * rules.phytoplanktonAssimilation +
       bacteria * rules.bacterioplanktonAssimilation;
-    const feces = consumed * WATER_CYCLE_RULES.daphnia.fecesFraction;
-    const respirationRequest = Math.max(0, consumed - assimilated - feces);
+    // Food-specific digestibility determines the unassimilated remainder.
+    // Do not turn a fixed part of the same bite into respiration: ongoing
+    // allometric maintenance already withdraws real reserve/body matter.
+    const feces = Math.max(0, consumed - assimilated);
     const index = this.indexAt(point);
     this.detritus[index] += feces;
     if (!this.effectsEnabled) {
       this.stepDaphniaAssimilation += assimilated;
-      this.stepDaphniaRespiration += respirationRequest;
       return assimilated;
     }
-    const respired = this.releaseRespiredBiomass(index, respirationRequest);
-    this.detritus[index] += Math.max(0, respirationRequest - respired);
     this.stepDaphniaAssimilation += assimilated;
-    this.stepDaphniaRespiration += respired;
     return assimilated;
   }
 
@@ -758,14 +892,16 @@ export class BiogeochemistryLedger {
     sites: BiofilmReactionSite[],
     shrimpMateCueSites: ShrimpMateCueSite[] = [],
     shrimpFoodCueSites: ShrimpFoodCueSite[] = [],
+    predatorDangerCueSites: PredatorDangerCueSite[] = [],
   ): void {
     if (deltaSeconds <= 0) return;
     const dt = Math.max(0, deltaSeconds);
     this.advanceShrimpFoodCue(dt, shrimpFoodCueSites);
     this.advanceShrimpMateCue(dt, shrimpMateCueSites);
+    this.advancePredatorDangerCue(dt, predatorDangerCueSites);
     if (!this.effectsEnabled) return;
     const solubilization = 1 - Math.exp(-WATER_CYCLE_RULES.detritusSolubilizationRate * dt);
-    for (let index = 0; index < CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const requested = this.detritus[index] * solubilization;
       if (requested <= 0) continue;
       const dissolved = this.addMassAround(this.organicMatter, index, requested);
@@ -883,7 +1019,7 @@ export class BiogeochemistryLedger {
 
     const sourceResponse =
       1 - Math.exp(-SHRIMP_FOOD_CUE_SOURCE_RESPONSE_PER_SECOND * deltaSeconds);
-    for (let index = 0; index < CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const source = this.shrimpFoodCueSources[index];
       if (source <= 0) continue;
       const localTarget = 1 - Math.exp(-source);
@@ -912,7 +1048,7 @@ export class BiogeochemistryLedger {
       -Math.LN2 * deltaSeconds / SHRIMP_FOOD_CUE_HALF_LIFE_SECONDS,
     );
     let active = false;
-    for (let index = 0; index < CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const retained = this.shrimpFoodCue[index] * retention;
       const value = retained >= SHRIMP_FOOD_CUE_MINIMUM ? retained : 0;
       this.shrimpFoodCue[index] = value;
@@ -937,7 +1073,7 @@ export class BiogeochemistryLedger {
 
     const sourceResponse =
       1 - Math.exp(-SHRIMP_MATE_CUE_SOURCE_RESPONSE_PER_SECOND * deltaSeconds);
-    for (let index = 0; index < CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const source = this.shrimpMateCueSources[index];
       if (source <= 0) continue;
       const localTarget = 1 - Math.exp(-source);
@@ -966,7 +1102,7 @@ export class BiogeochemistryLedger {
       -Math.LN2 * deltaSeconds / SHRIMP_MATE_CUE_HALF_LIFE_SECONDS,
     );
     let active = false;
-    for (let index = 0; index < CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const retained = this.shrimpMateCue[index] * retention;
       const value = retained >= SHRIMP_MATE_CUE_MINIMUM ? retained : 0;
       this.shrimpMateCue[index] = value;
@@ -974,6 +1110,57 @@ export class BiogeochemistryLedger {
     }
     this.shrimpMateCueActive = active;
     if (!active) this.shrimpMateCueAdvectionAccumulator = 0;
+  }
+
+  private advancePredatorDangerCue(
+    deltaSeconds: number,
+    sites: PredatorDangerCueSite[],
+  ): void {
+    if (!sites.length && !this.predatorDangerCueActive) return;
+
+    this.predatorDangerCueSources.fill(0);
+    for (const site of sites) {
+      const strength = clamp(site.strength, 0, 1);
+      if (strength <= 0) continue;
+      this.predatorDangerCueSources[this.indexAt(site.point)] += strength;
+    }
+    const sourceResponse =
+      1 - Math.exp(-PREDATOR_DANGER_CUE_SOURCE_RESPONSE_PER_SECOND * deltaSeconds);
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const source = this.predatorDangerCueSources[index];
+      if (source <= 0) continue;
+      const localTarget = 1 - Math.exp(-source);
+      if (localTarget > this.predatorDangerCue[index]) {
+        this.predatorDangerCue[index] +=
+          (localTarget - this.predatorDangerCue[index]) * sourceResponse;
+      }
+    }
+    this.transport.disperseConservativeField(
+      this.predatorDangerCue,
+      deltaSeconds,
+      PREDATOR_DANGER_CUE_MIXING_PER_SECOND,
+    );
+    this.predatorDangerCueAdvectionAccumulator += deltaSeconds;
+    if (this.predatorDangerCueAdvectionAccumulator + 1e-9 >= 1) {
+      this.transport.advectConservativeField(
+        this.predatorDangerCue,
+        this.predatorDangerCueAdvectionAccumulator,
+        1,
+      );
+      this.predatorDangerCueAdvectionAccumulator = 0;
+    }
+    const retention = Math.exp(
+      -Math.LN2 * deltaSeconds / PREDATOR_DANGER_CUE_HALF_LIFE_SECONDS,
+    );
+    let active = false;
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const retained = this.predatorDangerCue[index] * retention;
+      const value = retained >= PREDATOR_DANGER_CUE_MINIMUM ? retained : 0;
+      this.predatorDangerCue[index] = value;
+      active ||= value > 0;
+    }
+    this.predatorDangerCueActive = active;
+    if (!active) this.predatorDangerCueAdvectionAccumulator = 0;
   }
 
   public sampleAt(point: Vec2): WaterQualityValues {
@@ -1056,6 +1243,7 @@ export class BiogeochemistryLedger {
       daphniaBornAdults: Array.from(this.daphniaBornAdults),
       shrimpFoodCue: Array.from(this.shrimpFoodCue),
       shrimpMateCue: Array.from(this.shrimpMateCue),
+      predatorDangerCue: Array.from(this.predatorDangerCue),
       planktonCounters: {
         births: this.cumulativeDaphniaBirths,
         maturations: this.cumulativeDaphniaMaturations,
@@ -1086,46 +1274,59 @@ export class BiogeochemistryLedger {
     restoreField(this.toxicWaste, state.toxicWaste);
     restoreField(this.nutrients, state.nutrients);
     restoreField(this.oxygen, state.oxygen);
-    if (state.dissolvedInorganicCarbonField?.length === CELL_COUNT) {
+    if (state.dissolvedInorganicCarbonField?.length === this.cellCount) {
       restoreField(this.dissolvedInorganicCarbon, state.dissolvedInorganicCarbonField);
     } else {
       this.dissolvedInorganicCarbon.fill(
         finiteConcentration(state.dissolvedInorganicCarbon),
       );
     }
-    if (state.planktonicDecomposer?.length === CELL_COUNT) {
+    if (state.planktonicDecomposer?.length === this.cellCount) {
       restoreField(this.planktonicDecomposer, state.planktonicDecomposer);
     }
-    if (state.phytoplankton?.length === CELL_COUNT) {
+    if (state.phytoplankton?.length === this.cellCount) {
       restoreField(this.phytoplankton, state.phytoplankton);
     }
-    if (state.daphniaJuveniles?.length === CELL_COUNT) {
+    if (state.daphniaJuveniles?.length === this.cellCount) {
       restoreField(this.daphniaJuveniles, state.daphniaJuveniles);
     }
-    if (state.daphniaFounderAdults?.length === CELL_COUNT) {
+    if (state.daphniaFounderAdults?.length === this.cellCount) {
       restoreField(this.daphniaFounderAdults, state.daphniaFounderAdults);
     }
-    if (state.daphniaBornAdults?.length === CELL_COUNT) {
+    if (state.daphniaBornAdults?.length === this.cellCount) {
       restoreField(this.daphniaBornAdults, state.daphniaBornAdults);
     }
-    if (state.shrimpFoodCue?.length === CELL_COUNT) {
+    if (state.shrimpFoodCue?.length === this.cellCount) {
       restoreField(this.shrimpFoodCue, state.shrimpFoodCue);
-      for (let index = 0; index < CELL_COUNT; index += 1) {
+      for (let index = 0; index < this.cellCount; index += 1) {
         this.shrimpFoodCue[index] = Math.min(1, this.shrimpFoodCue[index]);
       }
     } else {
       this.shrimpFoodCue.fill(0);
     }
     this.shrimpFoodCueActive = this.shrimpFoodCue.some((value) => value > 0);
-    if (state.shrimpMateCue?.length === CELL_COUNT) {
+    if (state.shrimpMateCue?.length === this.cellCount) {
       restoreField(this.shrimpMateCue, state.shrimpMateCue);
-      for (let index = 0; index < CELL_COUNT; index += 1) {
+      for (let index = 0; index < this.cellCount; index += 1) {
         this.shrimpMateCue[index] = Math.min(1, this.shrimpMateCue[index]);
       }
     } else {
       this.shrimpMateCue.fill(0);
     }
     this.shrimpMateCueActive = this.shrimpMateCue.some((value) => value > 0);
+    if (state.predatorDangerCue?.length === this.cellCount) {
+      restoreField(this.predatorDangerCue, state.predatorDangerCue);
+      for (let index = 0; index < this.cellCount; index += 1) {
+        this.predatorDangerCue[index] = Math.min(
+          1,
+          this.predatorDangerCue[index],
+        );
+      }
+    } else {
+      this.predatorDangerCue.fill(0);
+    }
+    this.predatorDangerCueActive =
+      this.predatorDangerCue.some((value) => value > 0);
     this.cumulativeDaphniaBirths = Math.max(0, state.planktonCounters?.births ?? 0);
     this.cumulativeDaphniaMaturations = Math.max(
       0,
@@ -1153,6 +1354,7 @@ export class BiogeochemistryLedger {
     this.dissolvedAdvectionAccumulator = 0;
     this.shrimpFoodCueAdvectionAccumulator = 0;
     this.shrimpMateCueAdvectionAccumulator = 0;
+    this.predatorDangerCueAdvectionAccumulator = 0;
     this.individualDaphniaManaged = false;
     this.daphniaIndividualCount = 0;
     this.daphniaIndividualJuvenileBiomass = 0;
@@ -1180,8 +1382,8 @@ export class BiogeochemistryLedger {
     snapshot.detritusMass = material.detritus;
 
     const water = snapshot.water ?? {} as BiogeochemistrySnapshot['water'];
-    water.columns = this.effectsEnabled ? WATER_COLUMNS : 0;
-    water.rows = this.effectsEnabled ? WATER_ROWS : 0;
+    water.columns = this.effectsEnabled ? this.columns : 0;
+    water.rows = this.effectsEnabled ? this.rows : 0;
     if (this.effectsEnabled) {
       water.organicMatter = copyNumericArray(this.organicMatter, water.organicMatter);
       water.toxicWaste = copyNumericArray(this.toxicWaste, water.toxicWaste);
@@ -1203,12 +1405,12 @@ export class BiogeochemistryLedger {
         this.daphniaJuveniles,
         water.daphniaJuveniles,
       );
-      water.daphniaAdults ??= new Array<number>(CELL_COUNT);
-      for (let index = 0; index < CELL_COUNT; index += 1) {
+      water.daphniaAdults ??= new Array<number>(this.cellCount);
+      for (let index = 0; index < this.cellCount; index += 1) {
         water.daphniaAdults[index] =
           this.daphniaFounderAdults[index] + this.daphniaBornAdults[index];
       }
-      water.daphniaAdults.length = CELL_COUNT;
+      water.daphniaAdults.length = this.cellCount;
     } else {
       water.organicMatter ??= [];
       water.toxicWaste ??= [];
@@ -1338,8 +1540,8 @@ export class BiogeochemistryLedger {
 
   private applyPlanktonicDecomposerReactions(deltaSeconds: number): void {
     const kinetics = MICROBE_ECOLOGY_RULES.decomposer;
-    for (let index = 0; index < CELL_COUNT; index += 1) {
-      const biomass = this.planktonicDecomposer[index] / CELL_COUNT;
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const biomass = this.planktonicDecomposer[index] / this.cellCount;
       if (biomass <= 0) continue;
       if (biomass <= 1e-12) {
         // Values below the numerical reaction scale must not become an
@@ -1360,12 +1562,12 @@ export class BiogeochemistryLedger {
       );
       const requested = biomass * kinetics.maximumUptake * 0.78 *
         activity * temperatureFactor * deltaSeconds;
-      const availableFood = this.organicMatter[index] / CELL_COUNT;
+      const availableFood = this.organicMatter[index] / this.cellCount;
       const retainedFraction = kinetics.biomassYield * 0.72;
       const oxygenPerFood = organicCarbonOxygenDemand(
         (1 - retainedFraction) * WATER_CYCLE_RULES.biomassCarbon,
       );
-      const availableOxygen = this.oxygen[index] / CELL_COUNT;
+      const availableOxygen = this.oxygen[index] / this.cellCount;
       const consumed = Math.min(
         requested,
         availableFood,
@@ -1373,26 +1575,26 @@ export class BiogeochemistryLedger {
       );
       if (consumed > 0) {
         this.organicMatter[index] = finiteConcentration(
-          this.organicMatter[index] - consumed * CELL_COUNT,
+          this.organicMatter[index] - consumed * this.cellCount,
         );
         const growth = consumed * retainedFraction;
         const mineralized = consumed - growth;
         this.planktonicDecomposer[index] = finiteBiomassConcentration(
-          this.planktonicDecomposer[index] + growth * CELL_COUNT,
+          this.planktonicDecomposer[index] + growth * this.cellCount,
         );
         const oxygenDemand = organicCarbonOxygenDemand(
           mineralized * WATER_CYCLE_RULES.biomassCarbon,
         );
         this.oxygen[index] = finiteConcentration(
-          this.oxygen[index] - oxygenDemand * CELL_COUNT,
+          this.oxygen[index] - oxygenDemand * this.cellCount,
         );
         this.toxicWaste[index] = finiteConcentration(
           this.toxicWaste[index] +
-          mineralized * WATER_CYCLE_RULES.biomassNitrogen * CELL_COUNT,
+          mineralized * WATER_CYCLE_RULES.biomassNitrogen * this.cellCount,
         );
         this.dissolvedInorganicCarbon[index] = finiteConcentration(
           this.dissolvedInorganicCarbon[index] +
-          mineralized * WATER_CYCLE_RULES.biomassCarbon * CELL_COUNT,
+          mineralized * WATER_CYCLE_RULES.biomassCarbon * this.cellCount,
         );
         this.cumulativeOxygenDemand += oxygenDemand;
         this.cumulativeDissolvedWaste +=
@@ -1404,11 +1606,11 @@ export class BiogeochemistryLedger {
         kinetics.maintenanceDecayRate * 0.75 +
         kinetics.starvationDecayRate * 0.6 * (1 - realized)
       ) * temperatureFactor;
-      const currentMass = this.planktonicDecomposer[index] / CELL_COUNT;
+      const currentMass = this.planktonicDecomposer[index] / this.cellCount;
       const death = currentMass * (1 - Math.exp(-decayRate * deltaSeconds));
       if (death > 0) {
         this.planktonicDecomposer[index] = finiteBiomassConcentration(
-          this.planktonicDecomposer[index] - death * CELL_COUNT,
+          this.planktonicDecomposer[index] - death * this.cellCount,
         );
         this.detritus[index] += death;
       }
@@ -1425,10 +1627,10 @@ export class BiogeochemistryLedger {
     // continuously; no biomass amount is made inaccessible to grazers.
     const opticalDepth = this.phytoplanktonOpticalDepthScratch;
     opticalDepth.fill(0);
-    for (let column = 0; column < WATER_COLUMNS; column += 1) {
+    for (let column = 0; column < this.columns; column += 1) {
       let cumulativeConcentration = 0;
-      for (let row = 0; row < WATER_ROWS; row += 1) {
-        const index = row * WATER_COLUMNS + column;
+      for (let row = 0; row < this.rows; row += 1) {
+        const index = row * this.columns + column;
         const localConcentration = Math.max(0, this.phytoplankton[index]);
         opticalDepth[index] = (
           cumulativeConcentration + localConcentration * 0.5
@@ -1436,8 +1638,8 @@ export class BiogeochemistryLedger {
         cumulativeConcentration += localConcentration;
       }
     }
-    for (let index = 0; index < CELL_COUNT; index += 1) {
-      const biomass = this.phytoplankton[index] / CELL_COUNT;
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const biomass = this.phytoplankton[index] / this.cellCount;
       if (biomass <= 0) continue;
       if (biomass <= 1e-12) {
         // Do not freeze a trace producer population below the numerical
@@ -1480,12 +1682,12 @@ export class BiogeochemistryLedger {
       );
       if (growth > 0) {
         this.phytoplankton[index] = finiteBiomassConcentration(
-          this.phytoplankton[index] + growth * CELL_COUNT,
+          this.phytoplankton[index] + growth * this.cellCount,
         );
         this.stepPhytoplanktonGrowth += growth;
       }
 
-      const afterGrowth = this.phytoplankton[index] / CELL_COUNT;
+      const afterGrowth = this.phytoplankton[index] / this.cellCount;
       const respirationRequest = Math.min(
         afterGrowth,
         afterGrowth * rules.respirationPerSecond *
@@ -1498,19 +1700,19 @@ export class BiogeochemistryLedger {
       );
       if (respired > 0) {
         this.phytoplankton[index] = finiteBiomassConcentration(
-          this.phytoplankton[index] - respired * CELL_COUNT,
+          this.phytoplankton[index] - respired * this.cellCount,
         );
         this.stepPhytoplanktonRespiration += respired;
       }
 
-      const remaining = this.phytoplankton[index] / CELL_COUNT;
+      const remaining = this.phytoplankton[index] / this.cellCount;
       const darkness = 1 - lightLimited;
       const mortalityRate = rules.backgroundMortalityPerSecond +
         rules.darkStressMortalityPerSecond * darkness * darkness;
       const mortality = remaining * (1 - Math.exp(-mortalityRate * deltaSeconds));
       if (mortality > 0) {
         this.phytoplankton[index] = finiteBiomassConcentration(
-          this.phytoplankton[index] - mortality * CELL_COUNT,
+          this.phytoplankton[index] - mortality * this.cellCount,
         );
         this.detritus[index] += mortality;
         this.stepPhytoplanktonMortality += mortality;
@@ -1519,14 +1721,14 @@ export class BiogeochemistryLedger {
       const settleConcentration = this.phytoplankton[index] * settlingFraction;
       if (settleConcentration <= 0) continue;
       this.phytoplankton[index] -= settleConcentration;
-      const row = Math.floor(index / WATER_COLUMNS);
-      if (row >= WATER_ROWS - 1) {
-        this.detritus[index] += settleConcentration / CELL_COUNT;
+      const row = Math.floor(index / this.columns);
+      if (row >= this.rows - 1) {
+        this.detritus[index] += settleConcentration / this.cellCount;
       } else {
-        downward[index + WATER_COLUMNS] += settleConcentration;
+        downward[index + this.columns] += settleConcentration;
       }
     }
-    for (let index = 0; index < CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       if (downward[index] <= 0) continue;
       this.phytoplankton[index] = finiteBiomassConcentration(
         this.phytoplankton[index] + downward[index],
@@ -1541,13 +1743,13 @@ export class BiogeochemistryLedger {
     metabolicFactor: number,
     deltaSeconds: number,
   ): void {
-    const available = field[index] / CELL_COUNT;
+    const available = field[index] / this.cellCount;
     const requested = Math.min(
       available,
       available * rate * metabolicFactor * deltaSeconds,
     );
     const respired = this.releaseRespiredBiomass(index, requested);
-    field[index] = finiteConcentration(field[index] - respired * CELL_COUNT);
+    field[index] = finiteConcentration(field[index] - respired * this.cellCount);
     this.stepDaphniaRespiration += respired;
   }
 
@@ -1559,15 +1761,15 @@ export class BiogeochemistryLedger {
     secondGeneration: boolean,
   ): void {
     const rules = PLANKTON_ECOLOGY_RULES.daphnia;
-    const currentAdults = field[index] / CELL_COUNT;
+    const currentAdults = field[index] / this.cellCount;
     const birth = currentAdults *
       (1 - Math.exp(
         -rules.reproductionAllocationPerSecond * foodQuality * deltaSeconds,
       ));
     if (birth <= 0) return;
-    field[index] -= birth * CELL_COUNT;
+    field[index] -= birth * this.cellCount;
     this.daphniaJuveniles[index] = finiteConcentration(
-      this.daphniaJuveniles[index] + birth * CELL_COUNT,
+      this.daphniaJuveniles[index] + birth * this.cellCount,
     );
     this.cumulativeDaphniaBirths += birth;
     if (secondGeneration) this.cumulativeSecondGenerationBirths += birth;
@@ -1579,10 +1781,10 @@ export class BiogeochemistryLedger {
     mortalityRate: number,
     deltaSeconds: number,
   ): void {
-    const available = field[index] / CELL_COUNT;
+    const available = field[index] / this.cellCount;
     const death = available * (1 - Math.exp(-mortalityRate * deltaSeconds));
     if (death <= 0) return;
-    field[index] = finiteConcentration(field[index] - death * CELL_COUNT);
+    field[index] = finiteConcentration(field[index] - death * this.cellCount);
     this.detritus[index] += death;
     this.stepDaphniaMortality += death;
     this.cumulativeDaphniaDeaths += death;
@@ -1596,10 +1798,10 @@ export class BiogeochemistryLedger {
       rules.adultMaintenancePerSecond,
       rules.maintenanceMassExponent,
     ) / rules.representativeJuvenileBiomass;
-    for (let index = 0; index < CELL_COUNT; index += 1) {
-      const juvenileMass = this.daphniaJuveniles[index] / CELL_COUNT;
-      const founderMass = this.daphniaFounderAdults[index] / CELL_COUNT;
-      const bornAdultMass = this.daphniaBornAdults[index] / CELL_COUNT;
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const juvenileMass = this.daphniaJuveniles[index] / this.cellCount;
+      const founderMass = this.daphniaFounderAdults[index] / this.cellCount;
+      const bornAdultMass = this.daphniaBornAdults[index] / this.cellCount;
       const adultMass = founderMass + bornAdultMass;
       const totalMass = juvenileMass + adultMass;
       if (totalMass <= 0) continue;
@@ -1613,8 +1815,8 @@ export class BiogeochemistryLedger {
         continue;
       }
 
-      const phytoAvailable = this.phytoplankton[index] / CELL_COUNT;
-      const bacteriaAvailable = this.planktonicDecomposer[index] / CELL_COUNT;
+      const phytoAvailable = this.phytoplankton[index] / this.cellCount;
+      const bacteriaAvailable = this.planktonicDecomposer[index] / this.cellCount;
       const foodResponse = daphniaSuspendedFoodResponse(
         this.phytoplankton[index],
         this.planktonicDecomposer[index],
@@ -1627,10 +1829,10 @@ export class BiogeochemistryLedger {
       const phytoConsumed = Math.min(phytoAvailable, phytoRequested);
       const bacteriaConsumed = Math.min(bacteriaAvailable, bacteriaRequested);
       this.phytoplankton[index] = finiteConcentration(
-        this.phytoplankton[index] - phytoConsumed * CELL_COUNT,
+        this.phytoplankton[index] - phytoConsumed * this.cellCount,
       );
       this.planktonicDecomposer[index] = finiteConcentration(
-        this.planktonicDecomposer[index] - bacteriaConsumed * CELL_COUNT,
+        this.planktonicDecomposer[index] - bacteriaConsumed * this.cellCount,
       );
       this.cumulativeFilteredPhytoplankton += phytoConsumed;
       this.cumulativeFilteredPlanktonicDecomposer += bacteriaConsumed;
@@ -1638,33 +1840,29 @@ export class BiogeochemistryLedger {
       const assimilated = phytoConsumed * rules.phytoplanktonAssimilation +
         bacteriaConsumed * rules.bacterioplanktonAssimilation;
       const consumed = phytoConsumed + bacteriaConsumed;
-      const feces = consumed * rules.fecesFraction;
-      const respirationRequest = Math.max(0, consumed - assimilated - feces);
+      const feces = Math.max(0, consumed - assimilated);
       this.detritus[index] += feces;
-      const respiredFood = this.releaseRespiredBiomass(index, respirationRequest);
-      this.detritus[index] += Math.max(0, respirationRequest - respiredFood);
       this.stepDaphniaAssimilation += assimilated;
-      this.stepDaphniaRespiration += respiredFood;
 
       if (assimilated > 0) {
         const juvenileShare = totalMass > 0 ? juvenileMass / totalMass : 0;
         const juvenileGain = assimilated * juvenileShare;
         const adultGain = assimilated - juvenileGain;
         this.daphniaJuveniles[index] = finiteConcentration(
-          this.daphniaJuveniles[index] + juvenileGain * CELL_COUNT,
+          this.daphniaJuveniles[index] + juvenileGain * this.cellCount,
         );
         if (adultMass > 0) {
           this.daphniaFounderAdults[index] = finiteConcentration(
             this.daphniaFounderAdults[index] +
-            adultGain * founderMass / adultMass * CELL_COUNT,
+            adultGain * founderMass / adultMass * this.cellCount,
           );
           this.daphniaBornAdults[index] = finiteConcentration(
             this.daphniaBornAdults[index] +
-            adultGain * bornAdultMass / adultMass * CELL_COUNT,
+            adultGain * bornAdultMass / adultMass * this.cellCount,
           );
         } else {
           this.daphniaJuveniles[index] = finiteConcentration(
-            this.daphniaJuveniles[index] + adultGain * CELL_COUNT,
+            this.daphniaJuveniles[index] + adultGain * this.cellCount,
           );
         }
       }
@@ -1705,7 +1903,7 @@ export class BiogeochemistryLedger {
         ) * ration
         : 0;
 
-      const currentJuveniles = this.daphniaJuveniles[index] / CELL_COUNT;
+      const currentJuveniles = this.daphniaJuveniles[index] / this.cellCount;
       if (
         currentJuveniles > 0 &&
         foodQuality >= rules.minimumFoodQualityForMaturation
@@ -1714,9 +1912,9 @@ export class BiogeochemistryLedger {
           (1 - Math.exp(
             -rules.juvenileMaturationPerSecond * foodQuality * deltaSeconds,
           ));
-        this.daphniaJuveniles[index] -= maturation * CELL_COUNT;
+        this.daphniaJuveniles[index] -= maturation * this.cellCount;
         this.daphniaBornAdults[index] = finiteConcentration(
-          this.daphniaBornAdults[index] + maturation * CELL_COUNT,
+          this.daphniaBornAdults[index] + maturation * this.cellCount,
         );
         this.cumulativeDaphniaMaturations += maturation;
       }
@@ -1797,37 +1995,65 @@ export class BiogeochemistryLedger {
     const toxicWasteProducts = this.toxicWasteProductsScratch;
     const nutrientProducts = this.nutrientProductsScratch;
     const carbonProducts = this.carbonProductsScratch;
-    initialOrganicMatter.set(this.organicMatter);
-    initialToxicWaste.set(this.toxicWaste);
-    initialNutrients.set(this.nutrients);
-    initialOxygen.set(this.oxygen);
-    initialCarbon.set(this.dissolvedInorganicCarbon);
-    organicWithdrawal.set(initialOrganicMatter);
-    toxicWasteWithdrawal.set(initialToxicWaste);
-    oxygenWithdrawal.set(initialOxygen);
-    carbonWithdrawal.set(initialCarbon);
-    toxicWasteProducts.set(initialToxicWaste);
-    nutrientProducts.set(initialNutrients);
-    carbonProducts.set(initialCarbon);
+    // Keep all reaction budgets in their existing backing stores. Repeated
+    // TypedArray#set calls dominated the worker's transient allocation profile
+    // under Electron even though the arrays themselves were long-lived.
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const organic = this.organicMatter[index];
+      const toxicWaste = this.toxicWaste[index];
+      const nutrient = this.nutrients[index];
+      const oxygen = this.oxygen[index];
+      const carbon = this.dissolvedInorganicCarbon[index];
+      initialOrganicMatter[index] = organic;
+      initialToxicWaste[index] = toxicWaste;
+      initialNutrients[index] = nutrient;
+      initialOxygen[index] = oxygen;
+      initialCarbon[index] = carbon;
+      organicWithdrawal[index] = organic;
+      toxicWasteWithdrawal[index] = toxicWaste;
+      oxygenWithdrawal[index] = oxygen;
+      carbonWithdrawal[index] = carbon;
+      toxicWasteProducts[index] = toxicWaste;
+      nutrientProducts[index] = nutrient;
+      carbonProducts[index] = carbon;
+    }
     // The caller supplies a reusable scratch array, so sorting that array in
     // place preserves deterministic reaction ordering without allocating
     // another full list every simulated second.
-    const orderedSites = sites.sort((left, right) =>
-      left.point.y - right.point.y ||
-      left.point.x - right.point.x ||
-      left.biofilm.decomposer - right.biofilm.decomposer ||
-      left.biofilm.nitrifier - right.biofilm.nitrifier);
+    let sitesAlreadyOrdered = true;
+    for (let index = 1; index < sites.length; index += 1) {
+      if (
+        compareBiofilmReactionSites(sites[index - 1], sites[index]) <= 0
+      ) continue;
+      sitesAlreadyOrdered = false;
+      break;
+    }
+    const orderedSites = sitesAlreadyOrdered
+      ? sites
+      : sites.sort(compareBiofilmReactionSites);
 
     for (const site of orderedSites) {
-      site.biofilm.decomposer = clamp(site.biofilm.decomposer, 0, 1);
-      site.biofilm.nitrifier = clamp(site.biofilm.nitrifier, 0, 1);
+      const initialDecomposer = clamp(site.biofilm.decomposer, 0, 1);
+      const initialNitrifier = clamp(site.biofilm.nitrifier, 0, 1);
+      site.biofilm.decomposer = initialDecomposer;
+      site.biofilm.nitrifier = initialNitrifier;
+      // Both guilds occupy the same physical film at the beginning of this
+      // reaction step. Reading occupancy again after the decomposer update
+      // gave the first guild a permanent code-order advantage: nitrifiers saw
+      // less free surface simply because they were evaluated second. Growth
+      // and crowding must therefore use one shared pre-reaction occupancy;
+      // any overshoot is resolved proportionally after both updates below.
+      const occupied = initialDecomposer + initialNitrifier;
+      const freeSurface = clamp(1 - occupied, 0, 1);
       const index = this.indexAt(site.point);
 
       for (let guildIndex = 0; guildIndex < 2; guildIndex += 1) {
         const guildId: MicrobeGuildId = guildIndex === 0
           ? 'decomposer'
           : 'nitrifier';
-        const biomass = site.biofilm[guildId];
+        const biomass = guildId === 'decomposer'
+          ? initialDecomposer
+          : initialNitrifier;
         if (biomass <= 0) continue;
         const kinetics = MICROBE_ECOLOGY_RULES[guildId];
         const substrate = guildId === 'decomposer'
@@ -1840,8 +2066,6 @@ export class BiogeochemistryLedger {
           kinetics.referenceTemperature,
           kinetics.temperatureCoefficient,
         );
-        const occupied = site.biofilm.decomposer + site.biofilm.nitrifier;
-        const freeSurface = clamp(1 - occupied, 0, 1);
         const requested = biomass * kinetics.maximumUptake * activity *
           temperatureFactor * deltaSeconds;
         const foodField = guildId === 'decomposer' ? this.organicMatter : this.toxicWaste;
@@ -2031,11 +2255,15 @@ export class BiogeochemistryLedger {
     const oxygenPerBiomass = organicCarbonOxygenDemand(
       WATER_CYCLE_RULES.biomassCarbon,
     );
+    const carbonPerOxygen =
+      WATER_CYCLE_RULES.animalRespiratoryQuotient /
+      WATER_CYCLE_RULES.oxygenPerOrganicCarbon;
+    const carbonPerBiomass = oxygenPerBiomass * carbonPerOxygen;
     const oxygenAvailable = this.massAround(this.oxygen, index);
     const carbonCapacity = this.capacityAroundOrTank(
       this.dissolvedInorganicCarbon,
       index,
-      biomass * WATER_CYCLE_RULES.biomassCarbon,
+      biomass * carbonPerBiomass,
     );
     const nitrogenCapacity = this.capacityAroundOrTank(
       this.toxicWaste,
@@ -2045,19 +2273,35 @@ export class BiogeochemistryLedger {
     const actual = Math.min(
       biomass,
       oxygenPerBiomass > 0 ? oxygenAvailable / oxygenPerBiomass : biomass,
-      carbonCapacity / WATER_CYCLE_RULES.biomassCarbon,
+      carbonPerBiomass > 0 ? carbonCapacity / carbonPerBiomass : biomass,
       nitrogenCapacity / WATER_CYCLE_RULES.biomassNitrogen,
     );
     if (actual <= 0) return 0;
-    const carbon = actual * WATER_CYCLE_RULES.biomassCarbon;
-    const nitrogen = actual * WATER_CYCLE_RULES.biomassNitrogen;
-    const oxygenDemand = organicCarbonOxygenDemand(carbon);
+
+    // Withdraw oxygen first. Products are based on the oxygen that was
+    // actually removed, so a locally oxygen-limited animal cannot emit the
+    // full requested CO2 pulse.
+    const requestedOxygen = actual * oxygenPerBiomass;
+    const removedOxygen = this.removeMassAround(
+      this.oxygen,
+      index,
+      requestedOxygen,
+    );
+    const oxygenSupportedBiomass = oxygenPerBiomass > 0
+      ? Math.min(actual, removedOxygen / oxygenPerBiomass)
+      : actual;
+    if (oxygenSupportedBiomass <= 0) return 0;
+    const carbon = removedOxygen * carbonPerOxygen;
+    // TODO: Split nitrogen excretion from carbon respiration once animals
+    // carry explicit C and N compartments. Until then this release is required
+    // to close the fixed-composition B nitrogen ledger.
+    const nitrogen =
+      oxygenSupportedBiomass * WATER_CYCLE_RULES.biomassNitrogen;
     this.addMassAround(this.dissolvedInorganicCarbon, index, carbon);
     this.addMassAround(this.toxicWaste, index, nitrogen);
-    const removedOxygen = this.removeMassAround(this.oxygen, index, oxygenDemand);
     this.cumulativeOxygenDemand += removedOxygen;
     this.cumulativeDissolvedWaste += nitrogen;
-    return actual;
+    return oxygenSupportedBiomass;
   }
 
   private exchangeClosedHeadspace(deltaSeconds: number): void {
@@ -2122,11 +2366,11 @@ export class BiogeochemistryLedger {
     for (let index = 0; index < field.length; index += 1) {
       total += field[index];
     }
-    return total / CELL_COUNT;
+    return total / this.cellCount;
   }
 
   private copyPlanktonLight(light: ArrayLike<number>): void {
-    for (let index = 0; index < CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const value = Number(light[index] ?? 0);
       this.planktonLight[index] = Number.isFinite(value)
         ? clamp(value, 0, 120)
@@ -2140,12 +2384,12 @@ export class BiogeochemistryLedger {
 
   private indicesAround(index: number, radius = LOCAL_REACTION_RADIUS): number[] {
     if (radius === LOCAL_REACTION_RADIUS) return this.reactionNeighborhoods[index];
-    const centerRow = Math.floor(index / WATER_COLUMNS);
-    const centerColumn = index % WATER_COLUMNS;
+    const centerRow = Math.floor(index / this.columns);
+    const centerColumn = index % this.columns;
     const indices: number[] = [];
-    for (let row = Math.max(0, centerRow - radius); row <= Math.min(WATER_ROWS - 1, centerRow + radius); row += 1) {
-      for (let column = Math.max(0, centerColumn - radius); column <= Math.min(WATER_COLUMNS - 1, centerColumn + radius); column += 1) {
-        indices.push(row * WATER_COLUMNS + column);
+    for (let row = Math.max(0, centerRow - radius); row <= Math.min(this.rows - 1, centerRow + radius); row += 1) {
+      for (let column = Math.max(0, centerColumn - radius); column <= Math.min(this.columns - 1, centerColumn + radius); column += 1) {
+        indices.push(row * this.columns + column);
       }
     }
     return indices;
@@ -2161,7 +2405,7 @@ export class BiogeochemistryLedger {
     for (let offset = 0; offset < indices.length; offset += 1) {
       total += field[indices[offset]];
     }
-    return total / CELL_COUNT;
+    return total / this.cellCount;
   }
 
   private capacityAround(field: Float32Array | Float64Array, index: number): number {
@@ -2173,7 +2417,7 @@ export class BiogeochemistryLedger {
         MAX_CONCENTRATION - field[indices[offset]],
       );
     }
-    return capacity / CELL_COUNT;
+    return capacity / this.cellCount;
   }
 
   private fieldCapacity(field: Float32Array | Float64Array): number {
@@ -2181,7 +2425,7 @@ export class BiogeochemistryLedger {
     for (let index = 0; index < field.length; index += 1) {
       capacity += Math.max(0, MAX_CONCENTRATION - field[index]);
     }
-    return capacity / CELL_COUNT;
+    return capacity / this.cellCount;
   }
 
   /**
@@ -2234,7 +2478,7 @@ export class BiogeochemistryLedger {
     for (let offset = 0; offset < indices.length; offset += 1) {
       availableConcentration += field[indices[offset]];
     }
-    const available = availableConcentration / CELL_COUNT;
+    const available = availableConcentration / this.cellCount;
     const actual = Math.min(requested, available);
     if (actual <= 0 || available <= 0) return 0;
     const ratio = actual / available;
@@ -2258,7 +2502,7 @@ export class BiogeochemistryLedger {
         MAX_CONCENTRATION - field[indices[offset]],
       );
     }
-    const capacity = availableCapacity / CELL_COUNT;
+    const capacity = availableCapacity / this.cellCount;
     const actual = Math.min(requested, capacity);
     if (actual <= 0 || capacity <= 0) return 0;
     const ratio = actual / capacity;
@@ -2271,12 +2515,12 @@ export class BiogeochemistryLedger {
   }
 
   private indexAt(point: Vec2): number {
-    const column = clamp(Math.floor((point.x / TANK_WIDTH) * WATER_COLUMNS), 0, WATER_COLUMNS - 1);
+    const column = clamp(Math.floor((point.x / this.tankWidth) * this.columns), 0, this.columns - 1);
     const row = clamp(
-      Math.floor(((point.y - WATER_TOP) / (GROUND_Y - WATER_TOP)) * WATER_ROWS),
+      Math.floor(((point.y - this.waterTop) / (this.groundY - this.waterTop)) * this.rows),
       0,
-      WATER_ROWS - 1,
+      this.rows - 1,
     );
-    return row * WATER_COLUMNS + column;
+    return row * this.columns + column;
   }
 }

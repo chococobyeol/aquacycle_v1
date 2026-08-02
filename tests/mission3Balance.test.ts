@@ -85,6 +85,7 @@ describe('mission 3 balance', () => {
     expect(scenario.target?.type).toBe('biomass');
     const target = scenario.target;
     if (target?.type !== 'biomass') throw new Error('unexpected mission target');
+    expect(target.amount).toBe(0.267);
     expect(target).not.toHaveProperty('minLight');
     expect(target).not.toHaveProperty('maxY');
 
@@ -101,7 +102,7 @@ describe('mission 3 balance', () => {
     const seeded = world.snapshot();
     expect(seeded.missionProgress?.unit).toBe('biomass');
     expect(seeded.missionProgress?.current).toBeCloseTo(seeded.totalBiomass.oedogonium, 8);
-    expect(seeded.missionProgress?.current).toBeCloseTo(0.56, 8);
+    expect(seeded.missionProgress?.current).toBeCloseTo(0.24, 8);
 
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 8 });
@@ -145,18 +146,37 @@ describe('mission 3 balance', () => {
     expect(lowStone.outcome).toBe('failure');
     expect(lowStone.totalBiomass.oedogonium).toBeLessThan(target.amount);
 
+    const singleTallWorld = new SimulationWorld('mission-3');
+    placeStructure(singleTallWorld, 'tall-stone', { x: 408, y: 250 });
+    const tallStoneSeeds = separatedBrightest(
+      singleTallWorld.snapshot().cells.filter(
+        (cell) => cell.surfaceKind === 'structure-face',
+      ),
+      2,
+    );
+    expect(tallStoneSeeds).toHaveLength(2);
+    for (const cell of tallStoneSeeds) {
+      placeSeed(singleTallWorld, 'oedogonium', cell);
+    }
+    runPastTimeLimit(singleTallWorld);
+    const singleTall = singleTallWorld.snapshot();
+    expect(singleTall.outcome).toBe('failure');
+    expect(singleTall.totalBiomass.oedogonium).toBeLessThan(target.amount);
+
     // This stack is one convenient regression fixture, not a hidden scoring
     // rule. Every arrangement is still judged by the same whole-tank biomass.
     const assistedWorld = new SimulationWorld('mission-3');
     placeStructure(assistedWorld, 'tall-stone', { x: 408, y: 250 });
     placeStructure(assistedWorld, 'flat-stone', { x: 408, y: 300 });
-    const structureSeed = separatedClosest(
+    const structureSeeds = separatedClosest(
       assistedWorld.snapshot().cells.filter((cell) => cell.surfaceKind === 'structure-face'),
       68,
-      1,
+      2,
     );
-    expect(structureSeed).toHaveLength(1);
-    placeSeed(assistedWorld, 'oedogonium', structureSeed[0]);
+    expect(structureSeeds).toHaveLength(2);
+    for (const cell of structureSeeds) {
+      placeSeed(assistedWorld, 'oedogonium', cell);
+    }
     runPastTimeLimit(assistedWorld);
     const assisted = assistedWorld.snapshot();
     expect(assisted.outcome).toBe('success');

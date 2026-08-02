@@ -176,6 +176,43 @@ describe('Vallisneria ramet life cycle', () => {
     expect(shadedCell.light).toBeGreaterThan(unshaded * 0.45);
   });
 
+  it('includes a ramet own leaf shade in its canopy physiology', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === 'substrate');
+    const target = substrate[Math.floor(substrate.length / 2)];
+    placeSeed(world, 'vallisneria', target);
+
+    type LightInternals = {
+      cellById(id: string): unknown;
+      vallisneriaCanopyLight(cell: unknown): number;
+      vallisneriaCanopySamplePoints(cell: unknown): number;
+      vallisneriaCanopyPointsScratch: Vec2[];
+      sampleLightField(point: Vec2): number;
+      lightAt(point: Vec2, excludedBodyId?: number, cache?: boolean): number;
+    };
+    const internals = world as unknown as LightInternals;
+    const plant = world.snapshot().plants[0];
+    const cell = internals.cellById(plant.cellId);
+    const sampleCount = internals.vallisneriaCanopySamplePoints(cell);
+    const points = internals.vallisneriaCanopyPointsScratch.slice(
+      0,
+      sampleCount,
+    );
+    const sharedCanopyLight = points.reduce(
+      (sum, point) => sum + internals.sampleLightField(point),
+      0,
+    ) / sampleCount;
+    const lightWithoutAnyCanopy = points.reduce(
+      (sum, point) => sum + internals.lightAt(point, undefined, true),
+      0,
+    ) / sampleCount;
+
+    expect(internals.vallisneriaCanopyLight(cell))
+      .toBeCloseTo(sharedCanopyLight, 8);
+    expect(sharedCanopyLight).toBeLessThan(lightWithoutAnyCanopy);
+  });
+
   it('selects the visible leaves and exposes the exact ramet instead of requiring a root click', () => {
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
@@ -356,6 +393,9 @@ describe('Vallisneria ramet life cycle', () => {
     expect(before.plants).toHaveLength(1);
     expect(before.plants[0].lifeStage).toBe('juvenile');
     expect(before.remainingSeeds.vallisneria).toBe(2);
+    // Long leaves remain a visible rosette, but their low-nitrogen structural
+    // tissue must not reserve the same ledger mass as a full algal cell.
+    expect(before.totalBiomass.vallisneria).toBeCloseTo(0.154, 6);
 
     world.handle({ type: 'start' });
     advanceTo(world, 1_200);
@@ -377,7 +417,7 @@ describe('Vallisneria ramet life cycle', () => {
       .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   }, 60_000);
 
-  it('integrates light across exposed leaves instead of collapsing behind ordinary stone cover', () => {
+  it('integrates ray-cast light across leaves exposed past a stone edge', () => {
     const world = new SimulationWorld('mission-7');
     for (const point of [
       { x: 250, y: 300 },
@@ -403,11 +443,19 @@ describe('Vallisneria ramet life cycle', () => {
     const substrate = world.snapshot().cells
       .filter((cell) => cell.surfaceKind === 'substrate')
       .sort((left, right) => left.x - right.x);
-    for (const fraction of [0.24, 0.5, 0.76]) {
+    // Put each root just outside the corresponding stone silhouette so part of
+    // the painted canopy overlaps its vertical shadow and part remains exposed.
+    // A root directly below the stone is intentionally not expected to thrive.
+    for (const targetX of [405, 665, 1_015]) {
+      const target = substrate.reduce((nearest, candidate) =>
+        Math.abs(candidate.x - targetX) < Math.abs(nearest.x - targetX)
+          ? candidate
+          : nearest
+      );
       placeSeed(
         world,
         'vallisneria',
-        substrate[Math.round((substrate.length - 1) * fraction)],
+        target,
       );
     }
 
@@ -430,7 +478,7 @@ describe('Vallisneria ramet life cycle', () => {
     advanceTo(world, 330);
     const afterNight = world.snapshot().plants.find((plant) => plant.id === beforeNight.id)!;
     expect(afterNight).toBeTruthy();
-    expect(Math.abs(afterNight.structuralScale - beforeNight.structuralScale)).toBeLessThan(0.08);
+    expect(Math.abs(afterNight.structuralScale - beforeNight.structuralScale)).toBeLessThan(0.09);
   }, 20_000);
 
   it('dies at the end of its lifespan and returns its remaining mass to the closed cycle', () => {

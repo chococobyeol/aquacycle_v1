@@ -86,36 +86,42 @@ export interface WaterTransportObstacle {
  * different geometry or unrelated circulation paths.
  */
 export class WaterTransportGrid {
-  private readonly temperature = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly thermalEnergyScratch = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly advectedHeat = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly heatCapacity = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly maximumHeat = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly conductivity = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly solidFraction = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly flowResistance = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly light = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly velocityX = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly velocityY = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly velocityScratchX = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly velocityScratchY = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly pressure = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly pressureScratch = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly divergence = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly faceVelocityX = new Float32Array((TRANSPORT_COLUMNS + 1) * TRANSPORT_ROWS);
-  private readonly faceVelocityY = new Float32Array(TRANSPORT_COLUMNS * (TRANSPORT_ROWS + 1));
-  private readonly scalarScratch = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly scalarOutgoing = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly scalarIncoming = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly scalarSourceScale = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly scalarReceiverScale = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly scalarEdgeX = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly scalarEdgeY = new Float64Array(TRANSPORT_CELL_COUNT);
-  private readonly eddySpeed = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly eddyRetentionX = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly eddyRetentionY = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly eddyPermeabilityX = new Float32Array(TRANSPORT_CELL_COUNT);
-  private readonly eddyPermeabilityY = new Float32Array(TRANSPORT_CELL_COUNT);
+  private readonly columns: number;
+  private readonly rows: number;
+  private readonly cellCount: number;
+  private readonly tankWidth: number;
+  private readonly waterTop: number;
+  private readonly groundY: number;
+  private readonly temperature: Float32Array;
+  private readonly thermalEnergyScratch: Float64Array;
+  private readonly advectedHeat: Float32Array;
+  private readonly heatCapacity: Float32Array;
+  private readonly maximumHeat: Float32Array;
+  private readonly conductivity: Float32Array;
+  private readonly solidFraction: Float32Array;
+  private readonly flowResistance: Float32Array;
+  private readonly light: Float32Array;
+  private readonly velocityX: Float32Array;
+  private readonly velocityY: Float32Array;
+  private readonly velocityScratchX: Float64Array;
+  private readonly velocityScratchY: Float64Array;
+  private readonly pressure: Float32Array;
+  private readonly pressureScratch: Float32Array;
+  private readonly divergence: Float32Array;
+  private readonly faceVelocityX: Float32Array;
+  private readonly faceVelocityY: Float32Array;
+  private readonly scalarScratch: Float64Array;
+  private readonly scalarOutgoing: Float64Array;
+  private readonly scalarIncoming: Float64Array;
+  private readonly scalarSourceScale: Float64Array;
+  private readonly scalarReceiverScale: Float64Array;
+  private readonly scalarEdgeX: Float64Array;
+  private readonly scalarEdgeY: Float64Array;
+  private readonly eddySpeed: Float32Array;
+  private readonly eddyRetentionX: Float32Array;
+  private readonly eddyRetentionY: Float32Array;
+  private readonly eddyPermeabilityX: Float32Array;
+  private readonly eddyPermeabilityY: Float32Array;
 
   private revision = 0;
   private cumulativeExternalHeat = 0;
@@ -124,7 +130,52 @@ export class WaterTransportGrid {
   private dispersionPreparedRevision = -1;
   private dispersionPreparedSeconds = -1;
 
-  public constructor(initialTemperature = 23.5) {
+  public constructor(
+    initialTemperature = 23.5,
+    geometry?: {
+      columns?: number;
+      rows?: number;
+      tankWidth?: number;
+      waterTop?: number;
+      groundY?: number;
+    },
+  ) {
+    this.columns = Math.max(1, Math.floor(geometry?.columns ?? TRANSPORT_COLUMNS));
+    this.rows = Math.max(1, Math.floor(geometry?.rows ?? TRANSPORT_ROWS));
+    this.cellCount = this.columns * this.rows;
+    this.tankWidth = Math.max(1, geometry?.tankWidth ?? TANK_WIDTH);
+    this.waterTop = geometry?.waterTop ?? WATER_TOP;
+    this.groundY = geometry?.groundY ?? GROUND_Y;
+    this.temperature = new Float32Array(this.cellCount);
+    this.thermalEnergyScratch = new Float64Array(this.cellCount);
+    this.advectedHeat = new Float32Array(this.cellCount);
+    this.heatCapacity = new Float32Array(this.cellCount);
+    this.maximumHeat = new Float32Array(this.cellCount);
+    this.conductivity = new Float32Array(this.cellCount);
+    this.solidFraction = new Float32Array(this.cellCount);
+    this.flowResistance = new Float32Array(this.cellCount);
+    this.light = new Float32Array(this.cellCount);
+    this.velocityX = new Float32Array(this.cellCount);
+    this.velocityY = new Float32Array(this.cellCount);
+    this.velocityScratchX = new Float64Array(this.cellCount);
+    this.velocityScratchY = new Float64Array(this.cellCount);
+    this.pressure = new Float32Array(this.cellCount);
+    this.pressureScratch = new Float32Array(this.cellCount);
+    this.divergence = new Float32Array(this.cellCount);
+    this.faceVelocityX = new Float32Array((this.columns + 1) * this.rows);
+    this.faceVelocityY = new Float32Array(this.columns * (this.rows + 1));
+    this.scalarScratch = new Float64Array(this.cellCount);
+    this.scalarOutgoing = new Float64Array(this.cellCount);
+    this.scalarIncoming = new Float64Array(this.cellCount);
+    this.scalarSourceScale = new Float64Array(this.cellCount);
+    this.scalarReceiverScale = new Float64Array(this.cellCount);
+    this.scalarEdgeX = new Float64Array(this.cellCount);
+    this.scalarEdgeY = new Float64Array(this.cellCount);
+    this.eddySpeed = new Float32Array(this.cellCount);
+    this.eddyRetentionX = new Float32Array(this.cellCount);
+    this.eddyRetentionY = new Float32Array(this.cellCount);
+    this.eddyPermeabilityX = new Float32Array(this.cellCount);
+    this.eddyPermeabilityY = new Float32Array(this.cellCount);
     this.temperature.fill(finiteTemperature(initialTemperature, 23.5));
     this.heatCapacity.fill(WATER_HEAT_CAPACITY);
     this.maximumHeat.fill(55 * WATER_HEAT_CAPACITY);
@@ -133,14 +184,14 @@ export class WaterTransportGrid {
 
   public setEnvironment(light: ArrayLike<number>, obstacles: WaterTransportObstacle[]): void {
     this.copyLightField(light);
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.solidFraction[index] = 0;
     }
 
     const samplesPerAxis = 3;
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
         let coveredSamples = 0;
         let weightedSolidity = 0;
         for (let sampleY = 0; sampleY < samplesPerAxis; sampleY += 1) {
@@ -186,7 +237,7 @@ export class WaterTransportGrid {
   }
 
   private copyLightField(light: ArrayLike<number>): void {
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.light[index] = clamp(Number(light[index]) || 0, 0, 100);
     }
   }
@@ -220,7 +271,7 @@ export class WaterTransportGrid {
   public averageTemperature(): number {
     let totalEnergy = 0;
     let totalCapacity = 0;
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       totalEnergy += this.temperature[index] * this.heatCapacity[index];
       totalCapacity += this.heatCapacity[index];
     }
@@ -230,10 +281,10 @@ export class WaterTransportGrid {
   /** Mean temperature of the water cells touching the closed headspace. */
   public surfaceTemperature(): number {
     let total = 0;
-    for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
+    for (let column = 0; column < this.columns; column += 1) {
       total += this.temperature[column];
     }
-    return total / TRANSPORT_COLUMNS;
+    return total / this.columns;
   }
 
   /**
@@ -248,18 +299,18 @@ export class WaterTransportGrid {
     deltaSeconds: number,
     maximum: number | ArrayLike<number> = 100,
   ): void {
-    if (deltaSeconds <= 0 || field.length !== TRANSPORT_CELL_COUNT) return;
+    if (deltaSeconds <= 0 || field.length !== this.cellCount) return;
     this.scalarOutgoing.fill(0);
     this.scalarIncoming.fill(0);
     this.scalarEdgeX.fill(0);
     this.scalarEdgeY.fill(0);
 
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        if (column + 1 < TRANSPORT_COLUMNS) {
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        if (column + 1 < this.columns) {
           const neighbor = index + 1;
-          const velocity = this.faceVelocityX[row * (TRANSPORT_COLUMNS + 1) + column + 1];
+          const velocity = this.faceVelocityX[row * (this.columns + 1) + column + 1];
           if (Math.abs(velocity) >= 1e-10) {
             const donor = velocity > 0 ? index : neighbor;
             const proposed = Math.min(Math.abs(velocity) * deltaSeconds, 0.45) *
@@ -268,9 +319,9 @@ export class WaterTransportGrid {
             this.scalarOutgoing[donor] += proposed;
           }
         }
-        if (row + 1 < TRANSPORT_ROWS) {
-          const neighbor = index + TRANSPORT_COLUMNS;
-          const velocity = this.faceVelocityY[(row + 1) * TRANSPORT_COLUMNS + column];
+        if (row + 1 < this.rows) {
+          const neighbor = index + this.columns;
+          const velocity = this.faceVelocityY[(row + 1) * this.columns + column];
           if (Math.abs(velocity) >= 1e-10) {
             const donor = velocity > 0 ? index : neighbor;
             const proposed = Math.min(Math.abs(velocity) * deltaSeconds, 0.45) *
@@ -282,17 +333,17 @@ export class WaterTransportGrid {
       }
     }
 
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.scalarSourceScale[index] = this.scalarOutgoing[index] > field[index]
         ? field[index] / this.scalarOutgoing[index]
         : 1;
       this.scalarOutgoing[index] = 0;
       this.scalarIncoming[index] = 0;
     }
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        if (column + 1 < TRANSPORT_COLUMNS) {
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        if (column + 1 < this.columns) {
           const proposal = this.scalarEdgeX[index];
           if (proposal !== 0) {
             const donor = proposal > 0 ? index : index + 1;
@@ -300,18 +351,18 @@ export class WaterTransportGrid {
             this.scalarIncoming[receiver] += Math.abs(proposal) * this.scalarSourceScale[donor];
           }
         }
-        if (row + 1 < TRANSPORT_ROWS) {
+        if (row + 1 < this.rows) {
           const proposal = this.scalarEdgeY[index];
           if (proposal !== 0) {
-            const donor = proposal > 0 ? index : index + TRANSPORT_COLUMNS;
-            const receiver = proposal > 0 ? index + TRANSPORT_COLUMNS : index;
+            const donor = proposal > 0 ? index : index + this.columns;
+            const receiver = proposal > 0 ? index + this.columns : index;
             this.scalarIncoming[receiver] += Math.abs(proposal) * this.scalarSourceScale[donor];
           }
         }
       }
     }
 
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const localMaximum = typeof maximum === 'number' ? maximum : maximum[index];
       // Do not count simultaneous outgoing flux as receiver capacity here.
       // Some of that outgoing proposal may itself be rejected by its
@@ -325,10 +376,10 @@ export class WaterTransportGrid {
       this.scalarScratch[index] = field[index];
     }
 
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        if (column + 1 < TRANSPORT_COLUMNS) {
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        if (column + 1 < this.columns) {
           const proposal = this.scalarEdgeX[index];
           if (proposal !== 0) {
             const donor = proposal > 0 ? index : index + 1;
@@ -339,11 +390,11 @@ export class WaterTransportGrid {
             this.scalarScratch[receiver] += actual;
           }
         }
-        if (row + 1 < TRANSPORT_ROWS) {
+        if (row + 1 < this.rows) {
           const proposal = this.scalarEdgeY[index];
           if (proposal !== 0) {
-            const donor = proposal > 0 ? index : index + TRANSPORT_COLUMNS;
-            const receiver = proposal > 0 ? index + TRANSPORT_COLUMNS : index;
+            const donor = proposal > 0 ? index : index + this.columns;
+            const receiver = proposal > 0 ? index + this.columns : index;
             const actual = Math.abs(proposal) *
               this.scalarSourceScale[donor] * this.scalarReceiverScale[receiver];
             this.scalarScratch[donor] -= actual;
@@ -352,7 +403,7 @@ export class WaterTransportGrid {
         }
       }
     }
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const localMaximum = typeof maximum === 'number' ? maximum : maximum[index];
       field[index] = Number.isFinite(this.scalarScratch[index])
         ? clamp(this.scalarScratch[index], 0, localMaximum)
@@ -372,17 +423,17 @@ export class WaterTransportGrid {
     deltaSeconds: number,
     fieldMixingPerSecond: number,
   ): void {
-    if (deltaSeconds <= 0 || field.length !== TRANSPORT_CELL_COUNT) return;
+    if (deltaSeconds <= 0 || field.length !== this.cellCount) return;
     this.prepareDispersionEdges(deltaSeconds);
     const fieldRetention = Math.exp(-Math.max(0, fieldMixingPerSecond) * deltaSeconds);
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.scalarScratch[index] = field[index];
     }
 
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        if (column + 1 < TRANSPORT_COLUMNS) {
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        if (column + 1 < this.columns) {
           this.dispersePair(
             field,
             index,
@@ -392,11 +443,11 @@ export class WaterTransportGrid {
             this.eddyPermeabilityX[index],
           );
         }
-        if (row + 1 < TRANSPORT_ROWS) {
+        if (row + 1 < this.rows) {
           this.dispersePair(
             field,
             index,
-            index + TRANSPORT_COLUMNS,
+            index + this.columns,
             fieldRetention,
             this.eddyRetentionY[index],
             this.eddyPermeabilityY[index],
@@ -405,7 +456,7 @@ export class WaterTransportGrid {
       }
     }
 
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       // Pair responses are capped at one quarter, so four lower-valued
       // neighbours cannot withdraw more than the source held at step start.
       this.scalarScratch[index] = Math.max(0, this.scalarScratch[index]);
@@ -417,7 +468,7 @@ export class WaterTransportGrid {
 
   public totalThermalEnergy(): number {
     let total = 0;
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       total += this.temperature[index] * this.heatCapacity[index];
     }
     return total;
@@ -434,7 +485,7 @@ export class WaterTransportGrid {
   }
 
   public restoreSaveState(state: WaterTransportSaveState | undefined, fallbackTemperature: number): void {
-    if (!state || state.temperature.length !== TRANSPORT_CELL_COUNT) {
+    if (!state || state.temperature.length !== this.cellCount) {
       this.temperature.fill(finiteTemperature(fallbackTemperature, 23.5));
       this.velocityX.fill(0);
       this.velocityY.fill(0);
@@ -442,7 +493,7 @@ export class WaterTransportGrid {
       this.revision += 1;
       return;
     }
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.temperature[index] = finiteTemperature(state.temperature[index], fallbackTemperature);
       this.velocityX[index] = Number.isFinite(state.velocityX[index]) ? state.velocityX[index] : 0;
       this.velocityY[index] = Number.isFinite(state.velocityY[index]) ? state.velocityY[index] : 0;
@@ -457,17 +508,19 @@ export class WaterTransportGrid {
     let minimumTemperature = Number.POSITIVE_INFINITY;
     let maximumTemperature = Number.NEGATIVE_INFINITY;
     let maximumSpeed = 0;
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       minimumTemperature = Math.min(minimumTemperature, this.temperature[index]);
       maximumTemperature = Math.max(maximumTemperature, this.temperature[index]);
+      const velocityX = this.velocityX[index];
+      const velocityY = this.velocityY[index];
       maximumSpeed = Math.max(
         maximumSpeed,
-        Math.hypot(this.velocityX[index], this.velocityY[index]),
+        Math.sqrt(velocityX * velocityX + velocityY * velocityY),
       );
     }
     const snapshot = reuse ?? {} as WaterTransportSnapshot;
-    snapshot.columns = TRANSPORT_COLUMNS;
-    snapshot.rows = TRANSPORT_ROWS;
+    snapshot.columns = this.columns;
+    snapshot.rows = this.rows;
     snapshot.temperature = copyNumericArray(this.temperature, snapshot.temperature);
     snapshot.velocityX = copyNumericArray(this.velocityX, snapshot.velocityX);
     snapshot.velocityY = copyNumericArray(this.velocityY, snapshot.velocityY);
@@ -489,7 +542,7 @@ export class WaterTransportGrid {
   }
 
   private advanceHeatSubstep(deltaSeconds: number, ambientTemperature: number): void {
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.thermalEnergyScratch[index] = this.temperature[index] * this.heatCapacity[index];
       const solid = this.solidFraction[index];
       const absorption = WATER_LIGHT_ABSORPTION * (1 - solid) +
@@ -501,13 +554,13 @@ export class WaterTransportGrid {
     }
 
     // Symmetric pair fluxes conserve energy exactly before Float32 storage.
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        if (column + 1 < TRANSPORT_COLUMNS) this.conductPair(index, index + 1, deltaSeconds);
-        if (row + 1 < TRANSPORT_ROWS) this.conductPair(
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        if (column + 1 < this.columns) this.conductPair(index, index + 1, deltaSeconds);
+        if (row + 1 < this.rows) this.conductPair(
           index,
-          index + TRANSPORT_COLUMNS,
+          index + this.columns,
           deltaSeconds,
         );
       }
@@ -515,15 +568,15 @@ export class WaterTransportGrid {
 
     // Only these boundary terms exchange heat with the room/substrate. They
     // are booked separately so internal conduction can be tested in isolation.
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
         let boundaryRate = 0;
         if (row === 0) boundaryRate += SURFACE_HEAT_EXCHANGE_PER_SECOND;
-        if (column === 0 || column === TRANSPORT_COLUMNS - 1) {
+        if (column === 0 || column === this.columns - 1) {
           boundaryRate += GLASS_HEAT_EXCHANGE_PER_SECOND;
         }
-        if (row === TRANSPORT_ROWS - 1) boundaryRate += SUBSTRATE_HEAT_EXCHANGE_PER_SECOND;
+        if (row === this.rows - 1) boundaryRate += SUBSTRATE_HEAT_EXCHANGE_PER_SECOND;
         if (boundaryRate <= 0) continue;
         const exchange = (ambientTemperature - this.temperature[index]) *
           this.heatCapacity[index] * (1 - Math.exp(-boundaryRate * deltaSeconds));
@@ -532,7 +585,7 @@ export class WaterTransportGrid {
       }
     }
 
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.temperature[index] = finiteTemperature(
         this.thermalEnergyScratch[index] / this.heatCapacity[index],
         ambientTemperature,
@@ -552,7 +605,7 @@ export class WaterTransportGrid {
   private advanceVelocity(deltaSeconds: number): void {
     const referenceTemperature = this.averageTemperature();
     const damping = Math.exp(-VELOCITY_DAMPING_PER_SECOND * deltaSeconds);
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       const resistance = this.flowResistance[index];
       const localDamping = damping * Math.exp(-resistance * 5.2 * deltaSeconds);
       this.velocityX[index] *= localDamping;
@@ -569,22 +622,22 @@ export class WaterTransportGrid {
 
   private diffuseVelocity(deltaSeconds: number): void {
     const response = (1 - Math.exp(-VELOCITY_VISCOSITY_PER_SECOND * deltaSeconds)) / 4;
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.velocityScratchX[index] = this.velocityX[index];
       this.velocityScratchY[index] = this.velocityY[index];
     }
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        if (column + 1 < TRANSPORT_COLUMNS) {
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        if (column + 1 < this.columns) {
           this.exchangeVelocity(index, index + 1, response);
         }
-        if (row + 1 < TRANSPORT_ROWS) {
-          this.exchangeVelocity(index, index + TRANSPORT_COLUMNS, response);
+        if (row + 1 < this.rows) {
+          this.exchangeVelocity(index, index + this.columns, response);
         }
       }
     }
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.velocityX[index] = this.velocityScratchX[index];
       this.velocityY[index] = this.velocityScratchY[index];
     }
@@ -603,30 +656,30 @@ export class WaterTransportGrid {
   private projectVelocity(): void {
     this.faceVelocityX.fill(0);
     this.faceVelocityY.fill(0);
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let faceColumn = 1; faceColumn < TRANSPORT_COLUMNS; faceColumn += 1) {
-        const left = row * TRANSPORT_COLUMNS + faceColumn - 1;
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let faceColumn = 1; faceColumn < this.columns; faceColumn += 1) {
+        const left = row * this.columns + faceColumn - 1;
         const right = left + 1;
         const permeability = 1 - Math.max(
           this.flowResistance[left],
           this.flowResistance[right],
         );
-        this.faceVelocityX[row * (TRANSPORT_COLUMNS + 1) + faceColumn] = clamp(
+        this.faceVelocityX[row * (this.columns + 1) + faceColumn] = clamp(
           0.5 * (this.velocityX[left] + this.velocityX[right]) * permeability,
           -MAX_CELL_SPEED,
           MAX_CELL_SPEED,
         );
       }
     }
-    for (let faceRow = 1; faceRow < TRANSPORT_ROWS; faceRow += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const up = (faceRow - 1) * TRANSPORT_COLUMNS + column;
-        const down = up + TRANSPORT_COLUMNS;
+    for (let faceRow = 1; faceRow < this.rows; faceRow += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const up = (faceRow - 1) * this.columns + column;
+        const down = up + this.columns;
         const permeability = 1 - Math.max(
           this.flowResistance[up],
           this.flowResistance[down],
         );
-        this.faceVelocityY[faceRow * TRANSPORT_COLUMNS + column] = clamp(
+        this.faceVelocityY[faceRow * this.columns + column] = clamp(
           0.5 * (this.velocityY[up] + this.velocityY[down]) * permeability,
           -MAX_CELL_SPEED,
           MAX_CELL_SPEED,
@@ -634,49 +687,55 @@ export class WaterTransportGrid {
       }
     }
 
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        const left = this.faceVelocityX[row * (TRANSPORT_COLUMNS + 1) + column];
-        const right = this.faceVelocityX[row * (TRANSPORT_COLUMNS + 1) + column + 1];
-        const up = this.faceVelocityY[row * TRANSPORT_COLUMNS + column];
-        const down = this.faceVelocityY[(row + 1) * TRANSPORT_COLUMNS + column];
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        const left = this.faceVelocityX[row * (this.columns + 1) + column];
+        const right = this.faceVelocityX[row * (this.columns + 1) + column + 1];
+        const up = this.faceVelocityY[row * this.columns + column];
+        const down = this.faceVelocityY[(row + 1) * this.columns + column];
         this.divergence[index] = right - left + down - up;
         this.pressure[index] = 0;
       }
     }
 
     for (let iteration = 0; iteration < PRESSURE_ITERATIONS; iteration += 1) {
-      for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-        for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-          const index = row * TRANSPORT_COLUMNS + column;
+      for (let row = 0; row < this.rows; row += 1) {
+        for (let column = 0; column < this.columns; column += 1) {
+          const index = row * this.columns + column;
           const left = column > 0 ? this.pressure[index - 1] : this.pressure[index];
-          const right = column + 1 < TRANSPORT_COLUMNS
+          const right = column + 1 < this.columns
             ? this.pressure[index + 1]
             : this.pressure[index];
-          const up = row > 0 ? this.pressure[index - TRANSPORT_COLUMNS] : this.pressure[index];
-          const down = row + 1 < TRANSPORT_ROWS
-            ? this.pressure[index + TRANSPORT_COLUMNS]
+          const up = row > 0 ? this.pressure[index - this.columns] : this.pressure[index];
+          const down = row + 1 < this.rows
+            ? this.pressure[index + this.columns]
             : this.pressure[index];
           let neighborSum = 0;
           let neighborCount = 0;
           if (column > 0) { neighborSum += left; neighborCount += 1; }
-          if (column + 1 < TRANSPORT_COLUMNS) { neighborSum += right; neighborCount += 1; }
+          if (column + 1 < this.columns) { neighborSum += right; neighborCount += 1; }
           if (row > 0) { neighborSum += up; neighborCount += 1; }
-          if (row + 1 < TRANSPORT_ROWS) { neighborSum += down; neighborCount += 1; }
+          if (row + 1 < this.rows) { neighborSum += down; neighborCount += 1; }
           this.pressureScratch[index] = neighborCount > 0
             ? (neighborSum - this.divergence[index]) / neighborCount
             : 0;
         }
       }
-      this.pressure.set(this.pressureScratch);
+      // A direct TypedArray#set inside the 120 Hz worker showed up as one of
+      // the largest transient V8 allocation sites on Electron/macOS. Reusing
+      // the existing arrays with scalar copies keeps the pressure solve inside
+      // one fixed backing store.
+      for (let index = 0; index < this.cellCount; index += 1) {
+        this.pressure[index] = this.pressureScratch[index];
+      }
     }
 
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let faceColumn = 1; faceColumn < TRANSPORT_COLUMNS; faceColumn += 1) {
-        const leftCell = row * TRANSPORT_COLUMNS + faceColumn - 1;
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let faceColumn = 1; faceColumn < this.columns; faceColumn += 1) {
+        const leftCell = row * this.columns + faceColumn - 1;
         const rightCell = leftCell + 1;
-        const faceIndex = row * (TRANSPORT_COLUMNS + 1) + faceColumn;
+        const faceIndex = row * (this.columns + 1) + faceColumn;
         this.faceVelocityX[faceIndex] = clamp(
           this.faceVelocityX[faceIndex] -
             (this.pressure[rightCell] - this.pressure[leftCell]),
@@ -685,11 +744,11 @@ export class WaterTransportGrid {
         );
       }
     }
-    for (let faceRow = 1; faceRow < TRANSPORT_ROWS; faceRow += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const upCell = (faceRow - 1) * TRANSPORT_COLUMNS + column;
-        const downCell = upCell + TRANSPORT_COLUMNS;
-        const faceIndex = faceRow * TRANSPORT_COLUMNS + column;
+    for (let faceRow = 1; faceRow < this.rows; faceRow += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const upCell = (faceRow - 1) * this.columns + column;
+        const downCell = upCell + this.columns;
+        const faceIndex = faceRow * this.columns + column;
         this.faceVelocityY[faceIndex] = clamp(
           this.faceVelocityY[faceIndex] -
             (this.pressure[downCell] - this.pressure[upCell]),
@@ -699,13 +758,13 @@ export class WaterTransportGrid {
       }
     }
 
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        const leftFace = this.faceVelocityX[row * (TRANSPORT_COLUMNS + 1) + column];
-        const rightFace = this.faceVelocityX[row * (TRANSPORT_COLUMNS + 1) + column + 1];
-        const upFace = this.faceVelocityY[row * TRANSPORT_COLUMNS + column];
-        const downFace = this.faceVelocityY[(row + 1) * TRANSPORT_COLUMNS + column];
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        const leftFace = this.faceVelocityX[row * (this.columns + 1) + column];
+        const rightFace = this.faceVelocityX[row * (this.columns + 1) + column + 1];
+        const upFace = this.faceVelocityY[row * this.columns + column];
+        const downFace = this.faceVelocityY[(row + 1) * this.columns + column];
         this.velocityX[index] = 0.5 * (leftFace + rightFace);
         this.velocityY[index] = 0.5 * (upFace + downFace);
       }
@@ -713,11 +772,11 @@ export class WaterTransportGrid {
   }
 
   private advectWaterHeat(deltaSeconds: number, fallbackTemperature: number): void {
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.advectedHeat[index] = this.temperature[index] * this.heatCapacity[index];
     }
     this.advectConservativeField(this.advectedHeat, deltaSeconds, this.maximumHeat);
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
+    for (let index = 0; index < this.cellCount; index += 1) {
       this.temperature[index] = finiteTemperature(
         this.advectedHeat[index] / this.heatCapacity[index],
         fallbackTemperature,
@@ -755,17 +814,21 @@ export class WaterTransportGrid {
       Math.abs(this.dispersionPreparedSeconds - deltaSeconds) < 1e-10
     ) return;
 
-    for (let index = 0; index < TRANSPORT_CELL_COUNT; index += 1) {
-      this.eddySpeed[index] = Math.hypot(this.velocityX[index], this.velocityY[index]);
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const velocityX = this.velocityX[index];
+      const velocityY = this.velocityY[index];
+      this.eddySpeed[index] = Math.sqrt(
+        velocityX * velocityX + velocityY * velocityY,
+      );
       this.eddyRetentionX[index] = 1;
       this.eddyRetentionY[index] = 1;
       this.eddyPermeabilityX[index] = 0;
       this.eddyPermeabilityY[index] = 0;
     }
-    for (let row = 0; row < TRANSPORT_ROWS; row += 1) {
-      for (let column = 0; column < TRANSPORT_COLUMNS; column += 1) {
-        const index = row * TRANSPORT_COLUMNS + column;
-        if (column + 1 < TRANSPORT_COLUMNS) {
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let column = 0; column < this.columns; column += 1) {
+        const index = row * this.columns + column;
+        if (column + 1 < this.columns) {
           this.prepareDispersionPair(
             index,
             index + 1,
@@ -774,10 +837,10 @@ export class WaterTransportGrid {
             this.eddyPermeabilityX,
           );
         }
-        if (row + 1 < TRANSPORT_ROWS) {
+        if (row + 1 < this.rows) {
           this.prepareDispersionPair(
             index,
-            index + TRANSPORT_COLUMNS,
+            index + this.columns,
             deltaSeconds,
             this.eddyRetentionY,
             this.eddyPermeabilityY,
@@ -814,22 +877,22 @@ export class WaterTransportGrid {
 
   private indexAt(point: Vec2): number {
     const column = clamp(
-      Math.floor((point.x / TANK_WIDTH) * TRANSPORT_COLUMNS),
+      Math.floor((point.x / this.tankWidth) * this.columns),
       0,
-      TRANSPORT_COLUMNS - 1,
+      this.columns - 1,
     );
     const row = clamp(
-      Math.floor(((point.y - WATER_TOP) / (GROUND_Y - WATER_TOP)) * TRANSPORT_ROWS),
+      Math.floor(((point.y - this.waterTop) / (this.groundY - this.waterTop)) * this.rows),
       0,
-      TRANSPORT_ROWS - 1,
+      this.rows - 1,
     );
-    return row * TRANSPORT_COLUMNS + column;
+    return row * this.columns + column;
   }
 
   private worldPointAt(column: number, row: number): Vec2 {
     return {
-      x: (column / TRANSPORT_COLUMNS) * TANK_WIDTH,
-      y: WATER_TOP + (row / TRANSPORT_ROWS) * (GROUND_Y - WATER_TOP),
+      x: (column / this.columns) * this.tankWidth,
+      y: this.waterTop + (row / this.rows) * (this.groundY - this.waterTop),
     };
   }
 }

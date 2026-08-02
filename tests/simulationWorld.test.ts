@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { SCENARIOS, STRUCTURES } from '../src/simulation/config';
+import {
+  ALGAE_RENDER_TRACE_BIOMASS,
+  SCENARIOS,
+  STRUCTURES,
+} from '../src/simulation/config';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
 import { structureAuthoredPolygonToWorld } from '../src/simulation/structureGeometry';
 import type {
@@ -139,18 +143,33 @@ describe('V2 mission simulation world', () => {
       .filter((cell) => cell.ownerId === ownerId)
       .sort((a, b) => b.light - a.light)[0];
     placeSeed(world, 'oedogonium', brightest);
+    const inoculated = world.snapshot();
+    expect(inoculated.totalBiomass.oedogonium).toBeCloseTo(0.12, 8);
+    expect(inoculated.cells.filter(
+      (cell) => cell.biomass.oedogonium >= ALGAE_RENDER_TRACE_BIOMASS,
+    )).toHaveLength(1);
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 8 });
-    for (let index = 0; index < 1400 && world.snapshot().outcome === 'pending'; index += 1) {
+    for (let index = 0; index < 4000 && world.snapshot().outcome === 'pending'; index += 1) {
       world.tick(1 / 60);
     }
     const succeeded = world.snapshot();
     expect(succeeded.outcome).toBe('success');
     const elapsedAtSuccess = succeeded.elapsedSeconds;
-    for (let index = 0; index < 120; index += 1) world.tick(1 / 60);
+    world.handle({ type: 'set-speed', speed: 64 });
+    while (world.snapshot().elapsedSeconds < 1_800) world.tick(0.1);
     const continued = world.snapshot();
     expect(continued.phase).toBe('running');
     expect(continued.elapsedSeconds).toBeGreaterThan(elapsedAtSuccess);
+    expect(continued.totalBiomass.oedogonium)
+      .toBeGreaterThan(succeeded.totalBiomass.oedogonium);
+    expect(continued.missionProgress!.current)
+      .toBeGreaterThanOrEqual(continued.missionProgress!.target);
+    expect(continued.cells.every((cell) =>
+      Number.isFinite(cell.biomass.oedogonium) &&
+      cell.biomass.oedogonium >= 0 &&
+      cell.biomass.oedogonium <= 1
+    )).toBe(true);
   }, 30_000);
 
   it('scores mission 2 by total diatom biomass without penalizing extra habitat', () => {
@@ -158,7 +177,7 @@ describe('V2 mission simulation world', () => {
     const target = SCENARIOS['mission-2'].target;
     expect(target?.type).toBe('biomass');
     if (target?.type !== 'biomass') throw new Error('unexpected mission target');
-    expect(target.amount).toBe(220);
+    expect(target.amount).toBe(0.53);
     expect(world.snapshot().remainingSeeds.oedogonium).toBe(0);
     world.handle({ type: 'pick-seed', speciesId: 'oedogonium', point: { x: 400, y: 300 } });
     expect(world.snapshot().holding).toBeNull();
@@ -178,9 +197,10 @@ describe('V2 mission simulation world', () => {
     ];
     expect(inoculationCells).toHaveLength(4);
     for (const cell of inoculationCells) placeSeed(world, 'nitzschia', cell);
+    expect(world.snapshot().totalBiomass.nitzschia).toBeCloseTo(0.48, 8);
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 8 });
-    for (let index = 0; index < 2200 && world.snapshot().outcome === 'pending'; index += 1) {
+    for (let index = 0; index < 3000 && world.snapshot().outcome === 'pending'; index += 1) {
       world.tick(1 / 60);
     }
     const finalSnapshot = world.snapshot();
@@ -192,6 +212,19 @@ describe('V2 mission simulation world', () => {
     );
     expect(finalSnapshot.totalBiomass.nitzschia).toBeGreaterThanOrEqual(target.amount);
     expect(finalSnapshot.totalBiomass.oedogonium).toBe(0);
+    world.handle({ type: 'set-speed', speed: 64 });
+    while (world.snapshot().elapsedSeconds < 1_800) world.tick(0.1);
+    const continued = world.snapshot();
+    expect(continued.phase).toBe('running');
+    expect(continued.totalBiomass.nitzschia)
+      .toBeGreaterThan(finalSnapshot.totalBiomass.nitzschia);
+    expect(continued.missionProgress!.current)
+      .toBeGreaterThanOrEqual(continued.missionProgress!.target);
+    expect(continued.cells.every((cell) =>
+      Number.isFinite(cell.biomass.nitzschia) &&
+      cell.biomass.nitzschia >= 0 &&
+      cell.biomass.nitzschia <= 1
+    )).toBe(true);
   }, 30_000);
 
   it('starts mission 2 from a substrate inoculation without requiring a structure', () => {
@@ -202,25 +235,30 @@ describe('V2 mission simulation world', () => {
     expect(world.snapshot().phase).toBe('running');
   });
 
-  it('keeps four well-lit substrate inoculations below the mission 2 target', () => {
+  it('keeps four overlit inoculations below the mission 2 target', () => {
     const world = new SimulationWorld('mission-2');
     const target = SCENARIOS['mission-2'].target;
     if (target?.type !== 'biomass') throw new Error('unexpected mission target');
+    placeStructure(world, 'flat-stone', { x: 390, y: 250 });
+    placeStructure(world, 'tall-stone', { x: 620, y: 210 });
+    placeStructure(world, 'round-stone', { x: 875, y: 270 });
+    settle(world, 900);
     const selected: SurfaceCellSnapshot[] = [];
-    const substrate = world.snapshot().cells
-      .filter((cell) => cell.surfaceKind === 'substrate')
-      .sort((a, b) => Math.abs(a.light - 38) - Math.abs(b.light - 38));
-    for (const candidate of substrate) {
+    const overlitFaces = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === 'structure-face')
+      .sort((left, right) => right.light - left.light);
+    for (const candidate of overlitFaces) {
       if (selected.some((cell) => Math.hypot(cell.x - candidate.x, cell.y - candidate.y) < 70)) continue;
       selected.push(candidate);
       if (selected.length === 4) break;
     }
     expect(selected).toHaveLength(4);
+    expect(selected.every((cell) => cell.light >= 72)).toBe(true);
     for (const cell of selected) placeSeed(world, 'nitzschia', cell);
 
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 8 });
-    for (let index = 0; index < 2050; index += 1) world.tick(1 / 60);
+    for (let index = 0; index < 2800; index += 1) world.tick(1 / 60);
 
     const final = world.snapshot();
     expect(final.outcome).toBe('failure');
@@ -303,6 +341,7 @@ describe('V2 mission simulation world', () => {
       .sort((a, b) => b.light - a.light);
     expect(inoculationOptions.length).toBeGreaterThan(0);
     placeSeed(world, 'oedogonium', inoculationOptions[0]);
+    placeSeed(world, 'oedogonium', inoculationOptions[1]);
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 8 });
     for (let index = 0; index < 2600 && world.snapshot().outcome === 'pending'; index += 1) {
@@ -378,7 +417,7 @@ describe('V2 mission simulation world', () => {
     placeSeed(world, 'oedogonium', darkest);
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 8 });
-    for (let index = 0; index < 1800 && world.snapshot().outcome === 'pending'; index += 1) {
+    for (let index = 0; index < 3500 && world.snapshot().outcome === 'pending'; index += 1) {
       world.tick(1 / 60);
     }
     const failed = world.snapshot();

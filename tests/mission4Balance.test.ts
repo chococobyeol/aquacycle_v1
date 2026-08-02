@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { SCENARIOS } from "../src/simulation/config";
+import {
+  SCENARIOS,
+  SURFACE_ALGAE_INOCULUM_BIOMASS,
+} from "../src/simulation/config";
 import {
   SHRIMP_TECHNICAL_POPULATION_LIMIT,
   SimulationWorld,
@@ -120,6 +123,32 @@ const applyLayout = (
 };
 
 describe("mission 4 consumer balance", () => {
+  it("supplies equal, explicit matter in each surface-algae inoculum", () => {
+    const world = new SimulationWorld("mission-4");
+    const layout = viableLayout(world);
+    const oedogonium = layout.seedPoints.find(
+      (seed) => seed.speciesId === "oedogonium",
+    );
+    const nitzschia = layout.seedPoints.find(
+      (seed) => seed.speciesId === "nitzschia",
+    );
+    expect(oedogonium).toBeDefined();
+    expect(nitzschia).toBeDefined();
+
+    placeSeed(world, "oedogonium", oedogonium!.point);
+    placeSeed(world, "nitzschia", nitzschia!.point);
+    const supplied = world.snapshot().totalBiomass;
+
+    expect(supplied.oedogonium).toBeCloseTo(
+      SURFACE_ALGAE_INOCULUM_BIOMASS,
+      8,
+    );
+    expect(supplied.nitzschia).toBeCloseTo(
+      SURFACE_ALGAE_INOCULUM_BIOMASS,
+      8,
+    );
+  });
+
   it("publishes a settled setup after placing an animal in a tank without structures", () => {
     const world = new SimulationWorld("mission-4");
     const point = { x: 420, y: 600 };

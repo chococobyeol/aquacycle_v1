@@ -5,6 +5,11 @@ import {
   WATER_ROWS,
   type BiofilmReactionSite,
 } from '../src/simulation/biogeochemistry';
+import {
+  MICROBE_ECOLOGY_RULES,
+  WATER_CYCLE_RULES,
+} from '../src/simulation/config';
+import { thetaTemperatureFactor } from '../src/simulation/temperatureResponse';
 
 const point = { x: 600, y: 620 };
 
@@ -63,6 +68,25 @@ describe('active biogeochemistry', () => {
     expect(after.organicMatter).toBe(before.organicMatter);
   });
 
+  it('can withdraw rooted-plant resources at one point while releasing oxygen at a leaf', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 3, toxicWaste: 1.5, nutrients: 50, oxygen: 50 },
+    });
+    const root = { x: 120, y: 610 };
+    const leaf = { x: 1_080, y: 220 };
+    const rootBefore = ledger.sampleAt(root);
+    const leafBefore = ledger.sampleAt(leaf);
+
+    expect(ledger.commitAlgaeProduction(root, 1, leaf)).toBeGreaterThan(0);
+
+    const rootAfter = ledger.sampleAt(root);
+    const leafAfter = ledger.sampleAt(leaf);
+    expect(rootAfter.nutrients).toBeLessThan(rootBefore.nutrients);
+    expect(leafAfter.oxygen).toBeGreaterThan(leafBefore.oxygen);
+    expect(rootAfter.oxygen).toBeCloseTo(rootBefore.oxygen, 10);
+  });
+
   it('stores local organism effects in the addressed 36 by 20 water cell', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,
@@ -95,12 +119,86 @@ describe('active biogeochemistry', () => {
     const assimilated = ledger.recordAnimalFeeding(point, 1);
     const after = ledger.materialState();
 
-    expect(assimilated).toBeCloseTo(0.3, 12);
-    expect(after.detritus).toBeCloseTo(0.7, 12);
+    expect(assimilated).toBeCloseTo(0.58, 12);
+    expect(after.detritus).toBeCloseTo(0.42, 12);
     expect(after.dissolvedInorganicCarbon).toBeCloseTo(
       before.dissolvedInorganicCarbon,
       12,
     );
+    expect(after.toxicWaste).toBeCloseTo(before.toxicWaste, 12);
+  });
+
+  it('separates feeding from continuous oxygen-consuming animal respiration', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 1, nutrients: 20, oxygen: 76 },
+    });
+    const beforeFeeding = ledger.materialState();
+
+    expect(ledger.recordAnimalFeeding(point, 1, 'shrimp')).toBeCloseTo(0.58, 12);
+    const afterFeeding = ledger.materialState();
+    expect(afterFeeding.detritus - beforeFeeding.detritus).toBeCloseTo(0.42, 12);
+    expect(afterFeeding.dissolvedOxygen).toBeCloseTo(
+      beforeFeeding.dissolvedOxygen,
+      12,
+    );
+    expect(afterFeeding.dissolvedInorganicCarbon).toBeCloseTo(
+      beforeFeeding.dissolvedInorganicCarbon,
+      12,
+    );
+    expect(afterFeeding.toxicWaste).toBeCloseTo(
+      beforeFeeding.toxicWaste,
+      12,
+    );
+
+    expect(ledger.recordAnimalRespiration(point, 0.1)).toBeCloseTo(0.1, 12);
+    const afterRespiration = ledger.materialState();
+    expect(afterRespiration.dissolvedOxygen)
+      .toBeLessThan(afterFeeding.dissolvedOxygen);
+    expect(afterRespiration.dissolvedInorganicCarbon)
+      .toBeGreaterThan(afterFeeding.dissolvedInorganicCarbon);
+    expect(afterRespiration.toxicWaste)
+      .toBeGreaterThan(afterFeeding.toxicWaste);
+  });
+
+  it('returns the indigestible share of low-quality film to detritus', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 1, nutrients: 20, oxygen: 76 },
+    });
+    const before = ledger.materialState();
+
+    const assimilated = ledger.recordAnimalFeeding(
+      point,
+      1,
+      'shrimp',
+      0.45,
+    );
+    const after = ledger.materialState();
+
+    expect(assimilated).toBeCloseTo(0.58 * 0.45, 12);
+    expect(after.detritus - before.detritus).toBeCloseTo(
+      1 - 0.58 * 0.45,
+      12,
+    );
+  });
+
+  it('does not charge Daphnia a fixed respiration pulse at ingestion', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 1, nutrients: 20, oxygen: 76 },
+    });
+    const before = ledger.materialState();
+
+    const assimilated = ledger.recordDaphniaFeeding(point, 0.6, 0.4);
+    const after = ledger.materialState();
+
+    expect(assimilated).toBeGreaterThan(0);
+    expect(after.detritus - before.detritus)
+      .toBeCloseTo(1 - assimilated, 12);
+    expect(after.dissolvedOxygen).toBeCloseTo(before.dissolvedOxygen, 12);
+    expect(after.dissolvedInorganicCarbon)
+      .toBeCloseTo(before.dissolvedInorganicCarbon, 12);
     expect(after.toxicWaste).toBeCloseTo(before.toxicWaste, 12);
   });
 
@@ -166,10 +264,55 @@ describe('active biogeochemistry', () => {
       return ledger.microbeNetGrowthAt('nitrifier', point, 0.2);
     };
 
-    expect(netGrowthAt(0.1)).toBeLessThan(0);
-    expect(netGrowthAt(0.5)).toBeLessThan(0);
-    expect(netGrowthAt(0.8)).toBeGreaterThan(0);
-    expect(netGrowthAt(1.5)).toBeGreaterThan(0);
+    const trace = netGrowthAt(0.1);
+    const transition = netGrowthAt(0.5);
+    const missionBand = netGrowthAt(0.8);
+    const loaded = netGrowthAt(1.5);
+
+    expect(trace).toBeLessThan(0);
+    expect(transition).toBeGreaterThan(trace);
+    expect(missionBand).toBeGreaterThan(0);
+    expect(loaded).toBeGreaterThan(missionBand);
+  });
+
+  it('gives both guilds the same pre-reaction surface occupancy', () => {
+    const initial = {
+      organicMatter: 18,
+      toxicWaste: 9,
+      nutrients: 12,
+      oxygen: 72,
+    };
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial,
+    });
+    const film = site(0.45, 0.25);
+    const deltaSeconds = 20;
+    const kinetics = MICROBE_ECOLOGY_RULES.nitrifier;
+    const activity =
+      initial.toxicWaste / (initial.toxicWaste + kinetics.halfSaturation) *
+      initial.oxygen / (initial.oxygen + kinetics.oxygenHalfSaturation);
+    const temperatureFactor = thetaTemperatureFactor(
+      ledger.temperatureAt(point),
+      kinetics.referenceTemperature,
+      kinetics.temperatureCoefficient,
+    );
+    const freeSurfaceAtStepStart = 1 - 0.45 - 0.25;
+    const requested = 0.25 * kinetics.maximumUptake * activity *
+      temperatureFactor * deltaSeconds;
+    const expectedGrowth = requested * kinetics.biomassYield /
+      WATER_CYCLE_RULES.biomassNitrogen * freeSurfaceAtStepStart;
+    const decayRate = (
+      kinetics.maintenanceDecayRate +
+      kinetics.starvationDecayRate * (1 - activity)
+    ) * temperatureFactor;
+    const expectedDecay = 0.25 * (1 - Math.exp(-decayRate * deltaSeconds));
+
+    ledger.beginStep();
+    ledger.advance(deltaSeconds, [film]);
+
+    expect(film.biofilm.nitrifier)
+      .toBeCloseTo(0.25 + expectedGrowth - expectedDecay, 8);
   });
 
   it('lets an organic pulse grow decomposers before resource depletion makes them decline', () => {
@@ -231,7 +374,11 @@ describe('active biogeochemistry', () => {
     ledger.setTransportEnvironment(light, []);
 
     ledger.beginStep();
-    ledger.recordAnimalMetabolism(bottom, 0, 10, 1);
+    // Dissolved ammonia is released by actual continuous respiration, not by
+    // merely ingesting a meal. The old fixture used zero maintenance and
+    // still expected bite-time waste after that duplicate metabolism path had
+    // been removed from the model.
+    ledger.recordAnimalRespiration(bottom, 10);
     ledger.advanceTemperature(1, 22);
     ledger.advance(1, []);
     for (let second = 0; second < 119; second += 1) {

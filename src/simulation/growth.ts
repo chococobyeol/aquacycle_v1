@@ -1,9 +1,26 @@
-import { SPECIES } from './config';
+import { ECOLOGY_PROCESS_RATE_SCALE, SPECIES } from './config';
 import type { GrowthTrend, SpeciesBiomass, SpeciesId } from './types';
 import { thetaTemperatureFactor } from './temperatureResponse';
 
 export const clamp01 = (value: number): number =>
   Math.max(0, Math.min(1, value));
+
+// The shared surface-film calibration is set by the standing producer mass
+// required to replace grazing in the shrimp-scale tank. Both attached algae
+// use the same multiplier in every mission and the laboratory; this is not a
+// mission-specific food bonus. Respiration, stress and turnover use the same
+// clock so increasing net production cannot create a free oxygen-only path.
+// Individual ration limits reproduction, but the producer bed must still be
+// able to establish while the four supplied shrimp graze from the beginning.
+// The former 2x clock produced less new algae than those founders removed and
+// could only pass a staged fixture that withheld shrimp for an hour. 5x keeps
+// the documented species curves and all missions on one shared clock while
+// matching the compressed juvenile growth demand; respiration, stress and
+// turnover remain on the same scale.
+export const SURFACE_ALGAE_PROCESS_RATE_SCALE = ECOLOGY_PROCESS_RATE_SCALE;
+
+export const producerProcessRateScale = (speciesId: SpeciesId): number =>
+  speciesId === 'vallisneria' ? 1 : SURFACE_ALGAE_PROCESS_RATE_SCALE;
 
 const referenceNetLightRate = (speciesId: SpeciesId, light: number): number => {
   const curve = SPECIES[speciesId].lightCurve;
@@ -48,8 +65,10 @@ export const writeAlgaePhysiologyRates = (
   offset = 0,
 ): number => {
   const definition = SPECIES[speciesId];
-  const referenceNet = referenceNetLightRate(speciesId, light);
-  const referenceRespiration = definition.respirationRateAtReference;
+  const processScale = producerProcessRateScale(speciesId);
+  const referenceNet = referenceNetLightRate(speciesId, light) * processScale;
+  const referenceRespiration =
+    definition.respirationRateAtReference * processScale;
   const referenceGross = Math.max(0, referenceNet + referenceRespiration);
   const referenceStress = Math.max(0, -(referenceNet + referenceRespiration));
   const suitability = temperatureSuitability(speciesId, temperature);
@@ -61,7 +80,9 @@ export const writeAlgaePhysiologyRates = (
     2.1,
   );
   const grossPhotosynthesis = referenceGross * suitability;
-  const lightStressTurnover = referenceStress + (1 - suitability) * 0.012;
+  const lightStressTurnover = referenceStress +
+    (1 - suitability) * definition.temperatureStressTurnoverRate *
+      processScale;
   const netGrowth = grossPhotosynthesis - respiration - lightStressTurnover;
   target[offset + ALGAE_PHYSIOLOGY_GROSS] = grossPhotosynthesis;
   target[offset + ALGAE_PHYSIOLOGY_RESPIRATION] = respiration;
@@ -149,8 +170,10 @@ export const growthTrend = (
   temperature = 24,
 ): GrowthTrend => {
   const potential = netGrowthPotential(speciesId, light, temperature);
-  if (potential > 0.004) return 'growing';
-  if (potential < -0.0015) return 'declining';
+  const referenceRate = SPECIES[speciesId].maximumPositiveRate *
+    producerProcessRateScale(speciesId);
+  if (potential > referenceRate * 0.06) return 'growing';
+  if (potential < -referenceRate * 0.025) return 'declining';
   return 'stable';
 };
 
@@ -160,7 +183,13 @@ export const habitatSuitability = (
   temperature = 24,
 ): number => {
   const potential = netGrowthPotential(speciesId, light, temperature);
-  return clamp01(potential / SPECIES[speciesId].maximumPositiveRate);
+  return clamp01(
+    potential /
+      (
+        SPECIES[speciesId].maximumPositiveRate *
+        producerProcessRateScale(speciesId)
+      ),
+  );
 };
 
 export interface LocalGrowthInput {

@@ -17,6 +17,8 @@ import type {
   WorkerMotionOverlayMessage,
   WorkerSaveMessage,
   WorkerSnapshotMessage,
+  WorkerFaultMessage,
+  WorkerTelemetryResizeRequestMessage,
 } from './types';
 import { MOTION_SAMPLE_INTERVAL_MS } from './types';
 import {
@@ -38,13 +40,10 @@ let motionTelemetry: SharedTelemetryWriter | null = null;
 let binaryMotionTelemetry: SharedMotionWriter | null = null;
 let reusableMotion = world.motionTransportSnapshot();
 let reusableSnapshot: SimulationSnapshot | undefined;
-let snapshotFallbackMode = false;
-let lastSnapshotFallbackAtMs = Number.NEGATIVE_INFINITY;
-let pendingSnapshotFallbackTimer: ReturnType<typeof setTimeout> | null = null;
-let lastOversizedMotionFallbackAtMs = Number.NEGATIVE_INFINITY;
-let pendingOversizedMotionFallbackTimer: ReturnType<typeof setTimeout> | null = null;
-let pendingOversizedMotionSequence = 0;
-const LARGE_TELEMETRY_FALLBACK_INTERVAL_MS = 1_000;
+let snapshotResizePending = false;
+let snapshotResizeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let motionOverflowReported = false;
+const SNAPSHOT_RESIZE_RETRY_MS = 5_000;
 
 interface ConnectTelemetryCommand {
   type: 'connect-telemetry';
@@ -56,6 +55,7 @@ interface ConnectTelemetryCommand {
 type WorkerCommand = SimulationCommand | ConnectTelemetryCommand;
 
 const attemptSnapshotPublication = (): void => {
+  if (snapshotResizePending) return;
   reusableSnapshot = world.snapshot(reusableSnapshot);
   const message: WorkerSnapshotMessage = {
     type: 'snapshot',
@@ -64,44 +64,39 @@ const attemptSnapshotPublication = (): void => {
   if (!snapshotTelemetry) {
     // SharedArrayBuffer can be unavailable in a development browser. Preserve
     // the ordinary worker channel's existing immediate command acknowledgement
-    // semantics; only a confirmed fixed-slot overflow enters the coalescing
-    // backoff below.
-    snapshotFallbackMode = false;
+    // semantics there. Electron uses the bounded shared channel below.
     scope.postMessage(message);
     return;
   }
   if (snapshotTelemetry.publish(message)) {
-    snapshotFallbackMode = false;
     return;
   }
 
-  // A population spike must not silently stop every future HUD update and
-  // command acknowledgement. The fixed shared slot is the normal path; an
-  // exceptional oversized generation is coalesced into at most one ordinary
-  // structured-clone per real second. While that backoff is active, `publish`
-  // does not rebuild and re-encode the same oversized graph on every simulated
-  // second at 64x.
-  snapshotFallbackMode = true;
-  lastSnapshotFallbackAtMs = performance.now();
-  scope.postMessage(message);
-};
-
-const flushPendingSnapshotFallback = (): void => {
-  pendingSnapshotFallbackTimer = null;
-  attemptSnapshotPublication();
+  // Never structured-clone the oversized graph. Chromium retains backing
+  // regions from those clones on macOS, so a long population bloom can grow the
+  // renderer to several GB even though the JS heap remains small. Ask the
+  // renderer for a larger reusable triple buffer using a tiny control packet.
+  snapshotResizePending = true;
+  if (snapshotResizeRetryTimer === null) {
+    snapshotResizeRetryTimer = setTimeout(() => {
+      snapshotResizeRetryTimer = null;
+      snapshotResizePending = false;
+      try {
+        attemptSnapshotPublication();
+      } catch (error) {
+        postWorkerFault('command', error);
+      }
+    }, SNAPSHOT_RESIZE_RETRY_MS);
+  }
+  const resizeRequest: WorkerTelemetryResizeRequestMessage = {
+    type: 'telemetry-resize-request',
+    stream: 'snapshot',
+    minimumPayloadBytes: snapshotTelemetry.payloadByteLength * 2,
+  };
+  scope.postMessage(resizeRequest);
 };
 
 const publish = (): void => {
-  if (pendingSnapshotFallbackTimer !== null) return;
-  const fallbackDelayMs = LARGE_TELEMETRY_FALLBACK_INTERVAL_MS -
-    (performance.now() - lastSnapshotFallbackAtMs);
-  if (snapshotFallbackMode && fallbackDelayMs > 0) {
-    pendingSnapshotFallbackTimer = setTimeout(
-      flushPendingSnapshotFallback,
-      fallbackDelayMs,
-    );
-    return;
-  }
   attemptSnapshotPublication();
 };
 
@@ -119,53 +114,6 @@ const publishMotionOverlay = (message: WorkerMotionMessage): void => {
   if (!sharedPublished) scope.postMessage(overlay);
 };
 
-const flushPendingOversizedMotionFallback = (): void => {
-  pendingOversizedMotionFallbackTimer = null;
-  if (pendingOversizedMotionSequence === 0) return;
-  reusableMotion = world.motionSnapshot(reusableMotion);
-  const message: WorkerMotionMessage = {
-    type: 'motion',
-    sequence: pendingOversizedMotionSequence,
-    // `motionSnapshot` reads the pose now, not when the rejected binary sample
-    // originally queued this trailing fallback.
-    sampledAtMs: performance.now(),
-    snapshotRevision: reusableSnapshot?.revision ?? 0,
-    ...reusableMotion,
-  };
-  pendingOversizedMotionSequence = 0;
-  lastOversizedMotionFallbackAtMs = performance.now();
-  scope.postMessage(message);
-};
-
-const queueOversizedMotionFallback = (sequence: number): void => {
-  pendingOversizedMotionSequence = sequence;
-  const fallbackDelayMs = LARGE_TELEMETRY_FALLBACK_INTERVAL_MS -
-    (performance.now() - lastOversizedMotionFallbackAtMs);
-  if (fallbackDelayMs <= 0) {
-    if (pendingOversizedMotionFallbackTimer !== null) {
-      clearTimeout(pendingOversizedMotionFallbackTimer);
-      pendingOversizedMotionFallbackTimer = null;
-    }
-    flushPendingOversizedMotionFallback();
-    return;
-  }
-  if (pendingOversizedMotionFallbackTimer === null) {
-    pendingOversizedMotionFallbackTimer = setTimeout(
-      flushPendingOversizedMotionFallback,
-      fallbackDelayMs,
-    );
-  }
-};
-
-const cancelOversizedMotionFallback = (): void => {
-  if (pendingOversizedMotionFallbackTimer !== null) {
-    clearTimeout(pendingOversizedMotionFallbackTimer);
-    pendingOversizedMotionFallbackTimer = null;
-  }
-  pendingOversizedMotionSequence = 0;
-  lastOversizedMotionFallbackAtMs = Number.NEGATIVE_INFINITY;
-};
-
 const publishMotion = (): void => {
   const sampledAtMs = performance.now();
   const motion = world.motionTransportSnapshot(reusableMotion);
@@ -179,11 +127,9 @@ const publishMotion = (): void => {
   };
   if (!binaryMotionTelemetry) {
     if (!sharedMotionMessageFitsChannel(message)) {
-      queueOversizedMotionFallback(message.sequence);
       publishMotionOverlay(message);
       return;
     }
-    cancelOversizedMotionFallback();
     reusableMotion = world.motionSnapshot(reusableMotion);
     message.structures = reusableMotion.structures;
     message.animals = reusableMotion.animals;
@@ -195,15 +141,22 @@ const publishMotion = (): void => {
   }
   const binaryPublished = binaryMotionTelemetry.publish(message);
   if (!binaryPublished) {
-    // An extreme population beyond the fixed binary capacity still receives
-    // the newest coarse full pose, but never structured-clones the giant graph
-    // at 30 Hz. A scheduled trailing publication preserves the final pose even
-    // when autonomous motion stops before the next interval callback.
-    queueOversizedMotionFallback(message.sequence);
+    // Do not turn an extreme population into a giant ordinary postMessage.
+    // Full snapshots continue to provide a coarse pose while the binary stream
+    // is over capacity.
     publishMotionOverlay(message);
+    if (!motionOverflowReported) {
+      motionOverflowReported = true;
+      const fault: WorkerFaultMessage = {
+        type: 'worker-fault',
+        operation: 'command',
+        message: 'Motion telemetry capacity exceeded; using snapshot poses.',
+      };
+      scope.postMessage(fault);
+    }
     return;
   }
-  cancelOversizedMotionFallback();
+  motionOverflowReported = false;
   // Holding/probe records are not part of the numeric motion layout. Send only
   // that small metadata beside the successful binary sample; duplicating every
   // animal into the generic channel could overflow and structured-clone the
@@ -211,27 +164,53 @@ const publishMotion = (): void => {
   publishMotionOverlay(message);
 };
 
+const postWorkerFault = (
+  operation: WorkerFaultMessage['operation'],
+  error: unknown,
+): void => {
+  const fault: WorkerFaultMessage = {
+    type: 'worker-fault',
+    operation,
+    message: error instanceof Error ? error.message : String(error),
+    ...(error instanceof Error && error.stack ? { stack: error.stack } : {}),
+  };
+  scope.postMessage(fault);
+};
+
 scope.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
-  if (event.data.type === 'connect-telemetry') {
-    snapshotTelemetry = new SharedTelemetryWriter(event.data.snapshot);
-    motionTelemetry = new SharedTelemetryWriter(event.data.motion);
-    binaryMotionTelemetry = new SharedMotionWriter(event.data.binaryMotion);
-    return;
-  }
-  if (event.data.type === 'export-save') {
-    const message: WorkerSaveMessage = {
-      type: 'save-data',
-      requestId: event.data.requestId,
-      data: world.exportSaveData(),
-    };
-    scope.postMessage(message);
-    return;
-  }
-  world.handle(event.data);
-  if (event.data.type === 'pointer-move' || event.data.type === 'probe') {
-    interactiveMotionDirty = true;
-  } else {
-    publish();
+  try {
+    if (event.data.type === 'connect-telemetry') {
+      snapshotTelemetry = new SharedTelemetryWriter(event.data.snapshot);
+      motionTelemetry = new SharedTelemetryWriter(event.data.motion);
+      binaryMotionTelemetry = new SharedMotionWriter(event.data.binaryMotion);
+      if (snapshotResizeRetryTimer !== null) {
+        clearTimeout(snapshotResizeRetryTimer);
+        snapshotResizeRetryTimer = null;
+      }
+      snapshotResizePending = false;
+      attemptSnapshotPublication();
+      return;
+    }
+    if (event.data.type === 'export-save') {
+      const message: WorkerSaveMessage = {
+        type: 'save-data',
+        requestId: event.data.requestId,
+        data: world.exportSaveData(),
+      };
+      scope.postMessage(message);
+      return;
+    }
+    world.handle(event.data);
+    if (event.data.type === 'pointer-move' || event.data.type === 'probe') {
+      interactiveMotionDirty = true;
+    } else {
+      publish();
+    }
+  } catch (error) {
+    postWorkerFault(
+      event.data.type === 'export-save' ? 'export-save' : 'command',
+      error,
+    );
   }
 });
 
@@ -247,39 +226,50 @@ scope.addEventListener('message', (event: MessageEvent<WorkerCommand>) => {
  * yields so commands and the independent 30 Hz motion publisher keep running.
  */
 const scheduleSimulation = (): void => {
-  const taskStartedAtMs = performance.now();
-  const elapsedSeconds = (taskStartedAtMs - lastSchedulerAtMs) / 1000;
-  lastSchedulerAtMs = taskStartedAtMs;
-  pendingRealSeconds = addPendingWorkerTime(pendingRealSeconds, elapsedSeconds);
+  let nextDelayMs = WORKER_SIMULATION_QUANTUM_SECONDS * 1000;
+  try {
+    const taskStartedAtMs = performance.now();
+    const elapsedSeconds = (taskStartedAtMs - lastSchedulerAtMs) / 1000;
+    lastSchedulerAtMs = taskStartedAtMs;
+    pendingRealSeconds = addPendingWorkerTime(pendingRealSeconds, elapsedSeconds);
 
-  const quantum = takeWorkerSimulationQuantum(pendingRealSeconds);
-  if (quantum) {
-    pendingRealSeconds = quantum.remainingSeconds;
-    if (world.tick(quantum.deltaSeconds)) {
-      publish();
+    const quantum = takeWorkerSimulationQuantum(pendingRealSeconds);
+    if (quantum) {
+      pendingRealSeconds = quantum.remainingSeconds;
+      if (world.tick(quantum.deltaSeconds)) {
+        publish();
+      }
+      const taskFinishedAtMs = performance.now();
+      const continuation = planWorkerContinuation(
+        pendingRealSeconds,
+        taskFinishedAtMs - taskStartedAtMs,
+        consecutiveImmediateCatchUps,
+      );
+      pendingRealSeconds = continuation.pendingSeconds;
+      consecutiveImmediateCatchUps =
+        continuation.consecutiveImmediateCatchUps;
+      if (continuation.rebaseClock) {
+        lastSchedulerAtMs = taskFinishedAtMs;
+      }
+      nextDelayMs = continuation.delayMs;
+    } else {
+      consecutiveImmediateCatchUps = 0;
+      nextDelayMs = Math.max(
+        1,
+        (WORKER_SIMULATION_QUANTUM_SECONDS - pendingRealSeconds) * 1000,
+      );
     }
-    const taskFinishedAtMs = performance.now();
-    const continuation = planWorkerContinuation(
-      pendingRealSeconds,
-      taskFinishedAtMs - taskStartedAtMs,
-      consecutiveImmediateCatchUps,
-    );
-    pendingRealSeconds = continuation.pendingSeconds;
-    consecutiveImmediateCatchUps =
-      continuation.consecutiveImmediateCatchUps;
-    if (continuation.rebaseClock) {
-      lastSchedulerAtMs = taskFinishedAtMs;
-    }
-    setTimeout(scheduleSimulation, continuation.delayMs);
-    return;
+  } catch (error) {
+    // One model exception must not kill the only recurring scheduler callback.
+    // Drop accumulated catch-up debt, report the fault, and leave the worker
+    // event loop responsive to pause/reset/speed commands.
+    pendingRealSeconds = 0;
+    consecutiveImmediateCatchUps = 0;
+    lastSchedulerAtMs = performance.now();
+    nextDelayMs = 1_000;
+    postWorkerFault('simulation-tick', error);
   }
-
-  consecutiveImmediateCatchUps = 0;
-  const waitMs = Math.max(
-    1,
-    (WORKER_SIMULATION_QUANTUM_SECONDS - pendingRealSeconds) * 1000,
-  );
-  setTimeout(scheduleSimulation, waitMs);
+  setTimeout(scheduleSimulation, nextDelayMs);
 };
 
 setTimeout(() => {
@@ -293,9 +283,13 @@ setTimeout(() => {
 // from full snapshots: a full ecology publication must not create a missing or
 // short motion interval, and simulation speed must not alter presentation FPS.
 setInterval(() => {
-  if (!world.hasActiveMotion() && !interactiveMotionDirty) return;
-  interactiveMotionDirty = false;
-  publishMotion();
+  try {
+    if (!world.hasActiveMotion() && !interactiveMotionDirty) return;
+    interactiveMotionDirty = false;
+    publishMotion();
+  } catch (error) {
+    postWorkerFault('command', error);
+  }
 }, MOTION_SAMPLE_INTERVAL_MS);
 
 // The renderer always sends an explicit initialize command. Publishing the

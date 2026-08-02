@@ -19,12 +19,15 @@ interface ReproductionAnimalState {
   speciesId: AnimalSpeciesId;
   position: Vec2;
   velocity: Vec2;
+  facing: -1 | 1;
+  targetAnimalId: string | null;
   targetCellId: string | null;
   behavior: string;
   behaviorTimer: number;
   nextTargetEvaluation: number;
   lifeStage: 'juvenile' | 'adult' | 'egg';
   grazingSessionIntake: number;
+  grazingSessionSeconds?: number;
   sex: 'female' | 'male';
   energy: number;
   recentIntake: number;
@@ -232,6 +235,90 @@ const moveShrimpWithNeighbor = (
 };
 
 describe('shrimp population safety contract', () => {
+  it('keeps a ready female from chasing or shaking while contact remains local', () => {
+    const world = new SimulationWorld('laboratory');
+    placeShrimp(world, { x: 600, y: 300 });
+    placeShrimp(world, { x: 604, y: 300 });
+    const internals = reproductionInternals(world);
+    const female = internals.animals[0];
+    const male = internals.animals[1];
+    female.sex = 'female';
+    female.position = { x: 600, y: 300 };
+    female.velocity = { x: 0, y: 0 };
+    female.facing = 1;
+    female.energy = 0.9;
+    female.ovarianProgress = 1;
+    female.reproductiveBiomass = 1;
+    female.gestationRemaining = null;
+    female.reproductionCooldown = 0;
+    female.behavior = 'resting';
+    female.behaviorTimer = 0;
+    female.nextTargetEvaluation = 0;
+    female.targetCellId = null;
+    female.targetAnimalId = null;
+    male.sex = 'male';
+    male.position = { x: 604, y: 300 };
+    male.velocity = { x: 0, y: 0 };
+    male.energy = 0.9;
+    male.reproductionCooldown = 0;
+    male.behavior = 'resting';
+    male.behaviorTimer = 100;
+    male.targetCellId = null;
+
+    let facingChanges = 0;
+    let previousFacing = female.facing;
+    for (let step = 0; step < 80; step += 1) {
+      // 0.1 s is the actual 32x/64x steering step, where the old fixed-speed
+      // close approach made the left/right reversal most obvious.
+      internals.stepAnimalMotion(0.1);
+      if (female.facing !== previousFacing) facingChanges += 1;
+      previousFacing = female.facing;
+    }
+    const finalDistance = Math.hypot(
+      female.position.x - male.position.x,
+      female.position.y - male.position.y,
+    );
+
+    expect(facingChanges).toBeLessThanOrEqual(1);
+    expect(finalDistance).toBeLessThan(36);
+    expect(female.targetAnimalId).toBeNull();
+  });
+
+  it('does not assign a ready female a global male target as proximity changes', () => {
+    const world = new SimulationWorld('laboratory');
+    for (const x of [600, 620, 660]) {
+      placeShrimp(world, { x, y: 300 });
+    }
+    const internals = reproductionInternals(world);
+    const [female, firstMale, secondMale] = internals.animals;
+    female.sex = 'female';
+    female.position = { x: 600, y: 300 };
+    female.energy = 0.9;
+    female.ovarianProgress = 1;
+    female.reproductiveBiomass = 1;
+    female.gestationRemaining = null;
+    female.reproductionCooldown = 0;
+    female.targetAnimalId = null;
+    for (const [index, male] of [firstMale, secondMale].entries()) {
+      male.sex = 'male';
+      male.position = { x: index === 0 ? 620 : 660, y: 300 };
+      male.energy = 0.9;
+      male.reproductionCooldown = 0;
+      male.behavior = 'resting';
+      male.behaviorTimer = 100;
+      male.targetCellId = null;
+    }
+
+    internals.stepAnimalMotion(0.1);
+    expect(female.targetAnimalId).toBeNull();
+
+    firstMale.position = { x: 640, y: 300 };
+    secondMale.position = { x: 610, y: 300 };
+    internals.stepAnimalMotion(0.1);
+
+    expect(female.targetAnimalId).toBeNull();
+  });
+
   it('does not let unrelated Daphnia IDs change supplied shrimp traits', () => {
     const direct = new SimulationWorld('mission-7');
     placeShrimp(direct, { x: 420, y: 610 });
@@ -352,16 +439,15 @@ describe('shrimp population safety contract', () => {
     ).toBe(true);
   });
 
-  it('selects the nearest eligible male without allocating a sorted candidate list', () => {
+  it('makes a ready female emit while an eligible male follows the local cue', () => {
     const world = new SimulationWorld('laboratory');
-    for (let index = 0; index < 4; index += 1) {
-      placeShrimp(world, { x: 300 + index * 120, y: 300 });
-    }
+    placeShrimp(world, { x: 500, y: 300 });
+    placeShrimp(world, { x: 600, y: 300 });
     const internals = reproductionInternals(world);
     const female = internals.animals.find((animal) => animal.sex === 'female');
-    const males = internals.animals.filter((animal) => animal.sex === 'male');
-    if (!female || males.length < 2) {
-      throw new Error('nearest-mate fixture needs one female and two males');
+    const male = internals.animals.find((animal) => animal.sex === 'male');
+    if (!female || !male) {
+      throw new Error('mate-cue fixture needs one female and one male');
     }
 
     for (const animal of internals.animals) {
@@ -377,14 +463,64 @@ describe('shrimp population safety contract', () => {
     female.ovarianProgress = 1;
     female.reproductiveBiomass = 1;
     female.gestationRemaining = null;
-    males[0].position = { x: 700, y: 300 };
-    males[1].position = { x: 580, y: 300 };
+    male.position = { x: 500, y: 300 };
+    for (let second = 0; second < 12; second += 1) {
+      internals.biogeochemistry.advance(1, [], [{
+        point: female.position,
+        strength: 1,
+      }]);
+    }
+
+    const femaleStartX = female.position.x;
+    const maleStartX = male.position.x;
+    internals.stepAnimalMotion(0.1);
+
+    expect(female.targetAnimalId).toBeNull();
+    expect(female.position.x).toBe(femaleStartX);
+    expect(male.targetAnimalId).toBeNull();
+    expect(male.position.x).toBeGreaterThan(maleStartX);
+  });
+
+  it('keeps a nutritionally foraging male on food instead of diverting him to a mate plume', () => {
+    const world = new SimulationWorld('laboratory');
+    placeShrimp(world, { x: 600, y: 621 });
+    const internals = reproductionInternals(world);
+    const male = internals.animals[0];
+    const foodCell = internals.allCells()
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((left, right) =>
+        Math.abs(left.x - 600) - Math.abs(right.x - 600))[0];
+    if (!male || !foodCell) {
+      throw new Error('male foraging fixture needs a shrimp and substrate');
+    }
+
+    male.lifeStage = 'adult';
+    male.sex = 'male';
+    male.structuralBiomass = 1;
+    // Sixteen percent of the adult reserve is just above the courtship floor,
+    // but remains below the foraging hysteresis stop condition.
+    male.storedBiomass = 0.0096;
+    male.energy = 0.3952;
+    male.reproductionCooldown = 0;
+    male.position = internals.shrimpSurfaceContactPoint(foodCell);
+    male.behavior = 'exploring';
+    male.behaviorTimer = 0;
+    male.nextTargetEvaluation = 0;
+    male.targetCellId = null;
+    foodCell.biomass.nitzschia = 0.2;
+
+    const mateCuePoint = { x: foodCell.x + 100, y: foodCell.y };
+    for (let second = 0; second < 45; second += 1) {
+      internals.biogeochemistry.advance(1, [], [{
+        point: mateCuePoint,
+        strength: 1,
+      }]);
+    }
 
     internals.stepAnimalMotion(0.1);
 
-    expect(female.behavior).toBe('courting');
-    expect(female.velocity.x).toBeLessThan(0);
-    expect(female.position.x).toBeLessThan(600);
+    expect(male.targetCellId).toBe(foodCell.id);
+    expect(male.behavior).toBe('grazing');
   });
 
   it('derives condition from conserved body matter instead of killing on a stale hunger value', () => {
@@ -476,7 +612,8 @@ describe('shrimp population safety contract', () => {
     internals.stepAnimalEcology(1);
 
     expect(female.reproductiveBiomass).toBe(0);
-    expect(female.matingAccumulator).toBe(0);
+    expect(female.gestationRemaining).toBeNull();
+    expect(world.snapshot().animalPopulation[SHRIMP].total).toBe(2);
   });
 
   it('lets a funded pair mate and develop embryos across independent feeding gaps', () => {
@@ -485,13 +622,17 @@ describe('shrimp population safety contract', () => {
     const female = internals.animals.find((animal) => animal.sex === 'female');
     const male = internals.animals.find((animal) => animal.sex === 'male');
     if (!female || !male) throw new Error('funded fixture needs both sexes');
-    female.storedBiomass = 0.5;
-    female.reproductiveBiomass = 0.5;
+    // A ready full-sized female is left at the real 1.2%-of-structure
+    // protected reserve after paying the three-token brood (0.0525 B). That
+    // reserve must remain above the mating condition gate without relying on
+    // the former oversized hidden store.
+    female.storedBiomass = 0.012;
+    female.reproductiveBiomass = 0.053;
     female.recentIntake = 0;
-    male.storedBiomass = 0.5;
+    male.storedBiomass = 0.012;
     male.recentIntake = 0;
 
-    for (let second = 0; second < 3; second += 1) {
+    for (let second = 0; second < 5; second += 1) {
       internals.stepAnimalEcology(1);
     }
     expect(female.gestationRemaining).not.toBeNull();
@@ -575,7 +716,7 @@ describe('shrimp population safety contract', () => {
     expect(internals.chooseFoodTarget(shrimp)).not.toBeNull();
   });
 
-  it('prefers a locally sensed viable colony over a microscopic film underfoot', () => {
+  it('samples a microscopic film underfoot instead of knowing a richer cell remotely', () => {
     const world = new SimulationWorld('laboratory');
     placeShrimp(world, { x: 600, y: 621 });
     const internals = reproductionInternals(world);
@@ -597,10 +738,62 @@ describe('shrimp population safety contract', () => {
     shrimp.position = internals.shrimpSurfaceContactPoint(trace);
     shrimp.energy = 0.1;
 
+    expect(internals.chooseFoodTarget(shrimp)?.id).toBe(trace.id);
+
+    // After the poor patch has actually been sampled and left, the short
+    // revisit memory allows the stronger nearby cue to guide the next choice.
+    (
+      shrimp as ReproductionAnimalState & {
+        recentGrazingCellId?: string | null;
+        recentGrazingCellCooldown?: number;
+      }
+    ).recentGrazingCellId = trace.id;
+    (
+      shrimp as ReproductionAnimalState & {
+        recentGrazingCellCooldown?: number;
+      }
+    ).recentGrazingCellCooldown = 10;
     expect(internals.chooseFoodTarget(shrimp)?.id).toBe(colony.id);
   });
 
-  it('samples but leaves a trace film that cannot pay grazing metabolism', () => {
+  it('does not let growth or ovarian state reveal a better remote food cell', () => {
+    const world = new SimulationWorld('laboratory');
+    placeShrimp(world, { x: 600, y: 621 });
+    const internals = reproductionInternals(world);
+    const shrimp = internals.animals[0];
+    const substrate = internals.allCells()
+      .filter((cell) => cell.surfaceKind === 'substrate')
+      .sort((left, right) => left.x - right.x);
+    const near = substrate.reduce((best, cell) =>
+      Math.abs(cell.x - 600) < Math.abs(best.x - 600) ? cell : best
+    );
+    const far = substrate.reduce((best, cell) =>
+      Math.abs(cell.x - (near.x - 42)) <
+        Math.abs(best.x - (near.x - 42))
+        ? cell
+        : best
+    );
+    near.biomass.nitzschia = 0.18;
+    far.biomass.nitzschia = 0.42;
+    shrimp.position = internals.shrimpSurfaceContactPoint(near);
+    shrimp.energy = 0.1;
+
+    shrimp.lifeStage = 'juvenile';
+    const juvenileTarget = internals.chooseFoodTarget(shrimp)?.id;
+    shrimp.lifeStage = 'adult';
+    shrimp.sex = 'female';
+    shrimp.ovarianProgress = 1;
+    shrimp.reproductiveBiomass = 0;
+    const reproductiveFemaleTarget = internals.chooseFoodTarget(shrimp)?.id;
+    shrimp.sex = 'male';
+    shrimp.ovarianProgress = 0;
+    const adultMaleTarget = internals.chooseFoodTarget(shrimp)?.id;
+
+    expect(reproductiveFemaleTarget).toBe(juvenileTarget);
+    expect(adultMaleTarget).toBe(juvenileTarget);
+  });
+
+  it('samples but leaves a trace film whose realised intake cannot pay grazing metabolism', () => {
     const world = new SimulationWorld('laboratory');
     placeShrimp(world, { x: 600, y: 621 });
     const internals = reproductionInternals(world);
@@ -614,8 +807,9 @@ describe('shrimp population safety contract', () => {
     shrimp.position = internals.shrimpSurfaceContactPoint(trace);
     shrimp.targetCellId = trace.id;
     shrimp.behavior = 'grazing';
-    shrimp.behaviorTimer = 0;
+    shrimp.behaviorTimer = 10;
     shrimp.grazingSessionIntake = 0;
+    shrimp.grazingSessionSeconds = 3.1;
     shrimp.energy = 0.1;
 
     internals.stepAnimalMotion(0.25);

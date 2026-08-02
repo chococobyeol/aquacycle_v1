@@ -35,9 +35,11 @@ const sampleAt = (
   return {
     time,
     daphniaCount: 36 + (index % 5) - 2,
+    daphniaAdultCount: 14 + (index % 3) - 1,
     phytoplanktonBiomass:
       phytoplanktonCycle[index % phytoplanktonCycle.length]!,
     shrimpCount: 7,
+    shrimpAdultCount: 5,
     vallisneriaRunnerCount: 5,
     decomposerBiomass: 0.4,
     nitrifierBiomass: 0.35,
@@ -66,11 +68,15 @@ const passingEvidence = (): Mission7AcceptanceEvidence => ({
     event('daphnia', 'matured', 6_600),
     event('daphnia', 'death', 5_600, 'old-age'),
     event('daphnia', 'death', 6_900, 'old-age'),
+    event('daphnia', 'birth', 8_000),
+    event('daphnia', 'matured', 8_600),
     event('cherry-shrimp', 'birth', 4_000),
     event('cherry-shrimp', 'birth', 5_200),
     event('cherry-shrimp', 'matured', 4_900),
     event('cherry-shrimp', 'matured', 6_300),
     event('cherry-shrimp', 'death', 6_000, 'old-age'),
+    event('cherry-shrimp', 'birth', 8_200),
+    event('cherry-shrimp', 'matured', 9_000),
   ],
   final: {
     outcome: 'success',
@@ -229,7 +235,7 @@ describe('mission 7 shared long-run acceptance contract', () => {
     );
 
     expect(report.passed).toBe(true);
-    expect(report.checks).toHaveLength(12);
+    expect(report.checks).toHaveLength(15);
     expect(report.checks.every((check) => check.passed)).toBe(true);
     expect(report.ricefishPredationLoad).toBe('not-verified');
   });
@@ -273,6 +279,147 @@ describe('mission 7 shared long-run acceptance contract', () => {
     expect(failed).toContain('phytoplankton-recovery');
     expect(failed).toContain('vallisneria-generation');
     expect(failed).toContain('shrimp-generation');
+  });
+
+  it('rejects a grow-then-terminal shrimp decline despite a neutral full-tail slope', () => {
+    const evidence = passingEvidence();
+    const tail = evidence.samples.filter(
+      (sample) =>
+        sample.time >= MISSION7_LONG_RUN_ACCEPTANCE.tailStartSeconds,
+    );
+    evidence.samples = evidence.samples.map((sample) => {
+      const tailIndex = tail.findIndex(
+        (candidate) => candidate.time === sample.time,
+      );
+      if (tailIndex < 0) return sample;
+      const distanceFromPeak = Math.abs(tailIndex - 30);
+      return {
+        ...sample,
+        shrimpCount: 4 + Math.round(
+          16 * (1 - distanceFromPeak / 30),
+        ),
+        shrimpAdultCount: 1 + Math.round(
+          7 * (1 - distanceFromPeak / 30),
+        ),
+      };
+    });
+
+    const report = evaluateMission7Acceptance(
+      'full-stock-stress',
+      evidence,
+    );
+
+    expect(report.checks.find(
+      (check) => check.id === 'shrimp-generation',
+    )?.passed).toBe(true);
+    expect(report.checks.find(
+      (check) => check.id === 'shrimp-trajectory',
+    )?.passed).toBe(false);
+  });
+
+  it('rejects a late Daphnia decline while observed density floors still pass', () => {
+    const evidence = passingEvidence();
+    const tail = evidence.samples.filter(
+      (sample) =>
+        sample.time >= MISSION7_LONG_RUN_ACCEPTANCE.tailStartSeconds,
+    );
+    evidence.samples = evidence.samples.map((sample) => {
+      const tailIndex = tail.findIndex(
+        (candidate) => candidate.time === sample.time,
+      );
+      if (tailIndex < 0) return sample;
+      const distanceFromPeak = Math.abs(tailIndex - 30);
+      return {
+        ...sample,
+        daphniaCount: 20 + Math.round(
+          80 * (1 - distanceFromPeak / 30),
+        ),
+        daphniaAdultCount: 1 + Math.round(
+          39 * (1 - distanceFromPeak / 30),
+        ),
+      };
+    });
+
+    const report = evaluateMission7Acceptance(
+      'starter-only-minimal',
+      evidence,
+    );
+
+    expect(report.checks.find(
+      (check) => check.id === 'daphnia-density',
+    )?.passed).toBe(true);
+    expect(report.checks.find(
+      (check) => check.id === 'daphnia-generation',
+    )?.passed).toBe(true);
+    expect(report.checks.find(
+      (check) => check.id === 'daphnia-trajectory',
+    )?.passed).toBe(false);
+  });
+
+  it('keeps mortality ratios diagnostic when recruitment and trajectories are healthy', () => {
+    const evidence = passingEvidence();
+    evidence.events = evidence.events
+      .filter((candidate) => candidate.kind !== 'death')
+      .concat([
+        event('daphnia', 'death', 8_100, 'starvation'),
+        event('daphnia', 'death', 8_200, 'starvation'),
+        event('cherry-shrimp', 'death', 8_300, 'starvation'),
+        event('cherry-shrimp', 'death', 8_400, 'starvation'),
+      ]);
+
+    const report = evaluateMission7Acceptance(
+      'full-stock-stress',
+      evidence,
+    );
+
+    expect(report.passed).toBe(true);
+    expect(report.checks.find(
+      (check) => check.id === 'daphnia-deaths',
+    )?.passed).toBe(true);
+    expect(report.checks.find(
+      (check) => check.id === 'shrimp-deaths',
+    )?.passed).toBe(true);
+    expect(report.observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'daphnia-death-composition',
+        level: 'warning',
+      }),
+      expect.objectContaining({
+        id: 'shrimp-death-composition',
+        level: 'warning',
+      }),
+    ]));
+  });
+
+  it('rejects a recent water decline before any sampled threshold is crossed', () => {
+    const evidence = passingEvidence();
+    const tail = evidence.samples.filter(
+      (sample) =>
+        sample.time >= MISSION7_LONG_RUN_ACCEPTANCE.tailStartSeconds,
+    );
+    evidence.samples = evidence.samples.map((sample) => {
+      const tailIndex = tail.findIndex(
+        (candidate) => candidate.time === sample.time,
+      );
+      if (tailIndex < 0) return sample;
+      const distanceFromPeak = Math.abs(tailIndex - 30);
+      return {
+        ...sample,
+        oxygen: 31 + 49 * (1 - distanceFromPeak / 30),
+      };
+    });
+
+    const report = evaluateMission7Acceptance(
+      'starter-only-minimal',
+      evidence,
+    );
+
+    expect(report.checks.find(
+      (check) => check.id === 'water-quality',
+    )?.passed).toBe(true);
+    expect(report.checks.find(
+      (check) => check.id === 'water-trajectory',
+    )?.passed).toBe(false);
   });
 
   it('fails hidden loss of a microbe guild, unsafe water, or a ledger leak', () => {

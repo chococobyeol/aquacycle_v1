@@ -9,10 +9,12 @@ import {
 } from '../src/renderer/tank/tankVisualGeometry';
 import {
   canPanTankCamera,
+  cameraStateFromStoredTransform,
   clampTankInteractionPoint,
   containTankScale,
   coverTankScale,
   fitTankZoom,
+  freshTankCameraState,
   minimumTankZoom,
   isScreenDrag,
   isTankInteractionPoint,
@@ -20,6 +22,7 @@ import {
   tankCameraCenterBounds,
   TANK_INTERACTION_LEFT,
   TANK_INTERACTION_RIGHT,
+  wheelZoomTarget,
 } from '../src/renderer/tank/cameraInteraction';
 
 describe('aquarium camera interactions', () => {
@@ -56,6 +59,17 @@ describe('aquarium camera interactions', () => {
 
     expect(fitTankZoom(1920, 1080)).toBeCloseTo((1080 / CAMERA_SCENE_HEIGHT) / (1920 / CAMERA_SCENE_WIDTH));
     expect(fitTankZoom(CAMERA_SCENE_WIDTH, CAMERA_SCENE_HEIGHT)).toBe(1);
+  });
+
+  it('opens a fresh mission with the complete tank fitted to the viewport', () => {
+    const width = 1920;
+    const height = 1080;
+    const camera = freshTankCameraState(width, height);
+
+    expect(camera.zoom).toBe(fitTankZoom(width, height));
+    expect(camera.zoom).toBeLessThan(1);
+    expect(camera.centerX).toBe(CAMERA_SCENE_CENTER_X);
+    expect(camera.centerY).toBe(CAMERA_SCENE_CENTER_Y);
   });
 
   it('guards invalid viewport sizes when deriving the fit zoom', () => {
@@ -123,5 +137,42 @@ describe('aquarium camera interactions', () => {
     expect(shouldStartCameraPan(0, false, true)).toBe(false);
     expect(shouldStartCameraPan(1, false, false)).toBe(false);
     expect(shouldStartCameraPan(2, true, true)).toBe(false);
+  });
+
+  it('keeps one wheel event from jumping across most of the zoom range', () => {
+    expect(wheelZoomTarget(0.87, -800, 0, 720)).toBeCloseTo(
+      0.87 * Math.exp(0.12),
+    );
+    expect(wheelZoomTarget(1, 3, 1, 720)).toBeCloseTo(
+      Math.exp(-48 * 0.0012),
+    );
+    expect(wheelZoomTarget(1, -1, 2, 720)).toBeCloseTo(
+      Math.exp(0.12),
+    );
+  });
+
+  it('restores the exact zoom and world center from a staged renderer transform', () => {
+    const restored = cameraStateFromStoredTransform({
+      zoom: 1.75,
+      scale: 2.4,
+      offsetX: -820,
+      offsetY: -390,
+      viewportWidth: 1200,
+      viewportHeight: 720,
+    });
+
+    expect(restored).toEqual({
+      zoom: 1.75,
+      centerX: (600 + 820) / 2.4,
+      centerY: (360 + 390) / 2.4,
+    });
+    expect(cameraStateFromStoredTransform({
+      zoom: 1,
+      scale: 0,
+      offsetX: 0,
+      offsetY: 0,
+      viewportWidth: 1200,
+      viewportHeight: 720,
+    })).toBeNull();
   });
 });

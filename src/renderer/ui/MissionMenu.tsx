@@ -126,6 +126,23 @@ const MISSION_CARDS: readonly MissionCardDefinition[] = [
       </>
     ),
   },
+  {
+    id: 'mission-8',
+    stamp: '실험 8',
+    className: 'mission-eight',
+    title: '긴 수조의 송사리',
+    description: '긴 수조에서 돌 틈 피난처를 만들고 포식자가 합류한 먹이망을 관찰하세요.',
+    tags: '긴 수조 · 송사리 · 피난처 · 몸집별 접근',
+    illustrationClassName: 'ricefish-foodweb',
+    illustration: (
+      <>
+        <i className="mini-ricefish" />
+        <i className="mini-fry" />
+        <i className="mini-vallisneria" />
+        <i className="mini-shrimp-water" />
+      </>
+    ),
+  },
 ];
 export const MISSION_IDS: readonly MissionId[] = MISSION_CARDS.map(({ id }) => id);
 

@@ -5,6 +5,7 @@ import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiome
 import {
   GROUND_Y,
   WATER_TOP,
+  type AnimalSex,
   type MicrobeGuildId,
   type SpeciesId,
   type SurfaceCellSnapshot,
@@ -16,8 +17,12 @@ const placeSeed = (world: SimulationWorld, speciesId: SpeciesId, point: Vec2): v
   world.handle({ type: 'drop-held', point });
 };
 
-const placeShrimp = (world: SimulationWorld, point: Vec2): void => {
-  world.handle({ type: 'pick-animal', speciesId: 'cherry-shrimp', point });
+const placeShrimp = (
+  world: SimulationWorld,
+  point: Vec2,
+  sex?: AnimalSex,
+): void => {
+  world.handle({ type: 'pick-animal', speciesId: 'cherry-shrimp', sex, point });
   world.handle({ type: 'drop-held', point });
 };
 
@@ -119,6 +124,42 @@ const inoculateBestSurfaces = (
 };
 
 describe('mission 5 microbial cycle', () => {
+  it('stocks the exact selected shrimp sex and enforces separate 2+2 limits', () => {
+    const world = new SimulationWorld('mission-5');
+    expect(world.snapshot().remainingAnimalSexes['cherry-shrimp']).toEqual({
+      female: 2,
+      male: 2,
+    });
+
+    placeShrimp(world, { x: 420, y: 520 }, 'female');
+    placeShrimp(world, { x: 500, y: 520 }, 'female');
+    expect(world.snapshot().animals.map((animal) => animal.sex)).toEqual([
+      'female',
+      'female',
+    ]);
+    expect(world.snapshot().remainingAnimalSexes['cherry-shrimp']).toEqual({
+      female: 0,
+      male: 2,
+    });
+
+    world.handle({
+      type: 'pick-animal',
+      speciesId: 'cherry-shrimp',
+      sex: 'female',
+      point: { x: 580, y: 520 },
+    });
+    expect(world.snapshot().holding).toBeNull();
+
+    placeShrimp(world, { x: 660, y: 520 }, 'male');
+    placeShrimp(world, { x: 740, y: 520 }, 'male');
+    expect(world.snapshot().animalPopulation['cherry-shrimp']).toMatchObject({
+      adultFemales: 2,
+      adultMales: 2,
+      total: 4,
+    });
+    expect(world.snapshot().remainingAnimals['cherry-shrimp']).toBe(0);
+  });
+
   it('does not erase local ammonium merely by inoculating algae', () => {
     const world = new SimulationWorld('mission-5');
     const cell = [...world.snapshot().cells]
@@ -138,7 +179,7 @@ describe('mission 5 microbial cycle', () => {
     expect(afterOneSecond).toBeLessThanOrEqual(before);
   });
 
-  it('keeps ordinary layout editing locked while allowing paused biofilm inoculation', () => {
+  it('keeps structures locked while allowing paused biological stocking', () => {
     const world = new SimulationWorld('mission-5');
     world.handle({ type: 'start' });
     world.handle({ type: 'pick-biofilm', guildId: 'decomposer', point: { x: 600, y: 630 } });
@@ -148,7 +189,21 @@ describe('mission 5 microbial cycle', () => {
     world.handle({ type: 'pick-structure', definitionId: 'flat-stone', point: { x: 600, y: 400 } });
     expect(world.snapshot().holding).toBeNull();
     world.handle({ type: 'pick-seed', speciesId: 'oedogonium', point: { x: 600, y: 630 } });
-    expect(world.snapshot().holding).toBeNull();
+    expect(world.snapshot().holding).toMatchObject({
+      kind: 'seed',
+      speciesId: 'oedogonium',
+    });
+    world.handle({ type: 'cancel-held' });
+    world.handle({
+      type: 'pick-animal',
+      speciesId: 'cherry-shrimp',
+      point: { x: 600, y: 560 },
+    });
+    expect(world.snapshot().holding).toMatchObject({
+      kind: 'animal',
+      animalSpeciesId: 'cherry-shrimp',
+    });
+    world.handle({ type: 'cancel-held' });
 
     const point = world.snapshot().cells.find((cell) => cell.surfaceKind === 'substrate')!;
     world.handle({ type: 'pick-biofilm', guildId: 'decomposer', point });
@@ -179,36 +234,47 @@ describe('mission 5 microbial cycle', () => {
     expect(later.biogeochemistry.biofilmTotals.nitrifier).toBeLessThan(initial.nitrifier);
   });
 
-  it('scores only continuous shrimp-population survival, not a water-value range', () => {
+  it('scores the third tank-born generation instead of a short survival timer', () => {
     const world = new SimulationWorld('mission-5');
     populateTank(world);
     world.handle({ type: 'start' });
     const snapshot = advanceTo(world, 10);
 
     expect(snapshot.missionProgress).toMatchObject({
-      unit: 'population-count',
-      current: snapshot.animalPopulation['cherry-shrimp'].total,
-      target: 1,
-      holdTarget: 2_100,
+      unit: 'generation-count',
+      current: 0,
+      target: 20,
+      holdTarget: 0,
     });
-    expect(snapshot.missionProgress?.holdCurrent).toBeGreaterThan(0);
+    expect(snapshot.missionProgress?.holdCurrent).toBe(0);
   });
 
-  it('cannot sustain an untreated colony across multiple generations', () => {
+  it('limits each microbial inoculum to four placements', () => {
     const world = new SimulationWorld('mission-5');
-    populateTank(world);
+    const cells = world.snapshot().cells;
+    for (let index = 0; index < 4; index += 1) {
+      placeBiofilm(world, 'decomposer', cells[index]!);
+    }
+
+    expect(world.snapshot().remainingMicrobes.decomposer).toBe(0);
+    world.handle({ type: 'pick-biofilm', guildId: 'decomposer', point: cells[20]! });
+    expect(world.snapshot().holding).toBeNull();
+  });
+
+  it('lets unfed mission 5 shrimp exhaust their own matter and die', () => {
+    const world = new SimulationWorld('mission-5');
+    for (const x of [290, 430, 770, 910]) {
+      placeShrimp(world, { x, y: 600 });
+    }
     world.handle({ type: 'start' });
-    // A stage-separated adult lifespan means 2,400 seconds can end during a
-    // transient descendant pulse. Continue beyond that pulse so the assertion
-    // judges renewal, not the phase of one generation.
-    const final = advanceTo(world, 4_200);
+    const final = advanceTo(world, 3_200);
 
     expect(final.biogeochemistry.biofilmTotals.decomposer).toBe(0);
     expect(final.biogeochemistry.biofilmTotals.nitrifier).toBe(0);
-    // A lone old survivor is not a self-sustaining colony. Judge the actual
-    // population loss; the mission hold clock and outcome are UI state, not
-    // evidence that the ecology is or is not renewing.
-    expect(final.animalPopulation['cherry-shrimp'].total).toBeLessThan(4);
+    expect(final.totalBiomass.oedogonium + final.totalBiomass.nitzschia).toBe(0);
+    expect(final.animalPopulation['cherry-shrimp'].total).toBe(0);
+    expect(final.animalPopulationEventTotals.deathsByCause.starvation)
+      .toBeGreaterThan(0);
   }, 60_000);
 
   it('preserves the local water reading that caused a toxicity death', () => {
@@ -232,11 +298,11 @@ describe('mission 5 microbial cycle', () => {
     treated.handle({ type: 'start' });
     advanceTo(treated, 90);
     treated.handle({ type: 'pause' });
-    inoculateBestSurfaces(treated, 'decomposer', 10);
+    inoculateBestSurfaces(treated, 'decomposer', 4);
     treated.handle({ type: 'resume' });
     advanceTo(treated, 190);
     treated.handle({ type: 'pause' });
-    inoculateBestSurfaces(treated, 'nitrifier', 10);
+    inoculateBestSurfaces(treated, 'nitrifier', 4);
     treated.handle({ type: 'resume' });
     const samples = [280, 370, 460, 550, 640, 730, 820, 910, 1_000, 1_090, 1_180]
       .map((time) => advanceTo(treated, time));
@@ -247,6 +313,9 @@ describe('mission 5 microbial cycle', () => {
     const toxic = samples.map((sample) => sample.biogeochemistry.average.toxicWaste);
     const decomposers = samples.map((sample) => sample.biogeochemistry.biofilmTotals.decomposer);
     const nitrifiers = samples.map((sample) => sample.biogeochemistry.biofilmTotals.nitrifier);
+    const relativeRange = (values: number[]): number =>
+      range(values) /
+      Math.max(1e-9, values.reduce((sum, value) => sum + value, 0) / values.length);
 
     expect(treatedFinal.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
     expect(treatedFinal.biogeochemistry.biofilmTotals.decomposer).toBeGreaterThan(0);
@@ -255,10 +324,10 @@ describe('mission 5 microbial cycle', () => {
     expect(Math.min(...samples.map((sample) => sample.biogeochemistry.average.oxygen)))
       .toBeGreaterThan(30);
     expect(Math.max(...organics)).toBeLessThan(15);
-    expect(range(decomposers)).toBeGreaterThan(0.5);
-    expect(range(nitrifiers)).toBeGreaterThan(0.1);
+    expect(relativeRange(decomposers)).toBeGreaterThan(0.05);
+    expect(relativeRange(nitrifiers)).toBeGreaterThan(0.05);
     // A short window can sit on one side of a bounded slow organic orbit.
-    // Require active change here; the 7,200-second equilibrium test separately
+    // Require active change here; the 32,000-second equilibrium test separately
     // verifies a complete rise-and-fall cycle and late boundedness.
     expect(range(organics)).toBeGreaterThan(0.02);
     // Shared turbulent dispersion can place this short window on one side of
@@ -271,17 +340,17 @@ describe('mission 5 microbial cycle', () => {
       .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   }, 30_000);
 
-  it('lets a distributed established film process the local waste of ten adults', () => {
+  it('lets a distributed established film process the local waste of four adults', () => {
     const world = new SimulationWorld('mission-5');
-    populateTank(world, 10);
+    populateTank(world, 4);
     world.handle({ type: 'start' });
     advanceTo(world, 60);
     world.handle({ type: 'pause' });
-    inoculateBestSurfaces(world, 'decomposer', 14);
+    inoculateBestSurfaces(world, 'decomposer', 4);
     world.handle({ type: 'resume' });
     advanceTo(world, 120);
     world.handle({ type: 'pause' });
-    inoculateBestSurfaces(world, 'nitrifier', 16);
+    inoculateBestSurfaces(world, 'nitrifier', 4);
     world.handle({ type: 'resume' });
     const established = advanceTo(world, 600);
 

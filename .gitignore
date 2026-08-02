@@ -8,3 +8,5 @@ dist/
 *.tsbuildinfo
 /.codex-render-diagnostic.ts
 /index-*.js
+/tmp/
+/*_tmp.png

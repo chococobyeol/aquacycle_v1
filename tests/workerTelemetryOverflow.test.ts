@@ -12,6 +12,7 @@ import type {
   WorkerMotionMessage,
   WorkerMotionOverlayMessage,
   WorkerSnapshotMessage,
+  WorkerTelemetryResizeRequestMessage,
 } from '../src/simulation/types';
 
 interface WorkerHarness {
@@ -53,7 +54,7 @@ describe('worker oversized telemetry fallback', () => {
     vi.resetModules();
   });
 
-  it('coalesces an overflowing full snapshot and eventually publishes the latest state', async () => {
+  it('resizes fixed telemetry without structured-cloning an overflowing snapshot', async () => {
     vi.useFakeTimers();
     let revision = 0;
     let snapshotCalls = 0;
@@ -110,9 +111,10 @@ describe('worker oversized telemetry fallback', () => {
     harness.messages.length = 0;
     snapshotCalls = 0;
 
+    const undersizedChannel = createSharedTelemetryChannel(64);
     harness.dispatch({
       type: 'connect-telemetry',
-      snapshot: createSharedTelemetryChannel(64),
+      snapshot: undersizedChannel,
       motion: createSharedTelemetryChannel(64),
       binaryMotion: createSharedMotionChannel(),
     });
@@ -122,28 +124,43 @@ describe('worker oversized telemetry fallback', () => {
       harness.dispatch({ type: 'test-update', revision: nextRevision });
     }
 
-    const immediateSnapshots = harness.messages.filter(
+    const ordinarySnapshots = harness.messages.filter(
       (message): message is WorkerSnapshotMessage => message.type === 'snapshot',
     );
-    expect(immediateSnapshots).toHaveLength(1);
-    expect(immediateSnapshots[0].snapshot.revision).toBe(1);
-    // The 100 coalesced updates neither rebuild nor retry encoding the known
-    // oversized graph while the real-time fallback window is active.
-    expect(snapshotCalls).toBe(1);
-
-    await vi.advanceTimersByTimeAsync(999);
-    expect(snapshotCalls).toBe(1);
-    await vi.advanceTimersByTimeAsync(1);
-
-    const eventualSnapshots = harness.messages.filter(
-      (message): message is WorkerSnapshotMessage => message.type === 'snapshot',
+    expect(ordinarySnapshots).toHaveLength(0);
+    const resizeRequests = harness.messages.filter(
+      (message): message is WorkerTelemetryResizeRequestMessage =>
+        message.type === 'telemetry-resize-request',
     );
-    expect(eventualSnapshots).toHaveLength(2);
-    expect(eventualSnapshots[1].snapshot.revision).toBe(101);
+    expect(resizeRequests).toEqual([{
+      type: 'telemetry-resize-request',
+      stream: 'snapshot',
+      minimumPayloadBytes: 128,
+    }]);
+    // Commands remain responsive, but the known-oversized graph is not rebuilt
+    // or copied again while the renderer is replacing the fixed channel.
+    expect(snapshotCalls).toBe(1);
+
+    const resizedChannel = createSharedTelemetryChannel(4 * 1024);
+    const resizedReader =
+      new SharedTelemetryReader<WorkerSnapshotMessage>(resizedChannel);
+    harness.dispatch({
+      type: 'connect-telemetry',
+      snapshot: resizedChannel,
+      motion: createSharedTelemetryChannel(64),
+      binaryMotion: createSharedMotionChannel(),
+    });
+    expect(snapshotCalls).toBe(2);
+    expect(resizedReader.readLatest()).toMatchObject({
+      type: 'snapshot',
+      snapshot: { revision: 101 },
+    });
+
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(snapshotCalls).toBe(2);
   });
 
-  it('rate-limits binary overflow while preserving its trailing pose and small overlay', async () => {
+  it('keeps only the small overlay when binary motion exceeds capacity', async () => {
     vi.useFakeTimers();
     let activeMotion = true;
     let motionSnapshotCalls = 0;
@@ -196,9 +213,8 @@ describe('worker oversized telemetry fallback', () => {
       },
     }));
 
-    // Avoid cloning the deliberately oversized repeated array in the harness;
-    // real postMessage performs that clone, whose call frequency is what this
-    // regression test bounds.
+    // Keep message identity so an accidental giant ordinary fallback remains
+    // cheap enough for this regression harness to detect.
     const harness = await installWorkerHarness(false);
     const motionChannel = createSharedTelemetryChannel(4 * 1024);
     const overlayReader =
@@ -214,8 +230,8 @@ describe('worker oversized telemetry fallback', () => {
     const firstBurst = harness.messages.filter(
       (message): message is WorkerMotionMessage => message.type === 'motion',
     );
-    expect(firstBurst).toHaveLength(1);
-    expect(motionSnapshotCalls).toBe(1);
+    expect(firstBurst).toHaveLength(0);
+    expect(motionSnapshotCalls).toBe(0);
     const latestOverlay = overlayReader.readLatest();
     expect(latestOverlay).toMatchObject({
       type: 'motion-overlay',
@@ -226,19 +242,84 @@ describe('worker oversized telemetry fallback', () => {
     expect(latestOverlay).not.toHaveProperty('structures');
     expect(overlayReader.readLatest()).toBeNull();
 
-    // If motion stops inside the one-second backoff, the scheduled trailing
-    // publication must still deliver the latest rejected sequence.
+    // Oversized binary motion never falls back to a giant ordinary message.
+    // The bounded full snapshot stream remains the coarse visual fallback.
     activeMotion = false;
     await vi.advanceTimersByTimeAsync(1_000);
     const completedFallbacks = harness.messages.filter(
       (message): message is WorkerMotionMessage => message.type === 'motion',
     );
-    expect(completedFallbacks).toHaveLength(2);
-    expect(completedFallbacks[1].sequence).toBe(3);
-    expect(completedFallbacks[1].sequence).toBeGreaterThan(
-      completedFallbacks[0].sequence,
-    );
-    expect(completedFallbacks[1].sampledAtMs).toBeGreaterThanOrEqual(1_000);
-    expect(motionSnapshotCalls).toBe(2);
+    expect(completedFallbacks).toHaveLength(0);
+    expect(motionSnapshotCalls).toBe(0);
+  });
+
+  it('keeps the scheduler and command channel alive after a tick fault', async () => {
+    vi.useFakeTimers();
+    let tickCalls = 0;
+    const handledCommands: string[] = [];
+
+    vi.doMock('../src/simulation/SimulationWorld', () => ({
+      SimulationWorld: class {
+        public handle(command: { type: string }): void {
+          handledCommands.push(command.type);
+        }
+
+        public tick(): boolean {
+          tickCalls += 1;
+          if (tickCalls === 1) throw new Error('synthetic ecology fault');
+          return false;
+        }
+
+        public hasActiveMotion(): boolean {
+          return false;
+        }
+
+        public snapshot(reuse?: Record<string, unknown>): Record<string, unknown> {
+          return Object.assign(reuse ?? {}, {
+            scenarioId: 'laboratory',
+            revision: tickCalls,
+          });
+        }
+
+        public motionTransportSnapshot(reuse?: Record<string, unknown>): Record<string, unknown> {
+          return Object.assign(reuse ?? {}, {
+            structures: [],
+            animals: [],
+            holding: null,
+            probe: null,
+          });
+        }
+
+        public motionSnapshot(reuse?: Record<string, unknown>): Record<string, unknown> {
+          return this.motionTransportSnapshot(reuse);
+        }
+
+        public exportSaveData(): Record<string, never> {
+          return {};
+        }
+      },
+    }));
+
+    const harness = await installWorkerHarness();
+    harness.dispatch({
+      type: 'connect-telemetry',
+      snapshot: createSharedTelemetryChannel(4 * 1024),
+      motion: createSharedTelemetryChannel(4 * 1024),
+      binaryMotion: createSharedMotionChannel(),
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+    expect(tickCalls).toBe(1);
+    expect(harness.messages).toContainEqual(expect.objectContaining({
+      type: 'worker-fault',
+      operation: 'simulation-tick',
+      message: 'synthetic ecology fault',
+    }));
+
+    harness.dispatch({ type: 'set-speed', speed: 8 });
+    expect(handledCommands).toContain('set-speed');
+
+    await vi.advanceTimersByTimeAsync(1_010);
+    expect(tickCalls).toBeGreaterThan(1);
   });
 });

@@ -12,7 +12,12 @@ import {
   MISSION7_LONG_RUN_ACCEPTANCE,
   acuteWaterDeathCount,
   analyzeRecoveryOscillation,
+  recentHalf,
+  summarizeLinearTailTrend,
+  summarizePostTroughRecovery,
   summarizePopulationEvents,
+  sustainedProjectedCeilingBreach,
+  sustainedProjectedFloorBreach,
 } from './mission7LongRunAcceptance';
 import {
   VallisneriaLineageTracker,
@@ -176,6 +181,8 @@ interface LongRunSample {
   shrimpAdultFemales: number;
   shrimpAdultMales: number;
   shrimpBornDescendants: number;
+  shrimpMaximumLivingGeneration: number;
+  shrimpEdibleFood: number;
   shrimpFemaleMeanOvarianProgress: number;
   shrimpFemaleMeanReproductiveBiomass: number;
   shrimpReadyFemales: number;
@@ -231,6 +238,7 @@ const worldInternals = world as unknown as {
 };
 const observedAnimalEvents: AnimalPopulationEventSnapshot[] = [];
 const bornShrimpIds = new Set<string>();
+const shrimpGenerationById = new Map<string, number>();
 const lastShrimpForagingState = new Map<string, {
   time: number;
   behavior: string;
@@ -306,12 +314,28 @@ const captureAnimalEvents = (
       event.kind === 'birth'
     ) {
       bornShrimpIds.add(event.animalId);
+      shrimpGenerationById.set(
+        event.animalId,
+        (event.parentId
+          ? shrimpGenerationById.get(event.parentId) ?? 0
+          : 0) + 1,
+      );
+    } else if (
+      event.speciesId === 'cherry-shrimp' &&
+      !shrimpGenerationById.has(event.animalId)
+    ) {
+      shrimpGenerationById.set(event.animalId, 0);
     }
     lastObservedEventSequence = event.sequence;
   }
 };
 let nextSample = 0;
 let snapshot = world.snapshot();
+for (const animal of snapshot.animals) {
+  if (animal.speciesId === 'cherry-shrimp') {
+    shrimpGenerationById.set(animal.id, 0);
+  }
+}
 const vallisneriaLineage = new VallisneriaLineageTracker();
 vallisneriaLineage.observe(snapshot.plants);
 captureAnimalEvents(snapshot.animalPopulationEvents);
@@ -514,6 +538,16 @@ while (snapshot.elapsedSeconds < DURATION_SECONDS) {
     shrimpBornDescendants: livingShrimp.filter(
       (animal) => bornShrimpIds.has(animal.id),
     ).length,
+    shrimpMaximumLivingGeneration: Math.max(
+      0,
+      ...livingShrimp.map(
+        (animal) => shrimpGenerationById.get(animal.id) ?? 0,
+      ),
+    ),
+    shrimpEdibleFood: worldInternals.allCells().reduce(
+      (total, cell) => total + worldInternals.edibleBiomass(cell),
+      0,
+    ),
     shrimpFemaleMeanOvarianProgress: mean(
       savedShrimpFemales.map((animal) => animal.ovarianProgress ?? 0),
     ),
@@ -610,9 +644,22 @@ interface Check {
   passed: boolean;
   detail: string;
 }
+interface Observation {
+  label: string;
+  level: 'info' | 'warning';
+  detail: string;
+}
 const checks: Check[] = [];
+const observations: Observation[] = [];
 const check = (label: string, passed: boolean, detail: string): void => {
   checks.push({ label, passed, detail });
+};
+const observe = (
+  label: string,
+  level: Observation['level'],
+  detail: string,
+): void => {
+  observations.push({ label, level, detail });
 };
 const range = (values: number[]): [number, number] => [
   Math.min(...values),
@@ -621,6 +668,12 @@ const range = (values: number[]): [number, number] => [
 const mean = (values: number[]): number =>
   values.reduce((total, value) => total + value, 0) /
   Math.max(1, values.length);
+
+const seriesFromTail = (
+  select: (sample: LongRunSample) => number,
+): Array<{ time: number; value: number }> =>
+  tail.map((sample) => ({ time: sample.time, value: select(sample) }));
+
 const [daphniaMinimum, daphniaMaximum] = range(daphniaTail);
 const daphniaMean = mean(daphniaTail);
 const {
@@ -664,6 +717,117 @@ const vallisneriaMaximumLivingGeneration =
 const finalBornShrimp = finalShrimp.filter(
   (animal) => bornShrimpIds.has(animal.id),
 );
+const daphniaPopulationSeries = seriesFromTail((sample) => sample.daphnia);
+const daphniaAdultSeries = seriesFromTail((sample) => sample.daphniaAdults);
+const shrimpPopulationSeries = seriesFromTail((sample) => sample.shrimp);
+const shrimpAdultSeries = seriesFromTail((sample) => sample.shrimpAdults);
+const shrimpFoodSeries = seriesFromTail((sample) => sample.shrimpEdibleFood);
+const oxygenSeries = seriesFromTail((sample) => sample.oxygen);
+const toxicWasteSeries = seriesFromTail((sample) => sample.toxicWaste);
+const organicMatterSeries = seriesFromTail((sample) => sample.organicMatter);
+const daphniaPopulationTrend =
+  summarizeLinearTailTrend(daphniaPopulationSeries);
+const recentDaphniaPopulationTrend =
+  summarizeLinearTailTrend(recentHalf(daphniaPopulationSeries));
+const daphniaAdultTrend = summarizeLinearTailTrend(daphniaAdultSeries);
+const recentDaphniaAdultTrend =
+  summarizeLinearTailTrend(recentHalf(daphniaAdultSeries));
+const shrimpPopulationTrend =
+  summarizeLinearTailTrend(shrimpPopulationSeries);
+const recentShrimpPopulationTrend =
+  summarizeLinearTailTrend(recentHalf(shrimpPopulationSeries));
+const shrimpAdultTrend = summarizeLinearTailTrend(shrimpAdultSeries);
+const recentShrimpAdultTrend =
+  summarizeLinearTailTrend(recentHalf(shrimpAdultSeries));
+const shrimpFoodTrend = summarizeLinearTailTrend(shrimpFoodSeries);
+const recentShrimpFoodTrend =
+  summarizeLinearTailTrend(recentHalf(shrimpFoodSeries));
+const oxygenTrend = summarizeLinearTailTrend(oxygenSeries);
+const recentOxygenTrend =
+  summarizeLinearTailTrend(recentHalf(oxygenSeries));
+const toxicWasteTrend = summarizeLinearTailTrend(toxicWasteSeries);
+const recentToxicWasteTrend =
+  summarizeLinearTailTrend(recentHalf(toxicWasteSeries));
+const organicMatterTrend = summarizeLinearTailTrend(organicMatterSeries);
+const recentOrganicMatterTrend =
+  summarizeLinearTailTrend(recentHalf(organicMatterSeries));
+const daphniaPopulationProjectedCollapse = sustainedProjectedFloorBreach(
+  recentDaphniaPopulationTrend,
+  MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumCount,
+);
+const daphniaAdultProjectedCollapse = sustainedProjectedFloorBreach(
+  recentDaphniaAdultTrend,
+  1,
+);
+const shrimpPopulationProjectedCollapse = sustainedProjectedFloorBreach(
+  recentShrimpPopulationTrend,
+  MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumCount,
+);
+const shrimpAdultProjectedCollapse = sustainedProjectedFloorBreach(
+  recentShrimpAdultTrend,
+  1,
+);
+const waterProjectedUnsafe =
+  sustainedProjectedFloorBreach(
+    recentOxygenTrend,
+    MISSION7_LONG_RUN_ACCEPTANCE.water.minimumOxygen,
+  ) ||
+  sustainedProjectedCeilingBreach(
+    recentToxicWasteTrend,
+    MISSION7_LONG_RUN_ACCEPTANCE.water.maximumToxicWaste,
+  ) ||
+  sustainedProjectedCeilingBreach(
+    recentOrganicMatterTrend,
+    MISSION7_LONG_RUN_ACCEPTANCE.water.maximumOrganicMatter,
+  );
+const tailMidpointSeconds =
+  recentHalf(tail)[0]?.time ?? TAIL_START_SECONDS;
+const recentTailAnimalEvents = observedAnimalEvents.filter(
+  (event) => event.elapsedSeconds >= tailMidpointSeconds,
+);
+const recentTailDaphniaEvents = summarizePopulationEvents(
+  recentTailAnimalEvents,
+  'daphnia',
+);
+const recentTailShrimpEvents = summarizePopulationEvents(
+  recentTailAnimalEvents,
+  'cherry-shrimp',
+);
+const shrimpPostTroughRecovery = summarizePostTroughRecovery(
+  recentHalf(shrimpPopulationSeries),
+  observedAnimalEvents,
+  'cherry-shrimp',
+  {
+    populationFloor: MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumCount,
+    cohortStep: MISSION7_LONG_RUN_ACCEPTANCE.shrimp.recoveryCohortStep,
+    confirmationSeconds:
+      MISSION7_LONG_RUN_ACCEPTANCE.shrimp.recoveryConfirmationSeconds,
+  },
+);
+const shrimpRecoveryOverrideApplied =
+  (
+    shrimpPopulationProjectedCollapse ||
+    shrimpAdultProjectedCollapse
+  ) &&
+  shrimpPostTroughRecovery.confirmed;
+const finalShrimpMaximumGeneration = Math.max(
+  0,
+  ...finalShrimp.map(
+    (animal) => shrimpGenerationById.get(animal.id) ?? 0,
+  ),
+);
+const recentShrimpMaximumGeneration = Math.max(
+  0,
+  ...recentHalf(tail).map(
+    (sample) => sample.shrimpMaximumLivingGeneration,
+  ),
+);
+const shrimpFoodMinimum = Math.min(
+  ...tail.map((sample) => sample.shrimpEdibleFood),
+);
+const recentShrimpFoodMean = mean(
+  recentHalf(tail).map((sample) => sample.shrimpEdibleFood),
+);
 check(
   '10,800초 장기 검증 구간 완료',
   snapshot.elapsedSeconds >= DURATION_SECONDS &&
@@ -692,9 +856,32 @@ check(
   tailDaphniaEvents.births >=
       MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumTailBirths &&
     tailDaphniaEvents.maturations >=
+      MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumTailMaturations &&
+    recentTailDaphniaEvents.births >=
+      MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumTailBirths &&
+    recentTailDaphniaEvents.maturations >=
       MISSION7_LONG_RUN_ACCEPTANCE.daphnia.minimumTailMaturations,
   `births=${tailDaphniaEvents.births}, ` +
-    `maturations=${tailDaphniaEvents.maturations}`,
+    `maturations=${tailDaphniaEvents.maturations}, ` +
+    `recentBirths=${recentTailDaphniaEvents.births}, ` +
+    `recentMaturations=${recentTailDaphniaEvents.maturations}`,
+);
+check(
+  '물벼룩 후반 개체군·성체 추세',
+  !daphniaPopulationProjectedCollapse &&
+    !daphniaAdultProjectedCollapse,
+  `populationSlope95=[${daphniaPopulationTrend.slopeLower95.toExponential(3)}, ` +
+    `${daphniaPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentPopulationSlope95=[${recentDaphniaPopulationTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentDaphniaPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentPopulationProjected=${recentDaphniaPopulationTrend.projectedAfterSameDuration.toFixed(2)}, ` +
+    `adultSlope95=[${daphniaAdultTrend.slopeLower95.toExponential(3)}, ` +
+    `${daphniaAdultTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentAdultSlope95=[${recentDaphniaAdultTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentDaphniaAdultTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentAdultProjected=${recentDaphniaAdultTrend.projectedAfterSameDuration.toFixed(2)}, ` +
+    `populationCollapse=${daphniaPopulationProjectedCollapse}, ` +
+    `adultCollapse=${daphniaAdultProjectedCollapse}`,
 );
 check(
   '창시자 교체와 후속 세대 유지',
@@ -710,16 +897,25 @@ check(
     `maxGeneration=${Math.max(0, ...daphniaSave.map((animal) => animal.generation ?? 0))}`,
 );
 check(
-  '후반 물벼룩 사망 원인',
-  tailDaphniaEvents.deathsByCause['old-age'] > 0 &&
-    acuteWaterDeathCount(tailDaphniaEvents) === 0 &&
-    tailDaphniaEvents.deathsByCause.predation === 0 &&
-    tailDaphniaEvents.deathsByCause.starvation <=
-      tailDaphniaEvents.deathsByCause['old-age'],
+  '후반 물벼룩 급성·포식 사망 없음',
+  acuteWaterDeathCount(tailDaphniaEvents) === 0 &&
+    tailDaphniaEvents.deathsByCause.predation === 0,
   `oldAge=${tailDaphniaEvents.deathsByCause['old-age']}, ` +
     `starvation=${tailDaphniaEvents.deathsByCause.starvation}, ` +
     `waterStress=${acuteWaterDeathCount(tailDaphniaEvents)}, ` +
     `predation=${tailDaphniaEvents.deathsByCause.predation}`,
+);
+observe(
+  '후반 물벼룩 사망 원인',
+  tailDaphniaEvents.deathsByCause.starvation >
+    tailDaphniaEvents.deathsByCause['old-age']
+    ? 'warning'
+    : 'info',
+  `oldAge=${tailDaphniaEvents.deathsByCause['old-age']}, ` +
+    `starvation=${tailDaphniaEvents.deathsByCause.starvation}, ` +
+    `waterStress=${acuteWaterDeathCount(tailDaphniaEvents)}, ` +
+    `predation=${tailDaphniaEvents.deathsByCause.predation}; ` +
+    '사망 원인 구성은 관찰값이며 개체군·모집·먹이 시계열 판정을 대신하지 않음',
 );
 check(
   '식물플랑크톤 고갈 뒤 회복',
@@ -759,10 +955,60 @@ check(
       MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumTailBirths &&
     tailShrimpEvents.maturations >=
       MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumTailMaturations &&
-    finalBornShrimp.length >= 2,
+    recentTailShrimpEvents.births >=
+      MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumTailBirths &&
+    recentTailShrimpEvents.maturations >=
+      MISSION7_LONG_RUN_ACCEPTANCE.shrimp.minimumTailMaturations &&
+    finalBornShrimp.length >= 2 &&
+    recentShrimpMaximumGeneration >= 2 &&
+    finalShrimpMaximumGeneration >= 2,
   `tailMin=${shrimpMinimum}, births=${tailShrimpEvents.births}, ` +
     `maturations=${tailShrimpEvents.maturations}, ` +
+    `recentBirths=${recentTailShrimpEvents.births}, ` +
+    `recentMaturations=${recentTailShrimpEvents.maturations}, ` +
+    `recentMaxGeneration=${recentShrimpMaximumGeneration}, ` +
+    `finalMaxGeneration=${finalShrimpMaximumGeneration}, ` +
     `finalBorn=${finalBornShrimp.length}`,
+);
+check(
+  '체리새우 후반 개체군·성체 추세',
+  (
+    !shrimpPopulationProjectedCollapse &&
+    !shrimpAdultProjectedCollapse
+  ) ||
+    shrimpRecoveryOverrideApplied,
+  `populationSlope95=[${shrimpPopulationTrend.slopeLower95.toExponential(3)}, ` +
+    `${shrimpPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentPopulationSlope95=[${recentShrimpPopulationTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentShrimpPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentPopulationProjected=${recentShrimpPopulationTrend.projectedAfterSameDuration.toFixed(2)}, ` +
+    `adultSlope95=[${shrimpAdultTrend.slopeLower95.toExponential(3)}, ` +
+    `${shrimpAdultTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentAdultSlope95=[${recentShrimpAdultTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentShrimpAdultTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentAdultProjected=${recentShrimpAdultTrend.projectedAfterSameDuration.toFixed(2)}, ` +
+    `populationCollapse=${shrimpPopulationProjectedCollapse}, ` +
+    `adultCollapse=${shrimpAdultProjectedCollapse}, ` +
+    `recoveryOverride=${shrimpRecoveryOverrideApplied}, ` +
+    `trough=${shrimpPostTroughRecovery.troughPopulation ?? 'none'}` +
+      `@${shrimpPostTroughRecovery.troughTimeSeconds ?? 'none'}, ` +
+    `observedAfterTrough=${shrimpPostTroughRecovery.observedAfterTroughSeconds.toFixed(1)}, ` +
+    `finalThreeMedian=${shrimpPostTroughRecovery.finalThreeMedianPopulation.toFixed(2)}, ` +
+    `postTroughBirths=${shrimpPostTroughRecovery.postTroughRecruitment.births}, ` +
+    `postTroughDeaths=${shrimpPostTroughRecovery.postTroughRecruitment.deaths}, ` +
+    `postTroughMaturations=${shrimpPostTroughRecovery.postTroughRecruitment.maturations}`,
+);
+observe(
+  '체리새우 후반 수조 전체 먹이',
+  'info',
+  `foodMin=${shrimpFoodMinimum.toFixed(3)}, ` +
+    `recentFoodMean=${recentShrimpFoodMean.toFixed(3)}, ` +
+    `fullSlope95=[${shrimpFoodTrend.slopeLower95.toExponential(3)}, ` +
+    `${shrimpFoodTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentSlope95=[${recentShrimpFoodTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentShrimpFoodTrend.slopeUpper95.toExponential(3)}], ` +
+    `recentProjected=${recentShrimpFoodTrend.projectedAfterSameDuration.toFixed(3)}; ` +
+    '수조 전체 합은 개체별 도달 가능·수익성 먹이가 아니므로 합격선으로 사용하지 않음',
 );
 check(
   '체리새우 암수 계통 유지',
@@ -775,16 +1021,25 @@ check(
     `adultMales=${snapshot.animalPopulation['cherry-shrimp'].adultMales}`,
 );
 check(
-  '체리새우 후반 사망 원인',
-  tailShrimpEvents.deathsByCause['old-age'] > 0 &&
-    acuteWaterDeathCount(tailShrimpEvents) === 0 &&
-    tailShrimpEvents.deathsByCause.predation === 0 &&
-    tailShrimpEvents.deathsByCause.starvation <=
-      tailShrimpEvents.deathsByCause['old-age'],
+  '체리새우 후반 급성·포식 사망 없음',
+  acuteWaterDeathCount(tailShrimpEvents) === 0 &&
+    tailShrimpEvents.deathsByCause.predation === 0,
   `oldAge=${tailShrimpEvents.deathsByCause['old-age']}, ` +
     `starvation=${tailShrimpEvents.deathsByCause.starvation}, ` +
     `waterStress=${acuteWaterDeathCount(tailShrimpEvents)}, ` +
     `predation=${tailShrimpEvents.deathsByCause.predation}`,
+);
+observe(
+  '체리새우 후반 사망 원인',
+  tailShrimpEvents.deathsByCause.starvation >
+    tailShrimpEvents.deathsByCause['old-age']
+    ? 'warning'
+    : 'info',
+  `oldAge=${tailShrimpEvents.deathsByCause['old-age']}, ` +
+    `starvation=${tailShrimpEvents.deathsByCause.starvation}, ` +
+    `waterStress=${acuteWaterDeathCount(tailShrimpEvents)}, ` +
+    `predation=${tailShrimpEvents.deathsByCause.predation}; ` +
+    '기아 우세는 관찰 경고이며 개체군·성체·모집·먹이·수질 추세와 별도로 해석',
 );
 check(
   '두 부착 균 군집 후반 유지',
@@ -807,6 +1062,26 @@ check(
     `toxicMax=${toxicWasteMaximum.toFixed(3)}, ` +
     `organicMax=${organicMatterMaximum.toFixed(3)}, ` +
     `finiteNonNegative=${allWaterValuesFiniteAndNonNegative}`,
+);
+check(
+  '후반 수질 추세',
+  !waterProjectedUnsafe,
+  `oxygenFullSlope95=[${oxygenTrend.slopeLower95.toExponential(3)}, ` +
+    `${oxygenTrend.slopeUpper95.toExponential(3)}], ` +
+    `oxygenRecentSlope95=[${recentOxygenTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentOxygenTrend.slopeUpper95.toExponential(3)}], ` +
+    `oxygenRecentProjected=${recentOxygenTrend.projectedAfterSameDuration.toFixed(3)}, ` +
+    `toxicFullSlope95=[${toxicWasteTrend.slopeLower95.toExponential(3)}, ` +
+    `${toxicWasteTrend.slopeUpper95.toExponential(3)}], ` +
+    `toxicRecentSlope95=[${recentToxicWasteTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentToxicWasteTrend.slopeUpper95.toExponential(3)}], ` +
+    `toxicRecentProjected=${recentToxicWasteTrend.projectedAfterSameDuration.toFixed(3)}, ` +
+    `organicFullSlope95=[${organicMatterTrend.slopeLower95.toExponential(3)}, ` +
+    `${organicMatterTrend.slopeUpper95.toExponential(3)}], ` +
+    `organicRecentSlope95=[${recentOrganicMatterTrend.slopeLower95.toExponential(3)}, ` +
+    `${recentOrganicMatterTrend.slopeUpper95.toExponential(3)}], ` +
+    `organicRecentProjected=${recentOrganicMatterTrend.projectedAfterSameDuration.toFixed(3)}, ` +
+    `projectedUnsafe=${waterProjectedUnsafe}`,
 );
 check(
   '전 구간 닫힌 물질 장부',
@@ -855,6 +1130,8 @@ const compactCensus = samples.filter(
   shrimpMales: sample.shrimpMales,
   shrimpAdultFemales: sample.shrimpAdultFemales,
   shrimpAdultMales: sample.shrimpAdultMales,
+  shrimpMaximumLivingGeneration: sample.shrimpMaximumLivingGeneration,
+  shrimpEdibleFood: sample.shrimpEdibleFood,
   shrimpFemaleMeanOvarianProgress:
     sample.shrimpFemaleMeanOvarianProgress,
   shrimpFemaleMeanReproductiveBiomass:
@@ -908,6 +1185,7 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
       phytoplanktonMinimum,
       phytoplanktonMaximum,
       shrimpMinimum,
+      shrimpFoodMinimum,
       oxygenMinimum,
       toxicWasteMaximum,
     },
@@ -924,6 +1202,7 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
         snapshot.animalPopulation['cherry-shrimp'].adultFemales,
       shrimpAdultMales:
         snapshot.animalPopulation['cherry-shrimp'].adultMales,
+      shrimpMaximumGeneration: finalShrimpMaximumGeneration,
       oedogonium: snapshot.totalBiomass.oedogonium,
       nitzschia: snapshot.totalBiomass.nitzschia,
       decomposer: snapshot.biogeochemistry.biofilmTotals.decomposer,
@@ -936,6 +1215,8 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
     events: {
       daphnia: allDaphniaEvents,
       shrimp: allShrimpEvents,
+      recentTailDaphnia: recentTailDaphniaEvents,
+      recentTailShrimp: recentTailShrimpEvents,
       daphniaStressDeaths: compactDaphniaStressDeaths,
       shrimpLifecycle: process.env.MISSION7_VERIFY_SHRIMP_LIFECYCLE === '1'
         ? observedAnimalEvents
@@ -984,6 +1265,33 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
         })),
     },
     census: compactCensus,
+    tailTrends: {
+      daphnia: {
+        population: daphniaPopulationTrend,
+        recentPopulation: recentDaphniaPopulationTrend,
+        adults: daphniaAdultTrend,
+        recentAdults: recentDaphniaAdultTrend,
+      },
+      shrimp: {
+        population: shrimpPopulationTrend,
+        recentPopulation: recentShrimpPopulationTrend,
+        adults: shrimpAdultTrend,
+        recentAdults: recentShrimpAdultTrend,
+        food: shrimpFoodTrend,
+        recentFood: recentShrimpFoodTrend,
+        postTroughRecovery: shrimpPostTroughRecovery,
+        recoveryOverrideApplied: shrimpRecoveryOverrideApplied,
+      },
+      water: {
+        oxygen: oxygenTrend,
+        recentOxygen: recentOxygenTrend,
+        toxicWaste: toxicWasteTrend,
+        recentToxicWaste: recentToxicWasteTrend,
+        organicMatter: organicMatterTrend,
+        recentOrganicMatter: recentOrganicMatterTrend,
+      },
+    },
+    observations,
     failedChecks: checks.filter((item) => !item.passed),
     maximumMaterialDrift: {
       nitrogen: maximumNitrogenDrift,
@@ -1039,6 +1347,7 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
     phytoplanktonMaximum,
     phytoplanktonOscillation,
     shrimpMinimum,
+    shrimpFoodMinimum,
     runnerMinimum,
     decomposerMinimum,
     nitrifierMinimum,
@@ -1066,6 +1375,7 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
     shrimpAdultMales:
       snapshot.animalPopulation['cherry-shrimp'].adultMales,
     shrimpBornDescendants: finalBornShrimp.length,
+    shrimpMaximumGeneration: finalShrimpMaximumGeneration,
     suppliedVallisneria:
       snapshot.plants.filter((plant) => plant.origin === 'supplied').length,
     runnerVallisneria:
@@ -1088,6 +1398,37 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
       daphnia: tailDaphniaEvents,
       shrimp: tailShrimpEvents,
     },
+    recentTailHalf: {
+      startsAtSeconds: tailMidpointSeconds,
+      daphnia: recentTailDaphniaEvents,
+      shrimp: recentTailShrimpEvents,
+    },
+  },
+  tailTrends: {
+    daphnia: {
+      population: daphniaPopulationTrend,
+      recentPopulation: recentDaphniaPopulationTrend,
+      adults: daphniaAdultTrend,
+      recentAdults: recentDaphniaAdultTrend,
+    },
+    shrimp: {
+      population: shrimpPopulationTrend,
+      recentPopulation: recentShrimpPopulationTrend,
+      adults: shrimpAdultTrend,
+      recentAdults: recentShrimpAdultTrend,
+      food: shrimpFoodTrend,
+      recentFood: recentShrimpFoodTrend,
+      postTroughRecovery: shrimpPostTroughRecovery,
+      recoveryOverrideApplied: shrimpRecoveryOverrideApplied,
+    },
+    water: {
+      oxygen: oxygenTrend,
+      recentOxygen: recentOxygenTrend,
+      toxicWaste: toxicWasteTrend,
+      recentToxicWaste: recentToxicWasteTrend,
+      organicMatter: organicMatterTrend,
+      recentOrganicMatter: recentOrganicMatterTrend,
+    },
   },
   maximumMaterialDrift: {
     nitrogen: maximumNitrogenDrift,
@@ -1101,6 +1442,7 @@ if (process.env.MISSION7_VERIFY_COMPACT === '1') {
         0.02 ||
       sample === samples.at(-1),
   ),
+  observations,
   checks,
 }, null, 2));
 

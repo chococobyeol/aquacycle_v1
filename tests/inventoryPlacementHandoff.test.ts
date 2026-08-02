@@ -12,7 +12,10 @@ import {
   isInventoryHandoffCaughtUp,
   isSecondaryPointerGesture,
 } from '../src/renderer/tank/AquariumCanvas';
-import { heldPlacementToolbarCopy } from '../src/renderer/ui/SimulationScreen';
+import {
+  heldPlacementToolbarCopy,
+  inventoryPlacementEditable,
+} from '../src/renderer/ui/SimulationScreen';
 import type { HoldingSnapshot } from '../src/simulation/types';
 
 const heldStone = (x: number, y: number): HoldingSnapshot => ({
@@ -90,6 +93,99 @@ describe('held item toolbar copy', () => {
   });
 });
 
+describe('mission 8 staged animal release', () => {
+  it('unlocks only animals and biofilm while the challenge is paused', () => {
+    expect(inventoryPlacementEditable(
+      'animal',
+      'mission-8',
+      'challenge',
+      'paused',
+      true,
+    )).toBe(true);
+    expect(inventoryPlacementEditable(
+      'biofilm',
+      'mission-8',
+      'challenge',
+      'paused',
+      true,
+    )).toBe(true);
+
+    for (const kind of ['structure', 'seed', 'plankton'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-8',
+        'challenge',
+        'paused',
+        true,
+      )).toBe(false);
+    }
+  });
+
+  it('keeps staged animals locked while running and in earlier challenges', () => {
+    expect(inventoryPlacementEditable(
+      'animal',
+      'mission-8',
+      'challenge',
+      'running',
+      true,
+    )).toBe(false);
+    expect(inventoryPlacementEditable(
+      'animal',
+      'mission-7',
+      'challenge',
+      'paused',
+      true,
+    )).toBe(false);
+  });
+
+  it('preserves full paused editing in the laboratory', () => {
+    for (const kind of ['structure', 'seed', 'animal', 'biofilm', 'plankton'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'laboratory',
+        'laboratory',
+        'paused',
+        false,
+      )).toBe(true);
+    }
+  });
+});
+
+describe('mission 5 staged ecosystem stocking', () => {
+  it('unlocks algae, animals and biofilm while the challenge is paused', () => {
+    for (const kind of ['seed', 'animal', 'biofilm'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-5',
+        'challenge',
+        'paused',
+        true,
+      )).toBe(true);
+    }
+    for (const kind of ['structure', 'plankton'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-5',
+        'challenge',
+        'paused',
+        true,
+      )).toBe(false);
+    }
+  });
+
+  it('keeps every biological placement locked while the simulation is running', () => {
+    for (const kind of ['seed', 'animal', 'biofilm'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-5',
+        'challenge',
+        'running',
+        true,
+      )).toBe(false);
+    }
+  });
+});
+
 describe('secondary placement gesture', () => {
   it('treats a right click as cancel', () => {
     expect(isSecondaryPointerGesture(2, false)).toBe(true);
@@ -121,6 +217,28 @@ describe('inventory preview rendering contract', () => {
     new URL('../src/renderer/main.tsx', import.meta.url),
     'utf8',
   );
+
+  it('wires staged release only to animal cards', () => {
+    const structureCards = screenSource.slice(
+      screenSource.indexOf("{inventoryCategory === 'structures' && STRUCTURE_IDS"),
+      screenSource.indexOf("{inventoryCategory === 'organisms' && SPECIES_IDS"),
+    );
+    const animalCards = screenSource.slice(
+      screenSource.indexOf("{inventoryCategory === 'organisms' && ANIMAL_IDS"),
+      screenSource.indexOf("{inventoryCategory === 'organisms' && PLANKTON_IDS"),
+    );
+
+    expect(structureCards).toContain(
+      'disabled={!editable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}',
+    );
+    expect(structureCards).not.toContain('!animalEditable');
+    expect(animalCards).toContain(
+      'disabled={!animalEditable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}',
+    );
+    expect(animalCards).not.toContain(
+      'disabled={!editable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}',
+    );
+  });
 
   it('does not reuse the inner biofilm art class on the fixed cursor wrapper', () => {
     expect(screenSource).toContain('className="inventory-cursor-ghost"');
@@ -181,8 +299,10 @@ describe('inventory preview rendering contract', () => {
   it('avoids the pooled Pixi alpha-mask filter that can freeze a partial frame', () => {
     expect(canvasSource).not.toContain('detailGraphics.setMask');
     expect(canvasSource).not.toContain('detailMaskSprite');
-    expect(canvasSource).toContain('container.addChild(densityMarks, detailGraphics);');
+    expect(canvasSource).toContain('container.addChild(densitySprite, detailGraphics);');
     expect(canvasSource).not.toContain('densityTexture.source.update();');
+    expect(canvasSource).toContain('new BufferImageSource({');
+    expect(canvasSource).toContain('speciesLayer.densitySource?.update();');
     expect(canvasSource).toContain('autoStart: false');
     expect(canvasSource).toContain('app.ticker.remove(app.render, app);');
     expect(canvasSource).toContain('requestFullRendererRecovery();');

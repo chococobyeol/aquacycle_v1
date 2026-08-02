@@ -149,12 +149,15 @@ const sameMotionTopology = (
       ? !matchingHolding(previous.holding, current.holding)
       : false
   ) return false;
-  for (const structure of current.structures) {
-    const before = previous.structures.find((candidate) => candidate.id === structure.id);
-    if (!before || before.isHeld !== structure.isHeld) return false;
+  for (let index = 0; index < current.structures.length; index += 1) {
+    const before = previous.structures[index];
+    const after = current.structures[index];
+    if (before.id !== after.id || before.isHeld !== after.isHeld) return false;
   }
-  for (const animal of current.animals) {
-    if (!previous.animals.some((candidate) => candidate.id === animal.id)) return false;
+  for (let index = 0; index < current.animals.length; index += 1) {
+    const before = previous.animals[index];
+    const after = current.animals[index];
+    if (before.id !== after.id || before.speciesId !== after.speciesId) return false;
   }
   return true;
 };
@@ -236,10 +239,6 @@ export const interpolateMotionFrames = (
     Math.min(MAX_SAMPLE_DURATION_MS, rawDuration),
   );
   const ratio = clamp01((nowMs - current.receivedAtMs) / durationMs);
-  const previousAnimals = new Map(previous.animals.map((animal) => [animal.id, animal]));
-  const previousStructures = new Map(
-    previous.structures.map((structure) => [structure.id, structure]),
-  );
 
   const holding = matchingHolding(previous.holding, current.holding)
     ? {
@@ -261,16 +260,10 @@ export const interpolateMotionFrames = (
   return {
     sequence: current.sequence,
     interpolated: true,
-    structures: current.structures.map((structure) => {
-      const before = previousStructures.get(structure.id);
-      return before && before.isHeld === structure.isHeld
-        ? interpolateStructure(before, structure, ratio)
-        : structure;
-    }),
-    animals: current.animals.map((animal) => {
-      const before = previousAnimals.get(animal.id);
-      return before ? interpolateAnimal(before, animal, ratio) : animal;
-    }),
+    structures: current.structures.map((structure, index) =>
+      interpolateStructure(previous.structures[index], structure, ratio)),
+    animals: current.animals.map((animal, index) =>
+      interpolateAnimal(previous.animals[index], animal, ratio)),
     holding,
     probe,
   };
@@ -282,13 +275,6 @@ export interface ReusableMotionInterpolator {
     nowMs: number,
   ) => InterpolatedMotionState | null;
 }
-
-const findById = <T extends { id: string }>(items: readonly T[], id: string): T | undefined => {
-  for (const item of items) {
-    if (item.id === id) return item;
-  }
-  return undefined;
-};
 
 /**
  * Allocation-free counterpart used by the live Pixi ticker. The exported pure
@@ -339,40 +325,36 @@ export const createReusableMotionInterpolator = (): ReusableMotionInterpolator =
       output.interpolated = true;
       for (let index = 0; index < current.structures.length; index += 1) {
         const after = current.structures[index];
-        const before = findById(previous.structures, after.id);
+        const before = previous.structures[index];
         const target = output.structures[index] ?? { ...after };
         Object.assign(target, after);
-        if (before && before.isHeld === after.isHeld) {
-          target.x = lerp(before.x, after.x, ratio);
-          target.y = lerp(before.y, after.y, ratio);
-          target.angle = lerpAngle(before.angle, after.angle, ratio);
-        }
+        target.x = lerp(before.x, after.x, ratio);
+        target.y = lerp(before.y, after.y, ratio);
+        target.angle = lerpAngle(before.angle, after.angle, ratio);
         output.structures[index] = target;
       }
       output.structures.length = current.structures.length;
 
       for (let index = 0; index < current.animals.length; index += 1) {
         const after = current.animals[index];
-        const before = findById(previous.animals, after.id);
+        const before = previous.animals[index];
         const target = output.animals[index] ?? { ...after };
         Object.assign(target, after);
-        if (before) {
-          target.x = lerp(before.x, after.x, ratio);
-          target.y = lerp(before.y, after.y, ratio);
-          target.vx = lerp(before.vx, after.vx, ratio);
-          target.vy = lerp(before.vy, after.vy, ratio);
-          target.poseAngle = lerpAngle(before.poseAngle, after.poseAngle, ratio);
-          target.bodyLength = lerp(before.bodyLength, after.bodyLength, ratio);
-          target.ageSeconds = lerp(before.ageSeconds, after.ageSeconds, ratio);
-          target.energy = lerp(before.energy, after.energy, ratio);
-          target.health = lerp(before.health, after.health, ratio);
-          target.recentIntake = lerp(before.recentIntake, after.recentIntake, ratio);
-          target.consumedBiomass = lerp(
-            before.consumedBiomass,
-            after.consumedBiomass,
-            ratio,
-          );
-        }
+        target.x = lerp(before.x, after.x, ratio);
+        target.y = lerp(before.y, after.y, ratio);
+        target.vx = lerp(before.vx, after.vx, ratio);
+        target.vy = lerp(before.vy, after.vy, ratio);
+        target.poseAngle = lerpAngle(before.poseAngle, after.poseAngle, ratio);
+        target.bodyLength = lerp(before.bodyLength, after.bodyLength, ratio);
+        target.ageSeconds = lerp(before.ageSeconds, after.ageSeconds, ratio);
+        target.energy = lerp(before.energy, after.energy, ratio);
+        target.health = lerp(before.health, after.health, ratio);
+        target.recentIntake = lerp(before.recentIntake, after.recentIntake, ratio);
+        target.consumedBiomass = lerp(
+          before.consumedBiomass,
+          after.consumedBiomass,
+          ratio,
+        );
         output.animals[index] = target;
       }
       output.animals.length = current.animals.length;

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
-import { dayNightCycleDuration, dayNightStateAt } from '../src/simulation/dayNight';
+import {
+  DAYLIGHT_DAY_EDGE_ANGLE_RADIANS,
+  DAYLIGHT_HORIZON_ANGLE_RADIANS,
+  daylightAngleRadians,
+  dayNightCycleDuration,
+  dayNightStateAt,
+} from '../src/simulation/dayNight';
 import { algaePhysiology } from '../src/simulation/growth';
 import { SCENARIOS } from '../src/simulation/config';
 import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
@@ -45,6 +51,26 @@ describe('day/night producer metabolism', () => {
     expect(dayNightStateAt(330, cycle).phase).toBe('dawn');
     expect(dayNightStateAt(duration, cycle).phase).toBe('day');
     expect(dayNightStateAt(300, cycle).lightMultiplier).toBeCloseTo(0.045, 6);
+  });
+
+  it('keeps the solar orbit moving in one direction through the night', () => {
+    const cycle = SCENARIOS['mission-6'].dayNightCycle!;
+    const morning = daylightAngleRadians(dayNightStateAt(0, cycle));
+    const noon = daylightAngleRadians(dayNightStateAt(120, cycle));
+    const evening = daylightAngleRadians(dayNightStateAt(240, cycle));
+    const duskEnd = daylightAngleRadians(dayNightStateAt(270, cycle));
+    const midnight = daylightAngleRadians(dayNightStateAt(300, cycle));
+    const nightEnd = daylightAngleRadians(dayNightStateAt(329.999, cycle));
+    const nextDawn = daylightAngleRadians(dayNightStateAt(330, cycle));
+
+    expect(morning).toBeCloseTo(DAYLIGHT_DAY_EDGE_ANGLE_RADIANS, 10);
+    expect(noon).toBeCloseTo(0, 10);
+    expect(evening).toBeCloseTo(-DAYLIGHT_DAY_EDGE_ANGLE_RADIANS, 10);
+    expect(duskEnd).toBeCloseTo(-DAYLIGHT_HORIZON_ANGLE_RADIANS, 10);
+    expect(midnight).toBeCloseTo(-Math.PI, 10);
+    expect(nightEnd).toBeLessThan(midnight);
+    expect(Math.cos(nightEnd)).toBeCloseTo(Math.cos(nextDawn), 3);
+    expect(Math.sin(nightEnd)).toBeCloseTo(Math.sin(nextDawn), 3);
   });
 
   it('uses the same local-darkness response for night and structural shade', () => {
@@ -95,6 +121,42 @@ describe('day/night producer metabolism', () => {
     expect(night.dayNight?.effectiveLightOutput).toBeCloseTo(63.6, 4);
     expect(night.lightOutput).toBe(60);
   }, 20_000);
+
+  it('separates the night sky remainder from shadow-casting direct sunlight', () => {
+    const world = new SimulationWorld('mission-6');
+    type LightInternals = {
+      elapsedSeconds: number;
+      updateDayNightLighting(): void;
+      effectiveNaturalLightOutput(): number;
+      directNaturalLightOutput(): number;
+      diffuseNaturalLightOutput(): number;
+    };
+    const internals = world as unknown as LightInternals;
+    const naturalOutput = world.snapshot().naturalLightOutput;
+    const nightMultiplier =
+      SCENARIOS['mission-6'].dayNightCycle!.nightLightMultiplier;
+
+    expect(internals.directNaturalLightOutput()).toBeCloseTo(
+      naturalOutput * (1 - nightMultiplier),
+      8,
+    );
+    expect(internals.diffuseNaturalLightOutput()).toBeCloseTo(
+      naturalOutput * nightMultiplier,
+      8,
+    );
+
+    internals.elapsedSeconds = 300;
+    internals.updateDayNightLighting();
+    expect(internals.directNaturalLightOutput()).toBe(0);
+    expect(internals.diffuseNaturalLightOutput()).toBeCloseTo(
+      naturalOutput * nightMultiplier,
+      8,
+    );
+    expect(internals.effectiveNaturalLightOutput()).toBeCloseTo(
+      internals.diffuseNaturalLightOutput(),
+      8,
+    );
+  });
 
   it('changes the actual tank light and reverses producer oxygen flux at night', () => {
     const world = new SimulationWorld('mission-6');

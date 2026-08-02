@@ -3,7 +3,13 @@ import {
   FIXED_LAMP_X,
   FIXED_LAMP_Y,
 } from '../../simulation/lightGeometry';
-import { TANK_HEIGHT, TANK_WIDTH, WATER_TOP } from '../../simulation/types';
+import {
+  TANK_HEIGHT,
+  TANK_WIDTH,
+  WATER_TOP,
+  tankDefinition,
+  type TankDefinition,
+} from '../../simulation/types';
 
 // The tank keeps its complete local 1200 × 720 bounds. Exterior room space is
 // a sibling in the wider camera composition, never borrowed from the tank.
@@ -39,3 +45,49 @@ export const LAMP_GLOW_HEIGHT = 5;
 export const LAMP_GLOW_TOP = FIXED_LAMP_Y - LAMP_GLOW_HEIGHT / 2;
 export const LAMP_GLOW_BOTTOM = LAMP_GLOW_TOP + LAMP_GLOW_HEIGHT;
 export const LAMP_CABLE_TOP = CAMERA_SCENE_TOP + 4;
+
+export interface TankVisualGeometry {
+  tankWidth: number;
+  tankHeight: number;
+  waterTop: number;
+  groundY: number;
+  glassLeft: number;
+  glassTop: number;
+  glassRight: number;
+  glassBottom: number;
+  sceneLeft: number;
+  sceneRight: number;
+  sceneTop: number;
+  sceneBottom: number;
+  sceneWidth: number;
+  sceneHeight: number;
+  sceneCenterX: number;
+  sceneCenterY: number;
+}
+
+export const createTankVisualGeometry = (
+  tank: TankDefinition = tankDefinition('standard'),
+): TankVisualGeometry => {
+  const sceneLeft = 0;
+  const sceneRight = tank.width;
+  const sceneTop = CAMERA_SCENE_TOP;
+  const sceneBottom = tank.height;
+  return {
+    tankWidth: tank.width,
+    tankHeight: tank.height,
+    waterTop: tank.waterTop,
+    groundY: tank.groundY,
+    glassLeft: TANK_GLASS_LEFT,
+    glassTop: TANK_GLASS_TOP,
+    glassRight: tank.width - 7,
+    glassBottom: tank.height - 7,
+    sceneLeft,
+    sceneRight,
+    sceneTop,
+    sceneBottom,
+    sceneWidth: sceneRight - sceneLeft,
+    sceneHeight: sceneBottom - sceneTop,
+    sceneCenterX: (sceneLeft + sceneRight) / 2,
+    sceneCenterY: (sceneTop + sceneBottom) / 2,
+  };
+};

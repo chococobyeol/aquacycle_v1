@@ -11,9 +11,14 @@ declare global {
       onRenderingVisibilityChange?: (
         listener: (visible: boolean) => void,
       ) => () => void;
-      onSimulationMemoryPressure?: (
-        listener: (privateMb: number) => void,
+      onMemoryRecoveryRequested?: (
+        listener: (details: {
+          privateMb: number;
+          thresholdMb: number;
+        }) => void,
       ) => () => void;
+      completeMemoryRecovery?: (success: boolean) => void;
+      notifyRendererReady?: () => void;
     };
   }
 }

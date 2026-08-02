@@ -15,7 +15,8 @@
 // blooms. Keep that growth inside a reusable fixed transport instead of
 // overflowing into once-per-second structured clones that make Chromium retain
 // additional V8 backing regions for the lifetime of the renderer.
-export const SHARED_TELEMETRY_PAYLOAD_BYTES = 8 * 1024 * 1024;
+export const SHARED_TELEMETRY_PAYLOAD_BYTES = 16 * 1024 * 1024;
+export const MAX_SHARED_TELEMETRY_PAYLOAD_BYTES = 64 * 1024 * 1024;
 
 const CONTROL_SEQUENCE = 0;
 const CONTROL_LENGTH_SLOT_0 = 1;
@@ -82,9 +83,62 @@ const writeUtf8ToSharedBuffer = (
   return { read, written };
 };
 
+/**
+ * Compares an existing JavaScript string with UTF-8 bytes without first
+ * allocating another decoded string. Snapshot labels are frequently Korean,
+ * so comparing `string.length` with the UTF-8 byte count only reused ASCII and
+ * rebuilt hundreds of unchanged labels on every publication.
+ */
+const utf8BytesMatchString = (
+  value: string,
+  source: Uint8Array,
+  start: number,
+  byteLength: number,
+): boolean => {
+  let read = 0;
+  let matchedBytes = 0;
+  while (read < value.length && matchedBytes < byteLength) {
+    const codePoint = value.codePointAt(read)!;
+    const codeUnits = codePoint > 0xffff ? 2 : 1;
+    const byteCount = codePoint <= 0x7f
+      ? 1
+      : codePoint <= 0x7ff
+        ? 2
+        : codePoint <= 0xffff
+          ? 3
+          : 4;
+    if (matchedBytes + byteCount > byteLength) return false;
+
+    if (byteCount === 1) {
+      if (source[start + matchedBytes] !== codePoint) return false;
+    } else if (byteCount === 2) {
+      if (
+        source[start + matchedBytes] !== (0xc0 | (codePoint >> 6)) ||
+        source[start + matchedBytes + 1] !== (0x80 | (codePoint & 0x3f))
+      ) return false;
+    } else if (byteCount === 3) {
+      if (
+        source[start + matchedBytes] !== (0xe0 | (codePoint >> 12)) ||
+        source[start + matchedBytes + 1] !== (0x80 | ((codePoint >> 6) & 0x3f)) ||
+        source[start + matchedBytes + 2] !== (0x80 | (codePoint & 0x3f))
+      ) return false;
+    } else if (
+      source[start + matchedBytes] !== (0xf0 | (codePoint >> 18)) ||
+      source[start + matchedBytes + 1] !== (0x80 | ((codePoint >> 12) & 0x3f)) ||
+      source[start + matchedBytes + 2] !== (0x80 | ((codePoint >> 6) & 0x3f)) ||
+      source[start + matchedBytes + 3] !== (0x80 | (codePoint & 0x3f))
+    ) return false;
+
+    read += codeUnits;
+    matchedBytes += byteCount;
+  }
+  return read === value.length && matchedBytes === byteLength;
+};
+
 class SharedValueWriter {
   private readonly bytes: Uint8Array;
   private readonly view: DataView;
+  private readonly objectKeys = new WeakMap<object, readonly string[]>();
   private offset = 0;
 
   public constructor(buffer: SharedArrayBuffer) {
@@ -135,6 +189,23 @@ class SharedValueWriter {
     this.offset += result.written;
   }
 
+  private keysFor(record: Record<string, unknown>): readonly string[] {
+    const cached = this.objectKeys.get(record);
+    if (cached) {
+      let index = 0;
+      let matches = true;
+      for (const key in record) {
+        if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+        if (cached[index] !== key) matches = false;
+        index += 1;
+      }
+      if (matches && index === cached.length) return cached;
+    }
+    const keys = Object.keys(record);
+    this.objectKeys.set(record, keys);
+    return keys;
+  }
+
   private writeValue(value: unknown): void {
     if (value === null) {
       this.writeByte(ValueTag.Null);
@@ -170,7 +241,11 @@ class SharedValueWriter {
     }
     if (typeof value === 'object') {
       const record = value as Record<string, unknown>;
-      const keys = Object.keys(record);
+      // Simulation snapshots reuse the same object graph. Cache each stable
+      // shape instead of allocating more than a thousand Object.keys arrays
+      // per full publication. The for-in validation keeps union-shaped records
+      // correct if their fields change.
+      const keys = this.keysFor(record);
       this.writeByte(ValueTag.Object);
       this.writeUint32(keys.length);
       for (const key of keys) {
@@ -195,6 +270,7 @@ class SharedValueReader {
   private readonly objectShapes: WeakMap<object, readonly string[]>;
   private offset = 0;
   private limit = 0;
+  public decodedStringCount = 0;
 
   public constructor(
     buffer: SharedArrayBuffer,
@@ -247,24 +323,18 @@ class SharedValueReader {
     this.reserve(byteLength);
     const end = this.offset + byteLength;
 
-    // Snapshot property names, identifiers, and enum values are overwhelmingly
-    // ASCII and stable. Return the existing string without constructing a new
-    // one when its UTF-8 bytes already match the next encoded value.
-    if (typeof reuse === 'string' && reuse.length === byteLength) {
-      let matches = true;
-      for (let index = 0; index < byteLength; index += 1) {
-        const code = reuse.charCodeAt(index);
-        if (code > 0x7f || code !== this.bytes[this.offset + index]) {
-          matches = false;
-          break;
-        }
-      }
-      if (matches) {
+    // Return unchanged ASCII and non-ASCII values directly. This is especially
+    // important for the hundreds of identical Korean substrate labels in a
+    // full tank snapshot.
+    if (
+      typeof reuse === 'string' &&
+      utf8BytesMatchString(reuse, this.bytes, this.offset, byteLength)
+    ) {
         this.offset = end;
         return reuse;
-      }
     }
 
+    this.decodedStringCount += 1;
     let value = '';
     while (this.offset < end) {
       const first = this.bytes[this.offset];
@@ -412,6 +482,7 @@ export const createSharedTelemetryChannel = (
 
 export class SharedTelemetryWriter {
   private readonly control: Int32Array;
+  public readonly payloadByteLength: number;
   private readonly encoders: [
     SharedValueWriter,
     SharedValueWriter,
@@ -420,6 +491,7 @@ export class SharedTelemetryWriter {
 
   public constructor(channel: SharedTelemetryChannel) {
     this.control = new Int32Array(channel.control);
+    this.payloadByteLength = channel.payloads[0].byteLength;
     this.encoders = [
       new SharedValueWriter(channel.payloads[0]),
       new SharedValueWriter(channel.payloads[1]),
@@ -455,8 +527,8 @@ export class SharedTelemetryWriter {
       return false;
     } finally {
       // A failed encode did not publish a new generation. Restore the prior
-      // sequence so the old valid slot is not emitted again as a fresh packet;
-      // the worker's ordinary-message fallback carries the oversized value.
+      // sequence so the old valid slot is not emitted again as a fresh packet.
+      // The worker requests a larger fixed channel with a tiny control message.
       Atomics.store(
         this.control,
         CONTROL_SEQUENCE,
@@ -554,5 +626,13 @@ export class SharedTelemetryReader<T> {
 
   public overflowCount(): number {
     return Atomics.load(this.control, CONTROL_OVERFLOW_COUNT);
+  }
+
+  /** Diagnostic counter used to prove stable strings stop being rebuilt. */
+  public decodedStringCount(): number {
+    return this.decoders.reduce(
+      (total, decoder) => total + decoder.decodedStringCount,
+      0,
+    );
   }
 }

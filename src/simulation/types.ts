@@ -5,6 +5,47 @@ export const TANK_WIDTH = 1200;
 export const TANK_HEIGHT = 720;
 export const WATER_TOP = 56;
 export const GROUND_Y = 646;
+export const WATER_COLUMNS = 36;
+export const WATER_ROWS = 20;
+
+export type TankTypeId = 'standard' | 'long';
+
+export interface TankDefinition {
+  id: TankTypeId;
+  label: string;
+  width: number;
+  height: number;
+  waterTop: number;
+  groundY: number;
+  waterColumns: number;
+  waterRows: number;
+}
+
+export const TANK_DEFINITIONS: Record<TankTypeId, TankDefinition> = {
+  standard: {
+    id: 'standard',
+    label: '표준 수조',
+    width: TANK_WIDTH,
+    height: TANK_HEIGHT,
+    waterTop: WATER_TOP,
+    groundY: GROUND_Y,
+    waterColumns: WATER_COLUMNS,
+    waterRows: WATER_ROWS,
+  },
+  long: {
+    id: 'long',
+    label: '긴 수조',
+    width: TANK_WIDTH * 2,
+    height: TANK_HEIGHT,
+    waterTop: WATER_TOP,
+    groundY: GROUND_Y,
+    waterColumns: WATER_COLUMNS * 2,
+    waterRows: WATER_ROWS,
+  },
+};
+
+export const tankDefinition = (id: TankTypeId | undefined): TankDefinition =>
+  TANK_DEFINITIONS[id ?? 'standard'];
 /**
  * Structures settle on the middle of the shallow substrate depth band. The
  * lower substrate row remains visually in front of them while the upper rows
@@ -28,6 +69,7 @@ export type ScenarioId =
   | 'mission-5'
   | 'mission-6'
   | 'mission-7'
+  | 'mission-8'
   | 'laboratory';
 export type SimulationMode = 'challenge' | 'laboratory';
 export type SimulationPhase = 'setup' | 'running' | 'paused';
@@ -67,7 +109,12 @@ export type AnimalPopulationEventKind =
   | 'hatched'
   | 'matured'
   | 'death';
-export type StructureDefinitionId = 'flat-stone' | 'round-stone' | 'tall-stone';
+export type StructureDefinitionId =
+  | 'flat-stone'
+  | 'round-stone'
+  | 'tall-stone'
+  | 'small-flat-stone'
+  | 'small-wedge-stone';
 export type MicrobeGuildId = 'decomposer' | 'nitrifier';
 export type PlanktonKind = 'phytoplankton' | 'daphnia';
 export type WaterQualityVariable = 'organicMatter' | 'toxicWaste' | 'nutrients' | 'oxygen';
@@ -185,13 +232,27 @@ export interface AnimalSnapshot {
   ageSeconds: number;
   lifespanSeconds: number;
   energy: number;
+  /** Conserved structure, reserve and reproductive matter carried by this animal. */
+  biomass?: number;
+  /** Living body tissue, excluding short-term reserve and reproductive matter. */
+  structuralBiomass?: number;
+  /** Assimilated short-term nutrient reserve used before body tissue is catabolised. */
+  storedBiomass?: number;
+  /** Conserved matter already allocated to eggs or a brood. */
+  reproductiveBiomass?: number;
   health: number;
   behavior: AnimalBehavior;
   reproductiveState: AnimalReproductiveState;
   recentIntake: number;
   consumedBiomass: number;
-  /** Simulated seconds since the last non-zero consumed ration. */
+  /**
+   * Feeding deficit clock. For shrimp this accumulates the maintenance ration
+   * that recent intake did not cover; other animals use elapsed time since a
+   * non-zero ration.
+   */
   secondsSinceFood: number;
+  /** Food-funded progress toward the next life stage, from 0 to 1. */
+  growthProgress?: number;
   recentFood?: string | null;
   attachmentLabel?: string | null;
   developmentProgress?: number | null;
@@ -201,7 +262,7 @@ export interface AnimalSnapshot {
   metabolicTemperatureFactor: number;
   reproductionTemperatureFactor: number;
   thermalHealthSuitability: number;
-  /** Supplied Daphnia founders are generation 0; their descendants increment it. */
+  /** Supplied animals are generation 0; their descendants increment it. */
   generation?: number;
   parentId?: string | null;
 }
@@ -258,6 +319,8 @@ export interface AnimalPopulationEventSnapshot {
   y: number;
   ageSeconds: number;
   energy: number;
+  /** Lineage generation at the instant of this event. */
+  generation?: number;
   cause: AnimalDeathCause | null;
   parentId: string | null;
   water: WaterQualityValues | null;
@@ -388,6 +451,7 @@ export interface HoldingSnapshot {
   speciesId?: SpeciesId;
   animalId?: string;
   animalSpeciesId?: AnimalSpeciesId;
+  animalSex?: AnimalSex;
   microbeGuildId?: MicrobeGuildId;
   planktonKind?: PlanktonKind;
 }
@@ -460,15 +524,46 @@ export interface MissionProgressSnapshot {
     | 'biomass'
     | 'adult-count'
     | 'population-count'
-    | 'born-count';
+    | 'born-count'
+    | 'generation-count';
   label: string;
   ratio: number;
   holdCurrent: number;
   holdTarget: number;
+  /** Optional second requirement that must remain true during the same hold. */
+  supportingCurrent?: number;
+  supportingTarget?: number;
+  supportingLabel?: string;
+}
+
+export interface SpatialDebugGapSnapshot {
+  id: string;
+  x: number;
+  y: number;
+  clearance: number;
+  usableClearance: number;
+  first: Vec2;
+  second: Vec2;
+  structureIds: [string, string];
+}
+
+export interface SpatialDebugAgentSnapshot {
+  id: string;
+  speciesId: AnimalSpeciesId;
+  x: number;
+  y: number;
+  bodyThickness: number;
+}
+
+export interface SpatialDebugSnapshot {
+  enabled: boolean;
+  gaps: SpatialDebugGapSnapshot[];
+  agents: SpatialDebugAgentSnapshot[];
 }
 
 export interface SimulationSnapshot {
   scenarioId: ScenarioId;
+  tank: TankDefinition;
   mode: SimulationMode;
   phase: SimulationPhase;
   outcome: MissionOutcome;
@@ -502,9 +597,14 @@ export interface SimulationSnapshot {
   selection: SelectionSnapshot | null;
   remainingSeeds: Record<SpeciesId, number | null>;
   remainingAnimals: Record<AnimalSpeciesId, number | null>;
+  remainingAnimalSexes: Partial<
+    Record<AnimalSpeciesId, Record<AnimalSex, number | null>>
+  >;
   remainingMicrobes: Record<MicrobeGuildId, number | null>;
   remainingPlankton: Record<PlanktonKind, number | null>;
   remainingStructures: Record<StructureDefinitionId, number | null>;
+  /** Populated only while the laboratory spatial-debug view is enabled. */
+  spatialDebug: SpatialDebugSnapshot;
   totalBiomass: SpeciesBiomass;
   totalAlgaeConsumed: number;
   animalPopulation: Record<AnimalSpeciesId, AnimalPopulationSnapshot>;
@@ -542,6 +642,11 @@ export interface BiogeochemistrySaveState {
    * odour, this is behavioural information rather than conserved matter.
    */
   shrimpMateCue?: number[];
+  /**
+   * Short-lived non-material predator/attack cue. It carries no predator ID
+   * or exact coordinate and is excluded from the closed material ledger.
+   */
+  predatorDangerCue?: number[];
   planktonCounters?: PlanktonSnapshot['cumulativeEvents'] & {
     filteredPhytoplankton: number;
     filteredPlanktonicDecomposer: number;
@@ -599,7 +704,18 @@ export interface SavedAnimalState {
   lifespanSeconds: number;
   energy: number;
   structuralBiomass: number;
+  /**
+   * Greatest post-hatch structural mass reached by this animal. Ricefish use
+   * it to distinguish healthy small juveniles from individuals that have
+   * wasted away. Optional so older frozen aquariums remain loadable.
+   */
+  peakStructuralBiomass?: number;
   storedBiomass: number;
+  /**
+   * Portion of storedBiomass that is still endogenous post-hatch yolk.
+   * It is a subset marker, not additional matter. Optional for old saves.
+   */
+  yolkBiomass?: number;
   /** Conserved egg/reproduction buffer; optional only for version-1 save compatibility. */
   reproductiveBiomass?: number;
   health: number;
@@ -608,6 +724,32 @@ export interface SavedAnimalState {
   targetCellId: string | null;
   /** Optional so version-1 shrimp-only frozen aquariums remain loadable. */
   targetAnimalId?: string | null;
+  /**
+   * Reciprocal ricefish courtship partner. Optional so older frozen aquariums
+   * resume without a stale pairing.
+   */
+  courtshipPartnerId?: string | null;
+  /**
+   * Missed-strike recovery already spent on the current prey (0 or 1).
+   * Optional so older frozen aquariums restore with no spent recovery.
+   */
+  strikeRecoveryUses?: number;
+  /**
+   * Consecutive energetic effort spent pursuing visible prey. Optional so
+   * older frozen aquariums resume fully recovered.
+   */
+  pursuitEffort?: number;
+  /**
+   * Centre of the last prey-poor ricefish search patch. Optional so aquariums
+   * frozen before spatial patch departure was modelled remain loadable.
+   */
+  foragingPatchOrigin?: Vec2 | null;
+  /**
+   * Position of the last visual inspection along that patch transect.
+   * Optional so older frozen aquariums resume with a conservative first
+   * observation instead of becoming unloadable.
+   */
+  foragingLastInspectionPosition?: Vec2 | null;
   /** Egg attachment surface; null for mobile life stages. */
   attachmentCellId?: string | null;
   /** Remaining embryo development time for ricefish eggs. */
@@ -618,6 +760,12 @@ export interface SavedAnimalState {
   recentIntake: number;
   consumedBiomass: number;
   grazingSessionIntake: number;
+  /** Elapsed time in the current finite grazing bout; absent in older saves. */
+  grazingSessionSeconds?: number;
+  /** Most recently completed shrimp grazing patch; optional for old saves. */
+  recentGrazingCellId?: string | null;
+  /** Remaining local revisit delay for recentGrazingCellId. */
+  recentGrazingCellCooldown?: number;
   secondsSinceFood: number;
   growthProgress: number;
   reproductionCooldown: number;
@@ -631,7 +779,12 @@ export interface SavedAnimalState {
   maturationTargetInstars?: number;
   /** Female shrimp ovarian/molt readiness, independent of funded egg matter. */
   ovarianProgress?: number;
-  /** Completed shrimp broods; seeds stable per-cycle life-history variation. */
+  /**
+   * Cherry-shrimp clutch size fixed when the current ovarian cycle began.
+   * Optional so older frozen aquariums derive it from the female's own size.
+   */
+  ovarianClutchSize?: number;
+  /** Completed broods; seeds stable per-cycle life-history variation. */
   reproductiveCycleIndex?: number;
   /** Daphnia molt state. Broods are deposited and released only at a molt. */
   moltProgress?: number;
@@ -664,6 +817,10 @@ export interface SavedAnimalCarcassState {
 export interface SimulationSaveData {
   version: 1;
   scenarioId: ScenarioId;
+  /** Fresh-tank biological draw; persisted so thawing cannot reroll offspring. */
+  runSeed?: number;
+  /** Optional so frozen aquariums created before selectable tanks load as standard. */
+  tankType?: TankTypeId;
   savedPhase: SimulationPhase;
   outcome: MissionOutcome;
   outcomeAtSeconds: number | null;
@@ -713,11 +870,17 @@ export interface SimulationSaveData {
   animalPopulationEventSequence: number;
   totalAlgaeConsumed: number;
   animalInventoryUsed: Record<AnimalSpeciesId, number>;
+  /** Optional so frozen aquariums saved before sex-specific stocking remain loadable. */
+  animalSexInventoryUsed?: Partial<
+    Record<AnimalSpeciesId, Record<AnimalSex, number>>
+  >;
   microbeInventoryUsed: Record<MicrobeGuildId, number>;
   suspendedBiofilm: BiofilmBiomass;
   /** Optional so frozen aquariums from before mission 7 remain loadable. */
   planktonInventoryUsed?: Record<PlanktonKind, number>;
   biofilmSettlementCursor: number;
+  /** Optional so saves made before time-step-independent settlement still load. */
+  biofilmSettlementAttemptAccumulator?: Record<MicrobeGuildId, number>;
   materialReference: {
     nitrogen: number;
     carbon: number;
@@ -728,18 +891,28 @@ export interface SimulationSaveData {
 }
 
 export type SimulationCommand =
-  | { type: 'initialize'; scenarioId: ScenarioId }
+  | {
+    type: 'initialize';
+    scenarioId: ScenarioId;
+    tankType?: TankTypeId;
+    runSeed?: number;
+  }
   | { type: 'start' }
   | { type: 'pause' }
   | { type: 'resume' }
-  | { type: 'reset' }
+  | { type: 'reset'; runSeed?: number }
   | { type: 'export-save'; requestId: number }
   | { type: 'load-save'; data: SimulationSaveData }
   | { type: 'set-speed'; speed: SimulationSpeed }
   | { type: 'pointer-move'; point: Vec2 }
   | { type: 'pick-structure'; definitionId: StructureDefinitionId; point?: Vec2 }
   | { type: 'pick-seed'; speciesId: SpeciesId; point?: Vec2 }
-  | { type: 'pick-animal'; speciesId: AnimalSpeciesId; point?: Vec2 }
+  | {
+      type: 'pick-animal';
+      speciesId: AnimalSpeciesId;
+      sex?: AnimalSex;
+      point?: Vec2;
+    }
   | { type: 'pick-biofilm'; guildId: MicrobeGuildId; point?: Vec2 }
   | { type: 'pick-plankton'; planktonKind: PlanktonKind; point?: Vec2 }
   | { type: 'pick-at'; point: Vec2 }
@@ -763,7 +936,8 @@ export type SimulationCommand =
   | { type: 'remove-selected-algae'; speciesId: SpeciesId }
   | { type: 'set-light-output'; output: number }
   | { type: 'set-natural-light-output'; output: number }
-  | { type: 'set-day-night-enabled'; enabled: boolean };
+  | { type: 'set-day-night-enabled'; enabled: boolean }
+  | { type: 'set-spatial-debug'; enabled: boolean };
 
 export interface WorkerSnapshotMessage {
   type: 'snapshot';
@@ -805,8 +979,23 @@ export interface WorkerMotionOverlayMessage {
   probe: ProbeSnapshot | null;
 }
 
+export interface WorkerTelemetryResizeRequestMessage {
+  type: 'telemetry-resize-request';
+  stream: 'snapshot';
+  minimumPayloadBytes: number;
+}
+
+export interface WorkerFaultMessage {
+  type: 'worker-fault';
+  operation: 'command' | 'export-save' | 'simulation-tick';
+  message: string;
+  stack?: string;
+}
+
 export type WorkerMessage =
   | WorkerSnapshotMessage
   | WorkerMotionMessage
   | WorkerMotionOverlayMessage
-  | WorkerSaveMessage;
+  | WorkerSaveMessage
+  | WorkerTelemetryResizeRequestMessage
+  | WorkerFaultMessage;

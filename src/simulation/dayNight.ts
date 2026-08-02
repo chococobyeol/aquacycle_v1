@@ -25,6 +25,46 @@ const smoothstep = (value: number): number => {
   return x * x * (3 - 2 * x);
 };
 
+export const DAYLIGHT_DAY_EDGE_ANGLE_RADIANS = 20 * Math.PI / 180;
+export const DAYLIGHT_HORIZON_ANGLE_RADIANS = 45 * Math.PI / 180;
+
+/**
+ * Direction of the direct daylight bundle, measured from vertical.
+ *
+ * Positive angles travel down and to the right. The unwrapped angle always
+ * decreases: sunrise enters from one side, crosses vertical at noon, leaves
+ * from the other side, and continues below the horizon during the night.
+ * The below-horizon direction is not used as direct light; retaining it keeps
+ * the authored orbit continuous instead of teleporting the sun back overhead.
+ */
+export const daylightAngleRadians = (
+  state: DayNightState | null,
+): number => {
+  if (!state) return 0;
+  const progress = state.phaseProgress;
+  if (state.phase === 'dawn') {
+    return DAYLIGHT_HORIZON_ANGLE_RADIANS +
+      (
+        DAYLIGHT_DAY_EDGE_ANGLE_RADIANS -
+          DAYLIGHT_HORIZON_ANGLE_RADIANS
+      ) * progress;
+  }
+  if (state.phase === 'day') {
+    return DAYLIGHT_DAY_EDGE_ANGLE_RADIANS *
+      (1 - 2 * progress);
+  }
+  if (state.phase === 'dusk') {
+    return -DAYLIGHT_DAY_EDGE_ANGLE_RADIANS +
+      (
+        -DAYLIGHT_HORIZON_ANGLE_RADIANS +
+          DAYLIGHT_DAY_EDGE_ANGLE_RADIANS
+      ) * progress;
+  }
+  // End at -315°, which is the same direction as the next dawn's +45°.
+  return -DAYLIGHT_HORIZON_ANGLE_RADIANS -
+    (Math.PI * 2 - DAYLIGHT_HORIZON_ANGLE_RADIANS * 2) * progress;
+};
+
 export const dayNightCycleDuration = (cycle: DayNightCycleDefinition): number =>
   Math.max(1, cycle.dawnSeconds + cycle.daySeconds + cycle.duskSeconds + cycle.nightSeconds);
 

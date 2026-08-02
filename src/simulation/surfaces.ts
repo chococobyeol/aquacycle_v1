@@ -64,14 +64,19 @@ export const sampleEcologyFace = (
   return attachGridNeighbors(cells);
 };
 
-export const sampleSubstrate = (cellSize = 10, rowCount = 3): LocalSurfaceCell[] => {
+export const sampleSubstrate = (
+  cellSize = 10,
+  rowCount = 3,
+  tankWidth = TANK_WIDTH,
+  groundY = GROUND_Y,
+): LocalSurfaceCell[] => {
   const cells: LocalSurfaceCell[] = [];
-  const columns = Math.floor(TANK_WIDTH / cellSize);
+  const columns = Math.floor(tankWidth / cellSize);
   for (let row = 0; row < rowCount; row += 1) {
     for (let column = 0; column < columns; column += 1) {
       cells.push({
         x: (column + 0.5) * cellSize,
-        y: GROUND_Y - (row + 0.5) * cellSize,
+        y: groundY - (row + 0.5) * cellSize,
         row,
         column,
         cellSize,

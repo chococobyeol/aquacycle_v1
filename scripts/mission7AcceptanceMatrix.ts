@@ -15,7 +15,11 @@ import {
   MISSION7_LONG_RUN_ACCEPTANCE,
   acuteWaterDeathCount,
   analyzeRecoveryOscillation,
+  recentHalf,
+  summarizeLinearTailTrend,
   summarizePopulationEvents,
+  sustainedProjectedCeilingBreach,
+  sustainedProjectedFloorBreach,
   type LongRunPopulationEvent,
 } from './mission7LongRunAcceptance';
 
@@ -303,8 +307,10 @@ export const applyMission7AcceptanceFixture = (
 export interface Mission7AcceptanceSample {
   time: number;
   daphniaCount: number;
+  daphniaAdultCount: number;
   phytoplanktonBiomass: number;
   shrimpCount: number;
+  shrimpAdultCount: number;
   vallisneriaRunnerCount: number;
   decomposerBiomass: number;
   nitrifierBiomass: number;
@@ -344,14 +350,17 @@ export type Mission7AcceptanceCheckId =
   | 'duration'
   | 'daphnia-density'
   | 'daphnia-generation'
+  | 'daphnia-trajectory'
   | 'daphnia-deaths'
   | 'phytoplankton-recovery'
   | 'vallisneria-generation'
   | 'shrimp-generation'
+  | 'shrimp-trajectory'
   | 'shrimp-breeding-pair'
   | 'shrimp-deaths'
   | 'microbe-guilds'
   | 'water-quality'
+  | 'water-trajectory'
   | 'material-ledger';
 
 export interface Mission7AcceptanceCheck {
@@ -360,10 +369,17 @@ export interface Mission7AcceptanceCheck {
   detail: string;
 }
 
+export interface Mission7AcceptanceObservation {
+  id: 'daphnia-death-composition' | 'shrimp-death-composition';
+  level: 'info' | 'warning';
+  detail: string;
+}
+
 export interface Mission7AcceptanceReport {
   scenarioId: Mission7AcceptanceScenarioId;
   passed: boolean;
   checks: Mission7AcceptanceCheck[];
+  observations: Mission7AcceptanceObservation[];
   ricefishPredationLoad: 'not-verified';
 }
 
@@ -393,9 +409,23 @@ export const evaluateMission7Acceptance = (
   const tailEvents = allEvents.filter(
     (event) => event.elapsedSeconds >= thresholds.tailStartSeconds,
   );
+  const recentTailSamples = recentHalf(tail);
+  const recentTailStartSeconds =
+    recentTailSamples[0]?.time ?? thresholds.tailStartSeconds;
+  const recentTailEvents = allEvents.filter(
+    (event) => event.elapsedSeconds >= recentTailStartSeconds,
+  );
   const daphniaEvents = summarizePopulationEvents(tailEvents, 'daphnia');
+  const recentDaphniaEvents = summarizePopulationEvents(
+    recentTailEvents,
+    'daphnia',
+  );
   const shrimpEvents = summarizePopulationEvents(
     tailEvents,
+    'cherry-shrimp',
+  );
+  const recentShrimpEvents = summarizePopulationEvents(
+    recentTailEvents,
     'cherry-shrimp',
   );
   const daphniaCounts = tail.map((sample) => sample.daphniaCount);
@@ -414,6 +444,88 @@ export const evaluateMission7Acceptance = (
     thresholds.phytoplankton.meaningfulStep,
     thresholds.phytoplankton.minimumRecovery,
   );
+  const trendSeries = (
+    select: (sample: Mission7AcceptanceSample) => number,
+  ) => tail.map((sample) => ({
+    time: sample.time,
+    value: select(sample),
+  }));
+  const daphniaPopulationSeries = trendSeries(
+    (sample) => sample.daphniaCount,
+  );
+  const daphniaAdultSeries = trendSeries(
+    (sample) => sample.daphniaAdultCount,
+  );
+  const shrimpPopulationSeries = trendSeries(
+    (sample) => sample.shrimpCount,
+  );
+  const shrimpAdultSeries = trendSeries(
+    (sample) => sample.shrimpAdultCount,
+  );
+  const oxygenSeries = trendSeries((sample) => sample.oxygen);
+  const toxicWasteSeries = trendSeries((sample) => sample.toxicWaste);
+  const organicMatterSeries = trendSeries((sample) => sample.organicMatter);
+  const daphniaPopulationTrend =
+    summarizeLinearTailTrend(daphniaPopulationSeries);
+  const recentDaphniaPopulationTrend = summarizeLinearTailTrend(
+    recentHalf(daphniaPopulationSeries),
+  );
+  const daphniaAdultTrend = summarizeLinearTailTrend(daphniaAdultSeries);
+  const recentDaphniaAdultTrend = summarizeLinearTailTrend(
+    recentHalf(daphniaAdultSeries),
+  );
+  const shrimpPopulationTrend =
+    summarizeLinearTailTrend(shrimpPopulationSeries);
+  const recentShrimpPopulationTrend = summarizeLinearTailTrend(
+    recentHalf(shrimpPopulationSeries),
+  );
+  const shrimpAdultTrend = summarizeLinearTailTrend(shrimpAdultSeries);
+  const recentShrimpAdultTrend = summarizeLinearTailTrend(
+    recentHalf(shrimpAdultSeries),
+  );
+  const oxygenTrend = summarizeLinearTailTrend(oxygenSeries);
+  const recentOxygenTrend = summarizeLinearTailTrend(
+    recentHalf(oxygenSeries),
+  );
+  const toxicWasteTrend = summarizeLinearTailTrend(toxicWasteSeries);
+  const recentToxicWasteTrend = summarizeLinearTailTrend(
+    recentHalf(toxicWasteSeries),
+  );
+  const organicMatterTrend = summarizeLinearTailTrend(organicMatterSeries);
+  const recentOrganicMatterTrend = summarizeLinearTailTrend(
+    recentHalf(organicMatterSeries),
+  );
+  const daphniaPopulationProjectedCollapse =
+    sustainedProjectedFloorBreach(
+      recentDaphniaPopulationTrend,
+      thresholds.daphnia.minimumCount,
+    );
+  const daphniaAdultProjectedCollapse = sustainedProjectedFloorBreach(
+    recentDaphniaAdultTrend,
+    1,
+  );
+  const shrimpPopulationProjectedCollapse =
+    sustainedProjectedFloorBreach(
+      recentShrimpPopulationTrend,
+      thresholds.shrimp.minimumCount,
+    );
+  const shrimpAdultProjectedCollapse = sustainedProjectedFloorBreach(
+    recentShrimpAdultTrend,
+    1,
+  );
+  const waterProjectedUnsafe =
+    sustainedProjectedFloorBreach(
+      recentOxygenTrend,
+      thresholds.water.minimumOxygen,
+    ) ||
+    sustainedProjectedCeilingBreach(
+      recentToxicWasteTrend,
+      thresholds.water.maximumToxicWaste,
+    ) ||
+    sustainedProjectedCeilingBreach(
+      recentOrganicMatterTrend,
+      thresholds.water.maximumOrganicMatter,
+    );
   const maximumAbsoluteDrift = {
     nitrogen: Math.max(
       ...evidence.samples.map((sample) =>
@@ -454,6 +566,32 @@ export const evaluateMission7Acceptance = (
     ...tail.map((sample) => sample.nitrifierBiomass),
   );
 
+  const observations: Mission7AcceptanceObservation[] = [
+    {
+      id: 'daphnia-death-composition',
+      level: daphniaEvents.deathsByCause.starvation >
+          daphniaEvents.deathsByCause['old-age']
+        ? 'warning'
+        : 'info',
+      detail:
+        `oldAge=${daphniaEvents.deathsByCause['old-age']}, starvation=` +
+        `${daphniaEvents.deathsByCause.starvation}, ` +
+        `waterStress=${acuteWaterDeathCount(daphniaEvents)}, ` +
+        `predation=${daphniaEvents.deathsByCause.predation}`,
+    },
+    {
+      id: 'shrimp-death-composition',
+      level: shrimpEvents.deathsByCause.starvation >
+          shrimpEvents.deathsByCause['old-age']
+        ? 'warning'
+        : 'info',
+      detail:
+        `oldAge=${shrimpEvents.deathsByCause['old-age']}, starvation=` +
+        `${shrimpEvents.deathsByCause.starvation}, ` +
+        `waterStress=${acuteWaterDeathCount(shrimpEvents)}, ` +
+        `predation=${shrimpEvents.deathsByCause.predation}`,
+    },
+  ];
   const checks: Mission7AcceptanceCheck[] = [];
   const add = (
     id: Mission7AcceptanceCheckId,
@@ -487,25 +625,44 @@ export const evaluateMission7Acceptance = (
     daphniaEvents.births >= thresholds.daphnia.minimumTailBirths &&
       daphniaEvents.maturations >=
         thresholds.daphnia.minimumTailMaturations &&
+      recentDaphniaEvents.births >=
+        thresholds.daphnia.minimumTailBirths &&
+      recentDaphniaEvents.maturations >=
+        thresholds.daphnia.minimumTailMaturations &&
       evidence.final.daphniaFounders === 0 &&
       evidence.final.daphniaDescendants >=
         thresholds.daphnia.minimumFinalDescendants &&
       evidence.final.daphniaMaximumLivingGeneration >=
         thresholds.daphnia.minimumLivingGeneration,
     `tailBirths=${daphniaEvents.births}, tailMaturations=${daphniaEvents.maturations}, ` +
+      `recentBirths=${recentDaphniaEvents.births}, ` +
+      `recentMaturations=${recentDaphniaEvents.maturations}, ` +
       `founders=${evidence.final.daphniaFounders}, descendants=${evidence.final.daphniaDescendants}, ` +
       `generation=${evidence.final.daphniaMaximumLivingGeneration}`,
   );
   add(
+    'daphnia-trajectory',
+    !daphniaPopulationProjectedCollapse &&
+      !daphniaAdultProjectedCollapse,
+    `populationFullSlope95=[${daphniaPopulationTrend.slopeLower95.toExponential(3)}, ` +
+      `${daphniaPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+      `populationRecentSlope95=[${recentDaphniaPopulationTrend.slopeLower95.toExponential(3)}, ` +
+      `${recentDaphniaPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+      `populationRecentProjected=${recentDaphniaPopulationTrend.projectedAfterSameDuration.toFixed(2)}, ` +
+      `adultFullSlope95=[${daphniaAdultTrend.slopeLower95.toExponential(3)}, ` +
+      `${daphniaAdultTrend.slopeUpper95.toExponential(3)}], ` +
+      `adultRecentSlope95=[${recentDaphniaAdultTrend.slopeLower95.toExponential(3)}, ` +
+      `${recentDaphniaAdultTrend.slopeUpper95.toExponential(3)}], ` +
+      `adultRecentProjected=${recentDaphniaAdultTrend.projectedAfterSameDuration.toFixed(2)}`,
+  );
+  add(
     'daphnia-deaths',
-    daphniaEvents.deathsByCause['old-age'] > 0 &&
-      acuteWaterDeathCount(daphniaEvents) === 0 &&
-      daphniaEvents.deathsByCause.predation === 0 &&
-      daphniaEvents.deathsByCause.starvation <=
-        daphniaEvents.deathsByCause['old-age'],
+    acuteWaterDeathCount(daphniaEvents) === 0 &&
+      daphniaEvents.deathsByCause.predation === 0,
     `oldAge=${daphniaEvents.deathsByCause['old-age']}, starvation=` +
       `${daphniaEvents.deathsByCause.starvation}, ` +
-      `waterStress=${acuteWaterDeathCount(daphniaEvents)}`,
+      `waterStress=${acuteWaterDeathCount(daphniaEvents)}, ` +
+      `predation=${daphniaEvents.deathsByCause.predation}`,
   );
   add(
     'phytoplankton-recovery',
@@ -537,9 +694,30 @@ export const evaluateMission7Acceptance = (
     shrimpRange[0] >= thresholds.shrimp.minimumCount &&
       shrimpEvents.births >= thresholds.shrimp.minimumTailBirths &&
       shrimpEvents.maturations >= thresholds.shrimp.minimumTailMaturations &&
+      recentShrimpEvents.births >= thresholds.shrimp.minimumTailBirths &&
+      recentShrimpEvents.maturations >=
+        thresholds.shrimp.minimumTailMaturations &&
       evidence.final.shrimpBornDescendants >= 2,
     `tailMin=${shrimpRange[0]}, births=${shrimpEvents.births}, ` +
-      `maturations=${shrimpEvents.maturations}, bornAlive=${evidence.final.shrimpBornDescendants}`,
+      `maturations=${shrimpEvents.maturations}, ` +
+      `recentBirths=${recentShrimpEvents.births}, ` +
+      `recentMaturations=${recentShrimpEvents.maturations}, ` +
+      `bornAlive=${evidence.final.shrimpBornDescendants}`,
+  );
+  add(
+    'shrimp-trajectory',
+    !shrimpPopulationProjectedCollapse &&
+      !shrimpAdultProjectedCollapse,
+    `populationFullSlope95=[${shrimpPopulationTrend.slopeLower95.toExponential(3)}, ` +
+      `${shrimpPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+      `populationRecentSlope95=[${recentShrimpPopulationTrend.slopeLower95.toExponential(3)}, ` +
+      `${recentShrimpPopulationTrend.slopeUpper95.toExponential(3)}], ` +
+      `populationRecentProjected=${recentShrimpPopulationTrend.projectedAfterSameDuration.toFixed(2)}, ` +
+      `adultFullSlope95=[${shrimpAdultTrend.slopeLower95.toExponential(3)}, ` +
+      `${shrimpAdultTrend.slopeUpper95.toExponential(3)}], ` +
+      `adultRecentSlope95=[${recentShrimpAdultTrend.slopeLower95.toExponential(3)}, ` +
+      `${recentShrimpAdultTrend.slopeUpper95.toExponential(3)}], ` +
+      `adultRecentProjected=${recentShrimpAdultTrend.projectedAfterSameDuration.toFixed(2)}`,
   );
   add(
     'shrimp-breeding-pair',
@@ -554,14 +732,12 @@ export const evaluateMission7Acceptance = (
   );
   add(
     'shrimp-deaths',
-    shrimpEvents.deathsByCause['old-age'] > 0 &&
-      acuteWaterDeathCount(shrimpEvents) === 0 &&
-      shrimpEvents.deathsByCause.predation === 0 &&
-      shrimpEvents.deathsByCause.starvation <=
-        shrimpEvents.deathsByCause['old-age'],
+    acuteWaterDeathCount(shrimpEvents) === 0 &&
+      shrimpEvents.deathsByCause.predation === 0,
     `oldAge=${shrimpEvents.deathsByCause['old-age']}, starvation=` +
       `${shrimpEvents.deathsByCause.starvation}, ` +
-      `waterStress=${acuteWaterDeathCount(shrimpEvents)}`,
+      `waterStress=${acuteWaterDeathCount(shrimpEvents)}, ` +
+      `predation=${shrimpEvents.deathsByCause.predation}`,
   );
   add(
     'microbe-guilds',
@@ -578,6 +754,25 @@ export const evaluateMission7Acceptance = (
       `organicMax=${organicMatterMaximum.toFixed(3)}, finite=${finiteWater}`,
   );
   add(
+    'water-trajectory',
+    !waterProjectedUnsafe,
+    `oxygenFullSlope95=[${oxygenTrend.slopeLower95.toExponential(3)}, ` +
+      `${oxygenTrend.slopeUpper95.toExponential(3)}], ` +
+      `oxygenRecentSlope95=[${recentOxygenTrend.slopeLower95.toExponential(3)}, ` +
+      `${recentOxygenTrend.slopeUpper95.toExponential(3)}], ` +
+      `oxygenRecentProjected=${recentOxygenTrend.projectedAfterSameDuration.toFixed(3)}, ` +
+      `toxicFullSlope95=[${toxicWasteTrend.slopeLower95.toExponential(3)}, ` +
+      `${toxicWasteTrend.slopeUpper95.toExponential(3)}], ` +
+      `toxicRecentSlope95=[${recentToxicWasteTrend.slopeLower95.toExponential(3)}, ` +
+      `${recentToxicWasteTrend.slopeUpper95.toExponential(3)}], ` +
+      `toxicRecentProjected=${recentToxicWasteTrend.projectedAfterSameDuration.toFixed(3)}, ` +
+      `organicFullSlope95=[${organicMatterTrend.slopeLower95.toExponential(3)}, ` +
+      `${organicMatterTrend.slopeUpper95.toExponential(3)}], ` +
+      `organicRecentSlope95=[${recentOrganicMatterTrend.slopeLower95.toExponential(3)}, ` +
+      `${recentOrganicMatterTrend.slopeUpper95.toExponential(3)}], ` +
+      `organicRecentProjected=${recentOrganicMatterTrend.projectedAfterSameDuration.toFixed(3)}`,
+  );
+  add(
     'material-ledger',
     maximumAbsoluteDrift.nitrogen < CLOSED_MATERIAL_RELATIVE_TOLERANCE &&
       maximumAbsoluteDrift.carbon < CLOSED_MATERIAL_RELATIVE_TOLERANCE &&
@@ -592,6 +787,7 @@ export const evaluateMission7Acceptance = (
     scenarioId,
     passed: checks.every((check) => check.passed),
     checks,
+    observations,
     ricefishPredationLoad:
       MISSION7_ACCEPTANCE_MATRIX[scenarioId].ricefishPredationLoad,
   };

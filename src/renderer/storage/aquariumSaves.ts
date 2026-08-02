@@ -1,7 +1,7 @@
 import type { ScenarioId, SimulationSaveData } from '../../simulation/types';
 
 export const AQUARIUM_SAVES_KEY = 'aquacycle.frozen-aquariums.v1';
-export const MAX_FROZEN_AQUARIUMS = 12;
+export const MAX_FROZEN_AQUARIUMS = 16;
 
 export interface FrozenAquariumRecord {
   id: string;

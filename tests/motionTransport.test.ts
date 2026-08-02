@@ -123,7 +123,7 @@ describe('simulation worker motion cadence', () => {
     expect(messages.some((message) => message.type === 'snapshot')).toBe(true);
   });
 
-  it('falls back to ordinary messages when fixed shared slots are too small', async () => {
+  it('requests a larger snapshot slot while preserving small cursor messages', async () => {
     vi.useFakeTimers();
     const messages: WorkerMessage[] = [];
     let receiveCommand: ((event: MessageEvent<SimulationCommand>) => void) | null = null;
@@ -156,7 +156,12 @@ describe('simulation worker motion cadence', () => {
     });
     await vi.advanceTimersByTimeAsync(40);
 
-    expect(messages.some((message) => message.type === 'snapshot')).toBe(true);
+    expect(messages.some((message) => message.type === 'snapshot')).toBe(false);
+    expect(messages).toContainEqual({
+      type: 'telemetry-resize-request',
+      stream: 'snapshot',
+      minimumPayloadBytes: 128,
+    });
     const overlay = messages.find((message) => message.type === 'motion-overlay');
     expect(overlay).toMatchObject({
       type: 'motion-overlay',

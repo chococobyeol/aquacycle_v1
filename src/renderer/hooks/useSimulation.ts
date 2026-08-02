@@ -11,9 +11,12 @@ import type {
   AnimalSnapshot,
   WorkerMotionMessage,
   WorkerMessage,
+  TankTypeId,
 } from '../../simulation/types';
 import {
   createSharedTelemetryChannel,
+  MAX_SHARED_TELEMETRY_PAYLOAD_BYTES,
+  SHARED_TELEMETRY_PAYLOAD_BYTES,
   SharedTelemetryReader,
   sharedTelemetryAvailable,
 } from '../../simulation/sharedTelemetry';
@@ -55,6 +58,32 @@ export interface SimulationMotionStore extends SimulationMotionSource {
 
 export const BACKGROUND_TELEMETRY_POLL_INTERVAL_MS = 16;
 const INTERACTIVE_TELEMETRY_PAYLOAD_BYTES = 64 * 1024;
+const SAVE_REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * A fresh aquarium gets a fresh biological draw. The value is sent into the
+ * worker and stored with frozen aquariums, so restarting can vary offspring
+ * while saving/loading never rerolls an established lineage.
+ */
+export const createSimulationRunSeed = (): number => {
+  const values = new Uint32Array(1);
+  globalThis.crypto?.getRandomValues?.(values);
+  if (values[0] !== 0) return values[0] >>> 0;
+  return Math.floor(Math.random() * 0x1_0000_0000) >>> 0;
+};
+
+export const normalizeTelemetryPayloadBytes = (
+  minimumPayloadBytes: number,
+): number => {
+  let payloadBytes = SHARED_TELEMETRY_PAYLOAD_BYTES;
+  while (
+    payloadBytes < minimumPayloadBytes &&
+    payloadBytes < MAX_SHARED_TELEMETRY_PAYLOAD_BYTES
+  ) {
+    payloadBytes *= 2;
+  }
+  return Math.min(payloadBytes, MAX_SHARED_TELEMETRY_PAYLOAD_BYTES);
+};
 
 export interface TelemetryPollingClock {
   requestAnimationFrame: (callback: FrameRequestCallback) => number;
@@ -214,14 +243,14 @@ const sameHoldingIdentity = (
 export const useSimulation = (
   scenarioId: ScenarioId,
   initialSaveData?: SimulationSaveData,
+  initialTankType: TankTypeId = 'standard',
 ): SimulationController => {
   const workerRef = useRef<Worker | null>(null);
   const saveRequestSequence = useRef(0);
-  const latestSnapshotRef = useRef<SimulationSnapshot | null>(null);
-  const rendererRestartPendingRef = useRef(false);
   const saveRequests = useRef(new Map<number, {
     resolve: (data: SimulationSaveData) => void;
     reject: (reason: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
   }>());
   const [motionStore] = useState(createSimulationMotionStore);
   const [snapshot, setSnapshot] = useState<SimulationSnapshot | null>(null);
@@ -231,12 +260,15 @@ export const useSimulation = (
     // An inline worker becomes a same-origin Blob in packaged file:// builds.
     // A separate worker asset is blocked by Chromium's COEP enforcement there,
     // even though the development server can attach the required HTTP header.
-    let worker = new SimulationWorker();
+    const worker = new SimulationWorker();
     workerRef.current = worker;
     motionStore.clear();
     let stopTelemetryPolling: (() => void) | null = null;
-    let rendererRestartRequestId: number | null = null;
-    let connectWorkerTelemetry: (targetWorker: Worker) => void = () => {};
+    let snapshotPayloadBytes = SHARED_TELEMETRY_PAYLOAD_BYTES;
+    let connectWorkerTelemetry: (
+      targetWorker: Worker,
+      requestedSnapshotPayloadBytes?: number,
+    ) => void = () => {};
 
     const receiveWorkerMessage = (message: WorkerMessage): void => {
       if (message.type === 'snapshot') {
@@ -247,41 +279,33 @@ export const useSimulation = (
           // from the prior holding state must never repaint an older cursor pose.
           motionStore.clear();
         }
-        latestSnapshotRef.current = message.snapshot;
         setSnapshot(message.snapshot);
       } else if (message.type === 'save-data') {
-        if (message.requestId === rendererRestartRequestId) {
-          rendererRestartRequestId = null;
-          const previousWorker = worker;
-          previousWorker.removeEventListener('message', receivePostedMessage);
-          stopTelemetryPolling?.();
-          stopTelemetryPolling = null;
-          previousWorker.terminate();
-
-          // Replacing only the worker drops its long-lived object graph and
-          // lets Chromium reuse the old isolate's allocation arenas. Keep the
-          // existing BrowserWindow, React tree, Pixi canvas, open panels, and
-          // last painted snapshot in place while the in-memory aquarium state
-          // is handed to a fresh worker.
-          worker = new SimulationWorker();
-          workerRef.current = worker;
-          motionStore.reset();
-          worker.addEventListener('message', receivePostedMessage);
-          connectWorkerTelemetry(worker);
-          worker.postMessage({
-            type: 'load-save',
-            data: message.data,
-          } satisfies SimulationCommand);
-          if (message.data.savedPhase === 'running') {
-            worker.postMessage({ type: 'resume' } satisfies SimulationCommand);
-          }
-          rendererRestartPendingRef.current = false;
-          return;
-        }
         const pending = saveRequests.current.get(message.requestId);
         if (!pending) return;
         saveRequests.current.delete(message.requestId);
+        clearTimeout(pending.timeout);
         pending.resolve(message.data);
+      } else if (message.type === 'telemetry-resize-request') {
+        const nextPayloadBytes = normalizeTelemetryPayloadBytes(
+          message.minimumPayloadBytes,
+        );
+        if (nextPayloadBytes <= snapshotPayloadBytes) {
+          console.error(
+            '[AquaCycle] Simulation snapshot exceeds the maximum shared telemetry capacity.',
+            {
+              requestedBytes: message.minimumPayloadBytes,
+              maximumBytes: MAX_SHARED_TELEMETRY_PAYLOAD_BYTES,
+            },
+          );
+          return;
+        }
+        connectWorkerTelemetry(worker, nextPayloadBytes);
+      } else if (message.type === 'worker-fault') {
+        console.error(
+          `[AquaCycle] Simulation worker ${message.operation} fault: ${message.message}`,
+          message.stack,
+        );
       } else if (message.type === 'motion-overlay') {
         setSnapshot((current) => {
           if (!current || !shouldApplyInteractiveMotionOverlay(
@@ -294,7 +318,7 @@ export const useSimulation = (
             probe: message.probe,
           };
         });
-      } else {
+      } else if (message.type === 'motion') {
         const motion = message;
         motionStore.accept(motion, performance.now());
 
@@ -321,10 +345,37 @@ export const useSimulation = (
       receiveWorkerMessage(event.data);
     };
 
-    connectWorkerTelemetry = (targetWorker: Worker): void => {
+    const rejectPendingSaveRequests = (reason: Error): void => {
+      for (const pending of saveRequests.current.values()) {
+        clearTimeout(pending.timeout);
+        pending.reject(reason);
+      }
+      saveRequests.current.clear();
+    };
+
+    const receiveWorkerError = (event: ErrorEvent): void => {
+      console.error('[AquaCycle] Simulation worker error.', event.error ?? event.message);
+      rejectPendingSaveRequests(
+        new Error('시뮬레이션 워커 오류로 저장을 완료하지 못했습니다.'),
+      );
+    };
+
+    const receiveWorkerMessageError = (): void => {
+      console.error('[AquaCycle] Simulation worker message could not be decoded.');
+      rejectPendingSaveRequests(
+        new Error('시뮬레이션 데이터 전송 오류로 저장을 완료하지 못했습니다.'),
+      );
+    };
+
+    connectWorkerTelemetry = (
+      targetWorker: Worker,
+      requestedSnapshotPayloadBytes = snapshotPayloadBytes,
+    ): void => {
       if (!sharedTelemetryAvailable()) return;
       try {
-        const snapshotChannel = createSharedTelemetryChannel();
+        const snapshotChannel = createSharedTelemetryChannel(
+          requestedSnapshotPayloadBytes,
+        );
         const interactiveMotionChannel = createSharedTelemetryChannel(
           INTERACTIVE_TELEMETRY_PAYLOAD_BYTES,
         );
@@ -342,6 +393,8 @@ export const useSimulation = (
           motion: interactiveMotionChannel,
           binaryMotion: binaryMotionChannel,
         });
+        stopTelemetryPolling?.();
+        snapshotPayloadBytes = requestedSnapshotPayloadBytes;
 
         const pollSnapshot = (): void => {
           const snapshotMessage = snapshotReader.readLatest();
@@ -369,22 +422,9 @@ export const useSimulation = (
     };
 
     worker.addEventListener('message', receivePostedMessage);
+    worker.addEventListener('error', receiveWorkerError);
+    worker.addEventListener('messageerror', receiveWorkerMessageError);
     connectWorkerTelemetry(worker);
-
-    const stopMemoryPressureListener =
-      window.aquacycleDesktop?.onSimulationMemoryPressure?.(() => {
-        if (
-          rendererRestartPendingRef.current ||
-          saveRequests.current.size > 0 ||
-          latestSnapshotRef.current?.phase !== 'running'
-        ) return;
-        rendererRestartPendingRef.current = true;
-        rendererRestartRequestId = saveRequestSequence.current += 1;
-        worker.postMessage({
-          type: 'export-save',
-          requestId: rendererRestartRequestId,
-        } satisfies SimulationCommand);
-      });
 
     if (initialSaveData) {
       worker.postMessage({
@@ -398,50 +438,49 @@ export const useSimulation = (
       worker.postMessage({
         type: 'initialize',
         scenarioId,
+        tankType: initialTankType,
+        runSeed: createSimulationRunSeed(),
       } satisfies SimulationCommand);
     }
 
     return () => {
-      stopMemoryPressureListener?.();
       worker.removeEventListener('message', receivePostedMessage);
+      worker.removeEventListener('error', receiveWorkerError);
+      worker.removeEventListener('messageerror', receiveWorkerMessageError);
       stopTelemetryPolling?.();
       worker.terminate();
       workerRef.current = null;
-      for (const pending of saveRequests.current.values()) {
-        pending.reject(new Error('시뮬레이션이 닫혀 저장을 완료하지 못했습니다.'));
-      }
-      saveRequests.current.clear();
-      latestSnapshotRef.current = null;
-      rendererRestartPendingRef.current = false;
+      rejectPendingSaveRequests(
+        new Error('시뮬레이션이 닫혀 저장을 완료하지 못했습니다.'),
+      );
       motionStore.reset();
     };
-  }, [initialSaveData, motionStore, scenarioId]);
+  }, [initialSaveData, initialTankType, motionStore, scenarioId]);
 
   const send = useCallback((command: SimulationCommand): void => {
     // Topology, phase, or integration-speed changes begin a fresh interpolation
     // window. Replaying the last 64x sample after switching to 1x caused the
     // renderer to chase a stale target even though the worker was already stable.
     if (commandRebasesMotion(command)) motionStore.clear();
-    if (rendererRestartPendingRef.current) return;
     workerRef.current?.postMessage(command);
   }, [motionStore]);
 
   const requestSave = useCallback((): Promise<SimulationSaveData> => {
-    if (rendererRestartPendingRef.current) {
-      return Promise.reject(new Error('시뮬레이션 메모리를 정리하고 있습니다.'));
-    }
     const worker = workerRef.current;
     if (!worker) return Promise.reject(new Error('아직 수조가 준비되지 않았습니다.'));
     const requestId = saveRequestSequence.current += 1;
     return new Promise<SimulationSaveData>((resolve, reject) => {
-      saveRequests.current.set(requestId, { resolve, reject });
+      const timeout = setTimeout(() => {
+        saveRequests.current.delete(requestId);
+        reject(new Error('시뮬레이션 저장 응답 시간이 초과되었습니다.'));
+      }, SAVE_REQUEST_TIMEOUT_MS);
+      saveRequests.current.set(requestId, { resolve, reject, timeout });
       worker.postMessage({ type: 'export-save', requestId } satisfies SimulationCommand);
     });
   }, []);
 
   const loadSave = useCallback((data: SimulationSaveData): void => {
     motionStore.clear();
-    if (rendererRestartPendingRef.current) return;
     workerRef.current?.postMessage({
       type: 'load-save',
       data,

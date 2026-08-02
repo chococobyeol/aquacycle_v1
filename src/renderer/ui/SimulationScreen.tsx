@@ -30,6 +30,7 @@ import { SIMULATION_SPEED_OPTIONS, type SimulationSpeed } from '../../simulation
 import { thetaTemperatureFactor } from '../../simulation/temperatureResponse';
 import type {
   AnimalPopulationEventSnapshot,
+  AnimalSex,
   AnimalSpeciesId,
   GrowthTrend,
   HoldingSnapshot,
@@ -41,15 +42,22 @@ import type {
   SelectionFilter,
   ScenarioId,
   SimulationCommand,
+  SimulationMode,
+  SimulationPhase,
   SimulationSaveData,
   SimulationSnapshot,
   SpeciesId,
   StructureDefinitionId,
   StructureSnapshot,
+  TankTypeId,
   Vec2,
 } from '../../simulation/types';
 import { GROUND_Y, TANK_HEIGHT, TANK_WIDTH, WATER_TOP } from '../../simulation/types';
-import { useSimulation, type SimulationMotionSource } from '../hooks/useSimulation';
+import {
+  createSimulationRunSeed,
+  useSimulation,
+  type SimulationMotionSource,
+} from '../hooks/useSimulation';
 import {
   discardFrozenAquarium,
   freezeAquarium,
@@ -58,8 +66,13 @@ import {
 } from '../storage/aquariumSaves';
 import {
   PREPARE_MEMORY_RESTART_EVENT,
+  stageWarmRestart,
   stageWarmRestartUiState,
 } from '../storage/warmRestart';
+import {
+  readLaboratoryTankPreference,
+  writeLaboratoryTankPreference,
+} from '../storage/laboratoryPreferences';
 import { AquariumCanvas, type AquariumCameraTransform } from '../tank/AquariumCanvas';
 import { createReusableMotionInterpolator } from '../tank/motionInterpolation';
 import {
@@ -106,9 +119,31 @@ interface PendingInventoryItem {
   definitionId?: StructureDefinitionId;
   speciesId?: SpeciesId;
   animalSpeciesId?: AnimalSpeciesId;
+  animalSex?: AnimalSex;
   microbeGuildId?: MicrobeGuildId;
   planktonKind?: PlanktonKind;
 }
+
+export type PlaceableInventoryKind =
+  'structure' | 'seed' | 'animal' | 'biofilm' | 'plankton';
+
+export const inventoryPlacementEditable = (
+  kind: PlaceableInventoryKind,
+  scenarioId: ScenarioId,
+  mode: SimulationMode,
+  phase: SimulationPhase,
+  hasWaterCycle: boolean,
+): boolean => {
+  if (phase === 'setup' || (mode === 'laboratory' && phase === 'paused')) {
+    return true;
+  }
+  if (phase !== 'paused') return false;
+  if (kind === 'biofilm') return hasWaterCycle;
+  if (scenarioId === 'mission-5') {
+    return kind === 'seed' || kind === 'animal';
+  }
+  return scenarioId === 'mission-8' && kind === 'animal';
+};
 
 interface WaterQualityViewState {
   layers: WaterQualityLayer[];
@@ -130,6 +165,7 @@ interface EcologyHistoryPoint {
   grossPhotosynthesis: number;
   producerRespiration: number;
   shrimpCount: number;
+  shrimpBiomass: number;
   shrimpAdultFemales: number;
   shrimpAdultMales: number;
   shrimpJuveniles: number;
@@ -319,7 +355,7 @@ const closedHudPanels = (): Record<HudPanelId, boolean> => ({
   observation: false,
 });
 
-const STRUCTURE_IDS: StructureDefinitionId[] = ['flat-stone', 'round-stone', 'tall-stone'];
+const STRUCTURE_IDS = Object.keys(STRUCTURES) as StructureDefinitionId[];
 const SPECIES_IDS: SpeciesId[] = ['oedogonium', 'nitzschia', 'vallisneria'];
 const ANIMAL_IDS: AnimalSpeciesId[] = ['cherry-shrimp', 'japanese-ricefish', 'daphnia'];
 const MICROBE_IDS: MicrobeGuildId[] = ['decomposer', 'nitrifier'];
@@ -483,7 +519,8 @@ const formatProgressValue = (
     : `${progress.current.toFixed(1)} / ${progress.target.toFixed(1)}`
   : progress.unit === 'adult-count' ||
       progress.unit === 'population-count' ||
-      progress.unit === 'born-count'
+      progress.unit === 'born-count' ||
+      progress.unit === 'generation-count'
     ? `${Math.round(progress.current)} / ${Math.round(progress.target)}마리`
     : `${Math.round(progress.current * 100)} / ${Math.round(progress.target * 100)}%`;
 
@@ -756,9 +793,16 @@ export function SimulationScreen({
   onBack,
   onMissionComplete,
 }: SimulationScreenProps) {
+  const [initialTankType] = useState<TankTypeId>(() =>
+    initialSaveData?.tankType ??
+    (scenarioId === 'laboratory'
+      ? readLaboratoryTankPreference()
+      : SCENARIOS[scenarioId].tankType ?? 'standard')
+  );
   const { snapshot, motionSource, send, requestSave, loadSave } = useSimulation(
     scenarioId,
     initialSaveData,
+    initialTankType,
   );
   const scenario = SCENARIOS[scenarioId];
   const [activeTool, setActiveTool] = useState<InteractionTool>(
@@ -828,6 +872,10 @@ export function SimulationScreen({
   const [cameraResetToken, setCameraResetToken] = useState(0);
   const [pointer, setPointer] = useState({ x: 0, y: 0 });
   const completionReported = useRef(false);
+  const memoryRecoveryStartedRef = useRef(false);
+  const rendererReadyReportedRef = useRef(false);
+  const latestSnapshotRef = useRef(snapshot);
+  latestSnapshotRef.current = snapshot;
   const resumeAfterBriefing = useRef(false);
   const pendingInventoryRef = useRef<PendingInventoryItem | null>(null);
   const pendingInventoryRequestIdRef = useRef(0);
@@ -944,7 +992,9 @@ export function SimulationScreen({
     setSaveNotice(null);
     setShowGoalGuide(initialUiState?.showGoalGuide ?? false);
     setCameraTransform(initialUiState?.cameraTransform ?? null);
-    setCameraResetToken((current) => current + 1);
+    if (!initialUiState?.cameraTransform) {
+      setCameraResetToken((current) => current + 1);
+    }
     resumeAfterBriefing.current = false;
     setShowMissionBriefing(
       SCENARIOS[scenarioId].mode === 'challenge' && !initialSaveData,
@@ -1012,6 +1062,62 @@ export function SimulationScreen({
     waterQualityLegendCollapsed,
     waterQualityMapVisible,
   ]);
+
+  useEffect(() => {
+    if (!snapshot || rendererReadyReportedRef.current) return undefined;
+    let cancelled = false;
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        if (cancelled) return;
+        rendererReadyReportedRef.current = true;
+        window.aquacycleDesktop?.notifyRendererReady?.();
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+    };
+  }, [snapshot === null]);
+
+  useEffect(() => {
+    const desktop = window.aquacycleDesktop;
+    if (
+      !desktop?.onMemoryRecoveryRequested ||
+      !desktop.completeMemoryRecovery
+    ) return undefined;
+
+    return desktop.onMemoryRecoveryRequested(() => {
+      if (memoryRecoveryStartedRef.current) return;
+      const currentSnapshot = latestSnapshotRef.current;
+      if (!currentSnapshot) {
+        desktop.completeMemoryRecovery?.(false);
+        return;
+      }
+
+      memoryRecoveryStartedRef.current = true;
+      const shouldResume = currentSnapshot.phase === 'running';
+      // UI state is staged synchronously. Worker messages preserve order, so
+      // export-save observes the pause before serialising the ecological state.
+      window.dispatchEvent(new Event(PREPARE_MEMORY_RESTART_EVENT));
+      if (shouldResume) send({ type: 'pause' });
+
+      void requestSave()
+        .then((data) => {
+          if (shouldResume) data.savedPhase = 'running';
+          if (!stageWarmRestart(data)) {
+            throw new Error('임시 수조 상태를 보관하지 못했습니다.');
+          }
+          desktop.completeMemoryRecovery?.(true);
+        })
+        .catch(() => {
+          desktop.completeMemoryRecovery?.(false);
+          if (shouldResume) send({ type: 'resume' });
+          memoryRecoveryStartedRef.current = false;
+        });
+    });
+  }, [requestSave, send]);
 
   useEffect(() => {
     const workspace = tankWorkspaceRef.current;
@@ -1154,6 +1260,12 @@ export function SimulationScreen({
       grossPhotosynthesis: snapshot.biogeochemistry.algaeFluxes.grossProductionBiomassPerSecond,
       producerRespiration: snapshot.biogeochemistry.algaeFluxes.respirationBiomassPerSecond,
       shrimpCount: snapshot.animalPopulation['cherry-shrimp'].total,
+      shrimpBiomass: snapshot.animals.reduce(
+        (sum, animal) => animal.speciesId === 'cherry-shrimp'
+          ? sum + (animal.biomass ?? 0)
+          : sum,
+        0,
+      ),
       shrimpAdultFemales: snapshot.animalPopulation['cherry-shrimp'].adultFemales,
       shrimpAdultMales: snapshot.animalPopulation['cherry-shrimp'].adultMales,
       shrimpJuveniles: snapshot.animalPopulation['cherry-shrimp'].juveniles,
@@ -1203,6 +1315,7 @@ export function SimulationScreen({
     snapshot?.biogeochemistry.plankton.daphniaAdultBiomass,
     snapshot?.biogeochemistry.plankton.cumulativeEvents.secondGenerationBirths,
     snapshot?.animalPopulation['cherry-shrimp'].total,
+    snapshot?.animals,
     snapshot?.animalPopulation['cherry-shrimp'].adultFemales,
     snapshot?.animalPopulation['cherry-shrimp'].adultMales,
     snapshot?.animalPopulation['cherry-shrimp'].juveniles,
@@ -1312,7 +1425,12 @@ export function SimulationScreen({
     } else if (pending.kind === 'seed' && pending.speciesId) {
       send({ type: 'pick-seed', speciesId: pending.speciesId, point });
     } else if (pending.kind === 'animal' && pending.animalSpeciesId) {
-      send({ type: 'pick-animal', speciesId: pending.animalSpeciesId, point });
+      send({
+        type: 'pick-animal',
+        speciesId: pending.animalSpeciesId,
+        sex: pending.animalSex,
+        point,
+      });
     } else if (pending.kind === 'biofilm' && pending.microbeGuildId) {
       send({ type: 'pick-biofilm', guildId: pending.microbeGuildId, point });
     } else if (pending.kind === 'plankton' && pending.planktonKind) {
@@ -1346,13 +1464,44 @@ export function SimulationScreen({
     );
   }
 
-  const editable = snapshot.phase === 'setup' ||
-    (snapshot.mode === 'laboratory' && snapshot.phase === 'paused');
-  const biofilmEditable = snapshot.phase === 'setup' ||
-    (snapshot.phase === 'paused' && (Boolean(scenario.waterCycle) || snapshot.mode === 'laboratory'));
-  const canvasEditable = editable || (biofilmEditable && (
-    pendingInventory?.kind === 'biofilm' || snapshot.holding?.kind === 'biofilm'
-  ));
+  const editable = inventoryPlacementEditable(
+    'structure',
+    scenarioId,
+    snapshot.mode,
+    snapshot.phase,
+    Boolean(scenario.waterCycle),
+  );
+  const biofilmEditable = inventoryPlacementEditable(
+    'biofilm',
+    scenarioId,
+    snapshot.mode,
+    snapshot.phase,
+    Boolean(scenario.waterCycle),
+  );
+  const seedEditable = inventoryPlacementEditable(
+    'seed',
+    scenarioId,
+    snapshot.mode,
+    snapshot.phase,
+    Boolean(scenario.waterCycle),
+  );
+  const animalEditable = inventoryPlacementEditable(
+    'animal',
+    scenarioId,
+    snapshot.mode,
+    snapshot.phase,
+    Boolean(scenario.waterCycle),
+  );
+  const canvasEditable = editable ||
+    (seedEditable && (
+      pendingInventory?.kind === 'seed' || snapshot.holding?.kind === 'seed'
+    )) ||
+    (biofilmEditable && (
+      pendingInventory?.kind === 'biofilm' || snapshot.holding?.kind === 'biofilm'
+    )) ||
+    (animalEditable && (
+      pendingInventory?.kind === 'animal' || snapshot.holding?.kind === 'animal'
+    ));
   const progress = snapshot.missionProgress;
   const scoredZoneTarget = scenario.target?.type === 'habitat-coverage' ? scenario.target : null;
   const goalGuideCopy = scoredZoneTarget
@@ -1553,8 +1702,99 @@ export function SimulationScreen({
         ? '대기'
         : '계속';
 
+  const mission8LivingDaphnia = scenarioId === 'mission-8'
+    ? snapshot.animals.filter((animal) => animal.speciesId === 'daphnia')
+    : [];
+  const mission8DaphniaDescendantAdults = mission8LivingDaphnia.filter(
+    (animal) =>
+      (animal.generation ?? 0) >= 1 &&
+      animal.lifeStage === 'adult',
+  ).length;
+  const mission8DaphniaDescendants = mission8LivingDaphnia.filter(
+    (animal) => (animal.generation ?? 0) >= 1,
+  ).length;
+  const mission8DaphniaSecondGeneration = mission8LivingDaphnia.filter(
+    (animal) => (animal.generation ?? 0) >= 2,
+  ).length;
+  const mission8StabilityHistory = scenarioId === 'mission-8'
+    ? ecologyHistory.filter((point) =>
+      point.elapsedSeconds >= snapshot.elapsedSeconds - 300)
+    : [];
+  const mission8HistoryCoversStabilityWindow =
+    mission8StabilityHistory.length >= 2 &&
+    mission8StabilityHistory[0].elapsedSeconds <=
+      snapshot.elapsedSeconds - 295;
+  const mission8RecentBirthBaseline = scenarioId === 'mission-8'
+    ? [...ecologyHistory].reverse().find((point) =>
+      point.elapsedSeconds <= snapshot.elapsedSeconds - 180)
+    : undefined;
+  const mission8HasRecentSecondGenerationBirth =
+    mission8DaphniaSecondGeneration > 0 &&
+    (
+      snapshot.biogeochemistry.plankton.cumulativeEvents
+        .secondGenerationBirths -
+      (mission8RecentBirthBaseline?.daphniaSecondGenerationBirths ?? 0)
+    ) > 1e-9;
+  const mission8DaphniaReleaseRecommended =
+    mission8HistoryCoversStabilityWindow &&
+    Math.max(
+      0,
+      ...mission8StabilityHistory.map((point) => point.daphniaCount),
+    ) >= 120 &&
+    Math.min(
+      ...mission8StabilityHistory.map((point) => point.daphniaCount),
+    ) >= 96 &&
+    mission8DaphniaDescendants >= 90 &&
+    mission8DaphniaDescendantAdults >= 24 &&
+    mission8HasRecentSecondGenerationBirth;
+  const mission8DaphniaReadinessLabel =
+    mission8LivingDaphnia.length < 32
+      ? '아직 개체군이 작습니다'
+      : mission8DaphniaSecondGeneration === 0 ||
+          mission8DaphniaDescendantAdults < 12
+        ? '태어난 세대의 성체를 조금 더 기다리세요'
+        : mission8DaphniaReleaseRecommended
+          ? '여러 세대와 최근 출생이 5분간 이어졌습니다'
+          : mission8LivingDaphnia.length < 96
+          ? '여러 세대가 늘어나는 중입니다'
+          : !mission8HasRecentSecondGenerationBirth
+            ? '마릿수는 늘었지만 최근 출생을 더 지켜보세요'
+            : mission8HistoryCoversStabilityWindow
+              ? '여러 세대가 자리 잡는 중입니다'
+              : '여러 세대의 안정 상태를 확인하는 중입니다';
+
   const inventoryHint = (() => {
     if (pendingInventory || snapshot.holding) return '현재 항목을 배치하는 중입니다';
+    if (
+      scenarioId === 'mission-8' &&
+      inventoryCategory === 'organisms' &&
+      snapshot.phase === 'setup' &&
+      (snapshot.remainingAnimals['japanese-ricefish'] ?? 0) > 0
+    ) {
+      return '송사리는 목록에 남겨 두고, 큰물벼룩과 나머지 생물부터 배치해 번식시키세요';
+    }
+    if (
+      scenarioId === 'mission-8' &&
+      inventoryCategory === 'organisms' &&
+      snapshot.phase !== 'setup' &&
+      (snapshot.remainingAnimals['japanese-ricefish'] ?? 0) > 0
+    ) {
+      const countSummary =
+        `현재 큰물벼룩 ${mission8LivingDaphnia.length}마리` +
+        ` · 후손 성체 ${mission8DaphniaDescendantAdults}마리`;
+      return snapshot.phase === 'running'
+        ? `${countSummary} · ${mission8DaphniaReadinessLabel} · 방류하려면 일시정지하세요`
+        : `${countSummary} · ${mission8DaphniaReadinessLabel} · 원하면 남겨 둔 송사리를 방류할 수 있습니다`;
+    }
+    if (
+      !editable &&
+      inventoryCategory === 'organisms' &&
+      (seedEditable || animalEditable)
+    ) {
+      return scenarioId === 'mission-5'
+        ? '일시정지 중에는 남겨 둔 조류·새우를 추가하고 균 필름을 접종할 수 있습니다'
+        : '먹이망이 자리 잡으면 남겨 둔 동물을 방류하거나 균 필름을 접종할 수 있습니다';
+    }
     if (!editable && inventoryCategory === 'organisms' && biofilmEditable) {
       return '일시정지 중에는 균 필름을 표면에 접종할 수 있습니다';
     }
@@ -1871,10 +2111,32 @@ export function SimulationScreen({
   const resetSimulation = (): void => {
     resetUiState();
     resumeAfterBriefing.current = false;
-    send({ type: 'reset' });
+    send({ type: 'reset', runSeed: createSimulationRunSeed() });
     setCameraResetToken((current) => current + 1);
     setOpenHudPanels(closedHudPanels());
     setShowMissionBriefing(snapshot.mode === 'challenge');
+  };
+
+  const changeLaboratoryTank = (tankType: TankTypeId): void => {
+    if (
+      snapshot.mode !== 'laboratory' ||
+      snapshot.tank.id === tankType ||
+      snapshot.phase === 'running'
+    ) return;
+    writeLaboratoryTankPreference(tankType);
+    resetUiState();
+    setEcologyHistory([]);
+    lastEcologySampleAt.current = Number.NEGATIVE_INFINITY;
+    completionReported.current = false;
+    resumeAfterBriefing.current = false;
+    send({
+      type: 'initialize',
+      scenarioId: 'laboratory',
+      tankType,
+      runSeed: createSimulationRunSeed(),
+    });
+    setCameraResetToken((current) => current + 1);
+    setOpenHudPanels(closedHudPanels());
   };
 
   const freezeCurrentAquarium = async (): Promise<void> => {
@@ -2109,7 +2371,8 @@ export function SimulationScreen({
                     ? '✓'
                     : progress.unit === 'adult-count' ||
                         progress.unit === 'population-count' ||
-                        progress.unit === 'born-count'
+                        progress.unit === 'born-count' ||
+                        progress.unit === 'generation-count'
                       ? Math.round(progress.current)
                       : Math.min(99, Math.round(progress.ratio * 100))}
                 </i>
@@ -2267,7 +2530,7 @@ export function SimulationScreen({
                     <button
                       type="button"
                       className="inventory-card-main"
-                      disabled={!unlocked || !editable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
+                      disabled={!unlocked || !seedEditable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
                       onClick={(event) => {
                         rememberInventoryActivationPoint(event);
                         setPendingInventory({
@@ -2294,15 +2557,33 @@ export function SimulationScreen({
 
               {inventoryCategory === 'organisms' && ANIMAL_IDS
                 .filter((speciesId) => scenario.allowedAnimals.includes(speciesId))
-                .map((speciesId) => {
+                .flatMap((speciesId) => {
                   const animal = ANIMALS[speciesId];
-                  const remaining = snapshot.remainingAnimals[speciesId];
-                  return (
-                    <article className="inventory-card organism-card animal-card" key={speciesId}>
+                  const sexOptions: Array<AnimalSex | undefined> =
+                    scenario.animalSexBudget?.[speciesId]
+                      ? ['female', 'male']
+                      : [undefined];
+                  return sexOptions.map((animalSex) => {
+                    const remaining = animalSex
+                      ? snapshot.remainingAnimalSexes[speciesId]?.[animalSex] ?? 0
+                      : snapshot.remainingAnimals[speciesId];
+                    const sexLabel = animalSex === 'female'
+                      ? '암컷'
+                      : animalSex === 'male'
+                        ? '수컷'
+                        : null;
+                    const displayName = sexLabel
+                      ? `${animal.displayName} ${sexLabel}`
+                      : animal.displayName;
+                    return (
+                    <article
+                      className="inventory-card organism-card animal-card"
+                      key={`${speciesId}-${animalSex ?? 'mixed'}`}
+                    >
                       <button
                         type="button"
                         className="inventory-card-main"
-                        disabled={!editable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
+                        disabled={!animalEditable || Boolean(snapshot.holding) || Boolean(pendingInventory) || remaining === 0}
                         onClick={(event) => {
                           setCatalogSpecies(null);
                           setCatalogAnimal(null);
@@ -2310,22 +2591,24 @@ export function SimulationScreen({
                           setPendingInventory({
                             requestId: ++pendingInventoryRequestIdRef.current,
                             kind: 'animal',
-                            label: animal.displayName,
+                            label: displayName,
                             animalSpeciesId: speciesId,
+                            animalSex,
                           });
                           setActiveTool('move');
                         }}
                       >
                         <AnimalThumb speciesId={speciesId} />
                         <span className="inventory-copy">
-                          <strong>{animal.displayName}</strong>
+                          <strong>{displayName}</strong>
                           <small>{animal.scientificName}</small>
                           <em>{remaining === null ? '무제한' : `${remaining}마리 남음`}</em>
                         </span>
                       </button>
                       <button type="button" className="info-chip" disabled={Boolean(snapshot.holding) || Boolean(pendingInventory)} onClick={() => showCatalogAnimal(speciesId)}>정보</button>
                     </article>
-                  );
+                    );
+                  });
                 })}
 
               {inventoryCategory === 'organisms' && PLANKTON_IDS
@@ -2517,6 +2800,9 @@ export function SimulationScreen({
                     onToolComplete={completeCanvasInteraction}
                     onClearSelection={clearObservationSelection}
                     onCameraChange={setCameraTransform}
+                    initialCameraTransform={
+                      initialUiState?.cameraTransform ?? null
+                    }
                     cameraResetToken={cameraResetToken}
                     showGoalGuide={showGoalGuide}
                     waterQualityLayers={waterQualityMapVisible ? waterQualityLayers : []}
@@ -2617,15 +2903,25 @@ export function SimulationScreen({
                     <span>{progress.label}</span>
                     <strong>{formatProgressValue(progress)}</strong>
                   </div>
+                  {progress.supportingCurrent !== undefined &&
+                    progress.supportingTarget !== undefined && (
+                    <small className="progress-supporting-condition">
+                      {progress.supportingLabel ?? '함께 유지할 조건'}{' '}
+                      {Math.round(progress.supportingCurrent)} / {Math.round(progress.supportingTarget)}마리
+                    </small>
+                  )}
                   <div className="progress-track"><span style={{ width: `${Math.min(100, progress.ratio * 100)}%` }} /></div>
-                  {snapshot.outcome === 'pending' &&
+                  {snapshot.outcome === 'pending' && progress.holdTarget > 0 &&
                     (
                       snapshot.currentTargetMet ||
                       progress.unit === 'adult-count' ||
-                      progress.unit === 'population-count'
+                      progress.unit === 'population-count' ||
+                      progress.unit === 'generation-count'
                     ) && (
                     <>
-                      {(progress.unit === 'adult-count' || progress.unit === 'population-count') && (
+                      {(progress.unit === 'adult-count' ||
+                        progress.unit === 'population-count' ||
+                        progress.unit === 'generation-count') && (
                         <div className="progress-track hold-progress-track">
                           <span style={{ width: `${Math.min(100, (progress.holdCurrent / progress.holdTarget) * 100)}%` }} />
                         </div>
@@ -2933,7 +3229,47 @@ export function SimulationScreen({
 
               {snapshot.mode === 'laboratory' && (
                 <section className="paper-panel lab-controls v2-lab-controls">
-                  <div className="panel-label">실험실 광원</div>
+                  <div className="panel-label">실험실 수조</div>
+                  <div className="lab-tank-selector" role="group" aria-label="수조 종류">
+                    {(['standard', 'long'] as const).map((tankType) => (
+                      <button
+                        type="button"
+                        key={tankType}
+                        className={snapshot.tank.id === tankType ? 'active' : ''}
+                        disabled={snapshot.phase === 'running'}
+                        onClick={() => changeLaboratoryTank(tankType)}
+                      >
+                        <strong>{tankType === 'standard' ? '표준' : '긴 수조'}</strong>
+                        <small>{tankType === 'standard' ? '1200 × 720' : '2400 × 720'}</small>
+                      </button>
+                    ))}
+                  </div>
+                  <small className="lab-tank-note">
+                    {snapshot.phase === 'running'
+                      ? '일시정지하면 수조를 바꿀 수 있습니다.'
+                      : '바꾸면 현재 실험은 초기화됩니다. 선택은 다음에도 기억됩니다.'}
+                  </small>
+                  <button
+                    type="button"
+                    className={`lab-spatial-debug-toggle ${snapshot.spatialDebug.enabled ? 'active' : ''}`}
+                    aria-pressed={snapshot.spatialDebug.enabled}
+                    onClick={() => send({
+                      type: 'set-spatial-debug',
+                      enabled: !snapshot.spatialDebug.enabled,
+                    })}
+                  >
+                    <strong>공간 판정 {snapshot.spatialDebug.enabled ? '끄기' : '보기'}</strong>
+                    <small>돌 충돌선 · 부착면 · 틈 여유 폭 · 생물 몸 두께</small>
+                  </button>
+                  {snapshot.spatialDebug.enabled && (
+                    <p className="lab-spatial-debug-legend">
+                      <span className="collision">돌 외곽</span>
+                      <span className="surface">부착면</span>
+                      <span className="gap">통과 틈</span>
+                      <span className="agent">몸 두께</span>
+                    </p>
+                  )}
+                  <div className="panel-label lab-light-heading">실험실 광원</div>
                   <label className="lab-light-control">
                     <span>전등 <strong>{Math.round(snapshot.lightOutput)}</strong></span>
                     <input type="range" min={0} max={120} value={snapshot.lightOutput} disabled={!editable} onChange={(event) => send({ type: 'set-light-output', output: Number(event.target.value) })} />
@@ -3344,11 +3680,14 @@ const waterAtSurfaceCell = (
   if (!field.columns || !field.rows) return snapshot.biogeochemistry.average;
   const column = Math.max(0, Math.min(
     field.columns - 1,
-    Math.floor((cell.x / TANK_WIDTH) * field.columns),
+    Math.floor((cell.x / snapshot.tank.width) * field.columns),
   ));
   const row = Math.max(0, Math.min(
     field.rows - 1,
-    Math.floor(((cell.y - WATER_TOP) / (GROUND_Y - WATER_TOP)) * field.rows),
+    Math.floor(
+      ((cell.y - snapshot.tank.waterTop) /
+        (snapshot.tank.groundY - snapshot.tank.waterTop)) * field.rows,
+    ),
   ));
   const index = row * field.columns + column;
   return {
@@ -3366,11 +3705,14 @@ const transportAtPoint = (
   const transport = snapshot.biogeochemistry.transport;
   const column = Math.max(0, Math.min(
     transport.columns - 1,
-    Math.floor((point.x / TANK_WIDTH) * transport.columns),
+    Math.floor((point.x / snapshot.tank.width) * transport.columns),
   ));
   const row = Math.max(0, Math.min(
     transport.rows - 1,
-    Math.floor(((point.y - WATER_TOP) / (GROUND_Y - WATER_TOP)) * transport.rows),
+    Math.floor(
+      ((point.y - snapshot.tank.waterTop) /
+        (snapshot.tank.groundY - snapshot.tank.waterTop)) * transport.rows,
+    ),
   ));
   const index = row * transport.columns + column;
   const velocityX = transport.velocityX[index] ?? 0;
@@ -3866,6 +4208,17 @@ export const animalFeedingStateText = (
       ? `${Math.max(1, Math.round(secondsSinceFood))}초 전 섭식`
       : '최근 먹지 않음';
 
+export const shrimpFoodBalanceText = (
+  maintenanceDeficitSeconds: number,
+  recentFood: string | null | undefined,
+): string => maintenanceDeficitSeconds <= 2
+  ? `최근 섭취가 유지대사를 충당함 · ${recentFood ?? '먹이'}`
+  : maintenanceDeficitSeconds < 30
+    ? `작은 대사 적자 · ${Math.round(maintenanceDeficitSeconds)}초 상당`
+    : maintenanceDeficitSeconds < 120
+      ? `누적 대사 적자 · ${Math.round(maintenanceDeficitSeconds)}초 상당`
+      : `큰 대사 적자 · ${Math.round(maintenanceDeficitSeconds)}초 상당`;
+
 const animalDeathCauseLabel: Record<SimulationSnapshot['carcasses'][number]['cause'], string> = {
   starvation: '먹이 부족으로 에너지 고갈',
   'old-age': '수명을 다해 자연사',
@@ -3895,13 +4248,28 @@ function AnimalInspector({
   onRetrieve?: () => void;
 }) {
   const definition = ANIMALS[animal.speciesId];
-  const nutrition = animal.energy >= 0.72
-    ? '충분함'
-    : animal.energy >= 0.4
-      ? '보통'
-      : animal.energy >= 0.18
-        ? '부족함'
-        : '굶주림';
+  const isRicefish = animal.speciesId === 'japanese-ricefish';
+  const isDaphnia = animal.speciesId === 'daphnia';
+  const isShrimp = animal.speciesId === 'cherry-shrimp';
+  // Shrimp actively resume grazing around 0.38 and finish an ordinary meal
+  // around 0.44. Reusing the fish/plankton 0.72 label threshold meant a
+  // normally satiated shrimp could never be shown as "충분함", even while its
+  // conserved reserve was rising exactly as intended.
+  const nutrition = isShrimp
+    ? animal.energy >= 0.42
+      ? '충분함'
+      : animal.energy >= 0.32
+        ? '보통'
+        : animal.energy >= 0.18
+          ? '부족함'
+          : '굶주림'
+    : animal.energy >= 0.72
+      ? '충분함'
+      : animal.energy >= 0.36
+        ? '보통'
+        : animal.energy >= 0.18
+          ? '부족함'
+          : '굶주림';
   const reproduction = animal.sex === 'male'
     ? '수컷'
     : animal.reproductiveState === 'carrying-eggs'
@@ -3913,12 +4281,9 @@ function AnimalInspector({
       : animal.reproductiveState === 'ready'
         ? '번식 가능한 상태'
         : '번식 조건 미충족';
-  const feedingState = animalFeedingStateText(
-    animal.secondsSinceFood,
-    animal.recentFood,
-  );
-  const isRicefish = animal.speciesId === 'japanese-ricefish';
-  const isDaphnia = animal.speciesId === 'daphnia';
+  const feedingState = isShrimp
+    ? shrimpFoodBalanceText(animal.secondsSinceFood, animal.recentFood)
+    : animalFeedingStateText(animal.secondsSinceFood, animal.recentFood);
   const waterRules = isRicefish
     ? RICEFISH_ECOLOGY_RULES
     : isDaphnia
@@ -3936,10 +4301,29 @@ function AnimalInspector({
       </div>
       <dl className="species-facts">
         <div><dt>생활 단계</dt><dd>{stageLabel}{sexLabel}</dd></div>
-        <div><dt>시뮬레이션 나이</dt><dd>{formatTime(animal.ageSeconds)} / 수명 약 {formatTime(animal.lifespanSeconds)}</dd></div>
+        <div><dt>시뮬레이션 나이</dt><dd>{formatTime(animal.ageSeconds)} / 예상 수명 {formatTime(animal.lifespanSeconds)}</dd></div>
         <div><dt>현재 행동</dt><dd>{animalBehaviorText(animal)}</dd></div>
+        <div><dt>생리 상태</dt><dd>{Math.round(animal.health * 100)} / 100</dd></div>
         <div><dt>영양 상태</dt><dd>{nutrition} · {Math.round(animal.energy * 100)} / 100</dd></div>
-        {animal.lifeStage !== 'egg' && <div><dt>최근 섭식</dt><dd>{feedingState}</dd></div>}
+        {isShrimp && (
+          <>
+            <div>
+              <dt>몸 조직</dt>
+              <dd>{(animal.structuralBiomass ?? 0).toFixed(3)} B</dd>
+            </div>
+            <div>
+              <dt>저장 영양</dt>
+              <dd>{(animal.storedBiomass ?? 0).toFixed(3)} B</dd>
+            </div>
+            {animal.sex === 'female' && (
+              <div>
+                <dt>번식 저장</dt>
+                <dd>{(animal.reproductiveBiomass ?? 0).toFixed(3)} B</dd>
+              </div>
+            )}
+          </>
+        )}
+        {animal.lifeStage !== 'egg' && <div><dt>{isShrimp ? '먹이 수지' : '최근 섭식'}</dt><dd>{feedingState}</dd></div>}
         {animal.lifeStage !== 'egg' && (
           <div><dt>누적 섭식량</dt><dd>{animal.consumedBiomass.toFixed(1)}</dd></div>
         )}
@@ -3949,7 +4333,7 @@ function AnimalInspector({
             {animal.lifeStage === 'egg'
               ? `${Math.round((animal.developmentProgress ?? 0) * 100)}%`
               : animal.lifeStage === 'fry' || animal.lifeStage === 'juvenile'
-                ? '아직 성장 중'
+                ? `성장 중 · ${Math.round((animal.growthProgress ?? 0) * 100)}%`
                 : reproduction}
           </dd>
         </div>
@@ -4247,17 +4631,23 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
   };
-  const populationPoints = (values: number[], maximum: number): string => values.map((value, index) => {
+  const zeroBasedPoints = (
+    values: number[],
+    maximum: number,
+    bottom: number,
+  ): string => values.map((value, index) => {
     const x = historyTimeX(points[index]?.elapsedSeconds ?? 0, timeBounds, 43, 189);
-    const y = 65 - (value / Math.max(1, maximum)) * 22;
+    const y = bottom - (value / Math.max(1, maximum)) * 22;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
   const algaeValues = points.map((point) => point.algaeBiomass);
   const shrimpValues = points.map((point) => point.shrimpCount);
+  const shrimpBiomassValues = points.map((point) => point.shrimpBiomass);
   const femaleValues = points.map((point) => point.shrimpAdultFemales);
   const maleValues = points.map((point) => point.shrimpAdultMales);
   const juvenileValues = points.map((point) => point.shrimpJuveniles);
   const maximumShrimpCount = Math.max(1, ...shrimpValues);
+  const maximumShrimpBiomass = Math.max(1, ...shrimpBiomassValues);
   const latest = points.at(-1) ?? {
     elapsedSeconds: 0,
     algaeBiomass: 0,
@@ -4272,6 +4662,7 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
     grossPhotosynthesis: 0,
     producerRespiration: 0,
     shrimpCount: 0,
+    shrimpBiomass: 0,
     shrimpAdultFemales: 0,
     shrimpAdultMales: 0,
     shrimpJuveniles: 0,
@@ -4293,10 +4684,15 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
     headspaceOxygen: 0,
   };
   const algaePoints = sparkPoints(algaeValues, 4, 28);
-  const shrimpPoints = populationPoints(shrimpValues, maximumShrimpCount);
-  const femalePoints = populationPoints(femaleValues, maximumShrimpCount);
-  const malePoints = populationPoints(maleValues, maximumShrimpCount);
-  const juvenilePoints = populationPoints(juvenileValues, maximumShrimpCount);
+  const shrimpPoints = zeroBasedPoints(shrimpValues, maximumShrimpCount, 65);
+  const femalePoints = zeroBasedPoints(femaleValues, maximumShrimpCount, 65);
+  const malePoints = zeroBasedPoints(maleValues, maximumShrimpCount, 65);
+  const juvenilePoints = zeroBasedPoints(juvenileValues, maximumShrimpCount, 65);
+  const shrimpBiomassPoints = zeroBasedPoints(
+    shrimpBiomassValues,
+    maximumShrimpBiomass,
+    101,
+  );
 
   return (
     <div className="ecology-history">
@@ -4304,24 +4700,27 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
         <strong>시간에 따른 변화</strong>
         <small>{points.length > 1 ? `${formatTime(timeBounds.start)}–${formatTime(timeBounds.end)}` : '관찰 대기 중'}</small>
       </div>
-      <svg viewBox="0 0 240 72" role="img" aria-label="생산자 총량과 새우 개체 수의 시간 변화">
-        <path className="ecology-history-guide" d="M43 32H189M43 68H189" />
+      <svg viewBox="0 0 240 108" role="img" aria-label="생산자 총량, 새우 개체 수와 새우 생체량의 시간 변화">
+        <path className="ecology-history-guide" d="M43 32H189M43 68H189M43 104H189" />
         <text x="5" y="12">생산자</text>
         <text x="5" y="48">새우</text>
+        <text x="5" y="84">새우 B</text>
         {algaePoints && <polyline className="ecology-history-line algae" points={algaePoints} />}
         {shrimpPoints && <polyline className="ecology-history-line shrimp-total" points={shrimpPoints} />}
         {femalePoints && <polyline className="ecology-history-line shrimp-female" points={femalePoints} />}
         {malePoints && <polyline className="ecology-history-line shrimp-male" points={malePoints} />}
         {juvenilePoints && <polyline className="ecology-history-line shrimp-juvenile" points={juvenilePoints} />}
+        {shrimpBiomassPoints && <polyline className="ecology-history-line shrimp-biomass" points={shrimpBiomassPoints} />}
         <text className="ecology-history-value algae" x="235" y="12" textAnchor="end">{latest.algaeBiomass.toFixed(1)}</text>
         <text className="ecology-history-value shrimp" x="235" y="48" textAnchor="end">{latest.shrimpCount}마리</text>
+        <text className="ecology-history-value shrimp-biomass" x="235" y="84" textAnchor="end">{latest.shrimpBiomass.toFixed(1)} B</text>
       </svg>
       <div className="population-history-legend">
         <span className="female">성체 ♀ <b>{latest.shrimpAdultFemales}</b></span>
         <span className="male">성체 ♂ <b>{latest.shrimpAdultMales}</b></span>
         <span className="juvenile">어린 새우 <b>{latest.shrimpJuveniles}</b></span>
       </div>
-      <small className="ecology-history-note">모든 개체군 선은 0부터 같은 눈금을 사용합니다.</small>
+      <small className="ecology-history-note">개체 수 선은 같은 눈금을 사용하고, 새우 생체량은 별도 0 기준 눈금입니다.</small>
     </div>
   );
 });
@@ -4579,9 +4978,6 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
     : isDaphnia
       ? WATER_CYCLE_RULES.daphnia
       : WATER_CYCLE_RULES.shrimp;
-  const energyCapacityPerStructure =
-    WATER_CYCLE_RULES.shrimp.assimilationFraction /
-    SHRIMP_ECOLOGY_RULES.energyPerConsumedBiomass;
   const adultMaintenance = isRicefish
     ? RICEFISH_ECOLOGY_RULES.adultBaseMetabolismPerSecond +
       RICEFISH_ECOLOGY_RULES.restingActivityCostPerSecond
@@ -4593,11 +4989,8 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
         PLANKTON_ECOLOGY_RULES.daphnia.adultMaintenancePerSecond,
         PLANKTON_ECOLOGY_RULES.daphnia.maintenanceMassExponent,
       )
-      : (
-        SHRIMP_ECOLOGY_RULES.adultBaseMetabolismPerSecond +
-        SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond
-      ) * WATER_CYCLE_RULES.shrimp.adultStructuralBiomass *
-        energyCapacityPerStructure;
+      : SHRIMP_ECOLOGY_RULES.adultRoutineMaintenanceBiomassPerSecond *
+        SHRIMP_ECOLOGY_RULES.restingActivityMultiplier;
   const juvenileMaintenance = isDaphnia
     ? continuousBodyMassMaintenance(
       PLANKTON_ECOLOGY_RULES.daphnia.juvenileBirthBiomass,
@@ -4605,13 +4998,24 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
       PLANKTON_ECOLOGY_RULES.daphnia.adultMaintenancePerSecond,
       PLANKTON_ECOLOGY_RULES.daphnia.maintenanceMassExponent,
     )
-    : (
-      SHRIMP_ECOLOGY_RULES.juvenileBaseMetabolismPerSecond +
-      SHRIMP_ECOLOGY_RULES.restingActivityCostPerSecond
-    ) * WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass *
-      energyCapacityPerStructure;
+    : continuousBodyMassMaintenance(
+      WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass +
+        WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass,
+      SHRIMP_ECOLOGY_RULES.adultRoutineMaintenanceBiomassPerSecond /
+        (
+          WATER_CYCLE_RULES.shrimp.adultStructuralBiomass +
+          WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass
+        ),
+      SHRIMP_ECOLOGY_RULES.metabolicMassExponent,
+    ) * SHRIMP_ECOLOGY_RULES.restingActivityMultiplier;
   const oxygenPerAdultSecond = adultMaintenance * WATER_CYCLE_RULES.biomassCarbon *
     WATER_CYCLE_RULES.oxygenPerOrganicCarbon;
+  const ricefishClutchLabel =
+    RICEFISH_ECOLOGY_RULES.eggClutchMinimum ===
+      RICEFISH_ECOLOGY_RULES.eggClutchMaximum
+      ? `${RICEFISH_ECOLOGY_RULES.eggClutchMinimum}개`
+      : `${RICEFISH_ECOLOGY_RULES.eggClutchMinimum}–${RICEFISH_ECOLOGY_RULES.eggClutchMaximum}개`;
   return (
     <section className="paper-panel animal-inspector animal-guide">
       <div className="animal-inspector-heading">
@@ -4637,14 +5041,14 @@ function AnimalGuide({ speciesId }: { speciesId: AnimalSpeciesId }) {
       <section className="ecology-rules-card">
         <div className="ecology-rules-heading"><strong>게임 생존·수질 기준</strong><span>수질 농도 0–100</span></div>
         <dl>
-          <div><dt>용존산소</dt><dd><b>{ecologyRules.oxygenStressStart} 이상</b>은 저산소 피해 없음. 그 아래부터 피해가 커져 0에서 체력 <b>{(ecologyRules.oxygenMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
-          <div><dt>암모니아성 노폐물</dt><dd><b>{ecologyRules.toxicWasteStressStart} 이하</b>는 독성 피해 없음. {ecologyRules.toxicWasteStressStart}–{ecologyRules.toxicWasteFullStress}에서 증가해 {ecologyRules.toxicWasteFullStress} 이상이면 체력 <b>{(ecologyRules.toxicMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
+          <div><dt>용존산소</dt><dd><b>{ecologyRules.oxygenStressStart} 이상</b>은 저산소 피해 없음. 그 아래부터 피해가 커져 0에서 생리 상태 <b>{(ecologyRules.oxygenMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
+          <div><dt>암모니아성 노폐물</dt><dd><b>{ecologyRules.toxicWasteStressStart} 이하</b>는 독성 피해 없음. {ecologyRules.toxicWasteStressStart}–{ecologyRules.toxicWasteFullStress}에서 증가해 {ecologyRules.toxicWasteFullStress} 이상이면 생리 상태 <b>{(ecologyRules.toxicMaximumDamagePerSecond * 100).toFixed(1)}%/초</b> 감소.</dd></div>
           <div><dt>수온</dt><dd><b>{definition.temperature.referenceTemperature}°C</b> 기준 대사율에 1°C당 <b>×{definition.temperature.metabolicTheta}</b>를 적용합니다. 성장·번식은 별도 종 곡선을 사용하며 33°C에서는 번식 진행이 멈춥니다.</dd></div>
-          <div><dt>회복</dt><dd>저산소·독성·수온 스트레스가 없을 때 체력 <b>{(ecologyRules.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 세 피해는 합산됩니다.</dd></div>
-          <div><dt>먹이의 행방</dt><dd>먹은 먹이의 <b>{Math.round(matterRules.assimilationFraction * 100)}%</b>는 몸과 번식 자원, <b>{Math.round(matterRules.fecesFraction * 100)}%</b>는 유기성 찌꺼기, 나머지는 호흡·용존 배출로 돌아갑니다.</dd></div>
+          <div><dt>회복</dt><dd>저산소·독성·수온 스트레스가 없을 때 생리 상태 <b>{(ecologyRules.healthyWaterRecoveryPerSecond * 100).toFixed(1)}%/초</b> 회복. 세 피해는 합산됩니다.</dd></div>
+          <div><dt>먹이의 행방</dt><dd>먹은 먹이의 <b>{Math.round(matterRules.assimilationFraction * 100)}%</b>는 몸과 번식 자원, 나머지 <b>{Math.round(matterRules.fecesFraction * 100)}%</b>는 유기성 찌꺼기가 됩니다. 호흡은 저장된 자원에서 시간에 따라 별도로 소모됩니다.</dd></div>
           <div><dt>휴식 대사</dt><dd>성체는 몸·저장량 <b>{adultMaintenance.toFixed(6)}</b> /마리·초를 사용합니다. 이동 중에는 행동 비용만큼 더 사용합니다.{!isRicefish && <> 갓 태어난 {isDaphnia ? '물벼룩' : '새우'}은 <b>{juvenileMaintenance.toFixed(6)}</b> /마리·초를 사용합니다.</>}</dd></div>
           <div><dt>산소 소비</dt><dd>성체 기초 대사만으로 약 <b>{oxygenPerAdultSecond.toFixed(6)}</b> /마리·초를 소비하며, 먹이 호흡분도 같은 질량 장부로 계산됩니다.</dd></div>
-          <div><dt>번식 자원</dt><dd>{isRicefish ? '암컷은 먹이 동화분을 번식 저장량에 모읍니다. 가까운 수컷과 구애한 뒤 이 질량으로 2–4개의 알을 만들며, 알은 국소 수온·산소·암모니아 조건에 따라 발생합니다.' : isDaphnia ? '식물플랑크톤에서 얻은 동화분을 번식 저장량에 모읍니다. 충분히 먹은 뒤 알이 발달하며, 한 번에 한 개체씩 비교적 자주 태어나 먹이 피드백이 세대 사이에 작동합니다.' : '암컷은 체력 비축분을 넘는 먹이 동화분을 별도 번식 저장량에 조금씩 모읍니다. 가까운 수컷과 실제로 만난 뒤 이 질량만큼 새끼가 태어납니다.'}</dd></div>
+          <div><dt>번식 자원</dt><dd>{isRicefish ? `암컷은 먹이 동화분을 번식 저장량에 모읍니다. 가까운 수컷과 구애한 뒤 이 질량으로 ${ricefishClutchLabel}의 알을 만들며, 알은 국소 수온·산소·암모니아 조건에 따라 발생합니다.` : isDaphnia ? '식물플랑크톤에서 얻은 동화분을 번식 저장량에 모읍니다. 충분히 먹은 뒤 알이 발달하며, 한 번에 한 개체씩 비교적 자주 태어나 먹이 피드백이 세대 사이에 작동합니다.' : '암컷은 저장 영양의 생존 비축분을 넘는 먹이 동화분을 별도 번식 저장량에 조금씩 모읍니다. 가까운 수컷과 실제로 만난 뒤 이 질량만큼 새끼가 태어납니다.'}</dd></div>
           <div><dt>사체·배설물</dt><dd>남은 몸·일반 저장량·번식 저장량과 배설물은 유기성 찌꺼기가 되어 분해균의 먹이로 되돌아갑니다.</dd></div>
           <div><dt>굶주림</dt><dd>영양 상태는 일반 저장량을 중심으로 몸의 건전도를 함께 반영합니다. 먹이가 끊기면 번식과 성장이 먼저 멈추고 일반 저장량과 생존 가능한 범위의 몸체를 모두 소모한 뒤 아사합니다.</dd></div>
           <div><dt>수명</dt><dd>게임 압축 수명 약 <b>{formatTime(ecologyRules.minimumLifespanSeconds)}–{formatTime(ecologyRules.maximumLifespanSeconds)}</b>.</dd></div>
@@ -4680,19 +5084,62 @@ function SpeciesGuide({
   plantRamets?: SimulationSnapshot['plants'];
 }) {
   const species = SPECIES[speciesId];
-  const minRate = -0.045;
-  const maxRate = 0.07;
   const chartLeft = 32;
   const chartRight = 224;
   const chartTop = 13;
   const chartBottom = 84;
+  const curveSamples = Array.from({ length: 51 }, (_, index) => index * 2);
+  const curveRates = curveSamples.map(
+    (light) => netGrowthPotential(speciesId, light, temperature),
+  );
+  const nicePercentCeiling = (value: number): number => {
+    if (!Number.isFinite(value) || value <= 0) return 0.01;
+    const magnitude = 10 ** Math.floor(Math.log10(value));
+    const normalized = value / magnitude;
+    const ceiling = [1, 2, 2.5, 4, 5, 6, 8, 10].find(
+      (candidate) => normalized <= candidate,
+    ) ?? 10;
+    return ceiling * magnitude;
+  };
+  const positivePeakPercent = Math.max(0, ...curveRates) * 100;
+  const negativePeakPercent = Math.max(0, ...curveRates.map((rate) => -rate)) * 100;
+  const upperPercent = nicePercentCeiling(positivePeakPercent * 1.08);
+  const lowerPercent = nicePercentCeiling(
+    Math.max(negativePeakPercent * 1.08, upperPercent * 0.2),
+  );
+  const minRate = -lowerPercent / 100;
+  const maxRate = upperPercent / 100;
+  const chartPercentDecimals = Math.max(
+    upperPercent,
+    lowerPercent,
+  ) >= 2
+    ? 0
+    : Math.max(upperPercent, lowerPercent) >= 0.2
+      ? 1
+      : 2;
+  const formatPercentValue = (rate: number): string => {
+    const percent = rate * 100;
+    const absolute = Math.abs(percent);
+    const decimals = absolute >= 1
+      ? 1
+      : absolute >= 0.1
+        ? 2
+        : absolute >= 0.01
+          ? 3
+          : 4;
+    return percent.toFixed(decimals);
+  };
+  const formatAxisPercent = (rate: number): string => {
+    const percent = rate * 100;
+    const label = percent.toFixed(chartPercentDecimals);
+    return `${percent > 0 ? '+' : ''}${label}`;
+  };
   const toX = (light: number): number => chartLeft + (light / 100) * (chartRight - chartLeft);
   const toY = (rate: number): number => chartBottom -
     ((rate - minRate) / (maxRate - minRate)) * (chartBottom - chartTop);
-  const curveSamples = Array.from({ length: 51 }, (_, index) => index * 2);
   const curvePath = curveSamples.map((light, index) => {
     const x = toX(light);
-    const y = toY(netGrowthPotential(speciesId, light, temperature));
+    const y = toY(curveRates[index]);
     return `${index === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
   }).join(' ');
   const currentRate = probeLight === undefined
@@ -4704,12 +5151,12 @@ function SpeciesGuide({
     : toY(currentRate!);
   const rateLabel = currentRate === undefined
     ? null
-    : `${currentRate >= 0 ? '+' : ''}${(currentRate * 100).toFixed(1)}%/초`;
+    : `${currentRate >= 0 ? '+' : ''}${formatPercentValue(currentRate)}%/초`;
   const currentTrend = probeLight === undefined
     ? null
     : growthTrend(speciesId, probeLight, temperature);
   const xTicks = [0, 25, 50, 75, 100];
-  const yTicks = [0.07, 0.04, 0, -0.04];
+  const yTicks = [maxRate, maxRate / 2, 0, minRate / 2, minRate];
   const localTotal = localBiomass
     ? localBiomass.oedogonium + localBiomass.nitzschia + localBiomass.vallisneria
     : 0;
@@ -4766,9 +5213,9 @@ function SpeciesGuide({
           <div><dt>무기질소</dt><dd>암모니아성 노폐물과 영양염 합계 N에 <b>N ÷ ({WATER_CYCLE_RULES.mineralNutrientHalfSaturation} + N)</b>을 곱합니다. 새 군락은 필요한 질소 중 암모니아를 최대 <b>{Math.round(WATER_CYCLE_RULES.algae.ammoniumPreference * 100)}%</b> 우선 흡수하고, 부족분은 영양염에서 가져옵니다.</dd></div>
           <div><dt>무기탄소</dt><dd>유한한 물속 무기탄소 C에 <b>C ÷ ({WATER_CYCLE_RULES.carbonHalfSaturation} + C)</b>을 곱합니다. 새 군락 1.0에 탄소 <b>{WATER_CYCLE_RULES.biomassCarbon}</b>가 실제로 들어갑니다.</dd></div>
           <div><dt>산소 생산</dt><dd>고정한 탄소 1.0당 산소 <b>{WATER_CYCLE_RULES.oxygenPerOrganicCarbon}</b>를 만들고, 질산염을 흡수하면 질소 환원에 해당하는 산소 등가량이 더해집니다. 넘친 산소는 닫힌 공기층으로 이동합니다.</dd></div>
-          <div><dt>낮·밤 호흡</dt><dd>빛이 없어 총광합성이 멈춰도 호흡은 계속됩니다. 24°C 기준 군락량 1.0당 <b>{(species.respirationRateAtReference * 100).toFixed(1)}%/초</b>를 호흡하며, 수온이 높을수록 빨라집니다.</dd></div>
+          <div><dt>낮·밤 호흡</dt><dd>빛이 없어 총광합성이 멈춰도 호흡은 계속됩니다. 24°C 기준 군락량 1.0당 <b>{formatPercentValue(species.respirationRateAtReference)}%/초</b>를 호흡하며, 수온이 높을수록 빨라집니다.</dd></div>
           <div><dt>무기질소 흡수</dt><dd>새 생체량 1.0당 무기질소 <b>{WATER_CYCLE_RULES.biomassNitrogen}</b>를 흡수합니다. 죽거나 먹힌 생체량은 찌꺼기와 생물 몸을 거쳐 다시 순환합니다.</dd></div>
-          <div><dt>자연 소실</dt><dd>그래프의 환경 성장률 계산 뒤에 군락량의 <b>0.18%/초</b>가 추가로 줄며, 다른 종의 경쟁과 새우 섭식도 별도로 적용됩니다.</dd></div>
+          <div><dt>자연 소실</dt><dd>그래프의 환경 성장률 계산 뒤에 군락량의 <b>{formatPercentValue(species.naturalTurnoverPerSecond)}%/초</b>가 추가로 줄며, 다른 종의 경쟁과 새우 섭식도 별도로 적용됩니다.</dd></div>
         </dl>
       </section>
       <div className="response-chart">
@@ -4788,7 +5235,7 @@ function SpeciesGuide({
           {yTicks.map((tick) => (
             <g key={`y-${tick}`}>
               <line x1={chartLeft} y1={toY(tick)} x2={chartRight} y2={toY(tick)} className={tick === 0 ? 'zero-line' : 'grid-line'} />
-              <text x="27" y={toY(tick) + 3} textAnchor="end">{tick > 0 ? '+' : ''}{Math.round(tick * 100)}</text>
+              <text x="27" y={toY(tick) + 3} textAnchor="end">{formatAxisPercent(tick)}</text>
             </g>
           ))}
           <line x1={chartLeft} y1={chartTop} x2={chartLeft} y2={chartBottom} className="axis-line" />
