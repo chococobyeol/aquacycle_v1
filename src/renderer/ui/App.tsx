@@ -1,5 +1,8 @@
 import { useCallback, useState } from 'react';
-import type { ScenarioId } from '../../simulation/types';
+import type {
+  ScenarioId,
+  SimulationSaveData,
+} from '../../simulation/types';
 import {
   takeWarmRestart,
   takeWarmRestartUiState,
@@ -13,6 +16,27 @@ import {
 const LEGACY_PROGRESS_KEY = 'aquacycle.highest-unlocked-mission';
 const COMPLETED_MISSIONS_KEY = 'aquacycle.completed-missions';
 type MissionId = Exclude<ScenarioId, 'laboratory'>;
+
+export interface SimulationEntry {
+  scenarioId: ScenarioId;
+  initialSaveData?: SimulationSaveData;
+  initialUiState?: SimulationUiRestartState;
+}
+
+export const freshSimulationEntry = (
+  scenarioId: ScenarioId,
+): SimulationEntry => ({ scenarioId });
+
+const takeInitialSimulationEntry = (): SimulationEntry | null => {
+  const warmRestart = takeWarmRestart();
+  const warmRestartUi = takeWarmRestartUiState<SimulationUiRestartState>();
+  if (!warmRestart) return null;
+  return {
+    scenarioId: warmRestart.scenarioId,
+    initialSaveData: warmRestart,
+    initialUiState: warmRestartUi ?? undefined,
+  };
+};
 
 const readLegacyProgress = (): number => {
   const stored = window.localStorage.getItem(LEGACY_PROGRESS_KEY);
@@ -40,12 +64,11 @@ const readCompletedMissions = (): MissionId[] => {
 };
 
 export function App() {
-  const [warmRestart] = useState(takeWarmRestart);
-  const [warmRestartUi] = useState(
-    takeWarmRestartUiState<SimulationUiRestartState>,
-  );
-  const [scenarioId, setScenarioId] = useState<ScenarioId | null>(
-    warmRestart?.scenarioId ?? null,
+  // A memory-recovery save belongs to exactly one screen entry. Keeping the
+  // payload separately from scenarioId made it match the same mission again
+  // after returning to the menu, resurrecting state discarded by Retry.
+  const [simulationEntry, setSimulationEntry] = useState<SimulationEntry | null>(
+    takeInitialSimulationEntry,
   );
   const [completedMissions, setCompletedMissions] = useState<MissionId[]>(readCompletedMissions);
 
@@ -64,19 +87,13 @@ export function App() {
     setCompletedMissions([]);
   }, []);
 
-  if (scenarioId) {
+  if (simulationEntry) {
     return (
       <SimulationScreen
-        scenarioId={scenarioId}
-        initialSaveData={
-          warmRestart?.scenarioId === scenarioId ? warmRestart : undefined
-        }
-        initialUiState={
-          warmRestart?.scenarioId === scenarioId
-            ? warmRestartUi ?? undefined
-            : undefined
-        }
-        onBack={() => setScenarioId(null)}
+        scenarioId={simulationEntry.scenarioId}
+        initialSaveData={simulationEntry.initialSaveData}
+        initialUiState={simulationEntry.initialUiState}
+        onBack={() => setSimulationEntry(null)}
         onMissionComplete={handleMissionComplete}
       />
     );
@@ -85,7 +102,7 @@ export function App() {
   return (
     <MissionMenu
       completedMissions={completedMissions}
-      onOpen={setScenarioId}
+      onOpen={(scenarioId) => setSimulationEntry(freshSimulationEntry(scenarioId))}
       onResetMissionProgress={resetMissionProgress}
     />
   );

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import { SURFACE_ALGAE_INOCULUM_BIOMASS } from '../src/simulation/config';
 import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import type {
   MicrobeGuildId,
@@ -146,8 +147,18 @@ describe.sequential('mission 5 closed long-term ecology', () => {
       .toBeGreaterThanOrEqual(18);
     expect(finalShrimp.every((animal) => animal.origin === 'born')).toBe(true);
     expect(finalShrimp.some((animal) => (animal.generation ?? 0) >= 3)).toBe(true);
-    expect(final.totalBiomass.oedogonium + final.totalBiomass.nitzschia)
-      .toBeGreaterThan(35);
+    const establishedAlgae = samples
+      .filter((sample) => sample.elapsedSeconds >= 8_000)
+      .map((sample) =>
+        sample.totalBiomass.oedogonium + sample.totalBiomass.nitzschia);
+    const initialAlgaeInoculum = 8 * 2 * SURFACE_ALGAE_INOCULUM_BIOMASS;
+    // A fixed final threshold can land on either side of a healthy
+    // consumer-resource orbit. Require a producer bed well above inoculum and
+    // real movement here; the 40,000-second verifier checks the later
+    // fall-and-rebound sequence and bounded population minimum.
+    expect(Math.min(...establishedAlgae)).toBeGreaterThan(initialAlgaeInoculum * 4);
+    expect(Math.max(...establishedAlgae) - Math.min(...establishedAlgae))
+      .toBeGreaterThan(2);
     expect(final.biogeochemistry.biofilmTotals.decomposer).toBeGreaterThan(0);
     expect(final.biogeochemistry.biofilmTotals.nitrifier).toBeGreaterThan(0);
     expect(Math.min(...samples.map((sample) =>

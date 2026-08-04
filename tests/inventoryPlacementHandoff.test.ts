@@ -186,6 +186,41 @@ describe('mission 5 staged ecosystem stocking', () => {
   });
 });
 
+describe('mission 4 staged consumer release', () => {
+  it('unlocks algae and animals, but not structures or hidden-cycle tools, while paused', () => {
+    for (const kind of ['seed', 'animal'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-4',
+        'challenge',
+        'paused',
+        false,
+      )).toBe(true);
+    }
+    for (const kind of ['structure', 'biofilm', 'plankton'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-4',
+        'challenge',
+        'paused',
+        false,
+      )).toBe(false);
+    }
+  });
+
+  it('keeps delayed stocking locked while the consumer experiment is running', () => {
+    for (const kind of ['seed', 'animal'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-4',
+        'challenge',
+        'running',
+        false,
+      )).toBe(false);
+    }
+  });
+});
+
 describe('secondary placement gesture', () => {
   it('treats a right click as cancel', () => {
     expect(isSecondaryPointerGesture(2, false)).toBe(true);

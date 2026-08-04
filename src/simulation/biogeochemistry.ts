@@ -204,6 +204,17 @@ export class BiogeochemistryLedger {
   private readonly toxicWasteProductsScratch: Float64Array;
   private readonly nutrientProductsScratch: Float64Array;
   private readonly carbonProductsScratch: Float64Array;
+  // One ecology step first collects the mineral-N demand of every producer
+  // and nitrifier from the same pre-reaction water state. These buffers then
+  // partition only the finite ammonium pool; no guild receives a protected
+  // minimum and unused shares remain ordinary dissolved ammonium.
+  private readonly ammoniumCompetitionInitialScratch: Float64Array;
+  private readonly producerNitrogenDemandScratch: Float64Array;
+  private readonly nitrifierAmmoniumDemandScratch: Float64Array;
+  private readonly producerAmmoniumBudgetScratch: Float64Array;
+  private readonly nitrifierAmmoniumBudgetScratch: Float64Array;
+  private ammoniumCompetitionCollecting = false;
+  private ammoniumCompetitionReady = false;
   private readonly nitrifierReactionScratch: NitrifierStoichiometry = {
     processedNitrogen: 0,
     retainedNitrogen: 0,
@@ -319,6 +330,11 @@ export class BiogeochemistryLedger {
     this.toxicWasteProductsScratch = new Float64Array(this.cellCount);
     this.nutrientProductsScratch = new Float64Array(this.cellCount);
     this.carbonProductsScratch = new Float64Array(this.cellCount);
+    this.ammoniumCompetitionInitialScratch = new Float64Array(this.cellCount);
+    this.producerNitrogenDemandScratch = new Float64Array(this.cellCount);
+    this.nitrifierAmmoniumDemandScratch = new Float64Array(this.cellCount);
+    this.producerAmmoniumBudgetScratch = new Float64Array(this.cellCount);
+    this.nitrifierAmmoniumBudgetScratch = new Float64Array(this.cellCount);
     this.waterCellPoints = Array.from(
       { length: this.cellCount },
       (_, index): Vec2 => {
@@ -466,29 +482,138 @@ export class BiogeochemistryLedger {
     this.stepDaphniaAssimilation = 0;
     this.stepDaphniaRespiration = 0;
     this.stepDaphniaMortality = 0;
+    this.ammoniumCompetitionCollecting = false;
+    this.ammoniumCompetitionReady = false;
   }
 
   /**
-   * Smooth resource response used before requesting new algal biomass. The
-   * exact nitrogen and carbon withdrawal happens in commitAlgaeProduction.
+   * Starts one shared ammonium-allocation window from the water state that
+   * existed before either producers or nitrifiers reacted. Nitrifier demand is
+   * collected here; surface/macrophyte producer demand is registered by the
+   * world once its light-limited production requests are known.
+   */
+  public beginAmmoniumCompetition(
+    deltaSeconds: number,
+    sites: BiofilmReactionSite[],
+  ): void {
+    if (!this.effectsEnabled || deltaSeconds <= 0) return;
+    this.producerNitrogenDemandScratch.fill(0);
+    this.nitrifierAmmoniumDemandScratch.fill(0);
+    this.producerAmmoniumBudgetScratch.fill(0);
+    this.nitrifierAmmoniumBudgetScratch.fill(0);
+    this.ammoniumCompetitionInitialScratch.set(this.toxicWaste);
+    this.ammoniumCompetitionCollecting = true;
+    this.ammoniumCompetitionReady = false;
+
+    const kinetics = MICROBE_ECOLOGY_RULES.nitrifier;
+    for (const site of sites) {
+      const biomass = clamp(site.biofilm.nitrifier, 0, 1);
+      if (biomass <= 0) continue;
+      const index = this.indexAt(site.point);
+      const activity = saturation(
+        this.ammoniumCompetitionInitialScratch[index],
+        kinetics.halfSaturation,
+      ) * saturation(this.oxygen[index], kinetics.oxygenHalfSaturation);
+      const temperatureFactor = thetaTemperatureFactor(
+        this.temperatureAt(site.point),
+        kinetics.referenceTemperature,
+        kinetics.temperatureCoefficient,
+      );
+      const requestedNitrogen = biomass * kinetics.maximumUptake * activity *
+        temperatureFactor * deltaSeconds;
+      this.addDemandAround(
+        this.nitrifierAmmoniumDemandScratch,
+        index,
+        requestedNitrogen,
+        this.ammoniumCompetitionInitialScratch,
+      );
+    }
+
+    this.registerPhytoplanktonNitrogenDemand(deltaSeconds);
+  }
+
+  /** Adds a producer's finite new-biomass nitrogen request to the same step. */
+  public registerAlgaeProductionDemand(
+    point: Vec2,
+    requestedBiomass: number,
+  ): void {
+    if (!this.ammoniumCompetitionCollecting) return;
+    const nitrogenDemand = Math.max(0, requestedBiomass) *
+      WATER_CYCLE_RULES.biomassNitrogen;
+    if (nitrogenDemand <= 0) return;
+    const index = this.indexAt(point);
+    this.addDemandAround(
+      this.producerNitrogenDemandScratch,
+      index,
+      nitrogenDemand,
+      this.ammoniumCompetitionInitialScratch,
+      this.nutrients,
+    );
+  }
+
+  /**
+   * Partitions each water cell's pre-step ammonium in proportion to realised
+   * producer assimilation demand and nitrifier oxidation demand. Producers
+   * can still fill an ammonium shortfall from nitrate; nitrifiers cannot.
+   */
+  public finalizeAmmoniumCompetition(): void {
+    if (!this.ammoniumCompetitionCollecting) return;
+    const ammoniumPreference = WATER_CYCLE_RULES.algae.ammoniumPreference;
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const producerNitrogenDemand = this.producerNitrogenDemandScratch[index];
+      const nitrateAvailable = this.nutrients[index];
+      const producerAmmoniumDemand = Math.max(
+        producerNitrogenDemand * ammoniumPreference,
+        producerNitrogenDemand - nitrateAvailable,
+        0,
+      );
+      const nitrifierDemand = this.nitrifierAmmoniumDemandScratch[index];
+      const totalDemand = producerAmmoniumDemand + nitrifierDemand;
+      const available = this.ammoniumCompetitionInitialScratch[index];
+      if (totalDemand <= 0 || available <= 0) continue;
+      const scale = Math.min(1, available / totalDemand);
+      this.producerAmmoniumBudgetScratch[index] =
+        producerAmmoniumDemand * scale;
+      this.nitrifierAmmoniumBudgetScratch[index] = nitrifierDemand * scale;
+    }
+    this.ammoniumCompetitionCollecting = false;
+    this.ammoniumCompetitionReady = true;
+  }
+
+  /**
+   * Fraction of incident light that remains usable after dissolved and
+   * suspended organic matter attenuates the water column. Keep this separate
+   * from nutrient limitation: turbidity changes the producer's light regime
+   * and can push it below its compensation point, rather than merely slowing
+   * otherwise-positive growth.
+   */
+  public algaeLightTransmissionAt(point: Vec2): number {
+    if (!this.effectsEnabled) return 1;
+    const index = this.indexAt(point);
+    return Math.exp(
+      -WATER_CYCLE_RULES.algae.organicLightAttenuation *
+        this.organicMatter[index],
+    );
+  }
+
+  /**
+   * Smooth mineral-nitrogen and inorganic-carbon response used before
+   * requesting new algal biomass. The exact withdrawal happens in
+   * commitAlgaeProduction; optical limitation belongs in the incident-light
+   * calculation above.
    */
   public algaeResourceFactor(point: Vec2): number {
     if (!this.effectsEnabled) return 1;
     const index = this.indexAt(point);
     const mineralNitrogen = this.toxicWaste[index] + this.nutrients[index];
     const carbon = this.dissolvedInorganicCarbon[index];
-    const waterClarity = Math.exp(
-      -WATER_CYCLE_RULES.algae.organicLightAttenuation *
-        this.organicMatter[index],
-    );
     return Math.min(
       saturation(
         mineralNitrogen,
         WATER_CYCLE_RULES.mineralNutrientHalfSaturation,
       ),
       saturation(carbon, WATER_CYCLE_RULES.carbonHalfSaturation),
-    ) *
-      waterClarity;
+    );
   }
 
   /**
@@ -510,7 +635,12 @@ export class BiogeochemistryLedger {
     const index = this.indexAt(point);
     const nitrogenPerBiomass = WATER_CYCLE_RULES.biomassNitrogen;
     const carbonPerBiomass = WATER_CYCLE_RULES.biomassCarbon;
-    const availableAmmonium = this.massAround(this.toxicWaste, index);
+    const availableAmmonium = this.massAround(
+      this.ammoniumCompetitionReady
+        ? this.producerAmmoniumBudgetScratch
+        : this.toxicWaste,
+      index,
+    );
     const availableNutrients = this.massAround(this.nutrients, index);
     const nitrogenLimit = (availableAmmonium + availableNutrients) / nitrogenPerBiomass;
     const availableCarbon = this.massAround(this.dissolvedInorganicCarbon, index);
@@ -523,18 +653,32 @@ export class BiogeochemistryLedger {
       availableAmmonium,
       nitrogenNeed * WATER_CYCLE_RULES.algae.ammoniumPreference,
     );
-    let removedAmmonium = this.removeMassAround(this.toxicWaste, index, preferredAmmonium);
+    let removedAmmonium = this.ammoniumCompetitionReady
+      ? this.removeBudgetedAmmonium(
+        this.producerAmmoniumBudgetScratch,
+        index,
+        preferredAmmonium,
+      )
+      : this.removeMassAround(this.toxicWaste, index, preferredAmmonium);
     let removedNutrients = this.removeMassAround(
       this.nutrients,
       index,
       nitrogenNeed - removedAmmonium,
     );
     if (removedAmmonium + removedNutrients < nitrogenNeed) {
-      removedAmmonium += this.removeMassAround(
-        this.toxicWaste,
-        index,
-        nitrogenNeed - removedAmmonium - removedNutrients,
-      );
+      const ammoniumShortfall =
+        nitrogenNeed - removedAmmonium - removedNutrients;
+      removedAmmonium += this.ammoniumCompetitionReady
+        ? this.removeBudgetedAmmonium(
+          this.producerAmmoniumBudgetScratch,
+          index,
+          ammoniumShortfall,
+        )
+        : this.removeMassAround(
+          this.toxicWaste,
+          index,
+          ammoniumShortfall,
+        );
     }
     const paidNitrogen = removedAmmonium + removedNutrients;
     const paidBiomass = Math.min(actual, paidNitrogen / nitrogenPerBiomass);
@@ -911,6 +1055,10 @@ export class BiogeochemistryLedger {
     this.applyBiofilmReactions(dt, sites);
     this.applyPlanktonicDecomposerReactions(dt);
     this.applyPhytoplanktonReactions(dt);
+    // Every registered producer and nitrifier has now consumed only its
+    // proportional pre-step share. Any unused dissolved ammonium remains in
+    // the real field and becomes part of the next ecology step.
+    this.ammoniumCompetitionReady = false;
     if (!this.individualDaphniaManaged) this.applyDaphniaReactions(dt);
     this.transport.disperseConservativeField(
       this.organicMatter,
@@ -1649,7 +1797,9 @@ export class BiogeochemistryLedger {
         this.stepPhytoplanktonMortality += biomass;
         continue;
       }
-      const light = this.planktonLight[index] * Math.exp(-opticalDepth[index]);
+      const point = this.pointAtIndex(index);
+      const light = this.planktonLight[index] * Math.exp(-opticalDepth[index]) *
+        this.algaeLightTransmissionAt(point);
       const lightLimited = saturation(light, rules.lightHalfSaturation);
       const photoInhibition = light <= rules.photoInhibitionStart
         ? 1
@@ -1659,18 +1809,13 @@ export class BiogeochemistryLedger {
           0.52,
           1,
         );
-      const point = this.pointAtIndex(index);
       const mineralNitrogen =
         this.toxicWaste[index] + this.nutrients[index];
       const carbon = this.dissolvedInorganicCarbon[index];
-      const waterClarity = Math.exp(
-        -WATER_CYCLE_RULES.algae.organicLightAttenuation *
-          this.organicMatter[index],
-      );
       const resource = Math.min(
         saturation(mineralNitrogen, rules.mineralNitrogenHalfSaturation),
         saturation(carbon, rules.carbonHalfSaturation),
-      ) * waterClarity;
+      );
       const temperature = this.temperatureAt(this.pointAtIndex(index));
       const temperatureFactor = clamp(1 - Math.abs(temperature - 24) / 20, 0.12, 1);
       const requestedGrowth = biomass * rules.maximumGrowthPerSecond *
@@ -1733,6 +1878,59 @@ export class BiogeochemistryLedger {
       this.phytoplankton[index] = finiteBiomassConcentration(
         this.phytoplankton[index] + downward[index],
       );
+    }
+  }
+
+  /**
+   * Registers suspended-producer nitrogen demand before the shared ammonium
+   * budget is divided. This mirrors the growth request below without changing
+   * phytoplankton biomass or withdrawing any material.
+   */
+  private registerPhytoplanktonNitrogenDemand(deltaSeconds: number): void {
+    const rules = PLANKTON_ECOLOGY_RULES.phytoplankton;
+    const opticalDepth = this.phytoplanktonOpticalDepthScratch;
+    opticalDepth.fill(0);
+    for (let column = 0; column < this.columns; column += 1) {
+      let cumulativeConcentration = 0;
+      for (let row = 0; row < this.rows; row += 1) {
+        const index = row * this.columns + column;
+        const localConcentration = Math.max(0, this.phytoplankton[index]);
+        opticalDepth[index] = (
+          cumulativeConcentration + localConcentration * 0.5
+        ) * rules.selfShadingPerColumnConcentration;
+        cumulativeConcentration += localConcentration;
+      }
+    }
+    for (let index = 0; index < this.cellCount; index += 1) {
+      const biomass = this.phytoplankton[index] / this.cellCount;
+      if (biomass <= 1e-12) continue;
+      const point = this.pointAtIndex(index);
+      const light = this.planktonLight[index] * Math.exp(-opticalDepth[index]) *
+        this.algaeLightTransmissionAt(point);
+      const lightLimited = saturation(light, rules.lightHalfSaturation);
+      const photoInhibition = light <= rules.photoInhibitionStart
+        ? 1
+        : clamp(
+          1 - (light - rules.photoInhibitionStart) /
+            Math.max(1, 120 - rules.photoInhibitionStart) * 0.48,
+          0.52,
+          1,
+        );
+      const mineralNitrogen = this.toxicWaste[index] + this.nutrients[index];
+      const carbon = this.dissolvedInorganicCarbon[index];
+      const resource = Math.min(
+        saturation(mineralNitrogen, rules.mineralNitrogenHalfSaturation),
+        saturation(carbon, rules.carbonHalfSaturation),
+      );
+      const temperatureFactor = clamp(
+        1 - Math.abs(this.temperatureAt(point) - 24) / 20,
+        0.12,
+        1,
+      );
+      const requestedGrowth = biomass * rules.maximumGrowthPerSecond *
+        lightLimited * photoInhibition * resource * temperatureFactor *
+        deltaSeconds;
+      this.registerAlgaeProductionDemand(point, requestedGrowth);
     }
   }
 
@@ -2005,7 +2203,9 @@ export class BiogeochemistryLedger {
       const oxygen = this.oxygen[index];
       const carbon = this.dissolvedInorganicCarbon[index];
       initialOrganicMatter[index] = organic;
-      initialToxicWaste[index] = toxicWaste;
+      initialToxicWaste[index] = this.ammoniumCompetitionReady
+        ? this.ammoniumCompetitionInitialScratch[index]
+        : toxicWaste;
       initialNutrients[index] = nutrient;
       initialOxygen[index] = oxygen;
       initialCarbon[index] = carbon;
@@ -2072,7 +2272,10 @@ export class BiogeochemistryLedger {
         const foodWithdrawal = guildId === 'decomposer'
           ? organicWithdrawal
           : toxicWasteWithdrawal;
-        const foodAvailable = this.massAround(foodWithdrawal, index);
+        const foodAvailable = guildId === 'nitrifier' &&
+          this.ammoniumCompetitionReady
+          ? this.massAround(this.nitrifierAmmoniumBudgetScratch, index)
+          : this.massAround(foodWithdrawal, index);
         const oxygenAvailable = this.massAround(oxygenWithdrawal, index);
         let actual = Math.min(requested, foodAvailable);
 
@@ -2132,8 +2335,17 @@ export class BiogeochemistryLedger {
           }
         }
 
-        const consumed = this.removeMassAround(foodWithdrawal, index, actual);
-        this.removeMassAround(foodField, index, consumed);
+        const consumed = guildId === 'nitrifier' &&
+          this.ammoniumCompetitionReady
+          ? this.removeBudgetedAmmonium(
+            this.nitrifierAmmoniumBudgetScratch,
+            index,
+            actual,
+          )
+          : this.removeMassAround(foodWithdrawal, index, actual);
+        if (!(guildId === 'nitrifier' && this.ammoniumCompetitionReady)) {
+          this.removeMassAround(foodField, index, consumed);
+        }
 
         let growth = 0;
         let oxygenDemand = 0;
@@ -2451,6 +2663,73 @@ export class BiogeochemistryLedger {
     requested: number,
   ): number {
     return this.removeMassFromIndices(field, this.indicesAround(index), requested);
+  }
+
+  /**
+   * Spreads one mass demand over the same local stencil used for withdrawal.
+   * Existing dissolved substrate weights the claim, so overlapping consumers
+   * compete for the water cells they can actually reach rather than for a
+   * tank-wide scalar pool.
+   */
+  private addDemandAround(
+    demandField: Float64Array,
+    index: number,
+    requestedMass: number,
+    primaryResource: Float64Array,
+    secondaryResource?: Float64Array,
+  ): void {
+    if (requestedMass <= 0) return;
+    const indices = this.indicesAround(index);
+    let totalWeight = 0;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      const resourceIndex = indices[offset];
+      totalWeight += Math.max(
+        0,
+        primaryResource[resourceIndex] +
+          (secondaryResource?.[resourceIndex] ?? 0),
+      );
+    }
+    if (totalWeight <= 0) return;
+    const concentrationDemand = requestedMass * this.cellCount;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      const resourceIndex = indices[offset];
+      const weight = Math.max(
+        0,
+        primaryResource[resourceIndex] +
+          (secondaryResource?.[resourceIndex] ?? 0),
+      );
+      demandField[resourceIndex] += concentrationDemand * weight / totalWeight;
+    }
+  }
+
+  /** Withdraws exactly the cells assigned to one competition budget. */
+  private removeBudgetedAmmonium(
+    budgetField: Float64Array,
+    index: number,
+    requestedMass: number,
+  ): number {
+    if (requestedMass <= 0) return 0;
+    const indices = this.indicesAround(index);
+    let availableConcentration = 0;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      availableConcentration += budgetField[indices[offset]];
+    }
+    const availableMass = availableConcentration / this.cellCount;
+    const actual = Math.min(requestedMass, availableMass);
+    if (actual <= 0 || availableConcentration <= 0) return 0;
+    const ratio = actual / availableMass;
+    for (let offset = 0; offset < indices.length; offset += 1) {
+      const resourceIndex = indices[offset];
+      const removedConcentration = budgetField[resourceIndex] * ratio;
+      budgetField[resourceIndex] = Math.max(
+        0,
+        budgetField[resourceIndex] - removedConcentration,
+      );
+      this.toxicWaste[resourceIndex] = finiteConcentration(
+        this.toxicWaste[resourceIndex] - removedConcentration,
+      );
+    }
+    return actual;
   }
 
   private addMassAround(

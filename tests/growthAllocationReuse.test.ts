@@ -24,6 +24,7 @@ interface GrowthInternals {
   allCells(): GrowthCell[];
   stepGrowth(deltaSeconds: number): void;
   biogeochemistry: {
+    algaeLightTransmissionAt(point: Vec2): number;
     algaeResourceFactor(point: Vec2): number;
   };
   vallisneriaResourceFactor(cell: GrowthCell): number;
@@ -90,22 +91,24 @@ describe('growth hot-loop allocation reuse', () => {
       { x: cell.x, y: cell.y },
       0.72,
     );
-    const lights = leaves.flatMap((leaf) =>
+    const points = leaves.flatMap((leaf) =>
       [0.25, 0.5, 0.75, 1].map((position) =>
-        internals.sampleLightField(vallisneriaLeafPoint(leaf, position))
+        vallisneriaLeafPoint(leaf, position)
       )
     );
-    for (const light of lights) {
+    for (const point of points) {
+      const light = internals.sampleLightField(point) *
+        internals.biogeochemistry.algaeLightTransmissionAt(point);
       const sample = algaePhysiology('vallisneria', light, 24);
       expected.grossPhotosynthesis += sample.grossPhotosynthesis;
       expected.respiration += sample.respiration;
       expected.lightStressTurnover += sample.lightStressTurnover;
       expected.netGrowth += sample.netGrowth;
     }
-    expected.grossPhotosynthesis /= lights.length;
-    expected.respiration /= lights.length;
-    expected.lightStressTurnover /= lights.length;
-    expected.netGrowth /= lights.length;
+    expected.grossPhotosynthesis /= points.length;
+    expected.respiration /= points.length;
+    expected.lightStressTurnover /= points.length;
+    expected.netGrowth /= points.length;
 
     const reuse = internals.vallisneriaPhysiologySampleScratch;
     const actual = internals.vallisneriaCanopyPhysiology(cell, 24, reuse);

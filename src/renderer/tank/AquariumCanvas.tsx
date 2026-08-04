@@ -12,6 +12,7 @@ import {
 } from 'pixi.js';
 import { useEffect, useRef, useState } from 'react';
 import {
+  ALGAE_RENDER_TRACE_BIOMASS,
   ALGAE_VISIBLE_BIOMASS,
   MICROBES,
   SCENARIOS,
@@ -123,13 +124,6 @@ import {
   smoothPhytoplanktonConcentration,
   writePhytoplanktonBloomPixels,
 } from './phytoplanktonPresentation';
-import {
-  ALGAE_DENSITY_SATURATION_BIOMASS,
-  ALGAE_DENSITY_FIELD_SCALE,
-  ALGAE_RENDER_TRACE_BIOMASS,
-  writeAlgaeDensityPixels,
-} from './algaeDensityPresentation';
-
 interface AquariumCanvasProps {
   snapshot: SimulationSnapshot;
   motionSource: SimulationMotionSource;
@@ -171,29 +165,27 @@ const CAMERA_BUTTON_STEP = 1.28;
 const CAMERA_EPSILON = 0.001;
 const ALGAE_RASTER_FAST_REFRESH_MS = 250;
 const ALGAE_RASTER_HIGH_SPEED_REFRESH_MS = 500;
-export const ALGAE_VISUAL_LEVEL_COUNT = 32;
-// A cell is an ecological sample area, not one giant algal individual.
-// Perceptual (logarithmic) density makes a real, thin new colony readable
-// without painting biomass into cells where the simulation has none. Values
-// above the supplied inoculum remain distinguishable so grazing a mature patch
-// can still visibly thin it.
-export const ALGAE_VISUAL_SATURATION_BIOMASS = 0.72;
+export const ALGAE_VISUAL_LEVEL_COUNT = 24;
+export const ALGAE_VISUAL_SATURATION_BIOMASS = 1;
 export const ALGAE_PARTICLE_JITTER_SPAN = 0.35;
+export const ALGAE_PARTICLE_ALPHA_FLOOR = 0.58;
+export type AlgaeSpeciesId = 'oedogonium' | 'nitzschia';
 
-/**
- * Biomass is deliberately quantized before it reaches Pixi. Ecology snapshots
- * contain tiny floating-point changes on nearly every tick; most of those are
- * too small to alter a ten-pixel colony on screen. Keeping them in the same
- * visual bucket lets a settled tank reuse its existing density texture.
- */
-export const algaeVisualLevel = (amount: number): number => {
+export const algaeVisualRatio = (amount: number): number => {
   if (!Number.isFinite(amount) || amount <= ALGAE_RENDER_TRACE_BIOMASS) return 0;
-  const normalized = Math.max(0, Math.min(
-    1,
-    (amount - ALGAE_RENDER_TRACE_BIOMASS) /
-      (ALGAE_VISUAL_SATURATION_BIOMASS - ALGAE_RENDER_TRACE_BIOMASS),
-  ));
-  const visible = Math.log1p(normalized * 31) / Math.log(32);
+  // The ecological rewrite lowered standing biomass per surface sample by
+  // roughly two orders of magnitude. Preserve the packaged renderer and lift
+  // only its perceptual response so a real, spread-out film does not collapse
+  // into the palest visual bucket. A cube-root still reveals real trace biomass
+  // while leaving more distance between a grazed film and a dense colony than
+  // the former fourth-root response.
+  return Math.cbrt(Math.max(0, Math.min(1, amount)));
+};
+
+/** Quantize only the detail geometry; the soft wash keeps the continuous ratio. */
+export const algaeVisualLevel = (amount: number): number => {
+  const visible = algaeVisualRatio(amount);
+  if (visible <= 0) return 0;
   return Math.max(1, Math.min(
     ALGAE_VISUAL_LEVEL_COUNT,
     Math.round(visible * ALGAE_VISUAL_LEVEL_COUNT),
@@ -202,65 +194,68 @@ export const algaeVisualLevel = (amount: number): number => {
 
 export const algaeParticleRadiusRatio = (visualLevel: number): number => {
   const visible = Math.max(0, Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT));
-  // A newly established trace starts as a small wisp. It only fills and joins
-  // neighboring sample areas after its real biomass rises, so outward spread
-  // cannot be mistaken for a row of full-sized stamped circles.
-  return 0.28 + visible * 0.87;
+  return 0.69 + visible * 0.46;
 };
 
 export const algaeParticleAlpha = (visualLevel: number): number => {
   const visible = Math.max(0, Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT));
-  return 0.34 + visible * 0.66;
+  return ALGAE_PARTICLE_ALPHA_FLOOR +
+    visible * (1 - ALGAE_PARTICLE_ALPHA_FLOOR);
+};
+
+export const surfaceAlgaeSpeciesShare = (
+  biomass: SurfaceCellSnapshot['biomass'],
+  speciesId: AlgaeSpeciesId,
+): number => {
+  const oedogonium = Number.isFinite(biomass.oedogonium)
+    ? Math.max(0, biomass.oedogonium)
+    : 0;
+  const nitzschia = Number.isFinite(biomass.nitzschia)
+    ? Math.max(0, biomass.nitzschia)
+    : 0;
+  const total = oedogonium + nitzschia;
+  return total > 0
+    ? (speciesId === 'oedogonium' ? oedogonium : nitzschia) / total
+    : 0;
+};
+
+export const algaeSpeciesWashAlpha = (
+  cell: SurfaceCellSnapshot,
+  speciesId: AlgaeSpeciesId,
+): number => {
+  const visualRatio = algaeVisualRatio(cell.biomass[speciesId]);
+  if (visualRatio <= 0) return 0;
+  return algaeParticleAlpha(visualRatio * ALGAE_VISUAL_LEVEL_COUNT) *
+    surfaceAlgaeSpeciesShare(cell.biomass, speciesId);
 };
 
 export const algaeDetailCount = (
   maximumCount: number,
   visualLevel: number,
 ): number => {
-  // A newly dispersed film first reads as one continuous translucent wash.
-  // Cell-bound details only appear after real local biomass is established.
-  if (maximumCount <= 0 || visualLevel < 5) return 0;
+  if (maximumCount <= 0 || visualLevel <= 0) return 0;
   const visible = Math.max(
     0,
     Math.min(1, visualLevel / ALGAE_VISUAL_LEVEL_COUNT),
   );
-  return Math.max(1, Math.round(maximumCount * (0.14 + visible * 0.86)));
+  return Math.max(1, Math.round(maximumCount * (0.2 + visible * 0.8)));
 };
 
 /**
- * Oedogonium must remain recognisably filamentous at the advancing edge.
- * A deterministic subset of trace cells receives one strand; skipping the
- * others breaks the ecology-cell rhythm while still letting the strands
- * visibly travel with real, low-density biomass.
+ * Use the restrained identity-strand count from the July packaged renderer.
+ * Trace cells receive only one mark, while the soft wash carries their mass.
  */
 export const oedogoniumFilamentCount = (
-  cellId: string,
+  _cellId: string,
   visualLevel: number,
-  biomass?: number,
-): number => {
-  if (visualLevel <= 0) return 0;
-  if (biomass !== undefined && visualLevel >= 2) {
-    const linearAmount = Math.max(
-      0,
-      Math.min(1, biomass / ALGAE_VISUAL_SATURATION_BIOMASS),
-    );
-    return Math.max(
-      1,
-      Math.round(
-        1 +
-          (ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL - 1) *
-            Math.pow(linearAmount, 0.72),
-      ),
-    );
-  }
-  if (visualLevel >= 5) {
-    return algaeDetailCount(
-      ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL,
-      visualLevel,
-    );
-  }
-  return hash01(stringHash(`${cellId}:oedogonium-front`)) < 0.72 ? 1 : 0;
-};
+  _biomass?: number,
+  speciesShare = 1,
+): number => Math.round(
+  algaeDetailCount(
+    ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL,
+    visualLevel,
+  ) * Math.max(0, Math.min(1, speciesShare)),
+);
 
 export const shouldTriggerShrimpGrazingPulse = (
   previousSequence: number | null,
@@ -297,7 +292,7 @@ const algaeKeyNumber = (value: number): number => Math.round(value * 1000) / 100
 
 const algaeFineVisualAmount = (value: number): number => Math.round(
   Math.min(
-    ALGAE_DENSITY_SATURATION_BIOMASS,
+    ALGAE_VISUAL_SATURATION_BIOMASS,
     Math.max(0, value),
   ) * 500,
 );
@@ -308,8 +303,8 @@ export const algaeCellVisualKey = (cell: SurfaceCellSnapshot): string => [
   algaeKeyNumber(cell.x),
   algaeKeyNumber(cell.y),
   algaeKeyNumber(cell.cellSize),
-  // The fixed raster is cheap and bounded, so retain real grazing changes
-  // instead of waiting for a coarse 1/32 visual-level boundary. A 0.002
+  // The immutable brush sprites are cheap and bounded, so retain real grazing changes
+  // instead of waiting for a coarse 1/24 visual-level boundary. A 0.002
   // biomass bucket is below one ordinary multi-second bite but avoids
   // rebuilding for floating-point noise. Values above visual saturation are
   // intentionally equivalent.
@@ -3550,8 +3545,6 @@ const structureAlgaeGeometryKey = (snapshot: SimulationSnapshot): string =>
     algaeKeyNumber(structure.angle),
   ].join(':')).join('|');
 
-type AlgaeSpeciesId = 'oedogonium' | 'nitzschia';
-
 interface AlgaeDensitySurface {
   surfaceKind: SurfaceCellSnapshot['surfaceKind'];
   speciesLayers: Record<AlgaeSpeciesId, AlgaeSpeciesDensityLayer>;
@@ -3565,14 +3558,9 @@ interface AlgaeDensitySurface {
 
 interface AlgaeSpeciesDensityLayer {
   container: Container;
-  densitySprite: Sprite;
-  densityPixels: Uint8Array;
-  densityField: Float32Array;
-  densityScratch: Float32Array;
-  densitySource: BufferImageSource | null;
-  densityTexture: Texture | null;
-  fieldWidth: number;
-  fieldHeight: number;
+  densityMarks: Container;
+  brushTexture: Texture;
+  brushSprites: Map<string, Sprite>;
   detailGraphics: Graphics;
   detailContext: GraphicsContext;
   detailGeometryKey: string;
@@ -3585,58 +3573,35 @@ export interface AlgaeColonizationState {
 
 const algaeDensitySurfaces = new WeakMap<Container, AlgaeDensitySurface>();
 
-// The density wash carries standing biomass. Crisp strands are only species
-// identity marks, so they must not multiply into a second visual biomass layer
-// every time adjacent ecology cells become occupied. Eight keeps a mature cell
-// recognisably filamentous while avoiding the 18-per-cell tangle seen on the
-// Mission 5 flat stone.
-export const ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL = 8;
-export const OEDOGONIUM_DENSITY_ALPHA = 0.98;
-// The continuous density wash carries the occupied area. Keep enough distinct
-// diatoms to read at fit zoom, but cap them far below the old carpet of marks.
-export const ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL = 8;
+// Keep the July packaged build's restrained hand-drawn texture. The soft wash
+// carries biomass; the strokes and grains only identify the two algae types.
+export const ALGAE_OEDOGONIUM_DETAILS_PER_ACTIVE_CELL = 4;
+export const OEDOGONIUM_DENSITY_ALPHA = 0.86;
+export const ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL = 5;
 export const NITZSCHIA_VISUAL_STYLE = {
-  brush: { red: 172, green: 119, blue: 43, alpha: 0.6 },
-  substrateAlpha: 0.82,
-  structureAlpha: 0.74,
+  brush: { red: 176, green: 126, blue: 58, alpha: 0.58 },
+  substrateAlpha: 0.72,
+  structureAlpha: 0.58,
   speck: {
-    radiusMin: 0.62,
-    radiusSpan: 0.48,
-    aspectMin: 0.42,
-    aspectSpan: 0.18,
+    radiusMin: 0.42,
+    radiusSpan: 0.38,
+    aspectMin: 0.72,
+    aspectSpan: 0.22,
     color: 0x6f4a2b,
-    alpha: 0.58,
+    alpha: 0.46,
   },
 } as const;
 
 export const nitzschiaSpeckCount = (
   visualLevel: number,
-  biomass?: number,
-): number => {
-  if (visualLevel <= 0) return 0;
-  if (biomass !== undefined) {
-    // A dispersal trace is already represented by the soft density wash. Do
-    // not stamp a crisp grain into every newly reached ecology cell.
-    if (!Number.isFinite(biomass) || biomass <= ALGAE_VISIBLE_BIOMASS) {
-      return 0;
-    }
-    const linearAmount = Math.max(
-      0,
-      Math.min(1, biomass / ALGAE_VISUAL_SATURATION_BIOMASS),
-    );
-    return Math.max(
-      2,
-      Math.round(
-        2 +
-          (ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL - 2) * linearAmount,
-      ),
-    );
-  }
-  return algaeDetailCount(
+  _biomass?: number,
+  speciesShare = 1,
+): number => Math.round(
+  algaeDetailCount(
     ALGAE_NITZSCHIA_DETAILS_PER_ACTIVE_CELL,
     visualLevel,
-  );
-};
+  ) * Math.max(0, Math.min(1, speciesShare)),
+);
 
 export const algaeColonizationDetailSeed = (
   cellId: string,
@@ -3653,11 +3618,7 @@ const algaeDetailPosition = (
   surfaceAngle: number,
   seed: number,
 ): Vec2 => {
-  // The continuous wash already joins neighboring ecology cells. Keep detail
-  // centres close to their source cell so adjacent cells do not stamp several
-  // independent filament layers onto the same patch. A small spill still
-  // breaks the bookkeeping grid without recreating the old tangled carpet.
-  const spread = cell.cellSize * 0.58;
+  const spread = cell.cellSize * 1.05;
   const localX = (hash01(seed * 43 + 17) - 0.5) * spread * 2;
   const localY = (hash01(seed * 71 + 29) - 0.5) * spread * 2;
   const cosine = Math.cos(surfaceAngle);
@@ -3796,6 +3757,52 @@ const styleAlgaeDetailContext = (context: GraphicsContext): void => {
   context.batchMode = 'no-batch';
 };
 
+export const ALGAE_BRUSH_TEXTURE_SIZE = 96;
+export const ALGAE_BRUSH_MEMBRANE_RADIUS = 27;
+export const ALGAE_BRUSH_SOFT_EDGE_PIXELS = 10;
+export const ALGAE_PACKAGED_WASH_DARKEN_GAIN = 1.8;
+
+const createAlgaeBrushCanvas = (speciesId: AlgaeSpeciesId): HTMLCanvasElement => {
+  const size = ALGAE_BRUSH_TEXTURE_SIZE;
+  const center = size / 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+  if (!context) return canvas;
+
+  context.save();
+  context.filter = `blur(${ALGAE_BRUSH_SOFT_EDGE_PIXELS}px)`;
+  const nitzschiaBrush = NITZSCHIA_VISUAL_STYLE.brush;
+  const baseAlpha = speciesId === 'oedogonium' ? 0.52 : nitzschiaBrush.alpha;
+  const alpha = Math.min(1, baseAlpha * ALGAE_PACKAGED_WASH_DARKEN_GAIN);
+  context.fillStyle = speciesId === 'oedogonium'
+    ? `rgba(84, 132, 73, ${alpha})`
+    : `rgba(${nitzschiaBrush.red}, ${nitzschiaBrush.green}, ${nitzschiaBrush.blue}, ${alpha})`;
+  const membranePoints = Array.from({ length: 18 }, (_, index) => {
+    const angle = (index / 18) * Math.PI * 2;
+    const radius = ALGAE_BRUSH_MEMBRANE_RADIUS - 3 +
+      hash01(index * 29 + (speciesId === 'oedogonium' ? 5 : 41)) * 3;
+    return {
+      x: center + Math.cos(angle) * radius,
+      y: center + Math.sin(angle) * radius,
+    };
+  });
+  const first = membranePoints[0];
+  const last = membranePoints.at(-1)!;
+  context.beginPath();
+  context.moveTo((last.x + first.x) / 2, (last.y + first.y) / 2);
+  membranePoints.forEach((point, index) => {
+    const next = membranePoints[(index + 1) % membranePoints.length];
+    context.quadraticCurveTo(point.x, point.y, (point.x + next.x) / 2, (point.y + next.y) / 2);
+  });
+  context.closePath();
+  context.fill();
+  context.restore();
+
+  return canvas;
+};
+
 const createAlgaeParticleLayer = (
   surfaceKind: SurfaceCellSnapshot['surfaceKind'],
 ): Container => {
@@ -3806,18 +3813,15 @@ const createAlgaeParticleLayer = (
   const createSpeciesLayer = (speciesId: AlgaeSpeciesId): AlgaeSpeciesDensityLayer => {
     const container = new Container();
     container.visible = false;
-    const densitySprite = new Sprite(Texture.EMPTY);
-    // Keep the density wash opaque enough to anchor the crisp detail strokes,
-    // while the colony stays as light as the earlier hand-drawn version.
-    densitySprite.alpha = speciesId === 'oedogonium'
+    const brushTexture = Texture.from(createAlgaeBrushCanvas(speciesId));
+    brushTexture.source.scaleMode = 'linear';
+    const densityMarks = new Container();
+    densityMarks.alpha = speciesId === 'oedogonium'
       ? OEDOGONIUM_DENSITY_ALPHA
       : surfaceKind === 'substrate'
         ? NITZSCHIA_VISUAL_STYLE.substrateAlpha
         : NITZSCHIA_VISUAL_STYLE.structureAlpha;
 
-    // Restore the old continuous density surface without restoring its
-    // repeatedly updated HTML canvas. A single typed buffer is retained and
-    // uploaded in place, so Chromium cannot accumulate canvas backing stores.
     const detailGraphics = new Graphics();
     const detailContext = detailGraphics.context;
     styleAlgaeDetailContext(detailContext);
@@ -3828,30 +3832,23 @@ const createAlgaeParticleLayer = (
     // held-object preview are drawn. Details are already generated only for
     // biologically active cells, so drawing them directly preserves the colony
     // shape without the fragile GPU filter path.
-    container.addChild(densitySprite, detailGraphics);
+    container.addChild(densityMarks, detailGraphics);
     content.addChild(container);
     return {
       container,
-      densitySprite,
-      densityPixels: new Uint8Array(0),
-      densityField: new Float32Array(0),
-      densityScratch: new Float32Array(0),
-      densitySource: null,
-      densityTexture: null,
-      fieldWidth: 0,
-      fieldHeight: 0,
+      densityMarks,
+      brushTexture,
+      brushSprites: new Map<string, Sprite>(),
       detailGraphics,
       detailContext,
       detailGeometryKey: '',
     };
   };
 
-  // Put the sparse diatom lozenges above the filament wash. With the opposite
-  // order, even a mature Nitzschia colony disappeared completely anywhere
-  // Oedogonium shared the same stone.
+  // Match the packaged build: the brown film sits beneath green filaments.
   const speciesLayers = {
-    oedogonium: createSpeciesLayer('oedogonium'),
     nitzschia: createSpeciesLayer('nitzschia'),
+    oedogonium: createSpeciesLayer('oedogonium'),
   };
   content.mask = mask;
   root.addChild(content, mask);
@@ -3884,14 +3881,14 @@ const releaseAlgaeParticleLayer = (layer: Container): void => {
     surface.cells[speciesId].clear();
     surface.colonization[speciesId].clear();
     const speciesLayer = surface.speciesLayers[speciesId];
-    if (speciesLayer.densityTexture && !speciesLayer.densityTexture.destroyed) {
-      speciesLayer.densityTexture.destroy(true);
+    const sprites = speciesLayer.densityMarks.removeChildren();
+    for (const sprite of sprites) {
+      sprite.destroy();
     }
-    speciesLayer.densityPixels = new Uint8Array(0);
-    speciesLayer.densityField = new Float32Array(0);
-    speciesLayer.densityScratch = new Float32Array(0);
-    speciesLayer.densitySource = null;
-    speciesLayer.densityTexture = null;
+    speciesLayer.brushSprites.clear();
+    if (!speciesLayer.brushTexture.destroyed) {
+      speciesLayer.brushTexture.destroy(true);
+    }
   }
   algaeDensitySurfaces.delete(layer);
 };
@@ -3933,50 +3930,47 @@ const updateAlgaeMask = (
   }
 };
 
-const ensureAlgaeDensitySurface = (
+const syncAlgaeCellBrushSprite = (
   layer: AlgaeSpeciesDensityLayer,
-  snapshot: SimulationSnapshot,
+  cell: SurfaceCellSnapshot,
+  speciesId: AlgaeSpeciesId,
+  surfaceAngle: number,
 ): void => {
-  const fieldWidth = Math.max(
-    1,
-    Math.round(snapshot.tank.width * ALGAE_DENSITY_FIELD_SCALE),
-  );
-  const fieldHeight = Math.max(
-    1,
-    Math.round(snapshot.tank.height * ALGAE_DENSITY_FIELD_SCALE),
-  );
-  if (
-    layer.fieldWidth === fieldWidth &&
-    layer.fieldHeight === fieldHeight &&
-    layer.densitySource &&
-    !layer.densitySource.destroyed
-  ) {
-    layer.densitySprite.setSize(snapshot.tank.width, snapshot.tank.height);
-    return;
-  }
+  const speciesOffset = speciesId === 'oedogonium' ? 97 : 13;
+  const cellSeed = stringHash(cell.id);
+  const localJitterX = (hash01(cellSeed + speciesOffset) - 0.5) *
+    cell.cellSize * ALGAE_PARTICLE_JITTER_SPAN;
+  const localJitterY = (hash01(cellSeed + speciesOffset + 11) - 0.5) *
+    cell.cellSize * ALGAE_PARTICLE_JITTER_SPAN;
+  const cosine = Math.cos(surfaceAngle);
+  const sine = Math.sin(surfaceAngle);
+  const jitterX = localJitterX * cosine - localJitterY * sine;
+  const jitterY = localJitterX * sine + localJitterY * cosine;
+  // Geometry details remain quantized, but the standing wash follows the
+  // actual remaining biomass continuously. A shrimp bite therefore thins only
+  // the grazed cell even when it stays inside one 24-step detail bucket.
+  const continuousVisualLevel = algaeVisualRatio(
+    cell.biomass[speciesId],
+  ) * ALGAE_VISUAL_LEVEL_COUNT;
+  const radius = cell.cellSize * algaeParticleRadiusRatio(continuousVisualLevel);
+  const scaleX = radius / ALGAE_BRUSH_MEMBRANE_RADIUS *
+    (0.94 + hash01(cellSeed + speciesOffset + 23) * 0.12);
+  const scaleY = radius / ALGAE_BRUSH_MEMBRANE_RADIUS *
+    (0.94 + hash01(cellSeed + speciesOffset + 41) * 0.12);
 
-  if (layer.densityTexture && !layer.densityTexture.destroyed) {
-    layer.densityTexture.destroy(true);
+  let sprite = layer.brushSprites.get(cell.id);
+  if (!sprite) {
+    sprite = new Sprite(layer.brushTexture);
+    sprite.anchor.set(0.5);
+    layer.brushSprites.set(cell.id, sprite);
+    layer.densityMarks.addChild(sprite);
   }
-  const pixelCount = fieldWidth * fieldHeight;
-  layer.fieldWidth = fieldWidth;
-  layer.fieldHeight = fieldHeight;
-  layer.densityPixels = new Uint8Array(pixelCount * 4);
-  layer.densityField = new Float32Array(pixelCount);
-  layer.densityScratch = new Float32Array(pixelCount);
-  layer.densitySource = new BufferImageSource({
-    resource: layer.densityPixels,
-    width: fieldWidth,
-    height: fieldHeight,
-    format: 'rgba8unorm',
-    alphaMode: 'premultiply-alpha-on-upload',
-    autoGarbageCollect: false,
-  });
-  layer.densitySource.scaleMode = 'linear';
-  layer.densityTexture = new Texture({ source: layer.densitySource });
-  layer.densitySprite.texture = layer.densityTexture;
-  layer.densitySprite.position.set(0, 0);
-  layer.densitySprite.setSize(snapshot.tank.width, snapshot.tank.height);
+  sprite.position.set(cell.x + jitterX, cell.y + jitterY);
+  sprite.rotation = surfaceAngle +
+    hash01(cellSeed + speciesOffset + 59) * Math.PI * 2;
+  sprite.scale.set(scaleX, scaleY);
+  sprite.alpha = algaeSpeciesWashAlpha(cell, speciesId);
+  sprite.visible = true;
 };
 
 export const advanceAlgaeColonizationState = (
@@ -4018,8 +4012,17 @@ const algaeDetailGeometryKey = (
   const biomass = cell.biomass[speciesId];
   const visualLevel = algaeVisualLevel(biomass);
   const detailCount = speciesId === 'oedogonium'
-    ? oedogoniumFilamentCount(cell.id, visualLevel, biomass)
-    : nitzschiaSpeckCount(visualLevel, biomass);
+    ? oedogoniumFilamentCount(
+        cell.id,
+        visualLevel,
+        biomass,
+        surfaceAlgaeSpeciesShare(cell.biomass, speciesId),
+      )
+    : nitzschiaSpeckCount(
+        visualLevel,
+        biomass,
+        surfaceAlgaeSpeciesShare(cell.biomass, speciesId),
+      );
   return [
     cell.id,
     generation,
@@ -4057,6 +4060,7 @@ const rebuildAlgaeDetailGeometry = (
         cell.id,
         algaeVisualLevel(cell.biomass.oedogonium),
         cell.biomass.oedogonium,
+        surfaceAlgaeSpeciesShare(cell.biomass, 'oedogonium'),
       );
       const surfaceAngle = cell.surfaceKind === 'structure-face'
         ? structureAngles.get(cell.ownerId) ?? 0
@@ -4078,8 +4082,8 @@ const rebuildAlgaeDetailGeometry = (
     }
     context.stroke({
       color: 0x355f3b,
-      alpha: 0.62,
-      width: 0.68,
+      alpha: 0.4,
+      width: 0.52,
       cap: 'round',
       join: 'round',
     });
@@ -4091,6 +4095,7 @@ const rebuildAlgaeDetailGeometry = (
     const detailCount = nitzschiaSpeckCount(
       algaeVisualLevel(cell.biomass.nitzschia),
       cell.biomass.nitzschia,
+      surfaceAlgaeSpeciesShare(cell.biomass, 'nitzschia'),
     );
     const surfaceAngle = cell.surfaceKind === 'structure-face'
       ? structureAngles.get(cell.ownerId) ?? 0
@@ -4124,38 +4129,36 @@ const drawAlgaeDensityField = (
   const structureAngles = new Map(
     snapshot.structures.map((structure) => [structure.id, structure.angle]),
   );
-
+  const surfaceCellIds = new Set<string>();
+  for (const cell of snapshot.cells) {
+    if (cell.surfaceKind === surface.surfaceKind) surfaceCellIds.add(cell.id);
+  }
   const speciesCells: SurfaceCellSnapshot[] = [];
   const speciesLayer = surface.speciesLayers[speciesId];
-  ensureAlgaeDensitySurface(speciesLayer, snapshot);
+  for (const sprite of speciesLayer.brushSprites.values()) {
+    sprite.visible = false;
+  }
   for (const cell of snapshot.cells) {
     if (cell.surfaceKind !== surface.surfaceKind) continue;
     const level = algaeVisualLevel(cell.biomass[speciesId]);
     if (level === 0) continue;
     speciesCells.push(cell);
+    syncAlgaeCellBrushSprite(
+      speciesLayer,
+      cell,
+      speciesId,
+      cell.surfaceKind === 'structure-face'
+        ? structureAngles.get(cell.ownerId) ?? 0
+        : 0,
+    );
   }
-  const brushColor = speciesId === 'oedogonium'
-    ? { red: 84, green: 132, blue: 73 }
-    : NITZSCHIA_VISUAL_STYLE.brush;
-  writeAlgaeDensityPixels(
-    {
-      pixels: speciesLayer.densityPixels,
-      density: speciesLayer.densityField,
-      scratch: speciesLayer.densityScratch,
-      width: speciesLayer.fieldWidth,
-      height: speciesLayer.fieldHeight,
-      worldWidth: snapshot.tank.width,
-      worldHeight: snapshot.tank.height,
-    },
-    speciesCells.map((cell) => ({
-      x: cell.x,
-      y: cell.y,
-      cellSize: cell.cellSize,
-      biomass: cell.biomass[speciesId],
-    })),
-    brushColor,
-  );
-  speciesLayer.densitySource?.update();
+
+  for (const [cellId, sprite] of speciesLayer.brushSprites) {
+    if (surfaceCellIds.has(cellId)) continue;
+    speciesLayer.brushSprites.delete(cellId);
+    speciesLayer.densityMarks.removeChild(sprite);
+    sprite.destroy();
+  }
   rebuildAlgaeDetailGeometry(
     surface,
     speciesId,
@@ -4220,13 +4223,7 @@ const syncAlgaeParticles = (
         if (cells.delete(cell.id)) surface.fieldDirty[speciesId] = true;
         continue;
       }
-      const visualKey = [
-        cell.id,
-        algaeKeyNumber(cell.x),
-        algaeKeyNumber(cell.y),
-        algaeKeyNumber(cell.cellSize),
-        algaeFineVisualAmount(cell.biomass[speciesId]),
-      ].join(':');
+      const visualKey = algaeCellVisualKey(cell);
       if (cells.get(cell.id) === visualKey) continue;
       cells.set(cell.id, visualKey);
       surface.fieldDirty[speciesId] = true;

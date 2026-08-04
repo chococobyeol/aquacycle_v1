@@ -1,4 +1,5 @@
 import { SimulationWorld } from '../src/simulation/SimulationWorld';
+import { SCENARIOS } from '../src/simulation/config';
 import type {
   MicrobeGuildId,
   ScenarioId,
@@ -28,6 +29,16 @@ const requestedShrimpCountArgument = process.argv
 const requestedShrimpCount = requestedShrimpCountArgument === undefined
   ? 4
   : Math.max(0, Math.floor(Number(requestedShrimpCountArgument)));
+const requestedReleaseAt = Number(
+  process.argv
+    .find((argument) => argument.startsWith('--release-at='))
+    ?.slice('--release-at='.length) ?? 0,
+);
+const requestedMission4Capacity = Number(
+  process.argv
+    .find((argument) => argument.startsWith('--mission-4-capacity='))
+    ?.slice('--mission-4-capacity='.length) ?? Number.NaN,
+);
 const sterileShrimp = process.argv.includes('--sterile-shrimp');
 const durationOr = (fallback: number): number =>
   Number.isFinite(requestedDuration) && requestedDuration > 0
@@ -121,15 +132,7 @@ const seedProducerMission = (
   }
 };
 
-const seedShrimpMission = (world: SimulationWorld, closedCycle: boolean): void => {
-  placeStructure(world, 'flat-stone', { x: 480, y: 420 });
-  placeStructure(world, 'tall-stone', { x: 860, y: 320 });
-  const cells = world.snapshot().cells;
-  const used = new Set<string>();
-  for (const x of [260, 470, 730, 940]) {
-    placeSeed(world, 'nitzschia', nearestUnusedCell(cells, x, 38, used));
-    placeSeed(world, 'oedogonium', nearestUnusedCell(cells, x + 24, 68, used));
-  }
+const releaseShrimpMissionAnimals = (world: SimulationWorld): void => {
   const shrimpReleasePoints = [290, 430, 770, 910];
   for (
     let index = 0;
@@ -141,35 +144,51 @@ const seedShrimpMission = (world: SimulationWorld, closedCycle: boolean): void =
     placeShrimp(world, { x, y: 600 });
   }
   if (
-    requestedShrimpCount > shrimpReleasePoints.length ||
-    (sterileShrimp && requestedShrimpCount > 0)
+    requestedShrimpCount <= shrimpReleasePoints.length &&
+    !sterileShrimp
+  ) return;
+
+  const save = world.exportSaveData();
+  const templates = [...save.animals];
+  for (
+    let index = save.animals.length;
+    index < requestedShrimpCount;
+    index += 1
   ) {
-    const save = world.exportSaveData();
-    const templates = [...save.animals];
-    for (
-      let index = save.animals.length;
-      index < requestedShrimpCount;
-      index += 1
-    ) {
-      const template = templates[index % templates.length];
-      save.animals.push({
-        ...template,
-        id: `diagnostic-shrimp-${index + 1}`,
-        position: {
-          x: shrimpReleasePoints[index % shrimpReleasePoints.length] +
-            Math.floor(index / shrimpReleasePoints.length) * 12,
-          y: 600,
-        },
-        randomSeed: template.randomSeed + index * 0.017,
-      });
-    }
-    for (const animal of save.animals) {
-      if (sterileShrimp && animal.speciesId === 'cherry-shrimp') {
-        animal.sex = 'male';
-      }
-    }
-    world.loadSaveData(save);
+    const template = templates[index % templates.length];
+    save.animals.push({
+      ...template,
+      id: `diagnostic-shrimp-${index + 1}`,
+      position: {
+        x: shrimpReleasePoints[index % shrimpReleasePoints.length] +
+          Math.floor(index / shrimpReleasePoints.length) * 12,
+        y: 600,
+      },
+      randomSeed: template.randomSeed + index * 0.017,
+    });
   }
+  for (const animal of save.animals) {
+    if (sterileShrimp && animal.speciesId === 'cherry-shrimp') {
+      animal.sex = 'male';
+    }
+  }
+  world.loadSaveData(save);
+};
+
+const seedShrimpMission = (
+  world: SimulationWorld,
+  closedCycle: boolean,
+  includeShrimp = true,
+): void => {
+  placeStructure(world, 'flat-stone', { x: 480, y: 420 });
+  placeStructure(world, 'tall-stone', { x: 860, y: 320 });
+  const cells = world.snapshot().cells;
+  const used = new Set<string>();
+  for (const x of [260, 470, 730, 940]) {
+    placeSeed(world, 'nitzschia', nearestUnusedCell(cells, x, 38, used));
+    placeSeed(world, 'oedogonium', nearestUnusedCell(cells, x + 24, 68, used));
+  }
+  if (includeShrimp) releaseShrimpMissionAnimals(world);
   if (!closedCycle) return;
   const filmCells = cells.filter(
     (cell) => cell.surfaceKind === 'substrate',
@@ -184,6 +203,7 @@ const run = (
   scenarioId: ScenarioId,
   durationSeconds: number,
   populate: (world: SimulationWorld) => void,
+  duringRun?: (world: SimulationWorld, elapsedSeconds: number) => void,
 ): {
   world: SimulationWorld;
   samples: Snapshot[];
@@ -242,6 +262,7 @@ const run = (
     const elapsedSeconds = (
       world as unknown as { elapsedSeconds: number }
     ).elapsedSeconds;
+    duringRun?.(world, elapsedSeconds);
     if (elapsedSeconds < nextSample) continue;
     samples.push(world.snapshot());
     recordShrimpMatter();
@@ -276,6 +297,13 @@ const logSlopePerHour = (samples: { time: number; value: number }[]): number => 
 
 const reports: unknown[] = [];
 
+if (Number.isFinite(requestedMission4Capacity)) {
+  if (requestedMission4Capacity <= 0) {
+    throw new Error('--mission-4-capacity must be greater than 0');
+  }
+  SCENARIOS['mission-4'].backgroundProducerCapacity =
+    requestedMission4Capacity;
+}
 for (const scenarioId of ['mission-1', 'mission-2', 'mission-3'] as const) {
   if (requestedScenario && requestedScenario !== scenarioId) continue;
   const speciesId = scenarioId === 'mission-2' ? 'nitzschia' : 'oedogonium';
@@ -301,10 +329,22 @@ for (const scenarioId of ['mission-1', 'mission-2', 'mission-3'] as const) {
 
 for (const scenarioId of ['mission-4', 'mission-5'] as const) {
   if (requestedScenario && requestedScenario !== scenarioId) continue;
+  let shrimpReleased = requestedReleaseAt <= 0;
   const { world, samples, shrimpMatterTrace } = run(
     scenarioId,
     durationOr(FOOD_WEB_RUN_SECONDS),
-    (target) => seedShrimpMission(target, scenarioId === 'mission-5'),
+    (target) => seedShrimpMission(
+      target,
+      scenarioId === 'mission-5',
+      shrimpReleased,
+    ),
+    (target, elapsedSeconds) => {
+      if (shrimpReleased || elapsedSeconds < requestedReleaseAt) return;
+      target.handle({ type: 'pause' });
+      releaseShrimpMissionAnimals(target);
+      target.handle({ type: 'resume' });
+      shrimpReleased = true;
+    },
   );
   const tail = samples.slice(-Math.max(6, Math.floor(samples.length / 3)));
   const populations = samples.map(
@@ -357,6 +397,11 @@ for (const scenarioId of ['mission-4', 'mission-5'] as const) {
     fixture: {
       shrimpCount: requestedShrimpCount,
       reproductionEnabled: !sterileShrimp,
+      releaseAt: requestedReleaseAt,
+      mission4ProducerCapacity:
+        scenarioId === 'mission-4'
+          ? SCENARIOS['mission-4'].backgroundProducerCapacity
+          : null,
     },
     population: {
       final: populations.at(-1),

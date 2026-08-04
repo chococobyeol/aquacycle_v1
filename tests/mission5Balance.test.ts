@@ -54,11 +54,17 @@ const nearestUnusedCell = (
   targetLight: number,
   used: Set<string>,
 ): SurfaceCellSnapshot => {
-  const cell = cells
-    .filter((candidate) => !used.has(candidate.id))
+  const available = cells.filter((candidate) => !used.has(candidate.id));
+  const nearestXDistance = Math.min(
+    ...available.map((candidate) => Math.abs(candidate.x - targetX)),
+  );
+  const cell = available
+    .filter((candidate) =>
+      Math.abs(candidate.x - targetX) <= Math.max(70, nearestXDistance + 50),
+    )
     .sort((left, right) => {
-      const leftScore = Math.abs(left.x - targetX) / 35 + Math.abs(left.light - targetLight);
-      const rightScore = Math.abs(right.x - targetX) / 35 + Math.abs(right.light - targetLight);
+      const leftScore = Math.abs(left.x - targetX) / 12 + Math.abs(left.light - targetLight);
+      const rightScore = Math.abs(right.x - targetX) / 12 + Math.abs(right.light - targetLight);
       return leftScore - rightScore;
     })[0];
   if (!cell) throw new Error('mission 5 fixture needs another substrate cell');
@@ -66,21 +72,36 @@ const nearestUnusedCell = (
   return cell;
 };
 
-const populateTank = (world: SimulationWorld, shrimpCount = 4): void => {
+const populateTank = (
+  world: SimulationWorld,
+  shrimpCount = 4,
+  stockShrimp = true,
+): Vec2[] => {
   const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
   const used = new Set<string>();
-  const targetXs = shrimpCount <= 4
-    ? [260, 470, 730, 940]
-    : Array.from({ length: shrimpCount }, (_, index) =>
-      110 + (index / Math.max(1, shrimpCount - 1)) * 980);
+  const targetXs = [180, 260, 340, 420, 500, 580, 660, 740];
+  const foodPoints: Vec2[] = [];
   for (const targetX of targetXs) {
-    placeSeed(world, 'nitzschia', nearestUnusedCell(substrate, targetX, 38, used));
-    placeSeed(world, 'oedogonium', nearestUnusedCell(substrate, targetX + 24, 68, used));
+    const nitzschiaCell = nearestUnusedCell(substrate, targetX, 38, used);
+    const oedogoniumCell = nearestUnusedCell(substrate, targetX + 24, 68, used);
+    placeSeed(world, 'nitzschia', nitzschiaCell);
+    placeSeed(world, 'oedogonium', oedogoniumCell);
+    foodPoints.push({
+      x: (nitzschiaCell.x + oedogoniumCell.x) / 2,
+      y: Math.min(610, (nitzschiaCell.y + oedogoniumCell.y) / 2 - 10),
+    });
   }
-  const shrimpPoints = shrimpCount <= 4
-    ? [290, 430, 770, 910]
-    : targetXs;
-  for (const x of shrimpPoints) placeShrimp(world, { x, y: 600 });
+  if (stockShrimp) {
+    const pairPoints = [foodPoints[2]!, foodPoints[5]!];
+    const placements = pairPoints.flatMap((point) => [
+      { point: { x: point.x - 4, y: point.y }, sex: 'female' as const },
+      { point: { x: point.x + 4, y: point.y }, sex: 'male' as const },
+    ]);
+    for (const placement of placements.slice(0, shrimpCount)) {
+      placeShrimp(world, placement.point, placement.sex);
+    }
+  }
+  return foodPoints;
 };
 
 const valueAtCell = (
@@ -294,7 +315,7 @@ describe('mission 5 microbial cycle', () => {
 
   it('keeps a timed two-film ecosystem safe, closed and dynamically responsive', () => {
     const treated = new SimulationWorld('mission-5');
-    populateTank(treated);
+    const foodPoints = populateTank(treated, 4, false);
     treated.handle({ type: 'start' });
     advanceTo(treated, 90);
     treated.handle({ type: 'pause' });
@@ -304,9 +325,20 @@ describe('mission 5 microbial cycle', () => {
     treated.handle({ type: 'pause' });
     inoculateBestSurfaces(treated, 'nitrifier', 4);
     treated.handle({ type: 'resume' });
-    const samples = [280, 370, 460, 550, 640, 730, 820, 910, 1_000, 1_090, 1_180]
+    advanceTo(treated, 600);
+    treated.handle({ type: 'pause' });
+    const releasePoints = [foodPoints[2]!, foodPoints[2]!, foodPoints[5]!, foodPoints[5]!];
+    for (let index = 0; index < releasePoints.length; index += 1) {
+      const point = releasePoints[index]!;
+      placeShrimp(
+        treated,
+        { x: point.x + (index % 2 === 0 ? -4 : 4), y: point.y },
+        index % 2 === 0 ? 'female' : 'male',
+      );
+    }
+    treated.handle({ type: 'resume' });
+    const samples = [700, 800, 900, 1_000, 1_100, 1_200, 1_300, 1_400, 1_500, 1_600]
       .map((time) => advanceTo(treated, time));
-    advanceTo(treated, 1_600);
     const treatedFinal = advanceTo(treated, 2_200);
     const range = (values: number[]): number => Math.max(...values) - Math.min(...values);
     const organics = samples.map((sample) => sample.biogeochemistry.average.organicMatter);
@@ -342,7 +374,7 @@ describe('mission 5 microbial cycle', () => {
 
   it('lets a distributed established film process the local waste of four adults', () => {
     const world = new SimulationWorld('mission-5');
-    populateTank(world, 4);
+    const foodPoints = populateTank(world, 4, false);
     world.handle({ type: 'start' });
     advanceTo(world, 60);
     world.handle({ type: 'pause' });
@@ -352,7 +384,19 @@ describe('mission 5 microbial cycle', () => {
     world.handle({ type: 'pause' });
     inoculateBestSurfaces(world, 'nitrifier', 4);
     world.handle({ type: 'resume' });
-    const established = advanceTo(world, 600);
+    advanceTo(world, 600);
+    world.handle({ type: 'pause' });
+    const releasePoints = [foodPoints[2]!, foodPoints[2]!, foodPoints[5]!, foodPoints[5]!];
+    for (let index = 0; index < releasePoints.length; index += 1) {
+      const point = releasePoints[index]!;
+      placeShrimp(
+        world,
+        { x: point.x + (index % 2 === 0 ? -4 : 4), y: point.y },
+        index % 2 === 0 ? 'female' : 'male',
+      );
+    }
+    world.handle({ type: 'resume' });
+    const established = advanceTo(world, 1_200);
 
     expect(established.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
     expect(established.biogeochemistry.biofilmTotals.decomposer).toBeGreaterThan(0);

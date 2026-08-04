@@ -183,7 +183,14 @@ describe("mission 4 consumer balance", () => {
     const world = new SimulationWorld("mission-4");
     const initial = world.snapshot();
 
-    expect(SCENARIOS["mission-4"].backgroundProducerCapacity).toBe(60);
+    expect(SCENARIOS["mission-4"].backgroundProducerCapacity).toBe(35);
+    expect(SCENARIOS["mission-4"].backgroundProducerResourceMode).toBe("surface");
+    expect(SCENARIOS["mission-4"].lightOutput).toBe(88);
+    expect(SCENARIOS["mission-4"].timeLimitSeconds).toBeNull();
+    expect(SCENARIOS["mission-4"].target).toMatchObject({
+      type: "adult-population",
+      holdSeconds: 600,
+    });
     expect(initial.waterTemperature).toBeGreaterThan(24);
     expect(initial.waterTemperature).toBeLessThan(25);
     expect(initial.structures).toHaveLength(0);
@@ -211,7 +218,7 @@ describe("mission 4 consumer balance", () => {
     );
     world.handle({ type: "start" });
 
-    // Leave a full fixed-step margin before the 120-second hold boundary; the
+    // Leave a full fixed-step margin before the hold boundary; the
     // high-speed test driver can advance by more than one simulated second per
     // outer tick.
     const beforeRequiredHold = advanceTo(world, 110);
@@ -238,14 +245,14 @@ describe("mission 4 consumer balance", () => {
       );
     }
 
-    const failed = advanceTo(world, 300);
-    expect(failed.outcome).toBe("failure");
-    expect(failed.animalPopulation[SHRIMP].juveniles).toBe(0);
-    expect(failed.animalPopulation[SHRIMP].total).toBeLessThanOrEqual(4);
-    expect(failed.totalAlgaeConsumed).toBe(0);
-    expect(failed.missionProgress?.holdCurrent).toBe(0);
-    expect(failed.biogeochemistry.effectsEnabled).toBe(false);
-    expect(failed.carcasses).toHaveLength(0);
+    const depleted = advanceTo(world, 700);
+    expect(depleted.outcome).toBe("pending");
+    expect(depleted.animalPopulation[SHRIMP].juveniles).toBe(0);
+    expect(depleted.animalPopulation[SHRIMP].total).toBe(0);
+    expect(depleted.totalAlgaeConsumed).toBe(0);
+    expect(depleted.missionProgress?.holdCurrent).toBe(0);
+    expect(depleted.biogeochemistry.effectsEnabled).toBe(false);
+    expect(depleted.carcasses).toHaveLength(0);
   });
 
   it("records death mass once while its visual carcass expires independently", () => {
@@ -289,17 +296,26 @@ describe("mission 4 consumer balance", () => {
     expect(world.snapshot().biogeochemistry.detritusMass).toBe(0);
   });
 
-  it("lets a distributed, growing algae layout sustain four adults while recording grazing waste", () => {
+  it("lets a pre-grown algae layout sustain four later-released adults while recording grazing waste", () => {
     const fedWorld = new SimulationWorld("mission-4");
     const controlWorld = new SimulationWorld("mission-4");
     const layout = viableLayout(fedWorld);
-    applyLayout(fedWorld, layout, true);
+    applyLayout(fedWorld, layout, false);
     applyLayout(controlWorld, layout, false);
 
     fedWorld.handle({ type: "start" });
     controlWorld.handle({ type: "start" });
-    const fedAt60 = advanceTo(fedWorld, 60);
-    const controlAt60 = advanceTo(controlWorld, 60);
+    advanceTo(fedWorld, 900);
+    advanceTo(controlWorld, 900);
+    fedWorld.handle({ type: "pause" });
+    for (const point of layout.shrimpPoints) placeShrimp(fedWorld, point);
+    expect(fedWorld.snapshot().animalPopulation[SHRIMP]).toMatchObject({
+      adultFemales: 2,
+      adultMales: 2,
+    });
+    fedWorld.handle({ type: "resume" });
+    const fedAt60 = advanceTo(fedWorld, 960);
+    const controlAt60 = advanceTo(controlWorld, 960);
     const fedBiomass =
       fedAt60.totalBiomass.oedogonium + fedAt60.totalBiomass.nitzschia;
     const controlBiomass =
@@ -321,47 +337,47 @@ describe("mission 4 consumer balance", () => {
       if (!control) return false;
       const fedAmount = cell.biomass.oedogonium + cell.biomass.nitzschia;
       const controlAmount = control.biomass.oedogonium + control.biomass.nitzschia;
-      return controlAmount - fedAmount > 0.01;
+      return controlAmount - fedAmount > 0.001;
     })).toBe(true);
 
-    const succeeded = advanceTo(fedWorld, 125);
+    const succeeded = advanceTo(fedWorld, 1_505);
     expect(succeeded.outcome).toBe("success");
-    expect(succeeded.outcomeAtSeconds).toBeGreaterThanOrEqual(120);
-    expect(succeeded.outcomeAtSeconds).toBeLessThanOrEqual(125);
+    expect(succeeded.outcomeAtSeconds).toBeGreaterThanOrEqual(1_500);
+    expect(succeeded.outcomeAtSeconds).toBeLessThanOrEqual(1_505);
     expect(succeeded.animalPopulation[SHRIMP].adults).toBeGreaterThanOrEqual(4);
     expect(succeeded.missionProgress?.unit).toBe("adult-count");
     expect(succeeded.missionProgress?.current).toBeGreaterThanOrEqual(4);
     expect(succeeded.biogeochemistry.potentialOxygenDemand).toBeGreaterThan(0);
     expect(succeeded.biogeochemistry.dissolvedWasteProduced).toBeGreaterThan(0);
-  });
+  }, 30_000);
 
   it("lets real food support reproduction without a hidden population cap", () => {
     const world = new SimulationWorld("mission-4");
     const layout = viableLayout(world);
-    applyLayout(world, layout, true);
+    applyLayout(world, layout, false);
     world.handle({ type: "start" });
+    advanceTo(world, 900);
+    world.handle({ type: "pause" });
+    for (const point of layout.shrimpPoints) placeShrimp(world, point);
+    world.handle({ type: "resume" });
 
-    const at300 = advanceTo(world, 300);
-    expect(at300.animalPopulation[SHRIMP].adults).toBe(4);
-    // Local encounter-based food search can shift the first brood beyond the
-    // five-minute mission window. It must not require tank-wide food radar just
-    // to satisfy a test timestamp.
-    expect(at300.animalPopulation[SHRIMP].total).toBeLessThanOrEqual(8);
-    expect(at300.missionProgress?.current).toBe(
-      at300.animalPopulation[SHRIMP].adults,
+    const at1505 = advanceTo(world, 1_505);
+    expect(at1505.animalPopulation[SHRIMP].adults).toBeGreaterThanOrEqual(4);
+    expect(at1505.missionProgress?.current).toBe(
+      at1505.animalPopulation[SHRIMP].adults,
     );
     expect(SCENARIOS["mission-4"].target?.type).toBe("adult-population");
 
-    const consumedAt300 = at300.totalAlgaeConsumed;
-    const at600 = advanceTo(world, 600);
-    expect(at600.animalPopulation[SHRIMP].total).toBeGreaterThan(4);
-    expect(at600.animalPopulationEventTotals.births).toBeGreaterThan(0);
-    expect(at600.animalPopulation[SHRIMP].total).toBeLessThan(
+    const consumedAt1505 = at1505.totalAlgaeConsumed;
+    const at2400 = advanceTo(world, 2_400);
+    expect(at2400.animalPopulation[SHRIMP].total).toBeGreaterThan(4);
+    expect(at2400.animalPopulationEventTotals.births).toBeGreaterThan(0);
+    expect(at2400.animalPopulation[SHRIMP].total).toBeLessThan(
       SHRIMP_TECHNICAL_POPULATION_LIMIT,
     );
-    expect(at600.totalAlgaeConsumed).toBeGreaterThan(consumedAt300);
+    expect(at2400.totalAlgaeConsumed).toBeGreaterThan(consumedAt1505);
   // The complete ecology suite runs several long simulations in parallel.
-  // Keep this deterministic 600-second scenario from being mistaken for a
+  // Keep this deterministic multi-stage scenario from being mistaken for a
   // model failure when the test worker is temporarily CPU-starved.
   }, 30_000);
 

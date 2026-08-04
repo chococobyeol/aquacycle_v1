@@ -439,6 +439,42 @@ describe("cherry shrimp lifecycle", () => {
     expect(new Set(targets).size).toBeGreaterThan(1);
   });
 
+  it("uses only food-funded bounded compensatory growth when a juvenile falls behind", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const parent = world.exportSaveData().animals[0]!;
+    const internals = world as unknown as {
+      createJuvenileAnimalState(
+        animal: typeof parent,
+        birthIndex: number,
+      ): typeof parent;
+      shrimpJuvenileGrowthAllowance(
+        animal: typeof parent,
+        deltaSeconds: number,
+        temperatureFactor: number,
+      ): number;
+    };
+    const juvenile = internals.createJuvenileAnimalState(parent, 0);
+    const birth = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
+    const mature = SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+    const target = juvenile.maturationTargetSeconds!;
+
+    juvenile.ageSeconds = target * 0.5;
+    juvenile.structuralBiomass = birth + (mature - birth) * 0.5;
+    const onSchedule = internals.shrimpJuvenileGrowthAllowance(juvenile, 1, 1);
+
+    juvenile.ageSeconds = target;
+    juvenile.structuralBiomass = birth;
+    const delayed = internals.shrimpJuvenileGrowthAllowance(juvenile, 1, 1);
+
+    expect(delayed).toBeGreaterThan(onSchedule);
+    expect(delayed).toBeCloseTo(
+      onSchedule * SHRIMP_ECOLOGY_RULES.maximumCompensatoryGrowthMultiplier,
+      12,
+    );
+    expect(juvenile.structuralBiomass).toBe(birth);
+  });
+
   it("draws offspring sex independently instead of repairing each brood", () => {
     const world = new SimulationWorld("laboratory");
     placeShrimp(world, { x: 600, y: 610 });

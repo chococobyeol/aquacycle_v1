@@ -68,6 +68,22 @@ describe('active biogeochemistry', () => {
     expect(after.organicMatter).toBe(before.organicMatter);
   });
 
+  it('treats organic turbidity as light attenuation rather than nutrient scarcity', () => {
+    const clear = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 1.5, nutrients: 30, oxygen: 76 },
+    });
+    const turbid = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 90, toxicWaste: 1.5, nutrients: 30, oxygen: 76 },
+    });
+
+    expect(turbid.algaeResourceFactor(point))
+      .toBeCloseTo(clear.algaeResourceFactor(point), 12);
+    expect(turbid.algaeLightTransmissionAt(point))
+      .toBeLessThan(clear.algaeLightTransmissionAt(point) * 0.2);
+  });
+
   it('can withdraw rooted-plant resources at one point while releasing oxygen at a leaf', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,
@@ -253,6 +269,29 @@ describe('active biogeochemistry', () => {
     expect(after.nutrients).toBeGreaterThan(before.nutrients);
     expect(after.oxygen).toBeLessThan(before.oxygen);
     expect(film.biofilm.nitrifier).toBeGreaterThan(0.35);
+  });
+
+  it('allocates one pre-step ammonium pool proportionally between algae and nitrifiers', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 0.05, nutrients: 0, oxygen: 80 },
+    });
+    const film = site(0, 0.4);
+
+    ledger.beginStep(1);
+    ledger.beginAmmoniumCompetition(1, [film]);
+    ledger.registerAlgaeProductionDemand(point, 1);
+    ledger.finalizeAmmoniumCompetition();
+    const algae = ledger.commitAlgaeProduction(point, 1);
+    const afterAlgae = ledger.sampleAt(point);
+    ledger.advance(1, [film]);
+    const afterBoth = ledger.sampleAt(point);
+
+    expect(algae).toBeGreaterThan(0);
+    expect(algae).toBeLessThan(1);
+    expect(afterAlgae.toxicWaste).toBeGreaterThan(0);
+    expect(afterBoth.toxicWaste).toBeLessThan(afterAlgae.toxicWaste);
+    expect(afterBoth.nutrients).toBeGreaterThan(0);
   });
 
   it('turns an oxygenated nitrifier film from loss to growth inside the mission-5 ammonium band', () => {

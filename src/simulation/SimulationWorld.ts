@@ -579,22 +579,24 @@ const SETTLE_REQUIRED_SECONDS = 0.48;
 // same factor to lateral colonization made every new ring wait minutes before
 // exporting propagules. Keep growth/respiration at their ledger rates while
 // restoring the visibly quick, thin surface advance of the earlier model.
-export const SURFACE_FILM_DISPERSAL_TIME_SCALE = 0.19 / 0.001435;
-const SURFACE_FILM_FRONT_DISPERSAL_RATE_CAP = 0.21;
+const SURFACE_FILM_TARGET_FRONT_DISPERSAL_RATE = 0.38;
+export const SURFACE_FILM_DISPERSAL_TIME_SCALE =
+  SURFACE_FILM_TARGET_FRONT_DISPERSAL_RATE / SPECIES.oedogonium.dispersalRate;
+const SURFACE_FILM_FRONT_DISPERSAL_RATE_CAP = 0.42;
+// A newly arrived real propagule can continue the thin colonisation front.
+// Waiting for a food-density patch here turned a continuous surface spread
+// into a sequence of stationary clumps.
 const SURFACE_FILM_DISPERSAL_SOURCE_BIOMASS =
   ALGAE_VISIBLE_BIOMASS * 0.25;
-// Fast colonisation moves only a thread-thin propagule packet. Capping the
-// mass per edge lets the visible front advance without draining a dense food
-// patch into a tank-wide layer of nutritionally useless trace biomass.
+// Fast colonisation moves only a thread-thin conserved propagule packet. It
+// may be visually amplified, but remains real biomass and is fully grazeable.
+// Bulk food stays in locally growing patches instead of being homogenised.
 const SURFACE_FILM_FRONT_TRANSFER_PER_EDGE_PER_SECOND =
   ALGAE_VISIBLE_BIOMASS * 0.08;
 // Crossing the render threshold is only the first propagule, not an
-// established neighboring patch. Returning to the very slow mature-film
-// mixing rate at 0.001 B left almost all subsequent production piled into the
-// inoculation cells. Keep the front transfer active until the receiving cell
-// contains a small but grazeable film. Transfer remains mass-conserving; this
-// threshold only chooses the dispersal rate and never protects food from
-// grazing or reserves a source-cell remnant.
+// established neighboring patch. Keep the front transfer active until the
+// receiving cell contains a small but grazeable film. Transfer remains
+// mass-conserving; this threshold never protects a source-cell remnant.
 const SURFACE_FILM_FRONT_ESTABLISHMENT_BIOMASS = 0.04;
 // The shared ledger's biomass unit has the C:N of active microbial/animal
 // matter. A macrophyte rosette contains much more low-nitrogen structural
@@ -2546,24 +2548,17 @@ export class SimulationWorld {
   private biofilmOutgoingDemandScratch = new Float64Array(0);
   private growthOriginalScratch = new Float64Array(0);
   private growthNextScratch = new Float64Array(0);
+  private growthRatesByCellScratch = new Float64Array(0);
+  private growthPhysiologyByCellScratch = new Float64Array(0);
+  private growthProductionRequestsByCellScratch = new Float64Array(0);
   private readonly growthCellIndexByIdScratch = new Map<string, number>();
   private readonly growthRecruitmentTransfersScratch: GrowthRecruitmentTransfer[] = [];
   private growthIncomingDemandScratch = new Float64Array(0);
   private growthOutgoingDemandScratch = new Float64Array(0);
-  private readonly growthRatesScratch = new Float64Array(3);
   private readonly growthResourceFactorsScratch = new Float64Array(3);
-  private readonly growthProductionRequestsScratch = new Float64Array(3);
   private readonly growthProductionsScratch = new Float64Array(3);
   private readonly growthRespirationRequestsScratch = new Float64Array(3);
   private readonly growthRespirationsScratch = new Float64Array(3);
-  private readonly growthActivityPointsScratch: Record<SpeciesId, Vec2> = {
-    oedogonium: { x: 0, y: 0 },
-    nitzschia: { x: 0, y: 0 },
-    vallisneria: { x: 0, y: 0 },
-  };
-  private readonly growthPhysiologyScratch = new Float64Array(
-    3 * ALGAE_PHYSIOLOGY_VALUE_COUNT,
-  );
   private readonly vallisneriaPhysiologySampleScratch: AlgaePhysiologyRates = {
     grossPhotosynthesis: 0,
     respiration: 0,
@@ -3073,6 +3068,7 @@ export class SimulationWorld {
           if (this.lightDirty) this.recomputeLight();
           this.biogeochemistry.beginStep(growthStepSeconds);
           this.stepTemperature(growthStepSeconds);
+          this.beginAmmoniumCompetition(growthStepSeconds);
           this.stepGrowth(growthStepSeconds);
           this.stepVallisneriaLifecycle(growthStepSeconds);
           this.stepAnimalEcology(growthStepSeconds);
@@ -4832,11 +4828,6 @@ export class SimulationWorld {
     const addedBiomass = cell.biomass[heldSeed.speciesId] - previousBiomass;
     if (
       addedBiomass > 0 &&
-      (heldSeed.speciesId === 'oedogonium' || heldSeed.speciesId === 'nitzschia')
-    ) {
-    }
-    if (
-      addedBiomass > 0 &&
       this.hasStarted &&
       this.scenario.mode === 'challenge' &&
       this.materialReference
@@ -5200,7 +5191,11 @@ export class SimulationWorld {
   private canPlaceInventoryAnimal(): boolean {
     return this.canEdit() ||
       (
-        (this.scenario.id === 'mission-5' || this.scenario.id === 'mission-8') &&
+        (
+          this.scenario.id === 'mission-4' ||
+          this.scenario.id === 'mission-5' ||
+          this.scenario.id === 'mission-8'
+        ) &&
         this.phase === 'paused'
       );
   }
@@ -5208,7 +5203,7 @@ export class SimulationWorld {
   private canPlaceInventorySeed(): boolean {
     return this.canEdit() ||
       (
-        this.scenario.id === 'mission-5' &&
+        (this.scenario.id === 'mission-4' || this.scenario.id === 'mission-5') &&
         this.phase === 'paused'
       );
   }
@@ -5275,6 +5270,8 @@ export class SimulationWorld {
     this.phase = 'paused';
     this.message = this.scenario.mode === 'laboratory'
       ? '일시정지됨 · 구조물과 새 접종체를 편집할 수 있습니다.'
+      : this.scenario.id === 'mission-4'
+        ? '일시정지됨 · 남겨 둔 조류나 새우를 수조에 추가할 수 있습니다.'
       : this.scenario.id === 'mission-5'
         ? '일시정지됨 · 남겨 둔 조류·새우를 추가하거나 균 필름을 접종할 수 있습니다.'
       : this.scenario.id === 'mission-8'
@@ -7620,6 +7617,31 @@ export class SimulationWorld {
       predatorDangerCueSites,
     );
     if (this.probe) this.setProbe(this.probe);
+  }
+
+  /**
+   * Captures nitrifier demand before producers, grazers or decomposers alter
+   * this ecology step's dissolved ammonium. Producer demand is added by
+   * stepGrowth once its actual light-limited fixation requests are known.
+   */
+  private beginAmmoniumCompetition(deltaSeconds: number): void {
+    const sites = this.biofilmReactionSitesScratch;
+    const cells = this.allCells();
+    let siteCount = 0;
+    for (const cell of cells) {
+      const point = this.cellWorldPoint(cell);
+      const site = sites[siteCount] ?? {
+        point: { x: 0, y: 0 },
+        biofilm: cell.biofilm,
+      };
+      site.point.x = point.x;
+      site.point.y = point.y;
+      site.biofilm = cell.biofilm;
+      sites[siteCount] = site;
+      siteCount += 1;
+    }
+    sites.length = siteCount;
+    this.biogeochemistry.beginAmmoniumCompetition(deltaSeconds, sites);
   }
 
   private stepBiofilmDispersal(deltaSeconds: number): void {
@@ -11504,10 +11526,24 @@ export class SimulationWorld {
         ANIMALS[animal.speciesId].temperature.reproductionCurve,
         this.biogeochemistry.temperatureAt(animal.position),
       );
+    const structuralProgress = clamp01(
+      (animal.structuralBiomass - birthBiomass) /
+        Math.max(1e-9, maturationBiomass - birthBiomass),
+    );
+    const ageScheduleProgress = clamp01(
+      animal.ageSeconds / Math.max(1e-9, maturationTargetSeconds),
+    );
+    const scheduleDeficit = Math.max(
+      0,
+      ageScheduleProgress - structuralProgress,
+    );
+    const compensatoryMultiplier = 1 + scheduleDeficit *
+      (SHRIMP_ECOLOGY_RULES.maximumCompensatoryGrowthMultiplier - 1);
     return Math.min(
       Math.max(0, maturationBiomass - animal.structuralBiomass),
       (maturationBiomass - birthBiomass) *
-        Math.max(0, deltaSeconds) * temperatureFactor /
+        Math.max(0, deltaSeconds) * temperatureFactor *
+        compensatoryMultiplier /
       Math.max(1e-9, maturationTargetSeconds),
     );
   }
@@ -11647,7 +11683,7 @@ export class SimulationWorld {
       // quality is learned only from realised intake after arrival.
       const localPatchCue =
         food / (
-          food + WATER_CYCLE_RULES.shrimp.grazingHalfSaturationBiomass
+          food + WATER_CYCLE_RULES.shrimp.foragingCueHalfSaturationBiomass
         );
       if (
         distance > Math.max(4, cell.cellSize * 0.3) &&
@@ -12215,9 +12251,11 @@ export class SimulationWorld {
   ): ReturnType<typeof algaePhysiology> {
     const sampleCount = this.vallisneriaCanopyLightSamples(cell);
     if (sampleCount === 0) {
+      const activityPoint = this.producerActivityPoint(cell, 'vallisneria');
       return algaePhysiology(
         'vallisneria',
-        this.vallisneriaCanopyLight(cell),
+        this.vallisneriaCanopyLight(cell) *
+          this.biogeochemistry.algaeLightTransmissionAt(activityPoint),
         temperature,
         reuse,
       );
@@ -12242,7 +12280,10 @@ export class SimulationWorld {
     for (let index = 0; index < sampleCount; index += 1) {
       writeAlgaePhysiologyRates(
         'vallisneria',
-        this.vallisneriaCanopyLightsScratch[index],
+        this.vallisneriaCanopyLightsScratch[index] *
+          this.biogeochemistry.algaeLightTransmissionAt(
+            this.vallisneriaCanopyPointsScratch[index],
+          ),
         temperature,
         rates,
       );
@@ -12291,7 +12332,10 @@ export class SimulationWorld {
     for (let index = 0; index < sampleCount; index += 1) {
       writeAlgaePhysiologyRates(
         'vallisneria',
-        this.vallisneriaCanopyLightsScratch[index],
+        this.vallisneriaCanopyLightsScratch[index] *
+          this.biogeochemistry.algaeLightTransmissionAt(
+            this.vallisneriaCanopyPointsScratch[index],
+          ),
         temperature,
         this.vallisneriaPhysiologyRatesScratch,
       );
@@ -12330,6 +12374,59 @@ export class SimulationWorld {
     return committed;
   }
 
+  /** Registers the rooted and leaf shares before the shared N pool is split. */
+  private registerVallisneriaProductionDemand(
+    cell: SurfaceCellState,
+    requestedBiomass: number,
+    temperature: number,
+  ): void {
+    const requested = Math.max(0, requestedBiomass);
+    if (requested <= 0) return;
+    const uptakePoint = this.vallisneriaUptakePoint(cell);
+    const sampleCount = this.vallisneriaCanopyLightSamples(cell);
+    if (sampleCount === 0) {
+      this.biogeochemistry.registerAlgaeProductionDemand(
+        uptakePoint,
+        requested,
+      );
+      return;
+    }
+
+    let totalWeight = 0;
+    for (let index = 0; index < sampleCount; index += 1) {
+      writeAlgaePhysiologyRates(
+        'vallisneria',
+        this.vallisneriaCanopyLightsScratch[index] *
+          this.biogeochemistry.algaeLightTransmissionAt(
+            this.vallisneriaCanopyPointsScratch[index],
+          ),
+        temperature,
+        this.vallisneriaPhysiologyRatesScratch,
+      );
+      const weight = Math.max(
+        0,
+        this.vallisneriaPhysiologyRatesScratch[ALGAE_PHYSIOLOGY_GROSS],
+      );
+      this.vallisneriaCanopyProductionWeightsScratch[index] = weight;
+      totalWeight += weight;
+    }
+    if (totalWeight <= 1e-12) return;
+
+    for (let index = 0; index < sampleCount; index += 1) {
+      const share = requested *
+        this.vallisneriaCanopyProductionWeightsScratch[index] /
+        totalWeight;
+      this.biogeochemistry.registerAlgaeProductionDemand(
+        uptakePoint,
+        share * VALLISNERIA_ROOT_UPTAKE_SHARE,
+      );
+      this.biogeochemistry.registerAlgaeProductionDemand(
+        this.vallisneriaCanopyPointsScratch[index],
+        share * (1 - VALLISNERIA_ROOT_UPTAKE_SHARE),
+      );
+    }
+  }
+
   /**
    * Submerged leaf tissue also respires in place. Divide the canopy demand by
    * painted leaf area instead of consuming the entire plant's night oxygen at
@@ -12365,9 +12462,11 @@ export class SimulationWorld {
   ): number {
     const sampleCount = this.vallisneriaCanopyLightSamples(cell);
     if (sampleCount === 0) {
+      const activityPoint = this.producerActivityPoint(cell, 'vallisneria');
       return habitatSuitability(
         'vallisneria',
-        this.vallisneriaCanopyLight(cell),
+        this.vallisneriaCanopyLight(cell) *
+          this.biogeochemistry.algaeLightTransmissionAt(activityPoint),
         temperature,
       );
     }
@@ -12375,7 +12474,10 @@ export class SimulationWorld {
     for (let index = 0; index < sampleCount; index += 1) {
       total += habitatSuitability(
         'vallisneria',
-        this.vallisneriaCanopyLightsScratch[index],
+        this.vallisneriaCanopyLightsScratch[index] *
+          this.biogeochemistry.algaeLightTransmissionAt(
+            this.vallisneriaCanopyPointsScratch[index],
+          ),
         temperature,
       );
     }
@@ -12730,9 +12832,18 @@ export class SimulationWorld {
     if (this.growthOriginalScratch.length !== biomassValueCount) {
       this.growthOriginalScratch = new Float64Array(biomassValueCount);
       this.growthNextScratch = new Float64Array(biomassValueCount);
+      this.growthRatesByCellScratch = new Float64Array(biomassValueCount);
+      this.growthProductionRequestsByCellScratch =
+        new Float64Array(biomassValueCount);
+      this.growthPhysiologyByCellScratch = new Float64Array(
+        biomassValueCount * ALGAE_PHYSIOLOGY_VALUE_COUNT,
+      );
     }
     const original = this.growthOriginalScratch;
     const next = this.growthNextScratch;
+    const rates = this.growthRatesByCellScratch;
+    const productionRequests = this.growthProductionRequestsByCellScratch;
+    const physiology = this.growthPhysiologyByCellScratch;
     const cellIndexById = this.growthCellIndexByIdScratch;
     cellIndexById.clear();
     let currentProducerBiomass = 0;
@@ -12748,13 +12859,19 @@ export class SimulationWorld {
         source.oedogonium + source.nitzschia + source.vallisneria;
     }
     next.fill(0);
+    rates.fill(0);
+    productionRequests.fill(0);
+    physiology.fill(0);
     const backgroundProducerCapacity = this.scenario.waterCycle
       ? null
       : this.scenario.backgroundProducerCapacity;
-    const backgroundNutrientFactor = backgroundProducerCapacity === null
+    const tankBackgroundNutrientFactor = backgroundProducerCapacity === null
       ? 1
       : clamp01(1 - currentProducerBiomass / backgroundProducerCapacity);
 
+    // First calculate every producer's request from the same pre-reaction
+    // state. The ledger needs this complete demand field before it can divide
+    // finite ammonium fairly between producers and nitrifiers.
     for (let cellIndex = 0; cellIndex < cells.length; cellIndex += 1) {
       const cell = cells[cellIndex];
       const cellOffset = cellIndex * 3;
@@ -12762,14 +12879,18 @@ export class SimulationWorld {
         original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] +
         original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] +
         original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria];
+      const backgroundNutrientFactor =
+        backgroundProducerCapacity !== null &&
+        this.scenario.backgroundProducerResourceMode === 'surface'
+          ? clamp01(
+            1 - total / (
+              backgroundProducerCapacity / Math.max(1, cells.length)
+            ),
+          )
+          : tankBackgroundNutrientFactor;
       const freeCapacity = clamp01(1 - total);
-      const cellPoint = this.cellWorldPoint(cell);
-      const rates = this.growthRatesScratch;
-      rates.fill(0);
-      const physiology = this.growthPhysiologyScratch;
       const resourceFactors = this.growthResourceFactorsScratch;
       resourceFactors.fill(0);
-      const activityPoints = this.growthActivityPointsScratch;
       for (const speciesId of this.scenario.allowedSpecies) {
         const speciesIndex = GROWTH_SPECIES_INDEX[speciesId];
         // An absent producer contributes neither to this cell's weighted
@@ -12782,7 +12903,8 @@ export class SimulationWorld {
           ? this.vallisneriaUptakePoint(cell)
           : physiologyPoint;
         const localTemperature = this.biogeochemistry.temperatureAt(physiologyPoint);
-        const physiologyOffset = speciesIndex * ALGAE_PHYSIOLOGY_VALUE_COUNT;
+        const physiologyOffset = (cellOffset + speciesIndex) *
+          ALGAE_PHYSIOLOGY_VALUE_COUNT;
         if (speciesId === 'vallisneria') {
           const response = this.vallisneriaCanopyPhysiology(
             cell,
@@ -12803,7 +12925,8 @@ export class SimulationWorld {
         } else {
           writeAlgaePhysiologyRates(
             speciesId,
-            cell.light,
+            cell.light *
+              this.biogeochemistry.algaeLightTransmissionAt(physiologyPoint),
             localTemperature,
             physiology,
             physiologyOffset,
@@ -12814,91 +12937,109 @@ export class SimulationWorld {
             ? this.vallisneriaResourceFactor(cell)
             : this.biogeochemistry.algaeResourceFactor(activityPoint)
         ) * backgroundNutrientFactor;
-        activityPoints[speciesId] = activityPoint;
         resourceFactors[speciesIndex] = resourceFactor;
-        const netGrowth = physiology[physiologyOffset + ALGAE_PHYSIOLOGY_NET];
-        rates[speciesIndex] = netGrowth > 0
-          ? netGrowth * resourceFactor
-          : netGrowth;
-      }
-      const weightedAverage = total > 0
-        ? (
-          original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] *
-            rates[GROWTH_SPECIES_INDEX.oedogonium] +
-          original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] *
-            rates[GROWTH_SPECIES_INDEX.nitzschia] +
-          original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria] *
-            rates[GROWTH_SPECIES_INDEX.vallisneria]
-        ) / total
-        : 0;
-      const productionRequests = this.growthProductionRequestsScratch;
-      const productions = this.growthProductionsScratch;
-      const respirationRequests = this.growthRespirationRequestsScratch;
-      const respirations = this.growthRespirationsScratch;
-      productionRequests.fill(0);
-      productions.fill(0);
-      respirationRequests.fill(0);
-      respirations.fill(0);
-
-      // Build every producer's demand from the same pre-reaction state. The
-      // two attached algae use identical C/N stoichiometry at the same surface
-      // point, so commit their combined demand once and divide the finite
-      // result proportionally. Committing oedogonium first used to give it a
-      // permanent nutrient-order advantage over Nitzschia.
-      for (const speciesId of this.scenario.allowedSpecies) {
-        const speciesIndex = GROWTH_SPECIES_INDEX[speciesId];
-        const amount = original[cellOffset + speciesIndex];
-        if (amount <= 0) continue;
-        const physiologyOffset = speciesIndex * ALGAE_PHYSIOLOGY_VALUE_COUNT;
         const grossPhotosynthesis =
           physiology[physiologyOffset + ALGAE_PHYSIOLOGY_GROSS];
         const respirationRate =
           physiology[physiologyOffset + ALGAE_PHYSIOLOGY_RESPIRATION];
         const lightStressTurnover =
           physiology[physiologyOffset + ALGAE_PHYSIOLOGY_STRESS];
-        const netGrowth = physiology[physiologyOffset + ALGAE_PHYSIOLOGY_NET];
-        const resourceFactor = resourceFactors[speciesIndex];
+        // Resource limitation acts on all new biomass fixation. The previous
+        // formulation reduced only the positive surplus after replacing
+        // respiration and stress, allowing a nearly nutrient-free film to
+        // maintain itself indefinitely as long as a trace pool remained.
+        rates[cellOffset + speciesIndex] =
+          grossPhotosynthesis * resourceFactor -
+          respirationRate - lightStressTurnover;
+        const amount = original[cellOffset + speciesIndex];
         const speciesFreeCapacity = speciesId === 'vallisneria'
           ? clamp01(
             (VALLISNERIA_CELL_BIOMASS_CAPACITY - amount) /
               VALLISNERIA_CELL_BIOMASS_CAPACITY,
           )
           : freeCapacity;
-        // Density-dependent limitation throttles only the photosynthesis left
-        // after replacing respiration and stress losses. This preserves the
-        // established logistic net-growth curve while the ledger can still
-        // observe gross production and respiration as separate real fluxes.
-        const densityAdjustedGross = netGrowth > 0
+        const resourceAdjustedGross = grossPhotosynthesis * resourceFactor;
+        const resourceAdjustedNet = resourceAdjustedGross - respirationRate -
+          lightStressTurnover;
+        // Space limitation throttles only a genuinely positive surplus. If
+        // resource-limited fixation cannot replace maintenance and stress,
+        // preserve that deficit so the standing film actually declines.
+        const densityAdjustedGross = resourceAdjustedNet > 0
           ? respirationRate + lightStressTurnover +
-            netGrowth * resourceFactor * speciesFreeCapacity
-          : grossPhotosynthesis;
-        productionRequests[speciesIndex] =
+            resourceAdjustedNet * speciesFreeCapacity
+          : resourceAdjustedGross;
+        const productionRequest =
           amount * densityAdjustedGross * deltaSeconds;
+        productionRequests[cellOffset + speciesIndex] = productionRequest;
+        if (speciesId === 'vallisneria') {
+          this.registerVallisneriaProductionDemand(
+            cell,
+            productionRequest,
+            localTemperature,
+          );
+        } else {
+          this.biogeochemistry.registerAlgaeProductionDemand(
+            activityPoint,
+            productionRequest,
+          );
+        }
       }
+    }
+
+    this.biogeochemistry.finalizeAmmoniumCompetition();
+
+    for (let cellIndex = 0; cellIndex < cells.length; cellIndex += 1) {
+      const cell = cells[cellIndex];
+      const cellOffset = cellIndex * 3;
+      const total =
+        original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] +
+        original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] +
+        original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria];
+      const cellPoint = this.cellWorldPoint(cell);
+      const weightedAverage = total > 0
+        ? (
+          original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] *
+            rates[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] +
+          original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] *
+            rates[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] +
+          original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria] *
+            rates[cellOffset + GROWTH_SPECIES_INDEX.vallisneria]
+        ) / total
+        : 0;
+      const productions = this.growthProductionsScratch;
+      const respirationRequests = this.growthRespirationRequestsScratch;
+      const respirations = this.growthRespirationsScratch;
+      productions.fill(0);
+      respirationRequests.fill(0);
+      respirations.fill(0);
+
+      // The two attached algae use identical C/N stoichiometry at the same
+      // surface point, so commit their combined allocation once and divide the
+      // finite result proportionally.
 
       const oedogoniumSpeciesIndex = GROWTH_SPECIES_INDEX.oedogonium;
       const nitzschiaSpeciesIndex = GROWTH_SPECIES_INDEX.nitzschia;
       const vallisneriaSpeciesIndex = GROWTH_SPECIES_INDEX.vallisneria;
       const attachedProductionRequest =
-        productionRequests[oedogoniumSpeciesIndex] +
-        productionRequests[nitzschiaSpeciesIndex];
+        productionRequests[cellOffset + oedogoniumSpeciesIndex] +
+        productionRequests[cellOffset + nitzschiaSpeciesIndex];
       if (attachedProductionRequest > 0) {
         const committed = this.biogeochemistry.commitAlgaeProduction(
           cellPoint,
           attachedProductionRequest,
         );
         productions[oedogoniumSpeciesIndex] = committed *
-          productionRequests[oedogoniumSpeciesIndex] /
+          productionRequests[cellOffset + oedogoniumSpeciesIndex] /
           attachedProductionRequest;
         productions[nitzschiaSpeciesIndex] = committed *
-          productionRequests[nitzschiaSpeciesIndex] /
+          productionRequests[cellOffset + nitzschiaSpeciesIndex] /
           attachedProductionRequest;
       }
-      if (productionRequests[vallisneriaSpeciesIndex] > 0) {
+      if (productionRequests[cellOffset + vallisneriaSpeciesIndex] > 0) {
         productions[vallisneriaSpeciesIndex] = this.commitVallisneriaProduction(
           cell,
-          activityPoints.vallisneria,
-          productionRequests[vallisneriaSpeciesIndex],
+          this.vallisneriaUptakePoint(cell),
+          productionRequests[cellOffset + vallisneriaSpeciesIndex],
           this.biogeochemistry.temperatureAt(
             this.producerActivityPoint(cell, 'vallisneria'),
           ),
@@ -12909,7 +13050,8 @@ export class SimulationWorld {
         const speciesIndex = GROWTH_SPECIES_INDEX[speciesId];
         const amount = original[cellOffset + speciesIndex];
         if (amount <= 0) continue;
-        const physiologyOffset = speciesIndex * ALGAE_PHYSIOLOGY_VALUE_COUNT;
+        const physiologyOffset = (cellOffset + speciesIndex) *
+          ALGAE_PHYSIOLOGY_VALUE_COUNT;
         const respirationRate =
           physiology[physiologyOffset + ALGAE_PHYSIOLOGY_RESPIRATION];
         respirationRequests[speciesIndex] = Math.min(
@@ -12946,10 +13088,11 @@ export class SimulationWorld {
         const speciesIndex = GROWTH_SPECIES_INDEX[speciesId];
         const amount = original[cellOffset + speciesIndex];
         if (amount <= 0) continue;
-        const physiologyOffset = speciesIndex * ALGAE_PHYSIOLOGY_VALUE_COUNT;
+        const physiologyOffset = (cellOffset + speciesIndex) *
+          ALGAE_PHYSIOLOGY_VALUE_COUNT;
         const lightStressTurnover =
           physiology[physiologyOffset + ALGAE_PHYSIOLOGY_STRESS];
-        const rate = rates[speciesIndex];
+        const rate = rates[cellOffset + speciesIndex];
         const production = productions[speciesIndex];
         const respiration = respirations[speciesIndex];
         fixedBiomass += production;
@@ -12962,9 +13105,18 @@ export class SimulationWorld {
           SPECIES[speciesId].naturalTurnoverPerSecond *
           producerProcessRateScale(speciesId) *
           deltaSeconds;
+        // Aerobic respiration can be limited by local oxygen. The unmet
+        // maintenance demand still costs living tissue; otherwise anoxia
+        // paradoxically preserves algae by preventing respiration from being
+        // booked. This non-respired loss becomes detritus in localLoss below.
+        const unmetMaintenanceTurnover = Math.max(
+          0,
+          respirationRequests[speciesIndex] - respiration,
+        );
         next[cellOffset + speciesIndex] = Math.max(
           0,
-          amount + production - respiration - stressTurnover + replacement - naturalTurnover,
+          amount + production - respiration - unmetMaintenanceTurnover -
+            stressTurnover + replacement - naturalTurnover,
         );
       }
 
@@ -12974,8 +13126,8 @@ export class SimulationWorld {
       const vallisneriaIndex = cellOffset + GROWTH_SPECIES_INDEX.vallisneria;
       if (
         original[oedogoniumIndex] > 0.24 &&
-        rates[GROWTH_SPECIES_INDEX.oedogonium] >
-          rates[GROWTH_SPECIES_INDEX.nitzschia]
+        rates[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] >
+          rates[cellOffset + GROWTH_SPECIES_INDEX.nitzschia]
       ) {
         next[nitzschiaIndex] = Math.max(
           0,
@@ -13019,6 +13171,11 @@ export class SimulationWorld {
             sourceAmount < SURFACE_FILM_DISPERSAL_SOURCE_BIOMASS ||
             receiverAmount >= sourceAmount
           ) continue;
+          // Dispersal is a conserved physical transfer. Dissolved turbidity
+          // acts on the receiving film's photosynthesis in the next growth
+          // step; applying it here as well would charge the same optical
+          // stress once to arrival and again to survival. Surface exposure
+          // and temperature still gate whether a propagule can establish.
           const suitability = habitatSuitability(
             speciesId,
             neighbor.light,
@@ -13049,7 +13206,8 @@ export class SimulationWorld {
           const recruitment = dispersalTimeScale > 1
             ? Math.min(
               rawRecruitment,
-              SURFACE_FILM_FRONT_TRANSFER_PER_EDGE_PER_SECOND * deltaSeconds,
+              SURFACE_FILM_FRONT_TRANSFER_PER_EDGE_PER_SECOND *
+                deltaSeconds,
             )
             : rawRecruitment;
           if (recruitment <= 0) continue;
@@ -13116,10 +13274,7 @@ export class SimulationWorld {
       const demandIndex =
         transfer.sourceIndex * 3 + GROWTH_SPECIES_INDEX[transfer.speciesId];
       const demand = outgoingDemand[demandIndex];
-      const available = Math.max(
-        0,
-        next[demandIndex],
-      );
+      const available = Math.max(0, next[demandIndex]);
       if (demand > available && demand > 0) {
         transfer.amount *= available / demand;
       }

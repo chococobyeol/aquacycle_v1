@@ -154,8 +154,13 @@ describe('V2 mission simulation world', () => {
       world.tick(1 / 60);
     }
     const succeeded = world.snapshot();
-    expect(succeeded.outcome).toBe('success');
+    expect(
+      succeeded.outcome,
+      `mission 1 ended at ${succeeded.elapsedSeconds.toFixed(1)} s with ` +
+        `${((succeeded.missionProgress?.current ?? 0) * 100).toFixed(1)}% coverage`,
+    ).toBe('success');
     const elapsedAtSuccess = succeeded.elapsedSeconds;
+    expect(elapsedAtSuccess).toBeLessThan(300);
     world.handle({ type: 'set-speed', speed: 64 });
     while (world.snapshot().elapsedSeconds < 1_800) world.tick(0.1);
     const continued = world.snapshot();
@@ -445,8 +450,23 @@ describe('V2 mission simulation world', () => {
     const nitzschiaBefore = world.snapshot().cells.find((cell) => cell.id === surface.id)!.biomass.nitzschia;
     world.handle({ type: 'resume' });
     for (let index = 0; index < 1400; index += 1) world.tick(1 / 60);
-    const after = world.snapshot().cells.find((cell) => cell.id === surface.id)!;
-    expect(after.biomass.oedogonium).toBeGreaterThan(after.biomass.nitzschia);
+    const afterSnapshot = world.snapshot();
+    const after = afterSnapshot.cells.find((cell) => cell.id === surface.id)!;
+    const structureCells = afterSnapshot.cells.filter(
+      (cell) => cell.ownerId === surface.ownerId,
+    );
+    const oedogoniumTotal = structureCells.reduce(
+      (sum, cell) => sum + cell.biomass.oedogonium,
+      0,
+    );
+    const nitzschiaTotal = structureCells.reduce(
+      (sum, cell) => sum + cell.biomass.nitzschia,
+      0,
+    );
+    // Surface films now advance across real neighbouring samples. Judge the
+    // competition across the connected rock face rather than assuming both
+    // species remain piled in the original inoculation cell.
+    expect(oedogoniumTotal).toBeGreaterThan(nitzschiaTotal);
     expect(after.biomass.nitzschia).toBeLessThan(nitzschiaBefore);
   }, 30_000);
 });

@@ -311,12 +311,12 @@ export const WATER_CYCLE_RULES = {
   initialHeadspaceCarbonDioxide: 22,
   initialHeadspaceOxygen: 76,
   carbonHalfSaturation: 8,
-  // Surface algae must remain responsive to the 0.5-3 concentration band
-  // produced by ordinary closed-tank remineralisation. The former K=3.5 let
-  // mineral nitrogen accumulate while the producer bed recovered only after
-  // the adult shrimp cohort had disappeared. K=1 changes low-concentration
-  // affinity, not the finite N/C ledger or the maximum light-limited rate.
-  mineralNutrientHalfSaturation: 1,
+  // Surface algae must remain responsive to the 0.2-3 concentration band
+  // produced by ordinary closed-tank remineralisation. Resource limitation
+  // now applies to total biomass fixation rather than only to the positive
+  // surplus after maintenance; K=0.5 preserves recovery at that low dissolved
+  // pool without adding N/C matter or changing the maximum light-limited rate.
+  mineralNutrientHalfSaturation: 0.5,
   detritusSolubilizationRate: 0.009,
   closedGasExchangeRate: 0.018,
   // One shared oxygen-equivalent conversion is used in both directions:
@@ -364,6 +364,12 @@ export const WATER_CYCLE_RULES = {
     // how quickly intake falls as a film thins, but never makes a positive
     // biomass remainder inedible or protects it from exact depletion.
     grazingHalfSaturationBiomass: 0.07,
+    // Food detection and ingestion are different processes. Keep the local
+    // chemical/contact cue sensitive enough to find a sparse distributed
+    // film even when the ingestion response is calibrated more conservatively.
+    // Reusing the ingestion half-saturation here made a feeding adjustment
+    // silently turn into food-search blindness beside abundant total algae.
+    foragingCueHalfSaturationBiomass: 0.07,
     // Adults cannot retain every bite indefinitely. Excess assimilation is
     // returned to detritus, so a well-fed male does not become a permanent
     // carbon/nitrogen sink and an eventual oversized pollution pulse.
@@ -813,13 +819,19 @@ export const MICROBE_ECOLOGY_RULES = {
     // establishment despite a still-useful ammonia processing capacity.
     biomassYield: 0.035,
     maintenanceDecayRate: 0.00006,
-    // Nitrifiers are slow growers but a mature attached community also
-    // persists through low loading. With 0.0005, the configured Monod curve
-    // still had negative net growth around 0.5-0.8 ammonium and lost about
-    // 98% of the inoculum before animal waste arrived. This value makes the
-    // documented crossover real while all removal still pays the full oxygen
-    // and stoichiometric material cost in BiogeochemistryLedger.
-    starvationDecayRate: 0.0002,
+    // Attached ammonia oxidizers remain viable through long substrate gaps
+    // and can restart quickly after weeks of starvation. The former 0.0002,
+    // plus maintenance, halved viable film in only ~2,670 game seconds: about
+    // one shrimp generation. 0.0001 gives a fully starved half-life of about
+    // 4,330 seconds without a floor or extinction exemption; every cell still
+    // loses real biomass continuously and can reach zero through grazing.
+    starvationDecayRate: 0.0001,
+    // This is lateral equalisation inside one connected attached surface, not
+    // whole-tank colonisation. At 0.00045 the difference across one neighbour
+    // edge halves in about 1,540 simulated seconds; waterborne export below
+    // seeds disconnected surfaces. Faster sweep values homogenised good and
+    // poor sites but did not improve nitrifier survival, so retain local
+    // patchiness instead of smearing the inoculum across the tank.
     surfaceSpreadRate: 0.00045,
     // At 0.00004, even a lossless 0.4-B source could export at most 0.0095 B
     // over 600 simulated seconds, making the intended >0.01-B colonisation of
@@ -903,16 +915,25 @@ export const SHRIMP_ECOLOGY_RULES = {
   // `createAdultAnimalState`; there is no separate fixed preload shared by
   // every female.
   // Maturity is still paid by conserved somatic growth. A well-fed juvenile
-  // reaches it in about 12-20 gameplay minutes; sparse food postpones it.
+  // reaches it in about 11-18 gameplay minutes; sparse food postpones it.
   // This leaves a real adult feeding and reproduction phase without resetting
-  // or extending the birth-to-death deadline.
+  // or extending the birth-to-death deadline. The former 720-1,200-second
+  // ceiling left some otherwise fed offspring with too little adult life for
+  // generations to overlap; shortening the growth schedule does not reduce
+  // the conserved 0.20-B maturation mass.
   // Individual targets distribute a cohort without granting growth from age.
-  maturationMinimumSeconds: 720,
-  maturationMaximumSeconds: 1_200,
+  maturationMinimumSeconds: 648,
+  maturationMaximumSeconds: 1_080,
+  // A juvenile that fell behind its age schedule during a real food shortage
+  // may use later assimilated food for bounded compensatory growth. This does
+  // not add structure or waive the maturation mass: a well-fed animal stays
+  // on the ordinary curve, while a severely delayed one can catch up at no
+  // more than 2.5 times that individual's baseline structural growth rate.
+  maximumCompensatoryGrowthMultiplier: 2.5,
   // Sexual maturity precedes maximum adult size. Requiring 0.30 of the
   // supplied adult structure made a food-rich tank-born cohort spend
   // 1,900-2,200 seconds as juveniles even though its individual developmental
-  // target was 720-1,200 seconds. Females then reached adulthood only a few
+  // target was 648-1,080 seconds. Females then reached adulthood only a few
   // hundred seconds before their unchanged birth-to-death deadline and could
   // not complete one food-funded brood. At 0.20 B they still have to acquire
   // and conserve more than ten times their 0.0175-B birth structure, while
@@ -1525,6 +1546,8 @@ export interface ScenarioDefinition {
    * local nutrient field instead.
    */
   backgroundProducerCapacity: number | null;
+  /** Distribute the finite simplified resource across current surface cells. */
+  backgroundProducerResourceMode?: 'tank' | 'surface';
   dayNightCycle: DayNightCycleDefinition | null;
   dayNightCycleInitiallyEnabled: boolean;
   seedBudget: Record<SpeciesId, number | null>;
@@ -1637,7 +1660,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     timeLimitSeconds: 360,
     lightOutput: 92,
     naturalLightOutput: 0,
-    backgroundProducerCapacity: null,
+    backgroundProducerCapacity: 15,
     seedBudget: { oedogonium: 1, nitzschia: 0, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 0, 'japanese-ricefish': 0, daphnia: 0 },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
@@ -1744,24 +1767,27 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
     mode: 'challenge',
     title: '네 번째 실험 · 첫 번째 소비자',
     subtitle: '체리새우의 생존',
-    instruction: '체리새우 성체 4마리가 살아 있는 상태를 2분 동안 유지하세요.',
+    instruction: '조류를 먼저 번식시킨 뒤 체리새우를 방류해 성체 4마리를 10분 동안 유지하세요.',
     briefing: {
-      question: '직접 먹이를 주지 않고 체리새우가 살아갈 수 있는 수조를 만들 수 있을까요?',
-      goal: '체리새우 성체 4마리를 연속 2분 동안 유지하세요.',
+      question: '조류를 먼저 번식시킨 수조가 체리새우를 실제로 먹여 살릴 수 있을까요?',
+      goal: '조류를 번식시킨 뒤 체리새우 성체 4마리를 방류하고 연속 10분 동안 유지하세요.',
       success: '성체 수가 4마리 아래로 내려가면 유지 시간이 처음부터 다시 계산됩니다.',
-      supplied: '체리새우 성체 4마리 · 두 조류 접종 각 4회 · 세 종류의 구조물 무제한 · 광량 탐침 · 수온계',
+      supplied: '체리새우 성체 암컷 2마리·수컷 2마리 · 두 조류 접종 각 4회 · 세 종류의 구조물 무제한 · 광량 탐침 · 수온계',
     },
-    timeLimitSeconds: 300,
-    lightOutput: 68,
+    timeLimitSeconds: null,
+    lightOutput: 88,
     naturalLightOutput: 0,
-    // The consumer tutorial uses a finite simplified nutrient reserve. This
-    // limits total producer matter across every surface, so adding unlimited
-    // stones cannot turn the tank into an unlimited food generator. Grazing
-    // reopens the spent share, allowing producers to recover instead of being
-    // frozen at a hard biomass cap.
-    backgroundProducerCapacity: 60,
+    // Before the closed microbial cycle is introduced, Mission 4 uses one
+    // finite open-water resource budget distributed across current surfaces.
+    // Grazing may exhaust any cell completely; adding stones only redistributes
+    // the same total instead of creating extra producer matter.
+    backgroundProducerCapacity: 35,
+    backgroundProducerResourceMode: 'surface',
     seedBudget: { oedogonium: 4, nitzschia: 4, vallisneria: 0 },
     animalBudget: { 'cherry-shrimp': 4, 'japanese-ricefish': 0, daphnia: 0 },
+    animalSexBudget: {
+      'cherry-shrimp': { female: 2, male: 2 },
+    },
     planktonBudget: { phytoplankton: 0, daphnia: 0 },
     structureBudget: { 'flat-stone': null, 'round-stone': null, 'tall-stone': null, 'small-flat-stone': 0, 'small-wedge-stone': 0 },
     requiredStructures: {},
@@ -1777,7 +1803,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioDefinition> = {
       type: 'adult-population',
       speciesId: 'cherry-shrimp',
       count: 4,
-      holdSeconds: 120,
+      holdSeconds: 600,
       label: '체리새우 성체',
     },
     targetIncludesSubstrate: true,

@@ -139,7 +139,7 @@ export const inventoryPlacementEditable = (
   }
   if (phase !== 'paused') return false;
   if (kind === 'biofilm') return hasWaterCycle;
-  if (scenarioId === 'mission-5') {
+  if (scenarioId === 'mission-4' || scenarioId === 'mission-5') {
     return kind === 'seed' || kind === 'animal';
   }
   return scenarioId === 'mission-8' && kind === 'animal';
@@ -2110,6 +2110,9 @@ export function SimulationScreen({
 
   const resetSimulation = (): void => {
     resetUiState();
+    setEcologyHistory([]);
+    lastEcologySampleAt.current = Number.NEGATIVE_INFINITY;
+    completionReported.current = false;
     resumeAfterBriefing.current = false;
     send({ type: 'reset', runSeed: createSimulationRunSeed() });
     setCameraResetToken((current) => current + 1);
@@ -5209,11 +5212,12 @@ function SpeciesGuide({
       <section className="ecology-rules-card algae-rules-card">
         <div className="ecology-rules-heading"><strong>게임 생존·수질 기준</strong><span>표면 군락량 1.0 기준</span></div>
         <dl>
-          <div><dt>직접 생존 조건</dt><dd>현재 모델에서 용존산소·유기물·암모니아성 노폐물은 조류를 직접 죽이지 않습니다. 빛·수온·영양염·경쟁·섭식이 양을 결정합니다.</dd></div>
+          <div><dt>감소 조건</dt><dd>빛·수온·무기질소·무기탄소가 광합성과 유지 손실을 충당하지 못하면 조류막이 줄어듭니다. 낮은 산소에서 충당하지 못한 호흡량도 살아 있는 조직의 손실로 전환됩니다.</dd></div>
+          <div><dt>유기물 탁도</dt><dd>유기물이 많을수록 실제 유효광량에 <b>e<sup>-{WATER_CYCLE_RULES.algae.organicLightAttenuation}×유기물</sup></b>을 곱합니다. 탁도가 심하면 밝은 위치도 보상광점 아래로 내려갈 수 있습니다.</dd></div>
           <div><dt>무기질소</dt><dd>암모니아성 노폐물과 영양염 합계 N에 <b>N ÷ ({WATER_CYCLE_RULES.mineralNutrientHalfSaturation} + N)</b>을 곱합니다. 새 군락은 필요한 질소 중 암모니아를 최대 <b>{Math.round(WATER_CYCLE_RULES.algae.ammoniumPreference * 100)}%</b> 우선 흡수하고, 부족분은 영양염에서 가져옵니다.</dd></div>
           <div><dt>무기탄소</dt><dd>유한한 물속 무기탄소 C에 <b>C ÷ ({WATER_CYCLE_RULES.carbonHalfSaturation} + C)</b>을 곱합니다. 새 군락 1.0에 탄소 <b>{WATER_CYCLE_RULES.biomassCarbon}</b>가 실제로 들어갑니다.</dd></div>
           <div><dt>산소 생산</dt><dd>고정한 탄소 1.0당 산소 <b>{WATER_CYCLE_RULES.oxygenPerOrganicCarbon}</b>를 만들고, 질산염을 흡수하면 질소 환원에 해당하는 산소 등가량이 더해집니다. 넘친 산소는 닫힌 공기층으로 이동합니다.</dd></div>
-          <div><dt>낮·밤 호흡</dt><dd>빛이 없어 총광합성이 멈춰도 호흡은 계속됩니다. 24°C 기준 군락량 1.0당 <b>{formatPercentValue(species.respirationRateAtReference)}%/초</b>를 호흡하며, 수온이 높을수록 빨라집니다.</dd></div>
+          <div><dt>낮·밤 호흡</dt><dd>빛이 없어 총광합성이 멈춰도 유지대사는 계속됩니다. 24°C 기준 군락량 1.0당 <b>{formatPercentValue(species.respirationRateAtReference)}%/초</b>이며, 산소로 호흡한 질량은 무기탄소·암모니아로 돌아가고 산소가 부족한 몫은 죽은 조직과 찌꺼기가 됩니다.</dd></div>
           <div><dt>무기질소 흡수</dt><dd>새 생체량 1.0당 무기질소 <b>{WATER_CYCLE_RULES.biomassNitrogen}</b>를 흡수합니다. 죽거나 먹힌 생체량은 찌꺼기와 생물 몸을 거쳐 다시 순환합니다.</dd></div>
           <div><dt>자연 소실</dt><dd>그래프의 환경 성장률 계산 뒤에 군락량의 <b>{formatPercentValue(species.naturalTurnoverPerSecond)}%/초</b>가 추가로 줄며, 다른 종의 경쟁과 새우 섭식도 별도로 적용됩니다.</dd></div>
         </dl>

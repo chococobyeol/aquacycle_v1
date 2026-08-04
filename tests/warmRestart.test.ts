@@ -6,6 +6,7 @@ import {
   takeWarmRestart,
   takeWarmRestartUiState,
 } from '../src/renderer/storage/warmRestart';
+import { freshSimulationEntry } from '../src/renderer/ui/App';
 
 describe('memory-pressure warm restart handoff', () => {
   beforeEach(() => {
@@ -46,5 +47,19 @@ describe('memory-pressure warm restart handoff', () => {
     expect(stageWarmRestartUiState(uiState)).toBe(true);
     expect(takeWarmRestartUiState()).toEqual(uiState);
     expect(takeWarmRestartUiState()).toBeNull();
+  });
+
+  it('does not attach an old recovery save when the same mission is opened again', () => {
+    const data = new SimulationWorld('mission-5').exportSaveData();
+    const recoveredEntry = {
+      scenarioId: data.scenarioId,
+      initialSaveData: data,
+    };
+    const reopenedEntry = freshSimulationEntry(data.scenarioId);
+
+    expect(recoveredEntry.initialSaveData).toBe(data);
+    expect(reopenedEntry).toEqual({ scenarioId: 'mission-5' });
+    expect(reopenedEntry.initialSaveData).toBeUndefined();
+    expect(reopenedEntry.initialUiState).toBeUndefined();
   });
 });
