@@ -121,4 +121,15 @@ describe('background simulation continuity', () => {
     expect(hookSource).not.toContain('onSimulationMemoryPressure');
     expect(hookSource).toContain("message.type === 'telemetry-resize-request'");
   });
+
+  it('does not duplicate a memory-heavy renderer frame during recovery', () => {
+    const mainSource = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/main.ts'),
+      'utf8',
+    );
+
+    expect(mainSource).toContain('createRecoveryWindow');
+    expect(mainSource).not.toContain('capturePage(');
+    expect(mainSource).not.toContain('.toDataURL(');
+  });
 });

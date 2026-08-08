@@ -4,12 +4,24 @@ import {
   ECOLOGY_HISTORY_RETENTION_SECONDS,
   ECOLOGY_HISTORY_WINDOW_SECONDS,
   ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS,
+  historyAttachedAlgaeBiomass,
   historyPointsInWindow,
   historyTimeBounds,
   historyTimeX,
 } from '../src/renderer/ui/ecologyHistory';
 
 describe('rolling ecology history window', () => {
+  it('keeps attached algae separate from Vallisneria and migrates legacy traces', () => {
+    expect(historyAttachedAlgaeBiomass({
+      attachedAlgaeBiomass: 42.4,
+      plantBiomass: 0.8,
+    })).toBe(42.4);
+    expect(historyAttachedAlgaeBiomass({
+      algaeBiomass: 43.2,
+      plantBiomass: 0.8,
+    })).toBeCloseTo(42.4);
+  });
+
   it('retains enough history to expand the visible time window later', () => {
     let points: { elapsedSeconds: number; value: number }[] = [];
     for (let elapsedSeconds = 0; elapsedSeconds <= 4_500; elapsedSeconds += 2) {

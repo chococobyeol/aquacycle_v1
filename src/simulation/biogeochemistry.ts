@@ -49,14 +49,25 @@ const SHRIMP_FOOD_CUE_SOURCE_HALF_SATURATION = 0.08;
 const SHRIMP_FOOD_CUE_SOURCE_RESPONSE_PER_SECOND = 0.9;
 const SHRIMP_FOOD_CUE_HALF_LIFE_SECONDS = 45;
 const SHRIMP_FOOD_CUE_MINIMUM = 1e-9;
-const SHRIMP_MATE_CUE_MIXING_PER_SECOND = 0.04;
+// A receptive female's water-borne cue must cross several transport cells
+// before a low-density male ages out. The old 0.08/30-second plume remained
+// local to roughly one surface neighbourhood in the long tank: the final
+// healthy male/female pair in a recorded Mission 6 run stayed reproductively
+// isolated for more than 1,000 seconds despite abundant food. This is still a
+// conservative dissolved field and exposes no female position to the male.
+const SHRIMP_MATE_CUE_MIXING_PER_SECOND = 0.14;
 const SHRIMP_MATE_CUE_SOURCE_RESPONSE_PER_SECOND = 1.4;
-const SHRIMP_MATE_CUE_HALF_LIFE_SECONDS = 18;
+const SHRIMP_MATE_CUE_HALF_LIFE_SECONDS = 60;
 const SHRIMP_MATE_CUE_MINIMUM = 1e-9;
 const PREDATOR_DANGER_CUE_MIXING_PER_SECOND = 0.11;
 const PREDATOR_DANGER_CUE_SOURCE_RESPONSE_PER_SECOND = 1.8;
 const PREDATOR_DANGER_CUE_HALF_LIFE_SECONDS = 14;
 const PREDATOR_DANGER_CUE_MINIMUM = 1e-8;
+// Bottom sediment reversibly adsorbs nitrate at a higher concentration than
+// the overlying water. This is a finite conservative partition, not nutrient
+// generation; roots can draw the adsorbed side while algae cannot.
+const SEDIMENT_NITRATE_EXCHANGE_PER_SECOND = 0.006;
+const SEDIMENT_NITRATE_RELEASE_PER_SECOND = 0.001;
 
 export const emptyBiofilm = (): BiofilmBiomass => ({ decomposer: 0, nitrifier: 0 });
 
@@ -160,6 +171,12 @@ export class BiogeochemistryLedger {
   private readonly tankWidth: number;
   private readonly waterTop: number;
   private readonly groundY: number;
+  private readonly rootedSedimentEnabled: boolean;
+  /**
+   * Bottom-row concentration ratio that preserves the scenario's configured
+   * tank-wide sediment fraction at a well-mixed equilibrium.
+   */
+  private readonly sedimentNitratePartitionCoefficient: number;
   private readonly detritus: Float64Array;
   // Chemistry uses Float64 because these are conserved ledgers, not render
   // buffers. Float32 rounding was small per step but accumulated measurably
@@ -167,6 +184,8 @@ export class BiogeochemistryLedger {
   private readonly organicMatter: Float64Array;
   private readonly toxicWaste: Float64Array;
   private readonly nutrients: Float64Array;
+  /** Immobile mineral N in the bottom sediment; only rooted uptake can use it. */
+  private readonly sedimentNutrients: Float64Array;
   private readonly oxygen: Float64Array;
   private readonly dissolvedInorganicCarbon: Float64Array;
   private readonly planktonicDecomposer: Float64Array;
@@ -284,6 +303,10 @@ export class BiogeochemistryLedger {
     initial?: Partial<WaterQualityValues>;
     /** Scale finite initial C/N reservoirs while leaving oxygen unchanged. */
     initialMaterialScale?: number;
+    initialDissolvedInorganicCarbon?: number;
+    initialHeadspaceCarbonDioxide?: number;
+    /** Fraction of initial nitrate stored in finite bottom sediment. */
+    rootedPlantSedimentFraction?: number;
     initialTemperature?: number;
     columns?: number;
     rows?: number;
@@ -302,6 +325,7 @@ export class BiogeochemistryLedger {
     this.organicMatter = new Float64Array(this.cellCount);
     this.toxicWaste = new Float64Array(this.cellCount);
     this.nutrients = new Float64Array(this.cellCount);
+    this.sedimentNutrients = new Float64Array(this.cellCount);
     this.oxygen = new Float64Array(this.cellCount);
     this.dissolvedInorganicCarbon = new Float64Array(this.cellCount);
     this.planktonicDecomposer = new Float64Array(this.cellCount);
@@ -398,15 +422,52 @@ export class BiogeochemistryLedger {
     this.toxicWaste.fill(finiteConcentration(
       initial.toxicWaste * initialMaterialScale,
     ));
+    const sedimentFraction = clamp(
+      options?.rootedPlantSedimentFraction ?? 0,
+      0,
+      0.8,
+    );
+    this.rootedSedimentEnabled = sedimentFraction > 0;
+    // Sediment exists only in one of `rows` water-grid rows. If its bottom-row
+    // concentration is k times the water concentration, its share of the
+    // tank-wide nitrate mass is k / (rows + k). Solve that relation for k so
+    // the reversible exchange below converges to the same finite partition
+    // requested by the scenario. The former global k=8.5 represented roughly
+    // 30% in a 20-row tank and silently drained Mission 6's configured 60%
+    // rooted reserve into the water column over long runs.
+    this.sedimentNitratePartitionCoefficient = sedimentFraction > 0
+      ? this.rows * sedimentFraction / (1 - sedimentFraction)
+      : 0;
+    const initialNutrients = initial.nutrients * initialMaterialScale;
     this.nutrients.fill(finiteConcentration(
-      initial.nutrients * initialMaterialScale,
+      initialNutrients * (1 - sedimentFraction),
     ));
+    // Concentration is stored only in the bottom row. Multiplying by the row
+    // count keeps the tank-wide mineral-N mass identical to the former wholly
+    // dissolved initialization: fieldMass(water + sediment) is unchanged.
+    if (sedimentFraction > 0) {
+      // Adsorbed sediment is a compact bottom-row store, not a water-quality
+      // display concentration. It may legitimately exceed the water field's
+      // 0-100 presentation range when a large tank-wide fraction is packed
+      // into one of many rows.
+      const bottomConcentration = finiteBiomassConcentration(
+        initialNutrients * sedimentFraction * this.rows,
+      );
+      const bottomOffset = (this.rows - 1) * this.columns;
+      for (let column = 0; column < this.columns; column += 1) {
+        this.sedimentNutrients[bottomOffset + column] = bottomConcentration;
+      }
+    }
     this.oxygen.fill(finiteConcentration(initial.oxygen));
     this.dissolvedInorganicCarbon.fill(
-      WATER_CYCLE_RULES.initialDissolvedInorganicCarbon * initialMaterialScale,
+      (options?.initialDissolvedInorganicCarbon ??
+        WATER_CYCLE_RULES.initialDissolvedInorganicCarbon) *
+        initialMaterialScale,
     );
     this.headspaceCarbonDioxide =
-      WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide * initialMaterialScale;
+      (options?.initialHeadspaceCarbonDioxide ??
+        WATER_CYCLE_RULES.initialHeadspaceCarbonDioxide) *
+        initialMaterialScale;
     this.headspaceOxygen = finiteConcentration(initial.oxygen);
   }
 
@@ -486,6 +547,19 @@ export class BiogeochemistryLedger {
     this.ammoniumCompetitionReady = false;
   }
 
+  /** Rates from the ecology step that just finished, without building a full field snapshot. */
+  public producerFluxRates(): {
+    grossPhotosynthesis: number;
+    producerRespiration: number;
+  } {
+    return {
+      grossPhotosynthesis:
+        this.stepGrossAlgaeProduction / this.stepDurationSeconds,
+      producerRespiration:
+        this.stepAlgaeRespiration / this.stepDurationSeconds,
+    };
+  }
+
   /**
    * Starts one shared ammonium-allocation window from the water state that
    * existed before either producers or nitrifiers reacted. Nitrifier demand is
@@ -546,6 +620,36 @@ export class BiogeochemistryLedger {
       this.producerNitrogenDemandScratch,
       index,
       nitrogenDemand,
+      this.ammoniumCompetitionInitialScratch,
+      this.nutrients,
+    );
+  }
+
+  /**
+   * Registers only the rooted plant demand that its finite sediment reserve
+   * cannot supply. This prevents an unused water-ammonium allocation from
+   * being withheld from algae merely because the root can pay from sediment.
+   */
+  public registerRootedPlantProductionDemand(
+    point: Vec2,
+    requestedBiomass: number,
+    internalNitrogen = 0,
+  ): void {
+    if (!this.ammoniumCompetitionCollecting) return;
+    const index = this.indexAt(point);
+    const requestedNitrogen = Math.max(0, requestedBiomass) *
+      WATER_CYCLE_RULES.biomassNitrogen;
+    const waterNitrogenDemand = Math.max(
+      0,
+      requestedNitrogen -
+        Math.max(0, internalNitrogen) -
+        this.massAround(this.sedimentNutrients, index),
+    );
+    if (waterNitrogenDemand <= 0) return;
+    this.addDemandAround(
+      this.producerNitrogenDemandScratch,
+      index,
+      waterNitrogenDemand,
       this.ammoniumCompetitionInitialScratch,
       this.nutrients,
     );
@@ -613,6 +717,223 @@ export class BiogeochemistryLedger {
         WATER_CYCLE_RULES.mineralNutrientHalfSaturation,
       ),
       saturation(carbon, WATER_CYCLE_RULES.carbonHalfSaturation),
+    );
+  }
+
+  /**
+   * Resource response for a rooted submerged macrophyte. The current ledger
+   * represents sediment pore-water with the bottom water cell, so it cannot
+   * expose the larger rooting volume directly. A lower mineral-N
+   * half-saturation captures root uptake and stored-nutrient use while the
+   * subsequent commit still removes the full, finite N/C mass from the same
+   * local ledger. Carbon limitation is deliberately unchanged.
+   */
+  public rootedPlantResourceFactor(
+    point: Vec2,
+    internalNitrogen = 0,
+  ): number {
+    if (!this.effectsEnabled) return 1;
+    const index = this.indexAt(point);
+    const localCellCount = this.indicesAround(index).length;
+    const localMassToConcentration =
+      this.cellCount / Math.max(1, localCellCount);
+    // Production commits from the whole finite root neighbourhood below.
+    // Reading only the coordinate's centre cell here made the request collapse
+    // as soon as that one sediment voxel was depleted, even while the same
+    // commit path could still see mineral N in adjacent root-zone voxels.
+    // Convert those exact neighbourhood masses back to a mean concentration
+    // so the response and the subsequent withdrawal describe one root volume.
+    const mineralNitrogen = (
+      this.massAround(this.toxicWaste, index) +
+      this.massAround(this.nutrients, index) +
+      this.massAround(this.sedimentNutrients, index) +
+      Math.max(0, internalNitrogen)
+    ) * localMassToConcentration;
+    const carbon = this.massAround(
+      this.dissolvedInorganicCarbon,
+      index,
+    ) * localMassToConcentration;
+    return Math.min(
+      saturation(
+        mineralNitrogen,
+        WATER_CYCLE_RULES.mineralNutrientHalfSaturation * 0.45,
+      ),
+      saturation(carbon, WATER_CYCLE_RULES.carbonHalfSaturation),
+    );
+  }
+
+  /**
+   * Converts finite sediment/water mineral nitrogen and water-column carbon
+   * into rooted plant biomass. Sediment nitrate is preferred, then the same
+   * ammonium/nitrate pool used by algae; every committed unit remains fully
+   * represented in the closed C/N/redox ledger.
+   */
+  public commitRootedPlantProduction(
+    point: Vec2,
+    requestedBiomass: number,
+    oxygenReleasePoint: Vec2 = point,
+    internalNitrogen?: { available: number },
+  ): number {
+    const requested = Math.max(0, requestedBiomass);
+    if (requested <= 0) return 0;
+    if (!this.effectsEnabled) {
+      this.stepGrossAlgaeProduction += requested;
+      return requested;
+    }
+    const index = this.indexAt(point);
+    const nitrogenPerBiomass = WATER_CYCLE_RULES.biomassNitrogen;
+    const carbonPerBiomass = WATER_CYCLE_RULES.biomassCarbon;
+    const sedimentNitrogen = this.massAround(this.sedimentNutrients, index);
+    const storedPlantNitrogen = Math.max(0, internalNitrogen?.available ?? 0);
+    const availableAmmonium = this.massAround(
+      this.ammoniumCompetitionReady
+        ? this.producerAmmoniumBudgetScratch
+        : this.toxicWaste,
+      index,
+    );
+    const availableNutrients = this.massAround(this.nutrients, index);
+    const availableCarbon = this.massAround(this.dissolvedInorganicCarbon, index);
+    const actual = Math.min(
+      requested,
+      (
+        storedPlantNitrogen + sedimentNitrogen +
+        availableAmmonium + availableNutrients
+      ) /
+        nitrogenPerBiomass,
+      availableCarbon / carbonPerBiomass,
+    );
+    if (actual <= 0) return 0;
+
+    const nitrogenNeed = actual * nitrogenPerBiomass;
+    const removedStoredPlantNitrogen = Math.min(
+      storedPlantNitrogen,
+      nitrogenNeed,
+    );
+    if (internalNitrogen) {
+      internalNitrogen.available = Math.max(
+        0,
+        internalNitrogen.available - removedStoredPlantNitrogen,
+      );
+    }
+    const removedSediment = this.removeMassAround(
+      this.sedimentNutrients,
+      index,
+      nitrogenNeed - removedStoredPlantNitrogen,
+    );
+    const waterNitrogenNeed = Math.max(
+      0,
+      nitrogenNeed - removedStoredPlantNitrogen - removedSediment,
+    );
+    const preferredAmmonium = Math.min(
+      availableAmmonium,
+      waterNitrogenNeed * WATER_CYCLE_RULES.algae.ammoniumPreference,
+    );
+    let removedAmmonium = this.ammoniumCompetitionReady
+      ? this.removeBudgetedAmmonium(
+        this.producerAmmoniumBudgetScratch,
+        index,
+        preferredAmmonium,
+      )
+      : this.removeMassAround(this.toxicWaste, index, preferredAmmonium);
+    let removedNutrients = this.removeMassAround(
+      this.nutrients,
+      index,
+      waterNitrogenNeed - removedAmmonium,
+    );
+    if (removedAmmonium + removedNutrients < waterNitrogenNeed) {
+      const ammoniumShortfall =
+        waterNitrogenNeed - removedAmmonium - removedNutrients;
+      removedAmmonium += this.ammoniumCompetitionReady
+        ? this.removeBudgetedAmmonium(
+          this.producerAmmoniumBudgetScratch,
+          index,
+          ammoniumShortfall,
+        )
+        : this.removeMassAround(this.toxicWaste, index, ammoniumShortfall);
+    }
+    const paidNitrogen = removedStoredPlantNitrogen + removedSediment +
+      removedAmmonium + removedNutrients;
+    const paidBiomass = Math.min(actual, paidNitrogen / nitrogenPerBiomass);
+    if (paidBiomass <= 0) return 0;
+    const fixedCarbon = paidBiomass * carbonPerBiomass;
+    this.removeMassAround(this.dissolvedInorganicCarbon, index, fixedCarbon);
+    const nitrateNitrogen = removedSediment + removedNutrients;
+    const oxygenProduced = producerOxygenProduction(
+      fixedCarbon,
+      nitrateNitrogen,
+    );
+    const oxygenReleaseIndex = this.indexAt(oxygenReleasePoint);
+    const dissolved = this.addMassAround(
+      this.oxygen,
+      oxygenReleaseIndex,
+      oxygenProduced,
+    );
+    this.headspaceOxygen += oxygenProduced - dissolved;
+    this.cumulativeOxygenProduction += oxygenProduced;
+    this.stepGrossAlgaeProduction += paidBiomass;
+    this.stepAlgaeOxygenProduction += oxygenProduced;
+    return paidBiomass;
+  }
+
+  /**
+   * Rooted plants respire carbohydrate without mineralising their tissue N on
+   * every night. The shared B unit cannot otherwise express that separation,
+   * so the nitrogen represented by respired B is retained in a finite internal
+   * pool owned by that individual and must be paid back into later structural
+   * growth. The caller owns that pool because a water-grid coordinate cannot
+   * follow a runner-born plant through its life cycle.
+   */
+  public commitRootedPlantRespiration(
+    respirationPoint: Vec2,
+    requestedBiomass: number,
+    _rootPoint?: Vec2,
+  ): number {
+    const requested = Math.max(0, requestedBiomass);
+    if (requested <= 0) return 0;
+    if (!this.effectsEnabled) {
+      this.stepAlgaeRespiration += requested;
+      return requested;
+    }
+    const respirationIndex = this.indexAt(respirationPoint);
+    const oxygenPerBiomass = organicCarbonOxygenDemand(
+      WATER_CYCLE_RULES.biomassCarbon,
+    );
+    const availableOxygen = this.massAround(this.oxygen, respirationIndex);
+    const carbonCapacity = this.capacityAroundOrTank(
+      this.dissolvedInorganicCarbon,
+      respirationIndex,
+      requested * WATER_CYCLE_RULES.biomassCarbon,
+    );
+    const supported = Math.min(
+      requested,
+      availableOxygen / Math.max(1e-9, oxygenPerBiomass),
+      carbonCapacity / WATER_CYCLE_RULES.biomassCarbon,
+    );
+    const removedOxygen = this.removeMassAround(
+      this.oxygen,
+      respirationIndex,
+      supported * oxygenPerBiomass,
+    );
+    const actual = oxygenPerBiomass > 0
+      ? Math.min(supported, removedOxygen / oxygenPerBiomass)
+      : supported;
+    if (actual <= 0) return 0;
+    const carbon = actual * WATER_CYCLE_RULES.biomassCarbon;
+    this.addMassAround(this.dissolvedInorganicCarbon, respirationIndex, carbon);
+    this.cumulativeOxygenDemand += removedOxygen;
+    this.stepAlgaeRespiration += actual;
+    this.stepAlgaeOxygenDemand += removedOxygen;
+    return actual;
+  }
+
+  /** Returns a dead rooted plant's finite internal N to dissolved ammonium. */
+  public releaseRootedPlantNitrogen(point: Vec2, nitrogen: number): number {
+    const released = Math.max(0, nitrogen);
+    if (released <= 0 || !this.effectsEnabled) return released;
+    return this.addMassAround(
+      this.toxicWaste,
+      this.indexAt(point),
+      released,
     );
   }
 
@@ -1129,6 +1450,7 @@ export class BiogeochemistryLedger {
       }
       this.dissolvedAdvectionAccumulator = 0;
     }
+    this.exchangeSedimentNutrients(dt);
     this.exchangeClosedHeadspace(dt);
 
     let decomposerTotal = 0;
@@ -1140,6 +1462,33 @@ export class BiogeochemistryLedger {
     this.biofilmTotals.decomposer = decomposerTotal;
     this.biofilmTotals.nitrifier = nitrifierTotal;
     this.fieldRevision += 1;
+  }
+
+  /** Conservatively partitions bottom-water nitrate into rooted sediment. */
+  private exchangeSedimentNutrients(deltaSeconds: number): void {
+    if (!this.rootedSedimentEnabled || deltaSeconds <= 0) return;
+    const bottomOffset = (this.rows - 1) * this.columns;
+    const partition = this.sedimentNitratePartitionCoefficient;
+    for (let column = 0; column < this.columns; column += 1) {
+      const index = bottomOffset + column;
+      const water = this.nutrients[index];
+      const sediment = this.sedimentNutrients[index];
+      const equilibriumTransfer = (partition * water - sediment) /
+        (1 + partition);
+      const exchangeRate = equilibriumTransfer >= 0
+        ? SEDIMENT_NITRATE_EXCHANGE_PER_SECOND
+        : SEDIMENT_NITRATE_RELEASE_PER_SECOND;
+      const response = 1 - Math.exp(-exchangeRate * deltaSeconds);
+      const transfer = clamp(
+        equilibriumTransfer * response,
+        -sediment,
+        water,
+      );
+      this.nutrients[index] = finiteConcentration(water - transfer);
+      this.sedimentNutrients[index] = finiteBiomassConcentration(
+        sediment + transfer,
+      );
+    }
   }
 
   private advanceShrimpFoodCue(
@@ -1359,7 +1708,8 @@ export class BiogeochemistryLedger {
     return {
       organicMatter: this.fieldMass(this.organicMatter),
       toxicWaste: this.fieldMass(this.toxicWaste),
-      nutrients: this.fieldMass(this.nutrients),
+      nutrients:
+        this.fieldMass(this.nutrients) + this.fieldMass(this.sedimentNutrients),
       dissolvedOxygen: this.fieldMass(this.oxygen),
       detritus: this.detritus.reduce((sum, value) => sum + value, 0),
       dissolvedInorganicCarbon: this.fieldMass(this.dissolvedInorganicCarbon),
@@ -1381,6 +1731,7 @@ export class BiogeochemistryLedger {
       organicMatter: Array.from(this.organicMatter),
       toxicWaste: Array.from(this.toxicWaste),
       nutrients: Array.from(this.nutrients),
+      sedimentNutrients: Array.from(this.sedimentNutrients),
       oxygen: Array.from(this.oxygen),
       dissolvedInorganicCarbon: this.fieldMass(this.dissolvedInorganicCarbon),
       dissolvedInorganicCarbonField: Array.from(this.dissolvedInorganicCarbon),
@@ -1421,6 +1772,27 @@ export class BiogeochemistryLedger {
     restoreField(this.organicMatter, state.organicMatter);
     restoreField(this.toxicWaste, state.toxicWaste);
     restoreField(this.nutrients, state.nutrients);
+    if (state.sedimentNutrients?.length === this.cellCount) {
+      restoreField(this.sedimentNutrients, state.sedimentNutrients);
+    } else {
+      // Legacy saves already hold the complete mineral pool in water.
+      this.sedimentNutrients.fill(0);
+    }
+    if (state.rootedPlantStoredNitrogen?.length === this.cellCount) {
+      // The legacy format stranded respired N at root coordinates. Preserve
+      // its mass, but make it ordinary ammonium instead of assigning it to an
+      // arbitrary living ramet during migration.
+      let legacyStoredNitrogen = 0;
+      for (const value of state.rootedPlantStoredNitrogen) {
+        legacyStoredNitrogen += Number.isFinite(value) ? Math.max(0, value) : 0;
+      }
+      legacyStoredNitrogen /= this.cellCount;
+      for (let index = 0; index < this.cellCount; index += 1) {
+        this.toxicWaste[index] = finiteConcentration(
+          this.toxicWaste[index] + legacyStoredNitrogen,
+        );
+      }
+    }
     restoreField(this.oxygen, state.oxygen);
     if (state.dissolvedInorganicCarbonField?.length === this.cellCount) {
       restoreField(this.dissolvedInorganicCarbon, state.dissolvedInorganicCarbonField);
@@ -1528,6 +1900,11 @@ export class BiogeochemistryLedger {
     snapshot.potentialOxygenDemand = this.cumulativeOxygenDemand;
     snapshot.dissolvedWasteProduced = this.cumulativeDissolvedWaste;
     snapshot.detritusMass = material.detritus;
+    snapshot.sedimentMineralNitrogen = this.fieldMass(
+      this.sedimentNutrients,
+    );
+    // SimulationWorld fills this from living ramets after taking the snapshot.
+    snapshot.rootedPlantStoredNitrogen = 0;
 
     const water = snapshot.water ?? {} as BiogeochemistrySnapshot['water'];
     water.columns = this.effectsEnabled ? this.columns : 0;
@@ -1585,8 +1962,10 @@ export class BiogeochemistryLedger {
     snapshot.transport = this.transport.snapshot(snapshot.transport);
     snapshot.average ??= {} as WaterQualityValues;
     snapshot.average.organicMatter = material.organicMatter;
-    snapshot.average.toxicWaste = material.toxicWaste;
-    snapshot.average.nutrients = material.nutrients;
+    snapshot.average.toxicWaste = this.fieldMass(this.toxicWaste);
+    // The probe reports dissolved water nutrients; sediment remains visible
+    // separately and is included only in the closed material inventory.
+    snapshot.average.nutrients = this.fieldMass(this.nutrients);
     snapshot.average.oxygen = material.dissolvedOxygen;
     snapshot.biofilmTotals ??= emptyBiofilm();
     snapshot.biofilmTotals.decomposer = this.biofilmTotals.decomposer;

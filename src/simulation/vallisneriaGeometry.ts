@@ -21,8 +21,13 @@ export interface VallisneriaDepthAnchor extends Vec2 {
 
 export type VallisneriaRenderDepth = 'back' | 'front';
 
-const VALLISNERIA_YOUNG_HEIGHT_SCALE = 0.58;
-const VALLISNERIA_MATURE_HEIGHT_SCALE = 2.55;
+// A narrow-leaved aquatic rosette gains length much faster than dry mass: a
+// small mature ramet can already carry long, thin leaves. Waiting until 58%
+// structural scale to bend the height curve kept a real sixfold biomass gain
+// looking like the same short tuft. Start the nonlinear length transition at
+// 45%; width and leaf count remain biomass-scale controlled below.
+const VALLISNERIA_YOUNG_HEIGHT_SCALE = 0.45;
+const VALLISNERIA_MATURE_HEIGHT_SCALE = 2.82;
 
 /**
  * Young rosettes keep the compact placement size. Once a healthy plant passes
@@ -72,22 +77,36 @@ const cubicPoint = (
 /**
  * Writes the deterministic leaf geometry into a caller-owned workspace.
  * `target.length` is treated as capacity: callers should iterate only the
- * returned count so leaves that temporarily disappear while a ramet shrinks
- * remain available if it grows again.
+ * returned count. Structural scale describes attained leaf length, while
+ * leaf retention removes whole blades during stress or senescence. Keeping
+ * those axes separate prevents intact leaves from retracting with reserves.
  */
 export const writeVallisneriaLeaves = (
   cellIndex: number,
   anchor: Vec2,
   structuralScale: number,
   target: VallisneriaLeafGeometry[],
+  leafRetention = 1,
 ): number => {
   const plantHash = (cellIndex * 0.61803398875) % 1;
   const baseHeight = (184 + plantHash * 34) * vallisneriaLeafHeightScale(structuralScale);
-  const leafCount = Math.max(3, Math.round(2 + structuralScale * 6));
+  const fullLeafCount = Math.max(3, Math.round(2 + structuralScale * 6));
+  const leafCount = Math.max(
+    1,
+    Math.min(
+      fullLeafCount,
+      Math.round(fullLeafCount * Math.max(0.12, Math.min(1, leafRetention))),
+    ),
+  );
+  // Old outer blades are shed first. Geometry remains keyed to the original
+  // full-rosette slot so losing a neighbour cannot make surviving blades jump
+  // sideways or change length between frames.
+  const firstRetainedSlot = Math.floor((fullLeafCount - leafCount) / 2);
   for (let index = 0; index < leafCount; index += 1) {
-    const ratio = leafCount <= 1 ? 0.5 : index / (leafCount - 1);
+    const slotIndex = firstRetainedSlot + index;
+    const ratio = fullLeafCount <= 1 ? 0.5 : slotIndex / (fullLeafCount - 1);
     const side = ratio * 2 - 1;
-    const phase = cellIndex * 0.73 + index * 1.37;
+    const phase = cellIndex * 0.73 + slotIndex * 1.37;
     const leafHeight = baseHeight *
       (0.78 + (1 - Math.abs(side)) * 0.18) *
       (0.94 + Math.sin(phase) * 0.06);
@@ -95,7 +114,7 @@ export const writeVallisneriaLeaves = (
     const lean = side * (10 + structuralScale * 24 + Math.abs(side) * 9) +
       Math.sin(phase * 1.7) * (3 + structuralScale * 5);
     const tipX = rootX + lean;
-    const ribbonWidth = 4.6 + structuralScale * 2.5 + (index % 3) * 0.35;
+    const ribbonWidth = 4.6 + structuralScale * 2.5 + (slotIndex % 3) * 0.35;
     const swayA = Math.sin(phase * 1.11) * (3 + structuralScale * 6);
     const swayB = Math.cos(phase * 0.83) * (4 + structuralScale * 8);
     const leaf = target[index] ?? {
@@ -126,6 +145,7 @@ export const vallisneriaLeaves = (
   cellIndex: number,
   anchor: Vec2,
   structuralScale: number,
+  leafRetention = 1,
 ): VallisneriaLeafGeometry[] => {
   const leaves: VallisneriaLeafGeometry[] = [];
   const leafCount = writeVallisneriaLeaves(
@@ -133,6 +153,7 @@ export const vallisneriaLeaves = (
     anchor,
     structuralScale,
     leaves,
+    leafRetention,
   );
   leaves.length = leafCount;
   return leaves;
@@ -169,12 +190,14 @@ export const writeVallisneriaCanopyBounds = (
   target: VallisneriaCanopyBounds,
   leavesScratch: VallisneriaLeafGeometry[],
   pointScratch: Vec2,
+  leafRetention = 1,
 ): VallisneriaCanopyBounds => {
   const leafCount = writeVallisneriaLeaves(
     cellIndex,
     anchor,
     structuralScale,
     leavesScratch,
+    leafRetention,
   );
   let minX = anchor.x;
   let minY = anchor.y;
@@ -202,6 +225,7 @@ export const vallisneriaCanopyBounds = (
   cellIndex: number,
   anchor: Vec2,
   structuralScale: number,
+  leafRetention = 1,
 ): VallisneriaCanopyBounds => {
   const bounds = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
   return writeVallisneriaCanopyBounds(
@@ -211,6 +235,7 @@ export const vallisneriaCanopyBounds = (
     bounds,
     [],
     { x: 0, y: 0 },
+    leafRetention,
   );
 };
 
@@ -231,9 +256,15 @@ export const vallisneriaHitDistance = (
   cellIndex: number,
   anchor: Vec2,
   structuralScale: number,
+  leafRetention = 1,
 ): number => {
   let nearest = Number.POSITIVE_INFINITY;
-  for (const leaf of vallisneriaLeaves(cellIndex, anchor, structuralScale)) {
+  for (const leaf of vallisneriaLeaves(
+    cellIndex,
+    anchor,
+    structuralScale,
+    leafRetention,
+  )) {
     let previous = leaf.root;
     for (let sample = 1; sample <= 14; sample += 1) {
       const current = vallisneriaLeafPoint(leaf, sample / 14);

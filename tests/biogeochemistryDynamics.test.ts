@@ -84,6 +84,86 @@ describe('active biogeochemistry', () => {
       .toBeLessThan(clear.algaeLightTransmissionAt(point) * 0.2);
   });
 
+  it('gives roots lower mineral-nitrogen half-saturation without adding matter', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 1, toxicWaste: 0.03, nutrients: 0.08, oxygen: 76 },
+    });
+    const before = ledger.snapshot().materialBalance;
+
+    expect(ledger.rootedPlantResourceFactor(point))
+      .toBeGreaterThan(ledger.algaeResourceFactor(point));
+
+    const after = ledger.snapshot().materialBalance;
+    expect(after.totalNitrogen).toBeCloseTo(before.totalNitrogen, 12);
+    expect(after.totalCarbon).toBeCloseTo(before.totalCarbon, 12);
+  });
+
+  it('keeps each tank configured sediment share as the exchange equilibrium', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 0, nutrients: 10, oxygen: 76 },
+      rootedPlantSedimentFraction: 0.6,
+      columns: 36,
+      rows: 20,
+    });
+    const before = ledger.exportSaveState();
+
+    // The initialized 60:40 tank-wide split is already at equilibrium. Merely
+    // allowing sediment exchange must not drain it toward a hidden global
+    // 30:70 ratio.
+    (ledger as unknown as {
+      exchangeSedimentNutrients(deltaSeconds: number): void;
+    }).exchangeSedimentNutrients(60);
+    const after = ledger.exportSaveState();
+    const sum = (values: number[]): number =>
+      values.reduce((total, value) => total + value, 0);
+
+    expect(sum(after.sedimentNutrients!))
+      .toBeCloseTo(sum(before.sedimentNutrients!), 10);
+    expect(sum(after.nutrients)).toBeCloseTo(sum(before.nutrients), 10);
+  });
+
+  it('uses the same finite root neighbourhood for resource response and uptake', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 0, nutrients: 0, oxygen: 76 },
+    });
+    const fields = ledger as unknown as {
+      sedimentNutrients: Float64Array;
+      dissolvedInorganicCarbon: Float64Array;
+      indexAt(point: { x: number; y: number }): number;
+    };
+    fields.dissolvedInorganicCarbon.fill(30);
+    const rootIndex = fields.indexAt(point);
+    const neighboringRootVoxel = rootIndex + 1;
+    fields.sedimentNutrients[neighboringRootVoxel] = 10;
+
+    // The exact coordinate is empty; only an adjacent voxel inside the same
+    // finite reaction/root radius contains mineral N.
+    expect(fields.sedimentNutrients[rootIndex]).toBe(0);
+    expect(ledger.rootedPlantResourceFactor(point)).toBeGreaterThan(0);
+    expect(ledger.commitRootedPlantProduction(point, 0.1)).toBeGreaterThan(0);
+    expect(fields.sedimentNutrients[neighboringRootVoxel]).toBeLessThan(10);
+  });
+
+  it('lets one rooted individual reuse only its own finite internal nitrogen', () => {
+    const ledger = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: { organicMatter: 0, toxicWaste: 0, nutrients: 0, oxygen: 76 },
+    });
+    const budget = { available: WATER_CYCLE_RULES.biomassNitrogen };
+    const before = ledger.sampleAt(point);
+
+    expect(ledger.rootedPlantResourceFactor(point, budget.available)).toBeGreaterThan(0);
+    expect(ledger.commitRootedPlantProduction(point, 1, point, budget))
+      .toBeCloseTo(1, 10);
+    expect(budget.available).toBeCloseTo(0, 10);
+    const after = ledger.sampleAt(point);
+    expect(after.toxicWaste).toBeCloseTo(before.toxicWaste, 12);
+    expect(after.nutrients).toBeCloseTo(before.nutrients, 12);
+  });
+
   it('can withdraw rooted-plant resources at one point while releasing oxygen at a leaf', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,

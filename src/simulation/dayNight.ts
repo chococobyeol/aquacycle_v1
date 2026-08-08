@@ -7,6 +7,15 @@ export interface DayNightCycleDefinition {
   nightSeconds: number;
   nightLightMultiplier: number;
   startingOffsetSeconds: number;
+  /**
+   * `plateau` preserves the authored lamp-like cycle: dawn reaches full
+   * output, the whole day stays there, and dusk fades out. `solar-arc`
+   * follows one continuous sunrise-to-sunset irradiance arc while retaining
+   * the same phase lengths and solar direction.
+   */
+  lightProfile?: 'plateau' | 'solar-arc';
+  /** Shapes the clear-sky daylight arc without changing sunrise, noon, or sunset. */
+  solarArcExponent?: number;
 }
 
 export interface DayNightState {
@@ -105,6 +114,18 @@ export const dayNightStateAt = (
     phaseProgress = cycle.nightSeconds > 0 ? (timeInCycle - duskEnd) / cycle.nightSeconds : 1;
     lightMultiplier = nightLight;
     secondsUntilTransition = cycleDurationSeconds - timeInCycle;
+  }
+
+  if (cycle.lightProfile === 'solar-arc' && timeInCycle < duskEnd) {
+    const daylightSeconds = Math.max(1, duskEnd);
+    const solarElevation = Math.sin(
+      Math.PI * clamp01(timeInCycle / daylightSeconds),
+    );
+    const shapedElevation = Math.pow(
+      solarElevation,
+      Math.max(0.05, cycle.solarArcExponent ?? 1),
+    );
+    lightMultiplier = nightLight + (1 - nightLight) * shapedElevation;
   }
 
   return {

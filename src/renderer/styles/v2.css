@@ -2818,7 +2818,7 @@
   font-size: 10px;
   font-variant-numeric: tabular-nums;
 }
-.ecology-history svg { display: block; width: 100%; height: 112px; overflow: visible; }
+.ecology-history svg { display: block; width: 100%; height: 148px; overflow: visible; }
 .ecology-history svg text {
   fill: #65736d;
   font-family: "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
@@ -2839,12 +2839,14 @@
   vector-effect: non-scaling-stroke;
 }
 .ecology-history-line.algae { stroke: #5f8a57; }
+.ecology-history-line.vallisneria { stroke: #78964d; stroke-dasharray: 4 2; }
 .ecology-history-line.shrimp-total { stroke: rgba(65, 71, 68, 0.44); stroke-width: 1.5; stroke-dasharray: 3 2; }
 .ecology-history-line.shrimp-female { stroke: #c86f62; }
 .ecology-history-line.shrimp-male { stroke: #588a91; }
 .ecology-history-line.shrimp-juvenile { stroke: #bd974b; }
 .ecology-history-line.shrimp-biomass { stroke: #765b91; stroke-width: 1.8; }
 .ecology-history-value.algae { fill: #4f794b; }
+.ecology-history-value.vallisneria { fill: #66843f; }
 .ecology-history-value.shrimp { fill: #a85d54; }
 .ecology-history-value.shrimp-biomass { fill: #765b91; }
 .population-history-legend {

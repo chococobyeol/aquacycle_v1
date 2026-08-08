@@ -61,6 +61,40 @@ describe('closed material ledger', () => {
     expect(reducedState.headspaceOxygen).toBeCloseTo(baselineState.headspaceOxygen);
   });
 
+  it('can author the former 80-percent recipe as direct starting values', () => {
+    const scaled = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: {
+        organicMatter: 1.5,
+        toxicWaste: 0.8,
+        nutrients: 6,
+        oxygen: 80,
+      },
+      initialMaterialScale: 0.8,
+    }).materialState();
+    const direct = new BiogeochemistryLedger({
+      effectsEnabled: true,
+      initial: {
+        organicMatter: 1.2,
+        toxicWaste: 0.64,
+        nutrients: 4.8,
+        oxygen: 80,
+      },
+      initialDissolvedInorganicCarbon: 46.4,
+      initialHeadspaceCarbonDioxide: 17.6,
+    }).materialState();
+
+    expect(direct.organicMatter).toBeCloseTo(scaled.organicMatter, 12);
+    expect(direct.toxicWaste).toBeCloseTo(scaled.toxicWaste, 12);
+    expect(direct.nutrients).toBeCloseTo(scaled.nutrients, 12);
+    expect(direct.dissolvedInorganicCarbon)
+      .toBeCloseTo(scaled.dissolvedInorganicCarbon, 12);
+    expect(direct.headspaceCarbonDioxide)
+      .toBeCloseTo(scaled.headspaceCarbonDioxide, 12);
+    expect(direct.dissolvedOxygen).toBeCloseTo(scaled.dissolvedOxygen, 12);
+    expect(direct.headspaceOxygen).toBeCloseTo(scaled.headspaceOxygen, 12);
+  });
+
   it('conserves finite carbon and nitrogen through reaction, decay and transport', () => {
     const ledger = new BiogeochemistryLedger({
       effectsEnabled: true,

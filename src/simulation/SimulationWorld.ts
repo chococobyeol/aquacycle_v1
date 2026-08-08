@@ -35,6 +35,7 @@ import {
   presentedAnimalCarcasses,
 } from './animalPresentation';
 import { oxygenEquivalentInventory } from './stoichiometry';
+import { allocateShrimpDebProduction } from './shrimpDeb';
 import { FIXED_LAMP_WIDTH, FIXED_LAMP_X, FIXED_LAMP_Y } from './lightGeometry';
 import {
   daylightAngleRadians,
@@ -48,6 +49,7 @@ import {
   ALGAE_PHYSIOLOGY_RESPIRATION,
   ALGAE_PHYSIOLOGY_STRESS,
   ALGAE_PHYSIOLOGY_VALUE_COUNT,
+  attachedAlgaeEffectiveLight,
   algaePhysiology,
   clamp01,
   emptyBiomass,
@@ -56,6 +58,8 @@ import {
   netGrowthPotential,
   occupied,
   producerProcessRateScale,
+  producerNaturalTurnoverRateScale,
+  resolvedSurfaceFilmBiomass,
   type AlgaePhysiologyRates,
   writeAlgaePhysiologyRates,
 } from './growth';
@@ -114,6 +118,7 @@ import {
   type PlantRametSnapshot,
   type PlanktonKind,
   type ProbeSnapshot,
+  type ProducerFluxHistoryPoint,
   type ScenarioId,
   type SelectionFilter,
   type SeedSnapshot,
@@ -223,6 +228,14 @@ interface VallisneriaLifeState {
   ageSeconds: number;
   lifespanSeconds: number;
   structuralScale: number;
+  /** Living leaf-area cohort, separated from the maximum length already attained. */
+  leafCohortScale: number;
+  /** Mineral N retained by this individual after carbohydrate respiration. */
+  nitrogenReserve: number;
+  /** Subset of total ramet biomass allocated to the next runner/plantlet. */
+  runnerReserveBiomass: number;
+  /** Realised whole-ramet biomass change in the immediately preceding growth step. */
+  lastGrowthBiomassDelta: number;
   runnerProgress: number;
   reproductionCount: number;
   stressSeconds: number;
@@ -551,6 +564,11 @@ interface LightEmitter {
 // more than once per real second only churns V8 heap pages without making
 // animals or settling stones look smoother.
 const SNAPSHOT_INTERVAL_SECONDS = 1;
+const PRODUCER_FLUX_SAMPLE_INTERVAL_SECONDS = 2;
+// A full renderer snapshot can be 64 simulated seconds apart at x64. Keep
+// enough measured ecology samples to bridge several delayed publications;
+// the renderer owns the longer observation window after receiving them.
+const PRODUCER_FLUX_HISTORY_RETENTION_SECONDS = 180;
 const PHYSICS_STEP_MS = 1000 / 60;
 const MAX_PHYSICS_STEPS = 4;
 const GROWTH_STEP_SECONDS = 0.25;
@@ -593,49 +611,150 @@ const SURFACE_FILM_DISPERSAL_SOURCE_BIOMASS =
 // Bulk food stays in locally growing patches instead of being homogenised.
 const SURFACE_FILM_FRONT_TRANSFER_PER_EDGE_PER_SECOND =
   ALGAE_VISIBLE_BIOMASS * 0.08;
-// Crossing the render threshold is only the first propagule, not an
-// established neighboring patch. Keep the front transfer active until the
-// receiving cell contains a small but grazeable film. Transfer remains
-// mass-conserving; this threshold never protects a source-cell remnant.
-const SURFACE_FILM_FRONT_ESTABLISHMENT_BIOMASS = 0.04;
-// The shared ledger's biomass unit has the C:N of active microbial/animal
-// matter. A macrophyte rosette contains much more low-nitrogen structural
-// tissue, so represent the same visible Vallisneria at a smaller ledger mass
-// instead of charging one full algal cell of nitrogen for its long leaves.
-// All Vallisneria reserve, runner and display thresholds use this same scale.
-const VALLISNERIA_LEDGER_BIOMASS_SCALE = 0.55;
+// A fast front represents only the thin material needed to establish a new
+// visible sampling tile. Requiring 0.04 B in every crossed tile (one third of
+// an entire 0.12-B inoculum) spread nearly all real food into hundreds of
+// under-density cells. Stop the accelerated transfer just above the visible
+// threshold; subsequent local growth, not continued source drainage, builds
+// a grazeable mature patch.
+const SURFACE_FILM_FRONT_ESTABLISHMENT_BIOMASS =
+  ALGAE_VISIBLE_BIOMASS * 2;
+// Once a neighboring tile has a real established film, attached colonies do
+// not keep equalising like a dissolved concentration. Most lateral expansion
+// then comes from local growth at the living edge; retain only a small
+// propagule exchange between mature tiles. The fast, mass-conserving trace
+// front above is unchanged, so visual colonisation remains responsive without
+// draining every productive patch into a tank-wide 0.02-B haze.
+const SURFACE_FILM_MATURE_DISPERSAL_MULTIPLIER = 0.10;
+// The shared B ledger has the C:N composition of active algae/animal matter;
+// it is not a gram-for-gram dry-mass unit. Vallisneria contains far more
+// carbon-rich, nitrogen-poor support tissue, and its real dry mass is already
+// represented visually by structuralScale and the leaf geometry. Charging the
+// full dry-mass proxy (6 B) through this generic ledger made one ramet consume
+// about eleven times the former nutrient-equivalent budget and drove every
+// long run from a stand to one or two plants while attached algae inherited
+// the released nitrogen. Until the ledger carries species-specific C:N, keep
+// one adult rosette on the calibrated nutrient/metabolic-equivalent scale.
+const VALLISNERIA_ADULT_BIOMASS = 0.55;
 // Rooted-plant stock is a separate object budget. Do not silently change its
 // supplied matter whenever the surface-film inoculum is recalibrated.
+// Inventory stock is a rooted young rosette, not an adult crown preloaded for
+// immediate clonal expansion. At 24% of adult-equivalent matter, its biomass
+// matches the 62-70% living leaf cohort below with only a modest rhizome
+// reserve. The former 45% packet classified roughly half of the founder's
+// entire mass as runner-specific reserve, producing a founder-only boom that
+// later generations could not reproduce.
 const VALLISNERIA_SEED_BIOMASS =
-  0.4 * VALLISNERIA_LEDGER_BIOMASS_SCALE;
+  0.24 * VALLISNERIA_ADULT_BIOMASS;
+// The biomass-to-leaf relation is also used in reverse when a ramet pays for a
+// runner. This keeps its current crown, roots and living leaf cohort intact;
+// only biomass accumulated above that same vegetative requirement is
+// transferable. A fixed "retain 18%/25% of an adult" threshold ignored the
+// actual size of the individual and either stripped a large parent or blocked
+// a smaller healthy one at 100% runner progress.
+const VALLISNERIA_MIN_RESERVE_SCALE = 0.16;
+const VALLISNERIA_BASE_VEGETATIVE_BIOMASS =
+  0.02 * VALLISNERIA_ADULT_BIOMASS;
+const VALLISNERIA_LEAF_BIOMASS_RANGE =
+  0.32 * VALLISNERIA_ADULT_BIOMASS;
+const vallisneriaBiomassForLeafScale = (leafScale: number): number =>
+  VALLISNERIA_BASE_VEGETATIVE_BIOMASS +
+  clamp01(
+    (leafScale - VALLISNERIA_MIN_RESERVE_SCALE) /
+      (1 - VALLISNERIA_MIN_RESERVE_SCALE),
+  ) * VALLISNERIA_LEAF_BIOMASS_RANGE;
+// A runner-born ramet must first paint an unmistakable established leaf
+// rosette before it redirects surplus to its own daughter. The former 0.42
+// gate let a young clone start the next runner while its leaves were still
+// small, repeatedly draining biomass at about 0.59 visible scale. Individual
+// nitrogen reserve now follows the ramet, so a healthy daughter can reach this
+// structural gate without borrowing a population-wide nutrient store.
+// Independent daughters first finish a clearly adult-sized leaf cohort.
+// Allocation starts only after that transition, so later generations do not
+// remain permanently shorter merely because they begin building a runner.
+const VALLISNERIA_REPRODUCTIVE_STRUCTURAL_SCALE = 0.88;
+const VALLISNERIA_FULL_RUNNER_ALLOCATION_SCALE = 0.96;
+// Once a ramet has an independently functioning leaf cohort, part of each
+// realised positive biomass increment is allocated to clonal reproduction.
+// The remainder continues crown/root/leaf growth. This is a plastic allocation
+// rule, not free biomass or a fixed adult-mass birth threshold.
+const VALLISNERIA_MAX_RUNNER_ALLOCATION = 0.62;
 const VALLISNERIA_CELL_BIOMASS_CAPACITY =
-  VALLISNERIA_LEDGER_BIOMASS_SCALE;
+  VALLISNERIA_ADULT_BIOMASS;
 const VALLISNERIA_VISIBLE_BIOMASS =
-  0.004 * VALLISNERIA_LEDGER_BIOMASS_SCALE;
-// One authored day/night cycle is 360 seconds. A runner-born ramet therefore
-// needs about a day and a half to establish instead of becoming reproductive
-// after a single cycle.
-const VALLISNERIA_JUVENILE_SECONDS = 540;
-const VALLISNERIA_MIN_LIFESPAN_SECONDS = 2_400;
-const VALLISNERIA_MAX_LIFESPAN_SECONDS = 3_300;
+  0.004 * VALLISNERIA_ADULT_BIOMASS;
+// One authored day/night cycle is 360 seconds. The compressed plant life now
+// uses the same relative scale as the shrimp generation, so a healthy runner
+// can visibly establish during most of one cycle.
+const VALLISNERIA_JUVENILE_SECONDS = 270;
+// Calendar longevity is compressed independently from metabolic fluxes so a
+// player can observe growth, senescence, death and clonal replacement in one
+// mission. At x64 this is roughly 56-94 real seconds. The wider individual
+// range prevents every parent/daughter cohort from entering senescence in the
+// same few cycles while remaining far below the former invisible 67-89 cycles.
+const VALLISNERIA_MIN_LIFESPAN_SECONDS = 3_600;
+const VALLISNERIA_MAX_LIFESPAN_SECONDS = 6_000;
 const VALLISNERIA_SENESCENCE_START_RATIO = 0.82;
-// Healthy ramets still spread visibly during a mission, but no longer create
-// another daughter every ~1.7 authored days before density feedback matters.
-const VALLISNERIA_RUNNER_INTERVAL_SECONDS = 900;
-const VALLISNERIA_RUNNER_BIOMASS =
-  0.16 * VALLISNERIA_LEDGER_BIOMASS_SCALE;
+// A healthy ramet needs most of one authored day/night cycle of favourable
+// canopy conditions to finish a runner. The progress slows or reverses under
+// poor light and the daughter is still paid from the parent's real surplus.
+// The former 1,200-second clock was calibrated while Vallisneria physiology
+// was accidentally running at 80x; after separating that multiplier it made a
+// healthy supplied rosette miss its first replacement before senescence.
+// A healthy adult needs about one complete authored day/night cycle to finish
+// a runner. Now that rooting no longer pays future daughter support up front,
+// the former 270-second interval overproduced early ramets and displaced too
+// much of the shared producer resource before ordinary competition responded.
+// Poor-light progress still slows or reverses normally.
+const VALLISNERIA_RUNNER_INTERVAL_SECONDS = 360;
+const VALLISNERIA_RUNNER_INITIAL_STRUCTURAL_SCALE = 0.24;
+// A daughter starts with the real biomass implied by its small initial leaf
+// cohort. It is not assigned an unrelated percentage of the largest adult.
+const VALLISNERIA_RUNNER_BIOMASS = vallisneriaBiomassForLeafScale(
+  VALLISNERIA_RUNNER_INITIAL_STRUCTURAL_SCALE,
+);
+const VALLISNERIA_RUNNER_HEALTHY_SCALE = 0.34;
+const VALLISNERIA_RUNNER_HEALTHY_BIOMASS = vallisneriaBiomassForLeafScale(
+  VALLISNERIA_RUNNER_HEALTHY_SCALE,
+);
 const VALLISNERIA_RUNNER_MIN_DISTANCE = 42;
 const VALLISNERIA_RUNNER_MAX_DISTANCE = 170;
 const VALLISNERIA_LOW_RESERVE =
-  0.055 * VALLISNERIA_LEDGER_BIOMASS_SCALE;
-const VALLISNERIA_LOW_RESERVE_GRACE_SECONDS = 150;
+  0.035 * VALLISNERIA_ADULT_BIOMASS;
+const VALLISNERIA_LOW_RESERVE_GRACE_SECONDS = 75;
 // A stolon stays connected through the daughter's juvenile establishment.
 // Transfer is deliberately bounded and mass-conserving: it buffers a shaded
 // daughter but cannot create biomass or drain the parent below its own reserve.
 const VALLISNERIA_CLONAL_SUPPORT_PER_SECOND =
-  0.00055 * VALLISNERIA_LEDGER_BIOMASS_SCALE;
-const VALLISNERIA_CLONAL_SUPPORT_TARGET =
-  0.22 * VALLISNERIA_LEDGER_BIOMASS_SCALE;
+  0.00110 * VALLISNERIA_ADULT_BIOMASS;
+// A parent that starts a runner must be able to finish supporting the juvenile
+// within the same juvenile establishment window. The former 900-second trickle
+// outlived many late-life parents and severed daughters near their tiny birth
+// packet even though the UI had shown a completed runner.
+const VALLISNERIA_CLONAL_ESTABLISHMENT_SECONDS =
+  VALLISNERIA_JUVENILE_SECONDS;
+// A detached 20%-adult plantlet painted only a ~49%-scale rosette. In the
+// long-running mission-6 tank that small crown could balance respiration but
+// not accumulate enough new tissue to rise out of an older sibling's shade,
+// even though the UI correctly reported it as alive. Vegetative Vallisneria
+// ramets remain integrated until the daughter has a genuinely independent
+// leaf/root system, so support now targets a one-third-adult rosette and also
+// waits for the attained leaf cohort below before disconnecting.
+const VALLISNERIA_CLONAL_INDEPENDENCE_SCALE = 0.68;
+const VALLISNERIA_CLONAL_SUPPORT_TARGET = vallisneriaBiomassForLeafScale(
+  VALLISNERIA_CLONAL_INDEPENDENCE_SCALE,
+);
+// Rooting pays the daughter's actual initial tissue packet. Subsequent support
+// is transferred, mass-conservingly, through the still-connected stolon in
+// stepVallisneriaClonalIntegration. Pre-funding part of that future support
+// here charged it twice and left a completed runner waiting while an older
+// cohort died; no free biomass is introduced by removing the duplicate gate.
+const VALLISNERIA_RUNNER_COMMITMENT_BIOMASS =
+  VALLISNERIA_RUNNER_BIOMASS;
+// Candidate tips are evaluated with the leaves a newborn actually has, not a
+// fictitious adult canopy. This is only a soft, local foraging bias in the
+// weighted choice below: a daughter may still root in a poor patch and fail.
+// The model must never know its future survival or reject every risky site.
 // The ledger does not yet expose a separate sediment nutrient pool. Split
 // uptake between the rooted bottom-water proxy and the leaf surfaces instead
 // of pretending the root cell contains the entire sediment reserve.
@@ -662,12 +781,14 @@ const SHRIMP_TOXIC_STRESS_START = SHRIMP_ECOLOGY_RULES.toxicWasteStressStart;
 const SHRIMP_TOXIC_STRESS_FULL = SHRIMP_ECOLOGY_RULES.toxicWasteFullStress;
 const SHRIMP_WATER_RECOVERY_RATE = SHRIMP_ECOLOGY_RULES.healthyWaterRecoveryPerSecond;
 // The condition meter includes 28% healthy structure plus short-term reserve.
-// Starting at 0.48 and stopping at 0.70 made a structurally complete adult
-// keep scraping until it had stored an implausibly large fraction of its body
-// mass. Preserve visible feeding and hysteresis, but stop after a plausible
-// short feeding buffer.
-const SHRIMP_ADULT_FORAGE_START_ENERGY = 0.38;
-const SHRIMP_ADULT_FORAGE_STOP_ENERGY = 0.44;
+// A 0.38 start threshold left a full-sized adult with only about sixty seconds
+// of reserve plus expendable structure when it first began searching. Ordinary
+// local travel could therefore kill a stocked male beside a food-rich surface.
+// Begin at the supplied young-adult condition instead; stop at 0.54, which is
+// only about 36% of the finite 0.06-B reserve compartment, not continuous
+// feeding or an enlarged fasting store.
+const SHRIMP_ADULT_FORAGE_START_ENERGY = 0.46;
+const SHRIMP_ADULT_FORAGE_STOP_ENERGY = 0.54;
 // The energy meter describes present somatic condition. Juvenile growth demand
 // is handled separately in the foraging decision below, so a healthy but
 // undersized animal does not need an oversized hidden reserve just to keep
@@ -682,20 +803,21 @@ const SHRIMP_GRAZE_DISTANCE = 15;
 // Target choice and intake both use the real remaining biomass. Density
 // response below makes a trace patch unattractive without reserving an
 // uneatable floor.
-// Surface-cell biomass is bounded to 1. At the current 0.00155-B/s maximum
-// bite, K=0.07 gives a low-density slope of about 0.022/s: thin spread remains
-// edible and visibly grazed without letting a one-second fast-forward ecology
-// step erase a propagule cell numerically.
+// Surface-cell biomass is bounded to 1, while a thin colonisation front and a
+// locally mature feeding patch occupy different parts of that range. The
+// functional response is calibrated in the same contacted-sample scale;
+// exact allocation below still prevents a coarse fast-forward step from
+// consuming more than the cell actually contains.
 const SHRIMP_OEDOGONIUM_FOOD_QUALITY = 0.72;
 const SHRIMP_DECOMPOSER_FOOD_WEIGHT = 0.45;
 const SHRIMP_NITRIFIER_FOOD_WEIGHT = 0.22;
+// Local chemical/contact search remains below two adult body lengths; a more
+// distant surface is approached only through the dissolved cue field.
 const SHRIMP_LOCAL_FOOD_RADIUS = 64;
 // Surface-cell feeding requests already share the exact remaining biomass.
-// The former 20-point score penalty made a bookkeeping tile behave like an
-// exclusive territory and split identical hatchmates into fed/starved paths.
-// Retain only a mild preference for another equally profitable nearby tile;
-// the request allocator below remains the actual competition mechanism.
-const SHRIMP_TARGET_CELL_CONGESTION_PENALTY = 5;
+// A bookkeeping tile is not an exclusive territory: actual standing food and
+// the mass-conserving request allocator are the competition mechanism.
+const SHRIMP_TARGET_CELL_CONGESTION_PENALTY = 0;
 // Dissolved food odour is sampled across approximately one water-grid cell.
 // It guides movement without identifying a distant food cell.
 const SHRIMP_FOOD_CUE_SAMPLE_RADIUS = 42;
@@ -706,6 +828,12 @@ const SHRIMP_FOOD_CUE_UPSTREAM_WEIGHT = 0.18;
 // a navigational target from another tile. Otherwise adjacent numerical
 // remnants repeatedly override the dissolved cue from a visibly rich colony.
 const SHRIMP_LOCAL_PATCH_NAVIGATION_CUE_MINIMUM = 0.05;
+// Once reserve has fallen below the ordinary forage threshold, a trace film
+// whose realised intake cannot repay grazing metabolism must not repeatedly
+// interrupt a stronger dissolved-food gradient. This is a local cue threshold,
+// not protected biomass: a shrimp already touching the trace can still scrape
+// it to exactly zero, while active search prefers a patch capable of recovery.
+const SHRIMP_HUNGRY_PATCH_NAVIGATION_CUE_MINIMUM = 0.12;
 // Within roughly two adult body lengths, stronger food odour/contact cues can
 // outweigh a modest extra walk. This is sensory salience, not foreknowledge of
 // how much growth or egg production the patch could fund.
@@ -716,15 +844,22 @@ const SHRIMP_LOCAL_PATCH_CUE_DISTANCE_WEIGHT = 0.85;
 // maintenance; no remote cell is evaluated against an internal matter budget.
 const SHRIMP_PATCH_SAMPLE_MINIMUM_SECONDS = 3;
 const SHRIMP_MINIMUM_REALISED_GRAZING_RETURN = 1;
-// N. davidi males are pure-searching rather than long-range mate homing.
-// A ready female therefore supplies only a short-lived local chemical hint;
-// physical proximity is still required for mating.
-const SHRIMP_MATE_CUE_SAMPLE_RADIUS = 42;
-const SHRIMP_MATE_CUE_MINIMUM = 0.006;
-const SHRIMP_MATE_CUE_GRADIENT_MINIMUM = 0.001;
-const SHRIMP_MATE_CUE_UPSTREAM_WEIGHT = 0.12;
+// N. davidi males are pure-searching rather than directly homing to a known
+// female. A receptive female's water-soluble cue nevertheless needs to span
+// more than one body-length neighbourhood in this compressed aquarium, or two
+// healthy adults can remain reproductively isolated for an entire remaining
+// lifetime. Males still sample only the local concentration field and mating
+// still requires physical contact below.
+const SHRIMP_MATE_CUE_SAMPLE_RADIUS = 126;
+const SHRIMP_MATE_CUE_MINIMUM = 0.001;
+const SHRIMP_MATE_CUE_GRADIENT_MINIMUM = 0.00015;
+const SHRIMP_MATE_CUE_UPSTREAM_WEIGHT = 0.08;
 
-const SHRIMP_MATE_CUE_EMISSION_START_PROGRESS = 0.82;
+// Premating chemical signalling begins before the ovary reaches its final
+// locked-clutch state. Waiting until 82% left only a short overlap between a
+// distant low-density pair's cue-guided search and their unchanged lifespan.
+// Contact and fully food-funded egg matter are still mandatory below.
+const SHRIMP_MATE_CUE_EMISSION_START_PROGRESS = 0.70;
 // Cherry shrimp detect deteriorating water with short-range chemical and
 // oxygen cues. The probe radius is deliberately about one-and-a-half adult
 // body lengths: it lets an animal follow a local gradient away from a waste
@@ -799,12 +934,16 @@ const SHRIMP_POST_GRAZE_ROAM_VARIANCE_SECONDS = 1.5;
 // sooner after a productive bout. Sampling an underpaying patch retains the
 // full roaming interval so it can search elsewhere.
 const SHRIMP_HUNGRY_POST_GRAZE_ROAM_MAXIMUM_REDUCTION = 0.65;
-// Leaving a feeding bout must produce real movement rather than selecting the
-// identical bookkeeping cell on the next evaluation. This is a short local
-// revisit delay; the old cell remains a fallback when no other profitable
-// surface is available.
-const SHRIMP_RECENT_GRAZING_CELL_COOLDOWN_SECONDS = 10;
-const SHRIMP_JUVENILE_RECENT_GRAZING_CELL_COOLDOWN_SECONDS = 15;
+// The sampled-patch memory must still exist when the mandatory roaming interval
+// ends. The former 1-1.5 s memory always expired inside the 2.5-4 s roam, so a
+// juvenile could immediately choose the same underpaying trace again despite a
+// stronger local cue. Keep it only through the next target decision: the old
+// patch remains a fallback when no other edible surface is locally available.
+const SHRIMP_RECENT_GRAZING_CELL_COOLDOWN_SECONDS =
+  SHRIMP_POST_GRAZE_ROAM_MIN_SECONDS +
+  SHRIMP_POST_GRAZE_ROAM_VARIANCE_SECONDS + 0.5;
+const SHRIMP_JUVENILE_RECENT_GRAZING_CELL_COOLDOWN_SECONDS =
+  SHRIMP_RECENT_GRAZING_CELL_COOLDOWN_SECONDS + 0.5;
 // In a healthy tank adults settle near 0.5 energy. Reproduction is therefore
 // gated by current reserve and recent access to food rather than a hidden
 // population-capacity formula.
@@ -842,16 +981,6 @@ export const shrimpMaintenanceDeficitClockDelta = (
  * tank-born female has lower maintenance than a supplied 1-B adult, while the
  * actual clutch transfer remains explicit in the second term.
  */
-export const shrimpOvarianRecentIntakeRequirement = (
-  maintenanceBiomassPerSecond: number,
-  ovarianAllocationBiomassPerSecond: number,
-  assimilationFraction: number,
-  observationWindowSeconds: number,
-): number => (
-  Math.max(0, maintenanceBiomassPerSecond) +
-  Math.max(0, ovarianAllocationBiomassPerSecond)
-) * Math.max(0, observationWindowSeconds) /
-  Math.max(1e-9, assimilationFraction);
 // The visible 0..1 nutritional condition is derived from conserved animal
 // matter instead of being a second, independently drained hunger tank.
 // Reserve and a small viable share of structure therefore pay maintenance,
@@ -864,9 +993,8 @@ const SHRIMP_ADULT_MINIMUM_VIABLE_STRUCTURE_RATIO = 0.99;
 // Juvenile N. davidi reaches the point of no return under food deprivation
 // sooner than an adult. A five-percent expendable body margin made a hatchling
 // outlast a stocked adult even though the hatchling has no separate reserve.
-// Two percent keeps starvation a consequence of conserved tissue loss while
-// restoring the observed juvenile vulnerability instead of adding a second
-// hidden health drain.
+// Two percent keeps starvation a consequence of conserved tissue loss without
+// giving a hatchling a longer fasting buffer than a supplied adult.
 const SHRIMP_JUVENILE_MINIMUM_VIABLE_STRUCTURE_RATIO = 0.98;
 // The condition meter is reserve-led. Healthy structure contributes a small
 // baseline, but it is not treated as ordinary stored food; structure is only
@@ -880,36 +1008,26 @@ const SHRIMP_SUPPLIED_INITIAL_ENERGY =
   SHRIMP_RESERVE_CONDITION_SHARE *
     WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass /
     WATER_CYCLE_RULES.shrimp.adultReserveBiomass;
+// `juvenileBirthBiomass` is the complete conserved egg packet, not pure
+// structure. Keep one canonical split so body length, development, reserve
+// capacity and starvation all use the same DEB state at hatching.
+const SHRIMP_BIRTH_RESERVE_TO_STRUCTURE_RATIO =
+  WATER_CYCLE_RULES.shrimp.adultReserveBiomass /
+  WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+const SHRIMP_BIRTH_STRUCTURAL_BIOMASS =
+  WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass /
+  (1 + SHRIMP_BIRTH_RESERVE_TO_STRUCTURE_RATIO);
+const SHRIMP_BIRTH_RESERVE_BIOMASS =
+  WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass -
+  SHRIMP_BIRTH_STRUCTURAL_BIOMASS;
 // Adult females gradually allocate feeding surplus to eggs instead of needing
 // the complete clutch to appear in ordinary reserve at a single instant.
-// Egg matter and somatic condition recover in parallel after feeding. Protect
-// a size-scaled 1.2% structural reserve from
-// egg allocation and post-maturity growth. The same floor keeps a mature male
-// in mating condition after paying for real somatic growth; without it, every
-// tank-born male consumed his entire courtship reserve while growing and the
-// lineage stopped even as algae recovered. This is an individual body-
-// condition budget, not a population-count override.
-// With reserve capacity fixed at 6% of achieved structure, 1.2% retained
-// reserve produces condition 0.424 (= 0.28 structure + 0.72 × 0.20 reserve).
-// That is deliberately just above the 0.40 female mating gate. The former
-// 0.8% floor produced condition 0.376: a female that finished paying for her
-// eggs stopped reproductive foraging and simultaneously became ineligible to
-// mate, even in a food-rich tank.
-const SHRIMP_REPRODUCTIVE_ALLOCATION_PROTECTED_RESERVE_FRACTION = 0.012;
-// Juvenile growth is paid continuously from conserved reserve after
-// maintenance. Four percent of that individual's achieved structure remains
-// protected between grazing bouts. This must be a body-size ratio: the former
-// fixed 0.024-B floor was larger than a hatchling's whole 0.0175-B body and
-// left a half-grown juvenile with tens of compressed minutes of hidden food.
-const SHRIMP_JUVENILE_GROWTH_RESERVE_FRACTION = 0.04;
-// Metamorphosis into the adult feeding/reproductive state requires a small
-// conserved reserve as well as mature structure. Otherwise a juvenile reaches
-// the mass threshold with only the growth floor, immediately loses its
-// juvenile foraging capacity, and can never fund its first ovary or molt.
-const SHRIMP_MATURATION_RESERVE_BIOMASS =
-  WATER_CYCLE_RULES.shrimp.adultReserveBiomass *
-  SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass /
-  WATER_CYCLE_RULES.shrimp.adultStructuralBiomass * 0.5;
+// Egg matter and somatic condition recover in parallel after feeding. DEB
+// reserve density itself slows optional production continuously as the reserve
+// empties. Do not add a second protected survival floor: it made underfed
+// juveniles remain small consumers until old age instead of spending their
+// conserved reserve through the same growth/maintenance rules as every other
+// individual.
 // Longer approach is handled by the dissolved female cue sampled by males;
 // the mating timer itself still requires near-body contact.
 const SHRIMP_MATING_ENCOUNTER_RADIUS = 36;
@@ -2277,7 +2395,8 @@ const shrimpOvarianCycleSeconds = (
   );
 
 const shrimpClutchSizeForStructure = (structuralBiomass: number): number => {
-  const maturity = SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+  const maturity =
+    SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
   const fullSize = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
   const sizeProgress = clamp01(
     (structuralBiomass - maturity) /
@@ -2290,6 +2409,25 @@ const shrimpClutchSizeForStructure = (structuralBiomass: number): number => {
         SHRIMP_ECOLOGY_RULES.minimumClutchSize
       ) * sizeProgress,
   );
+};
+
+/**
+ * Sexual maturity is not maximum body size. Use the same conserved somatic
+ * axis for the rendered post-hatch growth instead of jumping every newly
+ * mature 0.09-B shrimp to the supplied 1-B adult drawing.
+ */
+const shrimpBodyLengthForStructure = (structuralBiomass: number): number => {
+  const birthMass = SHRIMP_BIRTH_STRUCTURAL_BIOMASS;
+  const adultMass = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+  const lengthProgress = clamp01(
+    (
+      Math.cbrt(Math.max(birthMass, structuralBiomass)) -
+        Math.cbrt(birthMass)
+    ) /
+      Math.max(1e-9, Math.cbrt(adultMass) - Math.cbrt(birthMass)),
+  );
+  return SHRIMP_JUVENILE_LENGTH +
+    (SHRIMP_ADULT_LENGTH - SHRIMP_JUVENILE_LENGTH) * lengthProgress;
 };
 
 const shrimpGestationSeconds = (
@@ -2369,6 +2507,8 @@ export class SimulationWorld {
   private growthAccumulator = 0;
   private animalMotionAccumulator = 0;
   private snapshotAccumulator = 0;
+  private producerFluxHistory: ProducerFluxHistoryPoint[] = [];
+  private nextProducerFluxSampleAt = 0;
   private snapshotDirty = true;
   private successHoldAccumulator = 0;
   private revision = 0;
@@ -2723,6 +2863,8 @@ export class SimulationWorld {
     this.growthAccumulator = 0;
     this.animalMotionAccumulator = 0;
     this.snapshotAccumulator = 0;
+    this.producerFluxHistory = [];
+    this.nextProducerFluxSampleAt = 0;
     this.snapshotDirty = true;
     this.successHoldAccumulator = 0;
     this.held = null;
@@ -2776,6 +2918,17 @@ export class SimulationWorld {
       effectsEnabled: Boolean(this.scenario.waterCycle),
       initial: this.scenario.waterCycle?.initial,
       initialMaterialScale: this.scenario.waterCycle?.initialMaterialScale,
+      initialDissolvedInorganicCarbon:
+        this.scenario.waterCycle?.initialDissolvedInorganicCarbon,
+      initialHeadspaceCarbonDioxide:
+        this.scenario.waterCycle?.initialHeadspaceCarbonDioxide,
+      // A rooted-plant scenario partitions existing mineral nitrogen between
+      // water and finite bottom sediment; it does not add mission resources.
+      rootedPlantSedimentFraction: this.scenario.allowedSpecies.includes(
+        'vallisneria',
+      )
+        ? this.scenario.waterCycle?.rootedPlantSedimentFraction ?? 0.3
+        : 0,
       initialTemperature: this.waterTemperature,
       columns: this.tank.waterColumns,
       rows: this.tank.waterRows,
@@ -3074,6 +3227,7 @@ export class SimulationWorld {
           this.stepAnimalEcology(growthStepSeconds);
           this.stepBiofilmDispersal(growthStepSeconds);
           this.resolveBiogeochemistry(growthStepSeconds);
+          this.recordProducerFluxSample();
           this.evaluateMission(growthStepSeconds);
           growthSteps += 1;
           processedEvent = true;
@@ -3135,6 +3289,10 @@ export class SimulationWorld {
     const biogeochemistry = this.biogeochemistry.snapshot(target.biogeochemistry);
     biogeochemistry.biofilmTotals.decomposer = decomposerBiofilm;
     biogeochemistry.biofilmTotals.nitrifier = nitrifierBiofilm;
+    biogeochemistry.rootedPlantStoredNitrogen = this.seedPlacements.reduce(
+      (sum, placement) => sum + Math.max(0, placement.plant?.nitrogenReserve ?? 0),
+      0,
+    );
     const materialTotals = this.computeMaterialTotals();
     const reference = this.materialReference;
     const materialBalance = biogeochemistry.materialBalance;
@@ -3331,6 +3489,18 @@ export class SimulationWorld {
     Object.assign(deathsByCause, this.animalPopulationEventTotals.deathsByCause);
     target.animalPopulationEventTotals = eventTotals;
     target.biogeochemistry = biogeochemistry;
+    const producerFluxHistory = target.producerFluxHistory ?? [];
+    for (let index = 0; index < this.producerFluxHistory.length; index += 1) {
+      const source = this.producerFluxHistory[index];
+      const point = producerFluxHistory[index] ?? {} as ProducerFluxHistoryPoint;
+      point.elapsedSeconds = source.elapsedSeconds;
+      point.effectiveLight = source.effectiveLight;
+      point.grossPhotosynthesis = source.grossPhotosynthesis;
+      point.producerRespiration = source.producerRespiration;
+      producerFluxHistory[index] = point;
+    }
+    producerFluxHistory.length = this.producerFluxHistory.length;
+    target.producerFluxHistory = producerFluxHistory;
     target.coverageRatio = coverageRatio;
     target.missionProgress = missionProgress;
     target.message = this.message;
@@ -3556,6 +3726,22 @@ export class SimulationWorld {
           ? placement.plant
             ? {
               ...placement.plant,
+              leafCohortScale: placement.plant.leafCohortScale ??
+                placement.plant.structuralScale,
+              nitrogenReserve: Math.max(0, placement.plant.nitrogenReserve ?? 0),
+              runnerReserveBiomass: clamp(
+                placement.plant.runnerReserveBiomass ?? Math.max(
+                  0,
+                  (this.cellById(placement.cellId)?.biomass.vallisneria ?? 0) -
+                    vallisneriaBiomassForLeafScale(
+                      placement.plant.leafCohortScale ??
+                        placement.plant.structuralScale,
+                    ),
+                ),
+                0,
+                this.cellById(placement.cellId)?.biomass.vallisneria ?? 0,
+              ),
+              lastGrowthBiomassDelta: 0,
               connectedToParent: placement.plant.connectedToParent ?? (
                 placement.plant.parentId !== null &&
                 placement.plant.ageSeconds < VALLISNERIA_JUVENILE_SECONDS
@@ -3637,7 +3823,6 @@ export class SimulationWorld {
         ),
         ovarianClutchSize:
           animal.speciesId === 'cherry-shrimp' &&
-          animal.lifeStage === 'adult' &&
           animal.sex === 'female'
             ? clamp(
               Math.round(
@@ -3688,6 +3873,15 @@ export class SimulationWorld {
         gestatingBroodSize: animal.gestatingBroodSize ?? null,
       });
     });
+    // Older saves could store a non-material ovarian timer ahead of the egg
+    // matter actually present. Preserve every conserved compartment exactly,
+    // then derive the displayed/readiness state from that matter instead of
+    // minting eggs to honour a legacy percentage.
+    for (const animal of this.animals) {
+      if (animal.speciesId === 'cherry-shrimp') {
+        this.synchroniseShrimpOvarianState(animal);
+      }
+    }
     this.carcasses = [];
     for (const carcass of data.carcasses) {
       const lifetimeSeconds = animalCarcassLifetimeSeconds(carcass.speciesId);
@@ -3889,13 +4083,18 @@ export class SimulationWorld {
       0,
     );
     const suspended = this.suspendedBiofilm.nitrifier;
+    const plantNitrogenReserve = this.seedPlacements.reduce(
+      (sum, placement) => sum + Math.max(0, placement.plant?.nitrogenReserve ?? 0),
+      0,
+    );
     const biologicalMatter = water.organicMatter + water.detritus +
       surfaceBiomass + animalBiomass + suspended +
       water.planktonicDecomposer + water.phytoplankton + water.daphnia;
     const organicCarbon = biologicalMatter * WATER_CYCLE_RULES.biomassCarbon;
     return {
       nitrogen: water.toxicWaste + water.nutrients +
-        biologicalMatter * WATER_CYCLE_RULES.biomassNitrogen,
+        biologicalMatter * WATER_CYCLE_RULES.biomassNitrogen +
+        plantNitrogenReserve,
       carbon: water.dissolvedInorganicCarbon + water.headspaceCarbonDioxide +
         organicCarbon,
       oxygenEquivalent: oxygenEquivalentInventory({
@@ -4531,6 +4730,7 @@ export class SimulationWorld {
           cell.index,
           this.cellWorldPoint(cell),
           placement.plant.structuralScale,
+          this.vallisneriaLeafRetention(placement.plant),
         );
         const intersects = canopy.maxX >= bounds.minX && canopy.minX <= bounds.maxX &&
           canopy.maxY >= bounds.minY && canopy.minY <= bounds.maxY;
@@ -5194,6 +5394,7 @@ export class SimulationWorld {
         (
           this.scenario.id === 'mission-4' ||
           this.scenario.id === 'mission-5' ||
+          this.scenario.id === 'mission-6' ||
           this.scenario.id === 'mission-8'
         ) &&
         this.phase === 'paused'
@@ -5203,7 +5404,11 @@ export class SimulationWorld {
   private canPlaceInventorySeed(): boolean {
     return this.canEdit() ||
       (
-        (this.scenario.id === 'mission-4' || this.scenario.id === 'mission-5') &&
+        (
+          this.scenario.id === 'mission-4' ||
+          this.scenario.id === 'mission-5' ||
+          this.scenario.id === 'mission-6'
+        ) &&
         this.phase === 'paused'
       );
   }
@@ -6025,12 +6230,13 @@ export class SimulationWorld {
       if (!cell || cell.biomass.vallisneria <= VALLISNERIA_VISIBLE_BIOMASS) return [];
       const anchor = this.vallisneriaRootPosition(placement, cell);
       const scale = placement.plant.structuralScale;
+      const leafRetention = this.vallisneriaLeafRetention(placement.plant);
       return [{
         plantId: placement.id,
-        bounds: vallisneriaCanopyBounds(cell.index, anchor, scale),
+        bounds: vallisneriaCanopyBounds(cell.index, anchor, scale, leafRetention),
         structuralScale: scale,
         leafOpticalDepth: 0.035 + scale * 0.028,
-        leafSamples: vallisneriaLeaves(cell.index, anchor, scale).map((leaf) =>
+        leafSamples: vallisneriaLeaves(cell.index, anchor, scale, leafRetention).map((leaf) =>
           Array.from({ length: 7 }, (_, index) =>
             vallisneriaLeafPoint(leaf, (index + 1) / 8)
           )
@@ -6089,8 +6295,11 @@ export class SimulationWorld {
         const scale = alive
           ? Math.round(placement.plant!.structuralScale / VALLISNERIA_CANOPY_LIGHT_QUANTIZATION)
           : 0;
+        const retainedLeaves = alive
+          ? Math.round(this.vallisneriaLeafRetention(placement.plant!) * 20)
+          : 0;
         const root = cell ? this.vallisneriaRootPosition(placement, cell) : null;
-        return `${placement.id}:${placement.cellId}:${root?.x.toFixed(2)}:${root?.y.toFixed(2)}:${scale}`;
+        return `${placement.id}:${placement.cellId}:${root?.x.toFixed(2)}:${root?.y.toFixed(2)}:${scale}:${retainedLeaves}`;
       })
       .sort()
       .join('|');
@@ -6426,38 +6635,48 @@ export class SimulationWorld {
       const nutritionalForaging =
         animal.energy <= forageStartEnergy ||
         (wasForaging && animal.energy < forageStopEnergy);
+      const adultGrowthForaging =
+        animal.lifeStage === 'adult' &&
+        animal.structuralBiomass + 1e-9 <
+          WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
       const mateCueDirection = nutritionalForaging
         ? null
         : this.shrimpMateCueDirection(animal);
-      const reserveCondition = this.shrimpReserveCondition(animal);
       const reproductiveForaging =
-        animal.lifeStage === 'adult' &&
-        animal.sex === 'female' &&
-        (
-          animal.reproductiveBiomass + 1e-9 <
-            this.shrimpOvarianMatterTarget(animal) ||
-          (animal.ovarianProgress ?? 0) < 1
-        );
+        this.shrimpOvarianDevelopmentEligible(animal) &&
+        animal.reproductiveBiomass + 1e-9 <
+          this.shrimpOvarianMatterTarget(animal);
       // Present condition and developmental demand are different signals.
-      // A juvenile with a full short-term reserve still has to acquire the
-      // conserved structural matter missing from sexual maturity. Previously
-      // that demand was represented by a fixed 0.09-B store; shrinking the
-      // physical store then made healthy hatchlings stop feeding permanently.
+      // Somatic maturity is shared by both sexes. Ovarian provisioning is a
+      // separate demand that begins late in female juvenile growth and may
+      // continue after the adult stage label without creating any matter.
       const juvenileGrowthForaging =
         animal.lifeStage === 'juvenile' &&
-        animal.structuralBiomass + 1e-9 <
-          SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+        this.shrimpJuvenileDevelopmentProgress(animal) < 1;
       let seeking = !mateCueDirection && !forcedRoaming && (
         reproductiveForaging ||
         juvenileGrowthForaging ||
+        adultGrowthForaging ||
         nutritionalForaging
       );
       const foragingMotivation = Math.max(
         reproductiveForaging ? 0.45 : 0,
         juvenileGrowthForaging
           ? 0.35 + 0.35 * clamp01(
-            1 - animal.structuralBiomass /
-              SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass,
+            1 - this.shrimpJuvenileDevelopmentProgress(animal),
+          )
+          : 0,
+        adultGrowthForaging
+          ? 0.22 + 0.28 * clamp01(
+            (
+              WATER_CYCLE_RULES.shrimp.adultStructuralBiomass -
+                animal.structuralBiomass
+            ) /
+              Math.max(
+                1e-9,
+                WATER_CYCLE_RULES.shrimp.adultStructuralBiomass -
+                  SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass,
+              ),
           )
           : 0,
         clamp(
@@ -6514,6 +6733,7 @@ export class SimulationWorld {
           (
             !reproductiveForaging &&
             !juvenileGrowthForaging &&
+            !adultGrowthForaging &&
             animal.energy >= forageStopEnergy
           ) ||
           targetFood <= 0
@@ -6630,7 +6850,11 @@ export class SimulationWorld {
         animal.targetCellId = foodTarget?.id ??
           (retainExplorationTarget
             ? currentTarget!.id
-            : this.chooseExplorationTarget(animal, localCueDirection)?.id ?? null);
+            : this.chooseExplorationTarget(
+              animal,
+              localCueDirection,
+              seeking,
+            )?.id ?? null);
         animal.nextTargetEvaluation = foodTarget
           ? 0.8 + behaviorNoise * 0.6
           : forcedRoaming
@@ -6676,7 +6900,19 @@ export class SimulationWorld {
         animal.behavior = nutritionallyWasting
           ? 'starving'
           : seeking && hasFood ? 'traveling' : 'exploring';
-        const weakFactor = nutritionallyWasting ? 0.45 : 1;
+        // Tissue catabolism begins at the first infinitesimal structural loss;
+        // it must not produce an immediate 55% locomotion cliff. Decline
+        // continuously across the real expendable tissue interval, reaching
+        // the former weak-search speed only at the viability boundary.
+        const minimumViableStructure = this.animalMinimumViableStructure(animal);
+        const targetStructure = this.animalTargetStructuralBiomass(animal);
+        const remainingExpendableStructure = clamp01(
+          (animal.structuralBiomass - minimumViableStructure) /
+            Math.max(1e-9, targetStructure - minimumViableStructure),
+        );
+        const weakFactor = nutritionallyWasting
+          ? 0.45 + 0.55 * Math.sqrt(remainingExpendableStructure)
+          : 1;
         const arrivalScale = shrimpArrivalScale(distance, 32);
         const baseSpeed = (distance > 80 ? 78 : 30) * arrivalScale;
         const individualSpeed = 0.88 + deterministicNoise(animal.randomSeed) * 0.24;
@@ -7542,8 +7778,11 @@ export class SimulationWorld {
         animal.lifeStage !== 'adult' ||
         animal.sex !== 'female' ||
         animal.gestationRemaining !== null ||
-        this.shrimpReserveCondition(animal) <
-          SHRIMP_ECOLOGY_RULES.reproductionReserveFraction ||
+        (
+          animal.reproductiveBiomass < this.shrimpBroodBiomass(animal) &&
+          this.shrimpReserveCondition(animal) <
+            SHRIMP_ECOLOGY_RULES.reproductionReserveFraction
+        ) ||
         animal.matingAccumulator >= SHRIMP_MATING_SECONDS
       ) continue;
       const progress = animal.ovarianProgress ?? 0;
@@ -8007,13 +8246,13 @@ export class SimulationWorld {
           : animal.behavior === 'grazing' || animal.behavior === 'exploring'
             ? SHRIMP_ECOLOGY_RULES.grazingActivityMultiplier
             : SHRIMP_ECOLOGY_RULES.restingActivityMultiplier;
-      const bodyMass = animal.structuralBiomass + animal.storedBiomass +
-        animal.reproductiveBiomass;
+      // DEB somatic maintenance belongs to living structure. Reserve and
+      // already provisioned eggs do not create a second maintenance burden.
+      const structuralMass = animal.structuralBiomass;
       const adultReferenceMass =
-        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass +
-        WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass;
+        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
       maintenanceRequests[shrimpIndex] = continuousBodyMassMaintenance(
-        bodyMass,
+        structuralMass,
         adultReferenceMass,
         SHRIMP_ECOLOGY_RULES.adultRoutineMaintenanceBiomassPerSecond /
           adultReferenceMass,
@@ -8098,17 +8337,22 @@ export class SimulationWorld {
           food > 0 &&
           distance <= Math.max(SHRIMP_GRAZE_DISTANCE, target.cellSize * 1.4)
         ) {
+          const foodResponsePower = Math.pow(
+            food,
+            WATER_CYCLE_RULES.shrimp.grazingResponseExponent,
+          );
+          const halfSaturationResponsePower = Math.pow(
+            WATER_CYCLE_RULES.shrimp.grazingHalfSaturationBiomass,
+            WATER_CYCLE_RULES.shrimp.grazingResponseExponent,
+          );
           const requested = SHRIMP_BITE_RATE *
             (
-              food /
-              (food +
-                WATER_CYCLE_RULES.shrimp.grazingHalfSaturationBiomass)
+              foodResponsePower /
+              (foodResponsePower + halfSaturationResponsePower)
             ) *
             deltaSeconds * stageScale;
           const nitzschiaWeight = Math.max(0, target.biomass.nitzschia);
-          const oedogoniumWeight =
-            Math.max(0, target.biomass.oedogonium) *
-              SHRIMP_OEDOGONIUM_FOOD_QUALITY;
+          const oedogoniumWeight = Math.max(0, target.biomass.oedogonium);
           const decomposerWeight =
             Math.max(0, target.biofilm.decomposer) *
             SHRIMP_DECOMPOSER_FOOD_WEIGHT;
@@ -8119,10 +8363,12 @@ export class SimulationWorld {
           const biofilmWeight = decomposerWeight + nitrifierWeight;
           const totalWeight = algaeWeight + biofilmWeight;
           if (totalWeight > 0) {
-            // Food weights already express preference and nutritional
-            // accessibility. A fixed minimum algae share made a shrimp spend
-            // most of every bite on a trace algal remnant even when edible
-            // biofilm was abundant, causing starvation beside visible food.
+            // A shrimp scrapes a mixed microscopic algal film rather than
+            // selecting individual diatom cells from it. Remove the two algae
+            // in proportion to their real biomass; apply their different food
+            // qualities only when the swallowed matter is assimilated below.
+            // Biofilm remains weighted by accessibility because it is a
+            // physically different food fraction of the scraped surface.
             const algaeShare = algaeWeight <= 0
               ? 0
               : biofilmWeight <= 0
@@ -8152,8 +8398,8 @@ export class SimulationWorld {
               reproductionTemperatureFactor,
               deltaSeconds,
             );
-            // The type-II response describes encounter/processing capacity,
-            // not permission to assimilate many times the matter the animal
+            // The local response describes processing capacity, not
+            // permission to assimilate many times the matter the animal
             // can use. Bound the raw bite by this individual's current
             // reserve and allocation demand. Positive traces remain edible;
             // this only prevents a full reproductive female from stripping a
@@ -8346,163 +8592,53 @@ export class SimulationWorld {
         continue;
       }
 
+      this.applyShrimpDebProduction(
+        animal,
+        reproductionTemperatureFactor,
+        deltaSeconds,
+        maintenanceRequests[shrimpIndex] ?? 0,
+      );
+
       if (animal.lifeStage === 'juvenile') {
-        const birthBiomass = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
         const maturationBiomass =
-          SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+          this.shrimpMaturationStructuralTarget(animal);
         const maturationTargetSeconds =
           animal.maturationTargetSeconds ??
           shrimpMaturationTargetSeconds(animal.randomSeed);
         animal.maturationTargetSeconds = maturationTargetSeconds;
-        const maximumGrowth = this.shrimpJuvenileGrowthAllowance(
-          animal,
-          deltaSeconds,
-          reproductionTemperatureFactor,
+        animal.growthProgress =
+          this.shrimpJuvenileDevelopmentProgress(animal);
+        animal.bodyLength = shrimpBodyLengthForStructure(
+          animal.peakStructuralBiomass ?? animal.structuralBiomass,
         );
-        const materialUsed = Math.min(
-          Math.max(0, maturationBiomass - animal.structuralBiomass),
-          maximumGrowth,
-          Math.max(
-            0,
-            animal.storedBiomass -
-              this.shrimpJuvenileGrowthReserveFloor(animal),
-          ),
-        );
-        animal.storedBiomass -= materialUsed;
-        animal.structuralBiomass += materialUsed;
-        animal.peakStructuralBiomass = Math.max(
-          animal.peakStructuralBiomass ?? 0,
-          animal.structuralBiomass,
-        );
-        animal.growthProgress = clamp01(
-          (animal.structuralBiomass - birthBiomass) /
-            (maturationBiomass - birthBiomass),
-        );
-        animal.bodyLength = SHRIMP_JUVENILE_LENGTH +
-          (SHRIMP_ADULT_LENGTH - SHRIMP_JUVENILE_LENGTH) * animal.growthProgress;
-        if (
-          animal.ageSeconds >= maturationTargetSeconds &&
-          animal.growthProgress >= 1 &&
-          animal.storedBiomass >= SHRIMP_MATURATION_RESERVE_BIOMASS
-        ) {
+
+        if (animal.structuralBiomass + 1e-9 >= maturationBiomass) {
           animal.lifeStage = 'adult';
-          animal.bodyLength = SHRIMP_ADULT_LENGTH;
-          animal.reproductiveCycleIndex = 0;
-          animal.ovarianClutchSize = animal.sex === 'female'
-            ? shrimpClutchSizeForStructure(animal.structuralBiomass)
-            : undefined;
-          animal.ovarianProgress = animal.sex === 'female'
-            ? deterministicNoise(animal.randomSeed * 0.091 + 47.3) *
-              SHRIMP_ECOLOGY_RULES.newAdultOvarianProgressMaximum
-            : 0;
-          const ovarianCycleSeconds = shrimpOvarianCycleSeconds(
-            animal.randomSeed,
-            0,
+          animal.bodyLength = shrimpBodyLengthForStructure(
+            animal.peakStructuralBiomass ?? animal.structuralBiomass,
           );
-          animal.reproductionCooldown = animal.sex === 'female'
-            ? (1 - animal.ovarianProgress) * ovarianCycleSeconds
-            : 0;
+          animal.reproductiveCycleIndex = 0;
+          if (animal.sex !== 'female') {
+            animal.ovarianClutchSize = undefined;
+            animal.ovarianProgress = 0;
+            animal.reproductionCooldown = 0;
+          }
           this.recordAnimalPopulationEvent('matured', animal);
         }
+        // A maturation target distributes well-fed growth schedules; it is
+        // not a second mortality clock. Food limitation already slows the
+        // conserved somatic gain above. If assimilation falls below
+        // maintenance, reserve and then structure are consumed, and the
+        // common viable-structure check below causes starvation. Killing an
+        // otherwise viable juvenile merely because age outpaced growth
+        // deleted the cohort that should mature when producer biomass
+        // recovered, driving finite populations into avoidable sex loss.
         this.synchroniseAnimalEnergy(animal);
       }
 
       if (animal.lifeStage === 'adult' && animal.sex === 'female') {
-        animal.ovarianClutchSize ??=
-          shrimpClutchSizeForStructure(animal.structuralBiomass);
         const cycleIndex = animal.reproductiveCycleIndex ?? 0;
         animal.reproductiveCycleIndex = cycleIndex;
-        // N. davidi ovarian rematuration can proceed while the current brood
-        // is carried. The locked embryo matter remains separate; only the
-        // readiness of the next ovarian cycle overlaps gestation.
-        const activeOvarianCycleIndex = animal.gestationRemaining !== null
-          ? cycleIndex + 1
-          : cycleIndex;
-        const ovarianCycleSeconds = shrimpOvarianCycleSeconds(
-          animal.randomSeed,
-          activeOvarianCycleIndex,
-        );
-        const ovarianReserveCondition = this.shrimpReserveCondition(animal);
-        const ovarianEnergyFactor = clamp(
-          (
-            ovarianReserveCondition -
-              SHRIMP_ECOLOGY_RULES.ovarianProgressReserveFloor
-          ) /
-            Math.max(
-              1e-6,
-              SHRIMP_ECOLOGY_RULES.ovarianFullSpeedReserveFraction -
-                SHRIMP_ECOLOGY_RULES.ovarianProgressReserveFloor,
-            ),
-          0,
-          1,
-        );
-        const ovarianRecentIntakeRequirement =
-          shrimpOvarianRecentIntakeRequirement(
-            this.shrimpGrazingMaintenancePerSecond(animal),
-            Math.min(
-              SHRIMP_ECOLOGY_RULES.ovarianAllocationPerSecond,
-              Math.max(
-                0,
-                this.shrimpOvarianMatterTarget(animal) -
-                  animal.reproductiveBiomass,
-              ) / Math.max(1e-9, deltaSeconds),
-            ),
-            WATER_CYCLE_RULES.shrimp.assimilationFraction,
-            SHRIMP_RECENT_INTAKE_WINDOW_SECONDS,
-          );
-        const ovarianFoodFactor = clamp(
-          animal.recentIntake / ovarianRecentIntakeRequirement,
-          0,
-          1,
-        );
-        animal.ovarianProgress = clamp01(
-          (animal.ovarianProgress ?? 0) +
-            deltaSeconds *
-              reproductionTemperatureFactor *
-              ovarianEnergyFactor *
-              ovarianFoodFactor *
-              animal.health /
-              ovarianCycleSeconds,
-        );
-        animal.reproductionCooldown = Math.max(
-          0,
-          (1 - (animal.ovarianProgress ?? 0)) * ovarianCycleSeconds,
-        );
-
-        // Egg matter is a conserved transfer from somatic reserve. When the
-        // next ovary rematures during incubation, its matter is provisioned at
-        // the same time; ovarian progress is never a free head start. The
-        // first brood remains locked in the leading brood-sized portion.
-        const ovarianMatterTarget = this.shrimpOvarianMatterTarget(animal);
-        if (
-          ovarianEnergyFactor > 0 &&
-          animal.reproductiveBiomass < ovarianMatterTarget
-        ) {
-          const reproductiveSomaticReserveFloor =
-            SHRIMP_REPRODUCTIVE_ALLOCATION_PROTECTED_RESERVE_FRACTION *
-            clamp(
-              this.animalTargetStructuralBiomass(animal) /
-                WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
-              SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass /
-                WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
-              1,
-          );
-          const allocationCondition =
-            ovarianEnergyFactor * ovarianFoodFactor * animal.health *
-            reproductionTemperatureFactor;
-          const allocation = Math.min(
-            Math.max(
-              0,
-              animal.storedBiomass - reproductiveSomaticReserveFloor,
-            ),
-            SHRIMP_ECOLOGY_RULES.ovarianAllocationPerSecond *
-              allocationCondition * deltaSeconds,
-            ovarianMatterTarget - animal.reproductiveBiomass,
-          );
-          animal.storedBiomass -= allocation;
-          animal.reproductiveBiomass += allocation;
-          this.synchroniseAnimalEnergy(animal);
-        }
         if (animal.gestationRemaining !== null) {
           // Embryos were funded from the mother's conserved reserve when
           // mating completed. Development therefore follows temperature and
@@ -8541,14 +8677,7 @@ export class SimulationWorld {
               // timing or grows into a moving material target mid-cycle.
               animal.ovarianClutchSize =
                 shrimpClutchSizeForStructure(animal.structuralBiomass);
-              animal.reproductionCooldown = Math.max(
-                0,
-                (1 - (animal.ovarianProgress ?? 0)) *
-                  shrimpOvarianCycleSeconds(
-                    animal.randomSeed,
-                    cycleIndex + 1,
-                  ),
-              );
+              this.synchroniseShrimpOvarianState(animal);
               this.synchroniseAnimalEnergy(animal);
             } else {
               // This can only occur after loading an older save whose gestation
@@ -8559,8 +8688,11 @@ export class SimulationWorld {
           }
         } else if (
           (animal.ovarianProgress ?? 0) >= 1 &&
-          this.shrimpReserveCondition(animal) >=
-            SHRIMP_ECOLOGY_RULES.reproductionReserveFraction &&
+          (
+            animal.reproductiveBiomass >= this.shrimpBroodBiomass(animal) ||
+            this.shrimpReserveCondition(animal) >=
+              SHRIMP_ECOLOGY_RULES.reproductionReserveFraction
+          ) &&
           shrimpAnimals.length + newborns.length < SHRIMP_TECHNICAL_POPULATION_LIMIT
         ) {
           const matingWasComplete =
@@ -8614,6 +8746,7 @@ export class SimulationWorld {
             // the following brood may both advance during gestation.
             animal.ovarianProgress = 0;
             animal.matingAccumulator = 0;
+            this.synchroniseShrimpOvarianState(animal);
           }
         } else {
           if (animal.matingAccumulator < SHRIMP_MATING_SECONDS) {
@@ -8623,39 +8756,6 @@ export class SimulationWorld {
             );
           }
         }
-      }
-
-      if (
-        animal.lifeStage === 'adult' &&
-        animal.structuralBiomass <
-          WATER_CYCLE_RULES.shrimp.adultStructuralBiomass &&
-        (
-          animal.sex === 'male' ||
-          animal.reproductiveBiomass + 1e-9 >=
-            this.shrimpBroodBiomass(animal)
-        )
-      ) {
-        // Females first finish funding the already committed clutch. During
-        // gestation, later feeding surplus can return to somatic growth. That
-        // creates a real allocation trade-off without letting growth erase a
-        // nearly completed brood target on every step.
-        const growthReserveFloor =
-          SHRIMP_REPRODUCTIVE_ALLOCATION_PROTECTED_RESERVE_FRACTION *
-          animal.structuralBiomass;
-        const adultGrowth = Math.min(
-          WATER_CYCLE_RULES.shrimp.adultStructuralBiomass -
-            animal.structuralBiomass,
-          SHRIMP_ECOLOGY_RULES.adultSomaticGrowthPerSecond *
-            reproductionTemperatureFactor * deltaSeconds,
-          Math.max(0, animal.storedBiomass - growthReserveFloor),
-        );
-        animal.storedBiomass -= adultGrowth;
-        animal.structuralBiomass += adultGrowth;
-        animal.peakStructuralBiomass = Math.max(
-          animal.peakStructuralBiomass ?? 0,
-          animal.structuralBiomass,
-        );
-        this.synchroniseAnimalEnergy(animal);
       }
 
       // Only the portion left after this tick's real maintenance, growth and
@@ -11120,11 +11220,15 @@ export class SimulationWorld {
     }
     const root = this.vallisneriaRootPosition(ramet, cell);
     const structuralScale = ramet.plant?.structuralScale ?? 0.72;
+    const leafRetention = ramet.plant
+      ? this.vallisneriaLeafRetention(ramet.plant)
+      : 1;
     const leafCount = writeVallisneriaLeaves(
       cell.index,
       root,
       structuralScale,
       this.vallisneriaLeavesScratch,
+      leafRetention,
     );
     if (leafCount === 0) {
       this.ricefishEggAttachmentPointScratch.x = root.x;
@@ -11417,15 +11521,17 @@ export class SimulationWorld {
 
   private animalTargetStructuralBiomass(animal: AnimalState): number {
     if (animal.lifeStage === 'adult') {
-      if (animal.origin === 'born') {
-        return Math.max(
-          SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass,
-          animal.peakStructuralBiomass ?? animal.structuralBiomass,
-        );
-      }
-      return WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+      // Present condition and fasting tolerance follow the largest body this
+      // individual has actually built, not the species' theoretical maximum.
+      // This must also apply to supplied young adults now that they no longer
+      // enter at maximum size. Growth can raise the peak normally; stocking
+      // never grants a hidden 1.0-B body or reserve compartment.
+      return Math.max(
+        SHRIMP_BIRTH_STRUCTURAL_BIOMASS,
+        animal.peakStructuralBiomass ?? animal.structuralBiomass,
+      );
     }
-    const birth = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
+    const birth = SHRIMP_BIRTH_STRUCTURAL_BIOMASS;
     // A juvenile's achieved size is a one-way physiological reference. Using
     // its current growthProgress here made the reference shrink whenever the
     // body was catabolised, so both displayed condition and the minimum viable
@@ -11454,8 +11560,82 @@ export class SimulationWorld {
   }
 
   private shrimpOvarianMatterTarget(animal: AnimalState): number {
-    return this.shrimpBroodBiomass(animal) *
-      (animal.gestationRemaining === null ? 1 : 2);
+    const broodBiomass = this.shrimpBroodBiomass(animal);
+    // While berried, the first brood-sized portion is already locked in the
+    // carried embryos and the second portion is the rematuring ovary. Outside
+    // gestation only one ovary can be provisioned. This is a physical capacity,
+    // not a timer-generated target: progress is derived from matter that
+    // actually reached this compartment after maintenance.
+    return animal.gestationRemaining === null
+      ? broodBiomass
+      : broodBiomass * 2;
+  }
+
+  private shrimpMaturationStructuralTarget(_animal: AnimalState): number {
+    return SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+  }
+
+  private shrimpJuvenileDevelopmentProgress(animal: AnimalState): number {
+    const birth = SHRIMP_BIRTH_STRUCTURAL_BIOMASS;
+    return clamp01(
+      (animal.structuralBiomass - birth) /
+        Math.max(
+          1e-9,
+          SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass - birth,
+        ),
+    );
+  }
+
+  private shrimpOvarianDevelopmentEligible(animal: AnimalState): boolean {
+    return animal.sex === 'female' && (
+      animal.lifeStage === 'adult' ||
+      this.shrimpJuvenileDevelopmentProgress(animal) + 1e-9 >=
+        SHRIMP_ECOLOGY_RULES.ovarianDevelopmentOnsetFraction
+    );
+  }
+
+  private shrimpDevelopingOvarianBiomass(animal: AnimalState): number {
+    const broodBiomass = this.shrimpBroodBiomass(animal);
+    const lockedBroodBiomass = animal.gestationRemaining === null
+      ? 0
+      : broodBiomass;
+    return clamp(
+      animal.reproductiveBiomass - lockedBroodBiomass,
+      0,
+      broodBiomass,
+    );
+  }
+
+  /**
+   * Ovarian percentage observes conserved egg matter; it is not an independent
+   * clock. A food-limited cohort therefore cannot silently reach 100% and then
+   * spawn synchronously as soon as food returns.
+   */
+  private synchroniseShrimpOvarianState(animal: AnimalState): void {
+    if (animal.speciesId !== 'cherry-shrimp' || animal.sex !== 'female') {
+      animal.ovarianProgress = 0;
+      return;
+    }
+    animal.ovarianClutchSize ??=
+      shrimpClutchSizeForStructure(animal.structuralBiomass);
+    const broodBiomass = this.shrimpBroodBiomass(animal);
+    animal.ovarianProgress = clamp01(
+      this.shrimpDevelopingOvarianBiomass(animal) /
+        Math.max(1e-9, broodBiomass),
+    );
+    const cycleIndex = animal.reproductiveCycleIndex ?? 0;
+    animal.reproductiveCycleIndex = cycleIndex;
+    const activeOvarianCycleIndex = animal.gestationRemaining !== null
+      ? cycleIndex + 1
+      : cycleIndex;
+    const ovarianCycleSeconds = shrimpOvarianCycleSeconds(
+      animal.randomSeed,
+      activeOvarianCycleIndex,
+    );
+    animal.reproductionCooldown = Math.max(
+      0,
+      (1 - (animal.ovarianProgress ?? 0)) * ovarianCycleSeconds,
+    );
   }
 
   private animalMinimumViableStructure(animal: AnimalState): number {
@@ -11477,9 +11657,9 @@ export class SimulationWorld {
   private shrimpReserveCapacity(animal: AnimalState): number {
     return WATER_CYCLE_RULES.shrimp.adultReserveBiomass *
       clamp(
-        this.animalTargetStructuralBiomass(animal) /
+        Math.max(0, animal.structuralBiomass) /
           WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
-        WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass /
+        SHRIMP_BIRTH_STRUCTURAL_BIOMASS /
           WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
         1,
       );
@@ -11498,16 +11678,10 @@ export class SimulationWorld {
         this.animalTargetStructuralBiomass(animal);
   }
 
-  private shrimpJuvenileGrowthReserveFloor(animal: AnimalState): number {
-    return this.animalTargetStructuralBiomass(animal) *
-      SHRIMP_JUVENILE_GROWTH_RESERVE_FRACTION;
-  }
-
   /**
-   * A juvenile may retain only the material it can turn into structure during
-   * this ecology step above its ordinary reserve capacity. That transient
-   * allowance funds continuous growth without becoming a long-lived hidden
-   * food store when grazing stops.
+   * Food-funded structural demand at full reserve. Actual realized growth is
+   * reduced continuously by reserve density in `applyShrimpDebProduction`.
+   * Age never grants structure or a compensatory multiplier.
    */
   private shrimpJuvenileGrowthAllowance(
     animal: AnimalState,
@@ -11515,9 +11689,8 @@ export class SimulationWorld {
     knownTemperatureFactor?: number,
   ): number {
     if (animal.lifeStage !== 'juvenile') return 0;
-    const birthBiomass = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
-    const maturationBiomass =
-      SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+    const birthBiomass = SHRIMP_BIRTH_STRUCTURAL_BIOMASS;
+    const maturationBiomass = this.shrimpMaturationStructuralTarget(animal);
     const maturationTargetSeconds =
       animal.maturationTargetSeconds ??
       shrimpMaturationTargetSeconds(animal.randomSeed);
@@ -11526,26 +11699,207 @@ export class SimulationWorld {
         ANIMALS[animal.speciesId].temperature.reproductionCurve,
         this.biogeochemistry.temperatureAt(animal.position),
       );
-    const structuralProgress = clamp01(
-      (animal.structuralBiomass - birthBiomass) /
-        Math.max(1e-9, maturationBiomass - birthBiomass),
-    );
-    const ageScheduleProgress = clamp01(
-      animal.ageSeconds / Math.max(1e-9, maturationTargetSeconds),
-    );
-    const scheduleDeficit = Math.max(
-      0,
-      ageScheduleProgress - structuralProgress,
-    );
-    const compensatoryMultiplier = 1 + scheduleDeficit *
-      (SHRIMP_ECOLOGY_RULES.maximumCompensatoryGrowthMultiplier - 1);
     return Math.min(
       Math.max(0, maturationBiomass - animal.structuralBiomass),
       (maturationBiomass - birthBiomass) *
         Math.max(0, deltaSeconds) * temperatureFactor *
-        compensatoryMultiplier /
-      Math.max(1e-9, maturationTargetSeconds),
+        Math.max(0, animal.health) /
+        Math.max(1e-9, maturationTargetSeconds),
     );
+  }
+
+  /**
+   * Food-funded post-maturity growth with no stage-boundary spike.
+   *
+   * The rate is highest at the somatic maturity threshold and declines
+   * continuously as structure approaches the maximum adult size. Reserve
+   * density and the fixed kappa split are applied later by the common DEB
+   * production step.
+   */
+  private shrimpAdultGrowthAllowance(
+    animal: AnimalState,
+    deltaSeconds: number,
+    reproductionTemperatureFactor: number,
+  ): number {
+    if (animal.lifeStage !== 'adult') return 0;
+    const maximumStructure = WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+    const structuralGap = Math.max(
+      0,
+      maximumStructure - animal.structuralBiomass,
+    );
+    const postMaturityRange = Math.max(
+      1e-9,
+      maximumStructure - SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass,
+    );
+    const gapResponse = clamp01(structuralGap / postMaturityRange);
+    return Math.min(
+      structuralGap,
+      SHRIMP_ECOLOGY_RULES.adultSomaticGrowthPerSecond *
+        gapResponse *
+        Math.max(0, reproductionTemperatureFactor) *
+        Math.max(0, animal.health) *
+        Math.max(0, deltaSeconds),
+    );
+  }
+
+  /**
+   * Real egg matter that this female can provision during the current step.
+   *
+   * Ovarian-cycle duration sets the physiological maximum rate, while DEB
+   * reserve density determines realised allocation. Food limitation therefore
+   * slows ovarian state itself instead of merely delaying birth after an
+   * independently completed timer.
+   */
+  private shrimpOvarianAllocationDemand(
+    animal: AnimalState,
+    reproductionTemperatureFactor: number,
+    deltaSeconds: number,
+    maintenanceRequest =
+      this.shrimpGrazingMaintenancePerSecond(animal) * deltaSeconds,
+    requireRecentSurplus = true,
+  ): number {
+    if (
+      !this.shrimpOvarianDevelopmentEligible(animal) ||
+      animal.reproductiveBiomass >= this.shrimpOvarianMatterTarget(animal)
+    ) return 0;
+    animal.ovarianClutchSize ??=
+      shrimpClutchSizeForStructure(animal.structuralBiomass);
+    const cycleIndex = animal.reproductiveCycleIndex ?? 0;
+    const activeCycleIndex = animal.gestationRemaining !== null
+      ? cycleIndex + 1
+      : cycleIndex;
+    const cycleSeconds = shrimpOvarianCycleSeconds(
+      animal.randomSeed,
+      activeCycleIndex,
+    );
+    const broodBiomass = this.shrimpBroodBiomass(animal);
+    const physiologicalDemand = broodBiomass *
+      Math.max(0, reproductionTemperatureFactor) *
+      Math.max(0, animal.health) *
+      Math.max(0, deltaSeconds) /
+      Math.max(1e-9, cycleSeconds);
+    const maintenancePerSecond = Math.max(0, maintenanceRequest) /
+      Math.max(1e-9, deltaSeconds);
+    const recentAssimilationPerSecond = Math.max(0, animal.recentIntake) *
+      WATER_CYCLE_RULES.shrimp.assimilationFraction /
+      SHRIMP_RECENT_INTAKE_WINDOW_SECONDS;
+    // This is the net-production form used by simple consumer-resource DEB
+    // models: reserve can smooth meals, but a new ovary is optional investment
+    // and may not advance while current assimilated intake is below somatic
+    // maintenance. This is only the current-food gate; the common allocation
+    // step below already applies the fixed kappa split to reserve mobilization.
+    // Applying (1-kappa) here as well would constrain the same reproductive
+    // flux twice and can prevent a well-fed replacement generation. The
+    // continuous ratio avoids a binary food gate.
+    const recentSurplusFactor = requireRecentSurplus
+      ? clamp01(
+        (recentAssimilationPerSecond - maintenancePerSecond) /
+          Math.max(1e-12, physiologicalDemand /
+            Math.max(1e-9, deltaSeconds)),
+      )
+      : 1;
+    return Math.min(
+      this.shrimpOvarianMatterTarget(animal) - animal.reproductiveBiomass,
+      physiologicalDemand * recentSurplusFactor,
+      SHRIMP_ECOLOGY_RULES.ovarianAllocationPerSecond *
+        Math.max(0, reproductionTemperatureFactor) *
+        Math.max(0, animal.health) *
+        Math.max(0, deltaSeconds),
+    );
+  }
+
+  /**
+   * One common DEB production step for every cherry shrimp in every mission.
+   * Maintenance has already been paid. This reduced model has no separate
+   * maturity-mass compartment, so an ordinary juvenile's non-somatic branch
+   * has no invented demand and remains in reserve. A late-juvenile female is
+   * the one real exception: after ovarian development begins, that branch has
+   * a conserved destination in reproductive biomass. The former implementation
+   * created a demand equal to every unused 1-kappa share and immediately
+   * respired it, making growth itself carry a hidden 25% metabolic surcharge.
+   * No material is shared between animals or redirected from an unused branch.
+   */
+  private applyShrimpDebProduction(
+    animal: AnimalState,
+    reproductionTemperatureFactor: number,
+    deltaSeconds: number,
+    maintenanceRequest =
+      this.shrimpGrazingMaintenancePerSecond(animal) * deltaSeconds,
+  ): void {
+    if (deltaSeconds <= 0 || animal.storedBiomass <= 0) {
+      this.synchroniseShrimpOvarianState(animal);
+      return;
+    }
+    const kappa = SHRIMP_ECOLOGY_RULES.kappaSomatic;
+    let somaticDemand = 0;
+    let maturityOrReproductionDemand = 0;
+    let maximumMobilization = 0;
+
+    if (animal.lifeStage === 'juvenile') {
+      somaticDemand = this.shrimpJuvenileGrowthAllowance(
+        animal,
+        deltaSeconds,
+        reproductionTemperatureFactor,
+      );
+      // Female ovarian provisioning has a real, conserved destination once
+      // late-juvenile ovarian development begins. Other juveniles still have
+      // no invented maturity-mass demand or respiratory surcharge.
+      maturityOrReproductionDemand = this.shrimpOvarianAllocationDemand(
+        animal,
+        reproductionTemperatureFactor,
+        deltaSeconds,
+        maintenanceRequest,
+      );
+      maximumMobilization = Math.max(
+        somaticDemand / Math.max(1e-9, kappa),
+        maturityOrReproductionDemand / Math.max(1e-9, 1 - kappa),
+      );
+    } else {
+      somaticDemand = this.shrimpAdultGrowthAllowance(
+        animal,
+        deltaSeconds,
+        reproductionTemperatureFactor,
+      );
+      maturityOrReproductionDemand = this.shrimpOvarianAllocationDemand(
+        animal,
+        reproductionTemperatureFactor,
+        deltaSeconds,
+        maintenanceRequest,
+      );
+      maximumMobilization = Math.max(
+        somaticDemand / Math.max(1e-9, kappa),
+        maturityOrReproductionDemand / Math.max(1e-9, 1 - kappa),
+      );
+    }
+
+    const allocation = allocateShrimpDebProduction({
+      reserveBiomass: animal.storedBiomass,
+      reserveCapacity: this.shrimpReserveCapacity(animal),
+      maximumMobilization,
+      somaticDemand,
+      maturityOrReproductionDemand,
+      kappaSomatic: kappa,
+      reserveResponseExponent:
+        SHRIMP_ECOLOGY_RULES.reserveMobilizationResponseExponent,
+    });
+    const maturityOrReproductionSpent =
+      allocation.maturityOrReproductionBiomass;
+    const totalSpent = allocation.somaticBiomass +
+      maturityOrReproductionSpent;
+    animal.storedBiomass = Math.max(0, animal.storedBiomass - totalSpent);
+    animal.structuralBiomass += allocation.somaticBiomass;
+    if (animal.sex === 'female') {
+      animal.reproductiveBiomass += maturityOrReproductionSpent;
+    }
+    this.synchroniseShrimpOvarianState(animal);
+    animal.peakStructuralBiomass = Math.max(
+      animal.peakStructuralBiomass ?? 0,
+      animal.structuralBiomass,
+    );
+    animal.bodyLength = shrimpBodyLengthForStructure(
+      animal.peakStructuralBiomass ?? animal.structuralBiomass,
+    );
+    this.synchroniseAnimalEnergy(animal);
   }
 
   /**
@@ -11571,39 +11925,26 @@ export class SimulationWorld {
       deltaSeconds,
       reproductionTemperatureFactor,
     );
-    const ovarianAllocation =
-      animal.lifeStage === 'adult' &&
-      animal.sex === 'female' &&
-      animal.reproductiveBiomass < this.shrimpOvarianMatterTarget(animal)
-        ? Math.min(
-          this.shrimpOvarianMatterTarget(animal) -
-            animal.reproductiveBiomass,
-          SHRIMP_ECOLOGY_RULES.ovarianAllocationPerSecond *
-            Math.max(0, reproductionTemperatureFactor) *
-            Math.max(0, animal.health) *
-            Math.max(0, deltaSeconds),
-        )
-        : 0;
-    const adultGrowthEligible =
-      animal.lifeStage === 'adult' &&
-      animal.structuralBiomass <
-        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass &&
-      (
-        animal.sex === 'male' ||
-        animal.reproductiveBiomass + 1e-9 >=
-          this.shrimpBroodBiomass(animal)
-      );
-    const adultGrowth = adultGrowthEligible
-      ? Math.min(
-        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass -
-          animal.structuralBiomass,
-        SHRIMP_ECOLOGY_RULES.adultSomaticGrowthPerSecond *
-          Math.max(0, reproductionTemperatureFactor) *
-          Math.max(0, deltaSeconds),
-      )
-      : 0;
+    const ovarianAllocation = this.shrimpOvarianAllocationDemand(
+      animal,
+      reproductionTemperatureFactor,
+      deltaSeconds,
+      maintenanceRequest,
+      false,
+    );
+    const adultGrowth = this.shrimpAdultGrowthAllowance(
+      animal,
+      deltaSeconds,
+      reproductionTemperatureFactor,
+    );
+    const kappa = SHRIMP_ECOLOGY_RULES.kappaSomatic;
+    // Appetite follows matter the animal can actually retain or spend this
+    // step. Kappa branch capacity is not itself food demand: counting an
+    // unused branch made a full-sized female overeat and immediately return
+    // the excess to detritus.
     return freeReserve + Math.max(0, maintenanceRequest) +
-      juvenileGrowth + ovarianAllocation + adultGrowth;
+      juvenileGrowth +
+      adultGrowth + ovarianAllocation;
   }
 
   private synchroniseAnimalEnergy(animal: AnimalState): void {
@@ -11656,8 +11997,15 @@ export class SimulationWorld {
       : undefined;
     let bestCell: SurfaceCellState | null = null;
     let bestScore = Number.NEGATIVE_INFINITY;
+    let contactCell: SurfaceCellState | null = null;
+    let contactDistance = Number.POSITIVE_INFINITY;
     let recentFallbackCell: SurfaceCellState | null = null;
     let recentFallbackScore = Number.NEGATIVE_INFINITY;
+    const forageStartEnergy = animal.lifeStage === 'juvenile'
+      ? SHRIMP_JUVENILE_FORAGE_START_ENERGY
+      : SHRIMP_ADULT_FORAGE_START_ENERGY;
+    const urgentForaging = animal.energy <= forageStartEnergy ||
+      this.shrimpIsWasting(animal);
     const cells = this.allCells();
     for (let cellIndex = 0; cellIndex < cells.length; cellIndex += 1) {
       const cell = cells[cellIndex];
@@ -11685,9 +12033,25 @@ export class SimulationWorld {
         food / (
           food + WATER_CYCLE_RULES.shrimp.foragingCueHalfSaturationBiomass
         );
+      const minimumNavigationCue = urgentForaging
+        ? SHRIMP_HUNGRY_PATCH_NAVIGATION_CUE_MINIMUM
+        : SHRIMP_LOCAL_PATCH_NAVIGATION_CUE_MINIMUM;
+      const isRecentPatch =
+        (animal.recentGrazingCellCooldown ?? 0) > 0 &&
+        cell.id === animal.recentGrazingCellId;
+      const isPhysicalContact = distance <= Math.max(4, cell.cellSize * 0.3);
+      // Contact sampling comes before remote cue comparison. A shrimp whose
+      // appendages are already touching an edible trace cannot know that a
+      // stronger patch a few cells away is better until it has sampled and
+      // left the trace. Recently sampled patches remain eligible only as the
+      // fallback below, which prevents the animal from getting stuck there.
+      if (!isRecentPatch && isPhysicalContact && distance < contactDistance) {
+        contactCell = cell;
+        contactDistance = distance;
+      }
       if (
-        distance > Math.max(4, cell.cellSize * 0.3) &&
-        localPatchCue < SHRIMP_LOCAL_PATCH_NAVIGATION_CUE_MINIMUM
+        (urgentForaging || !isPhysicalContact) &&
+        localPatchCue < minimumNavigationCue
       ) {
         continue;
       }
@@ -11706,10 +12070,7 @@ export class SimulationWorld {
         -distance + foodUtility -
         congestion * SHRIMP_TARGET_CELL_CONGESTION_PENALTY +
         targetCommitment + noise;
-      if (
-        (animal.recentGrazingCellCooldown ?? 0) > 0 &&
-        cell.id === animal.recentGrazingCellId
-      ) {
+      if (isRecentPatch) {
         if (score > recentFallbackScore) {
           recentFallbackCell = cell;
           recentFallbackScore = score;
@@ -11721,7 +12082,7 @@ export class SimulationWorld {
         bestScore = score;
       }
     }
-    return bestCell ?? recentFallbackCell;
+    return contactCell ?? bestCell ?? recentFallbackCell;
   }
 
   private shrimpRealisedGrazingReturn(animal: AnimalState): number {
@@ -11731,8 +12092,21 @@ export class SimulationWorld {
       animal.grazingSessionIntake *
       WATER_CYCLE_RULES.shrimp.assimilationFraction /
       sampledSeconds;
+    const maintenanceDemand = this.shrimpGrazingMaintenancePerSecond(animal);
+    // Patch departure is based on what this shrimp actually obtained after
+    // contact, never on knowledge of a richer remote cell. A juvenile must
+    // fund both current grazing metabolism and its food-paid development.
+    // Comparing only with maintenance made any thin film that prevented
+    // starvation look profitable, so juveniles stayed on traces while a
+    // several-times-richer film was present inside the same local cue radius.
+    // Adults retain the maintenance comparison because ovarian allocation is
+    // optional reproductive investment rather than required development.
+    const juvenileSomaticDemand = animal.lifeStage === 'juvenile'
+      ? this.shrimpJuvenileGrowthAllowance(animal, 1)
+      : 0;
+    const developmentDemand = juvenileSomaticDemand;
     return realisedAssimilationPerSecond /
-      Math.max(1e-9, this.shrimpGrazingMaintenancePerSecond(animal));
+      Math.max(1e-9, maintenanceDemand + developmentDemand);
   }
 
   private shrimpGrazingMaintenancePerSecond(animal: AnimalState): number {
@@ -11745,13 +12119,14 @@ export class SimulationWorld {
       temperatureProfile.minimumMetabolicFactor,
       temperatureProfile.maximumMetabolicFactor,
     );
-    const bodyMass = animal.structuralBiomass + animal.storedBiomass +
-      animal.reproductiveBiomass;
+    // Keep the behavioural profitability estimate on the exact same DEB
+    // maintenance basis as the ecology step. Reserve and provisioned eggs are
+    // matter stores, not extra structure that silently raises respiration.
+    const structuralMass = animal.structuralBiomass;
     const adultReferenceMass =
-      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass +
-      WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass;
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
     return continuousBodyMassMaintenance(
-      bodyMass,
+      structuralMass,
       adultReferenceMass,
       SHRIMP_ECOLOGY_RULES.adultRoutineMaintenanceBiomassPerSecond /
         adultReferenceMass,
@@ -12056,22 +12431,36 @@ export class SimulationWorld {
   private chooseExplorationTarget(
     animal: AnimalState,
     localCueDirection: Vec2 | null = null,
+    benthicSettling = false,
   ): SurfaceCellState | null {
     const cells = this.allCells();
     if (!cells.length) return null;
     const phase = Math.floor(animal.ageSeconds / 4.5);
     const randomHeading =
       deterministicNoise(animal.randomSeed + phase * 19 + 0.37) * Math.PI * 2;
-    const direction = localCueDirection ?? {
-      x: Math.cos(randomHeading),
-      y: Math.sin(randomHeading),
-    };
+    let directionX = localCueDirection?.x ?? Math.cos(randomHeading);
+    let directionY = localCueDirection?.y ?? Math.sin(randomHeading);
+    if (benthicSettling) {
+      // Food odour can be locally flat or distorted beside a tank wall. A
+      // foraging atyid still settles back toward a physical surface instead
+      // of following that weak horizontal/upward ambiguity through open
+      // water. This does not reveal which surface has food; the ordinary
+      // contact scan decides that after arrival.
+      if (animal.position.x <= 36 && directionX < 0) directionX = 0;
+      if (animal.position.x >= this.tank.width - 36 && directionX > 0) {
+        directionX = 0;
+      }
+      directionY = Math.max(0.45, directionY);
+      const magnitude = Math.hypot(directionX, directionY);
+      directionX /= Math.max(1e-9, magnitude);
+      directionY /= Math.max(1e-9, magnitude);
+    }
     const roamingDistance = animal.lifeStage === 'juvenile'
       ? localCueDirection ? 112 : 72
       : localCueDirection ? 210 : 170;
     const desiredPoint = {
-      x: animal.position.x + direction.x * roamingDistance,
-      y: animal.position.y + direction.y * roamingDistance,
+      x: animal.position.x + directionX * roamingDistance,
+      y: animal.position.y + directionY * roamingDistance,
     };
     let best: { cell: SurfaceCellState; score: number } | null = null;
     const samples = Math.min(48, cells.length);
@@ -12131,6 +12520,9 @@ export class SimulationWorld {
     const ramet = this.vallisneriaRametForCell(cell);
     const anchor = ramet ? this.vallisneriaRootPosition(ramet, cell) : surfacePoint;
     const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
+    const leafRetention = ramet?.plant
+      ? this.vallisneriaLeafRetention(ramet.plant)
+      : 1;
     const canopy = writeVallisneriaCanopyBounds(
       cell.index,
       anchor,
@@ -12138,6 +12530,7 @@ export class SimulationWorld {
       this.vallisneriaCanopyBoundsScratch,
       this.vallisneriaLeavesScratch,
       this.vallisneriaLeafPointScratch,
+      leafRetention,
     );
     this.vallisneriaActivityPointScratch.x = anchor.x;
     this.vallisneriaActivityPointScratch.y = Math.max(
@@ -12160,11 +12553,15 @@ export class SimulationWorld {
       ? this.vallisneriaRootPosition(ramet, cell)
       : this.cellWorldPoint(cell);
     const structuralScale = ramet?.plant?.structuralScale ?? 0.72;
+    const leafRetention = ramet?.plant
+      ? this.vallisneriaLeafRetention(ramet.plant)
+      : 1;
     const leafCount = writeVallisneriaLeaves(
       cell.index,
       anchor,
       structuralScale,
       this.vallisneriaLeavesScratch,
+      leafRetention,
     );
     let pointCount = 0;
     for (let leafIndex = 0; leafIndex < leafCount; leafIndex += 1) {
@@ -12210,14 +12607,19 @@ export class SimulationWorld {
   }
 
   /**
-   * Rooted uptake remains the larger share, while submerged leaves can use
-   * locally dissolved nutrients and carbon. Averaging every actual tissue
-   * sample prevents both the former richest-cell selection and the root-only
-   * starvation caused by treating bottom water as if it were sediment.
+   * Roots and submerged leaves are complementary uptake paths connected by
+   * translocation inside one ramet. Requiring a weighted mean made a depleted
+   * bottom-water proxy suppress an otherwise supplied canopy before the real
+   * finite withdrawal was attempted. Use the better of the plant's own root
+   * neighbourhood and mean painted-leaf neighbourhood for the request only;
+   * commitVallisneriaProduction still withdraws every atom from those exact
+   * locations and lets a leaf cover only the root share that was not paid.
    */
   private vallisneriaResourceFactor(cell: SurfaceCellState): number {
-    const rootFactor = this.biogeochemistry.algaeResourceFactor(
+    const ramet = this.vallisneriaRametForCell(cell);
+    const rootFactor = this.biogeochemistry.rootedPlantResourceFactor(
       this.vallisneriaUptakePoint(cell),
+      ramet?.plant?.nitrogenReserve ?? 0,
     );
     const sampleCount = this.vallisneriaCanopySamplePoints(cell);
     if (sampleCount === 0) return rootFactor;
@@ -12228,8 +12630,7 @@ export class SimulationWorld {
       );
     }
     const leafFactor = leafTotal / sampleCount;
-    return rootFactor * VALLISNERIA_ROOT_UPTAKE_SHARE +
-      leafFactor * (1 - VALLISNERIA_ROOT_UPTAKE_SHARE);
+    return Math.max(rootFactor, leafFactor);
   }
 
   private vallisneriaCanopyLight(cell: SurfaceCellState): number {
@@ -12296,6 +12697,21 @@ export class SimulationWorld {
     total.respiration /= sampleCount;
     total.lightStressTurnover /= sampleCount;
     total.netGrowth /= sampleCount;
+    // Cell biomass includes roots, crown and reserves as well as blades. When
+    // old leaves are shed, the surviving long blades keep their length but a
+    // smaller fraction of that whole-ramet mass remains photosynthetic. An
+    // unweighted leaf average would let one remaining blade fix carbon as if
+    // the full cohort were still present.
+    const ramet = this.vallisneriaRametForCell(cell);
+    const photosyntheticLeafFraction = ramet?.plant
+      ? this.vallisneriaLeafRetention(ramet.plant)
+      : 1;
+    if (photosyntheticLeafFraction < 1) {
+      total.grossPhotosynthesis *= photosyntheticLeafFraction;
+      total.lightStressTurnover *= photosyntheticLeafFraction;
+      total.netGrowth = total.grossPhotosynthesis -
+        total.respiration - total.lightStressTurnover;
+    }
     if (total !== output) {
       output.grossPhotosynthesis = total.grossPhotosynthesis;
       output.respiration = total.respiration;
@@ -12319,13 +12735,20 @@ export class SimulationWorld {
   ): number {
     const requested = Math.max(0, requestedBiomass);
     if (requested <= 0) return 0;
+    const life = this.vallisneriaRametForCell(cell)?.plant;
+    const nitrogenBudget = {
+      available: Math.max(0, life?.nitrogenReserve ?? 0),
+    };
     const sampleCount = this.vallisneriaCanopyLightSamples(cell);
     if (sampleCount === 0) {
-      return this.biogeochemistry.commitAlgaeProduction(
+      const committed = this.biogeochemistry.commitRootedPlantProduction(
         uptakePoint,
         requested,
         this.producerActivityPoint(cell, 'vallisneria'),
+        nitrogenBudget,
       );
+      if (life) life.nitrogenReserve = nitrogenBudget.available;
+      return committed;
     }
 
     let totalWeight = 0;
@@ -12356,10 +12779,11 @@ export class SimulationWorld {
         this.vallisneriaCanopyProductionWeightsScratch[index] /
         totalWeight;
       if (share <= 0) continue;
-      const rootCommitted = this.biogeochemistry.commitAlgaeProduction(
+      const rootCommitted = this.biogeochemistry.commitRootedPlantProduction(
         uptakePoint,
         share * VALLISNERIA_ROOT_UPTAKE_SHARE,
         this.vallisneriaCanopyPointsScratch[index],
+        nitrogenBudget,
       );
       // If the bottom-water proxy cannot supply its nominal rooted share,
       // permit the illuminated leaf at this exact location to take up the
@@ -12369,8 +12793,23 @@ export class SimulationWorld {
         share - rootCommitted,
         this.vallisneriaCanopyPointsScratch[index],
       );
-      committed += rootCommitted + leafCommitted;
+      // Root uptake is the primary mineral path in Vallisneria. The previous
+      // implementation allowed a leaf to cover an undersupplied root share,
+      // but not the reverse: once water-column nitrate was depleted, 45% of
+      // every otherwise funded request was discarded even while finite
+      // sediment nitrogen remained at the root. Let the same ramet translocate
+      // that exact unpaid remainder from its root compartment.
+      const rootFallback = rootCommitted + leafCommitted < share
+        ? this.biogeochemistry.commitRootedPlantProduction(
+          uptakePoint,
+          share - rootCommitted - leafCommitted,
+          this.vallisneriaCanopyPointsScratch[index],
+          nitrogenBudget,
+        )
+        : 0;
+      committed += rootCommitted + leafCommitted + rootFallback;
     }
+    if (life) life.nitrogenReserve = nitrogenBudget.available;
     return committed;
   }
 
@@ -12383,11 +12822,14 @@ export class SimulationWorld {
     const requested = Math.max(0, requestedBiomass);
     if (requested <= 0) return;
     const uptakePoint = this.vallisneriaUptakePoint(cell);
+    const life = this.vallisneriaRametForCell(cell)?.plant;
+    let unclaimedInternalNitrogen = Math.max(0, life?.nitrogenReserve ?? 0);
     const sampleCount = this.vallisneriaCanopyLightSamples(cell);
     if (sampleCount === 0) {
-      this.biogeochemistry.registerAlgaeProductionDemand(
+      this.biogeochemistry.registerRootedPlantProductionDemand(
         uptakePoint,
         requested,
+        unclaimedInternalNitrogen,
       );
       return;
     }
@@ -12416,9 +12858,17 @@ export class SimulationWorld {
       const share = requested *
         this.vallisneriaCanopyProductionWeightsScratch[index] /
         totalWeight;
-      this.biogeochemistry.registerAlgaeProductionDemand(
+      const rootRequest = share * VALLISNERIA_ROOT_UPTAKE_SHARE;
+      const rootNitrogenNeed = rootRequest * WATER_CYCLE_RULES.biomassNitrogen;
+      const internalForRequest = Math.min(
+        unclaimedInternalNitrogen,
+        rootNitrogenNeed,
+      );
+      unclaimedInternalNitrogen -= internalForRequest;
+      this.biogeochemistry.registerRootedPlantProductionDemand(
         uptakePoint,
-        share * VALLISNERIA_ROOT_UPTAKE_SHARE,
+        rootRequest,
+        internalForRequest,
       );
       this.biogeochemistry.registerAlgaeProductionDemand(
         this.vallisneriaCanopyPointsScratch[index],
@@ -12439,19 +12889,30 @@ export class SimulationWorld {
     const requested = Math.max(0, requestedBiomass);
     if (requested <= 0) return 0;
     const sampleCount = this.vallisneriaCanopySamplePoints(cell);
+    const rootPoint = this.vallisneriaUptakePoint(cell);
+    const life = this.vallisneriaRametForCell(cell)?.plant;
     if (sampleCount === 0) {
-      return this.biogeochemistry.commitAlgaeRespiration(
+      const committed = this.biogeochemistry.commitRootedPlantRespiration(
         this.producerActivityPoint(cell, 'vallisneria'),
         requested,
+        rootPoint,
       );
+      if (life) {
+        life.nitrogenReserve += committed * WATER_CYCLE_RULES.biomassNitrogen;
+      }
+      return committed;
     }
     const share = requested / sampleCount;
     let committed = 0;
     for (let index = 0; index < sampleCount; index += 1) {
-      committed += this.biogeochemistry.commitAlgaeRespiration(
+      committed += this.biogeochemistry.commitRootedPlantRespiration(
         this.vallisneriaCanopyPointsScratch[index],
         share,
+        rootPoint,
       );
+    }
+    if (life) {
+      life.nitrogenReserve += committed * WATER_CYCLE_RULES.biomassNitrogen;
     }
     return committed;
   }
@@ -12482,6 +12943,43 @@ export class SimulationWorld {
       );
     }
     return total / sampleCount;
+  }
+
+  private vallisneriaProjectedCanopySuitability(
+    cell: SurfaceCellState,
+    anchor: Vec2,
+    structuralScale: number,
+    temperature: number,
+  ): number {
+    const leafCount = writeVallisneriaLeaves(
+      cell.index,
+      anchor,
+      structuralScale,
+      this.vallisneriaLeavesScratch,
+      1,
+    );
+    let total = 0;
+    let sampleCount = 0;
+    for (let leafIndex = 0; leafIndex < leafCount; leafIndex += 1) {
+      const leaf = this.vallisneriaLeavesScratch[leafIndex];
+      for (let positionIndex = 0; positionIndex < 4; positionIndex += 1) {
+        const point = this.vallisneriaCanopyPointsScratch[sampleCount] ?? {
+          x: 0,
+          y: 0,
+        };
+        vallisneriaLeafPoint(leaf, (positionIndex + 1) * 0.25, point);
+        this.vallisneriaCanopyPointsScratch[sampleCount] = point;
+        const effectiveLight = this.sampleLightField(point) *
+          this.biogeochemistry.algaeLightTransmissionAt(point);
+        total += habitatSuitability(
+          'vallisneria',
+          effectiveLight,
+          temperature,
+        );
+        sampleCount += 1;
+      }
+    }
+    return sampleCount > 0 ? total / sampleCount : 0;
   }
 
   private createSeedPlacement(
@@ -12550,64 +13048,187 @@ export class SimulationWorld {
     const lifespanSeconds = VALLISNERIA_MIN_LIFESPAN_SECONDS +
       deterministicNoise(seed * 0.0137) *
       (VALLISNERIA_MAX_LIFESPAN_SECONDS - VALLISNERIA_MIN_LIFESPAN_SECONDS);
+    const structuralScale = origin === 'supplied'
+      // Inventory stock is an established rooted rosette, not a newly
+      // detached runner. Its leaves must begin tall enough to sample the
+      // water above ordinary hardscape instead of shrinking forever inside
+      // one stone's shadow.
+      ? 0.62 + deterministicNoise(seed * 0.0319) * 0.08
+      // A runner plantlet remains visibly smaller, but retains enough leaf
+      // area to use the support it receives from its connected parent.
+      : VALLISNERIA_RUNNER_INITIAL_STRUCTURAL_SCALE;
+    const initialBiomass = origin === 'supplied'
+      ? VALLISNERIA_SEED_BIOMASS
+      : VALLISNERIA_RUNNER_BIOMASS;
     return {
       parentId,
       connectedToParent: origin === 'runner' && parentId !== null,
       // Inventory plants are established young rosettes, while a runner-born
       // daughter visibly starts small and must mature before making a runner.
       ageSeconds: origin === 'supplied'
-        ? 180 + deterministicNoise(seed * 0.0211) * 120
+        // The planted rosette is already rooted and near the end of the same
+        // 270-second juvenile establishment period used by runner daughters.
+        // Giving it a 90-second age with a two-thirds adult leaf cohort reset
+        // most of its biological age while preserving mature structure.
+        ? 270 + deterministicNoise(seed * 0.0211) * 150
         : 0,
       lifespanSeconds,
-      structuralScale: origin === 'supplied'
-        // Inventory stock is an established rooted rosette, not a newly
-        // detached runner. Its leaves must begin tall enough to sample the
-        // water above ordinary hardscape instead of shrinking forever inside
-        // one stone's shadow.
-        ? 0.62 + deterministicNoise(seed * 0.0319) * 0.08
-        // A runner plantlet remains visibly smaller, but retains enough leaf
-        // area to use the support it receives from its connected parent.
-        : 0.24,
+      structuralScale,
+      leafCohortScale: structuralScale,
       runnerProgress: origin === 'supplied'
         ? deterministicNoise(seed * 0.0473) * 0.12
         : 0,
       reproductionCount: 0,
       stressSeconds: 0,
+      nitrogenReserve: 0,
+      // Established stock may already contain rhizome/crown storage above the
+      // matter implied by its living leaf cohort. A newborn runner packet is
+      // entirely establishment tissue and starts with no reproductive store.
+      runnerReserveBiomass: origin === 'supplied'
+        ? Math.max(
+          0,
+          initialBiomass - vallisneriaBiomassForLeafScale(structuralScale),
+        )
+        : 0,
+      lastGrowthBiomassDelta: 0,
     };
   }
 
   private vallisneriaLifeStage(life: VallisneriaLifeState): PlantLifeStage {
-    if (life.ageSeconds < VALLISNERIA_JUVENILE_SECONDS) return 'juvenile';
     if (life.ageSeconds >= life.lifespanSeconds * VALLISNERIA_SENESCENCE_START_RATIO) {
       return 'senescent';
     }
+    if (
+      life.ageSeconds < VALLISNERIA_JUVENILE_SECONDS ||
+      life.structuralScale < VALLISNERIA_CLONAL_INDEPENDENCE_SCALE
+    ) return 'juvenile';
     return 'mature';
   }
 
   private vallisneriaHealth(placement: SeedPlacementState, cell: SurfaceCellState): number {
     const life = placement.plant;
     if (!life) return 0;
+    const minimumViableReserve = 0.018 * VALLISNERIA_ADULT_BIOMASS;
+    // A runner plantlet is a complete but small ramet. Judge its early health
+    // against the biomass implied by an established juvenile leaf cohort,
+    // rather than against the largest adult or the unrelated seed-stock mass.
+    const healthyReserveTarget = placement.origin === 'runner'
+      ? VALLISNERIA_RUNNER_HEALTHY_BIOMASS
+      : 0.288 * VALLISNERIA_ADULT_BIOMASS;
     const reserveHealth = clamp01(
       (
         cell.biomass.vallisneria -
-          0.018 * VALLISNERIA_LEDGER_BIOMASS_SCALE
+          minimumViableReserve
       ) /
-        (0.27 * VALLISNERIA_LEDGER_BIOMASS_SCALE),
+        (healthyReserveTarget - minimumViableReserve),
     );
     const stressHealth = 1 - clamp01(life.stressSeconds / VALLISNERIA_LOW_RESERVE_GRACE_SECONDS);
     return reserveHealth * stressHealth;
+  }
+
+  /**
+   * Biomass explicitly allocated from realised growth to a runner. It remains
+   * part of the ramet's total conserved mass until transferred, but is kept
+   * separate from living crown/root/leaf tissue.
+   */
+  private vallisneriaTransferableSurplus(
+    life: VallisneriaLifeState,
+    cell: SurfaceCellState,
+  ): number {
+    return clamp(
+      life.runnerReserveBiomass,
+      0,
+      cell.biomass.vallisneria,
+    );
+  }
+
+  private updateVallisneriaRunnerReserveAfterGrowth(
+    life: VallisneriaLifeState,
+    previousBiomass: number,
+    currentBiomass: number,
+  ): void {
+    const realisedChange = currentBiomass - previousBiomass;
+    life.lastGrowthBiomassDelta = realisedChange;
+    if (realisedChange < 0) {
+      // Once allocated, this compartment includes constructed stolon/runner
+      // tissue as well as mobile assimilate. Ordinary whole-ramet respiration
+      // therefore reduces it proportionally; erasing the entire runner store
+      // first every night made multi-day construction impossible.
+      life.runnerReserveBiomass *= currentBiomass /
+        Math.max(1e-9, previousBiomass);
+    } else if (
+      realisedChange > 0 &&
+      life.ageSeconds >= VALLISNERIA_JUVENILE_SECONDS &&
+      this.vallisneriaLifeStage(life) !== 'senescent'
+    ) {
+      const allocationReadiness = clamp01(
+        (life.leafCohortScale - VALLISNERIA_REPRODUCTIVE_STRUCTURAL_SCALE) /
+          Math.max(
+            1e-9,
+            VALLISNERIA_FULL_RUNNER_ALLOCATION_SCALE -
+              VALLISNERIA_REPRODUCTIVE_STRUCTURAL_SCALE,
+          ),
+      );
+      life.runnerReserveBiomass += realisedChange *
+        VALLISNERIA_MAX_RUNNER_ALLOCATION * allocationReadiness;
+    }
+    life.runnerReserveBiomass = clamp(
+      life.runnerReserveBiomass,
+      0,
+      Math.max(0, currentBiomass - VALLISNERIA_BASE_VEGETATIVE_BIOMASS),
+    );
+  }
+
+  /**
+   * Reserve controls whether new leaves can be made, not the length of tissue
+   * that already exists. Prolonged stress and age therefore remove complete
+   * blades from the cohort instead of elastically shortening every leaf.
+   */
+  private vallisneriaLeafRetention(life: VallisneriaLifeState): number {
+    const cohortRetention = clamp(
+      life.leafCohortScale / Math.max(0.12, life.structuralScale),
+      0.16,
+      1,
+    );
+    const stressProgress = clamp01(
+      (life.stressSeconds - VALLISNERIA_LOW_RESERVE_GRACE_SECONDS * 0.28) /
+        (VALLISNERIA_LOW_RESERVE_GRACE_SECONDS * 0.72),
+    );
+    const senescenceProgress = this.vallisneriaLifeStage(life) === 'senescent'
+      ? clamp01(
+        (life.ageSeconds - life.lifespanSeconds * VALLISNERIA_SENESCENCE_START_RATIO) /
+          (life.lifespanSeconds * (1 - VALLISNERIA_SENESCENCE_START_RATIO)),
+      )
+      : 0;
+    return clamp(
+      Math.min(
+        cohortRetention,
+        1 - Math.max(stressProgress * 0.78, senescenceProgress * 0.84),
+      ),
+      0.16,
+      1,
+    );
   }
 
   private runnerDestination(parent: SeedPlacementState): SurfaceCellState | null {
     const source = this.cellById(parent.cellId);
     if (!source || source.surfaceKind !== 'substrate') return null;
     const sourcePoint = this.vallisneriaRootPosition(parent, source);
-    const occupiedCells = new Set(this.seedPlacements
-      .filter((placement) => placement.speciesId === 'vallisneria')
-      .map((placement) => placement.cellId));
+    const livingRamets = this.seedPlacements.flatMap((placement) => {
+      if (placement.speciesId !== 'vallisneria') return [];
+      const cell = this.cellById(placement.cellId);
+      if (!cell || cell.biomass.vallisneria <= VALLISNERIA_VISIBLE_BIOMASS) {
+        return [];
+      }
+      return [placement];
+    });
+    const occupiedCells = new Set(livingRamets.map(
+      (placement) => placement.cellId,
+    ));
     const parentSeed = deterministicStringSeed(parent.id) + (parent.plant?.reproductionCount ?? 0) * 97;
-    const sourceTotal = source.biomass.oedogonium +
-      source.biomass.nitzschia + source.biomass.vallisneria;
+    const futureDaughterId = `seed-${this.seedCounter + 1}`;
+    const sourceAttachedTotal = source.biomass.oedogonium +
+      source.biomass.nitzschia;
     const sourceTemperature = this.biogeochemistry.temperatureAt(
       this.producerActivityPoint(source, 'vallisneria'),
     );
@@ -12615,39 +13236,95 @@ export class SimulationWorld {
       source,
       sourceTemperature,
     );
+    const searchExtension = clamp01(
+      (parent.plant?.runnerProgress ?? 1) - 1,
+    );
+    const maximumDistance = VALLISNERIA_RUNNER_MAX_DISTANCE +
+      searchExtension * 100;
     // Ramets in a poor or crowded patch tend to explore farther before
     // rooting; productive patches keep a shorter, denser clone network.
     const preferredDistance = 82 + (1 - sourceSuitability) * 34 +
-      clamp01((sourceTotal - 0.62) / 0.38) * 24;
+      clamp01((sourceAttachedTotal - 0.62) / 0.38) * 24 +
+      searchExtension * 72;
     const candidates = this.substrateCells.flatMap((cell) => {
       if (occupiedCells.has(cell.id) || cell.biomass.vallisneria > ALGAE_VISIBLE_BIOMASS) return [];
-      const total = cell.biomass.oedogonium + cell.biomass.nitzschia + cell.biomass.vallisneria;
-      if (total + VALLISNERIA_RUNNER_BIOMASS > 1) return [];
-      const distance = Math.sqrt(distanceSquared(sourcePoint, this.cellWorldPoint(cell)));
+      const attachedTotal = cell.biomass.oedogonium + cell.biomass.nitzschia;
+      if (
+        cell.biomass.vallisneria + VALLISNERIA_RUNNER_BIOMASS >
+          VALLISNERIA_CELL_BIOMASS_CAPACITY
+      ) return [];
+      const candidateRoot = this.defaultVallisneriaRootPosition(
+        futureDaughterId,
+        cell,
+      );
+      const distance = Math.sqrt(distanceSquared(sourcePoint, candidateRoot));
       if (
         distance < VALLISNERIA_RUNNER_MIN_DISTANCE ||
-        distance > VALLISNERIA_RUNNER_MAX_DISTANCE
+        distance > maximumDistance
       ) return [];
-      const targetPoint = this.producerActivityPoint(cell, 'vallisneria');
-      const targetSuitability = this.vallisneriaCanopySuitability(
-        cell,
-        this.biogeochemistry.temperatureAt(targetPoint),
+      // The three substrate rows are an x/depth ground-plane grid projected
+      // into the side view. occupiedCells already prevents two crowns from
+      // taking the same physical 10x10 patch. A second pixel-distance test
+      // would incorrectly treat front/back neighbours as overlapping merely
+      // because their projected drawings are close on screen.
+      const targetTemperature = this.biogeochemistry.temperatureAt(
+        candidateRoot,
       );
-      const targetResourceSuitability = this.biogeochemistry.algaeResourceFactor(
-        this.vallisneriaUptakePoint(cell),
+      const juvenileSuitability = this.vallisneriaProjectedCanopySuitability(
+        cell,
+        candidateRoot,
+        VALLISNERIA_RUNNER_INITIAL_STRUCTURAL_SCALE,
+        targetTemperature,
+      );
+      const establishedSuitability = this.vallisneriaProjectedCanopySuitability(
+        cell,
+        candidateRoot,
+        VALLISNERIA_CLONAL_INDEPENDENCE_SCALE,
+        targetTemperature,
+      );
+      const targetResourceSuitability = this.biogeochemistry.rootedPlantResourceFactor(
+        candidateRoot,
       );
       // Clonal foraging is a bias, not omniscience: habitat and competition
       // matter, while deterministic noise still produces varied directions.
-      const competition = clamp01(total);
+      const competition = clamp01(attachedTotal);
       const score = Math.abs(distance - preferredDistance) +
-        (1 - targetSuitability) * 68 +
+        (1 - juvenileSuitability) * 88 +
+        (1 - establishedSuitability) * 28 +
         (1 - targetResourceSuitability) * 42 +
         competition * 54 +
         deterministicNoise(parentSeed + cell.index * 1.71) * 24;
       return [{ cell, score }];
     });
-    candidates.sort((left, right) => left.score - right.score);
-    return candidates[0]?.cell ?? null;
+    if (!candidates.length) return null;
+    // Clonal foraging changes allocation probabilities; it is not an
+    // all-seeing optimisation pass. Use a deterministic weighted draw so good
+    // local tips are favoured while poor establishment and mortality remain
+    // possible outcomes of the simulation.
+    const bestScore = Math.min(...candidates.map(({ score }) => score));
+    const weighted = candidates
+      .map((candidate) => ({
+        ...candidate,
+        // Keep every physically reachable tip possible, but do not add a
+        // constant once per candidate. With scores for hundreds of cells, the
+        // former floor accumulated until poor patches as a group outweighed
+        // the few locally favourable tips. A steeper, strictly-positive
+        // softmax makes present light/resource conditions matter while still
+        // allowing a bad establishment draw; it is not a future-survival
+        // filter.
+        weight: Math.exp(-(candidate.score - bestScore) / 18),
+      }))
+      .sort((left, right) => left.cell.index - right.cell.index);
+    const totalWeight = weighted.reduce(
+      (total, candidate) => total + candidate.weight,
+      0,
+    );
+    let draw = deterministicNoise(parentSeed + 81.17) * totalWeight;
+    for (const candidate of weighted) {
+      draw -= candidate.weight;
+      if (draw <= 0) return candidate.cell;
+    }
+    return weighted.at(-1)!.cell;
   }
 
   private stepVallisneriaClonalIntegration(deltaSeconds: number): void {
@@ -12662,31 +13339,54 @@ export class SimulationWorld {
       const parent = life.parentId ? byId.get(life.parentId) : undefined;
       const parentCell = parent ? this.cellById(parent.cellId) : undefined;
       const daughterCell = this.cellById(daughter.cellId);
+      const physiologicallyEstablished = daughterCell &&
+        life.ageSeconds >= VALLISNERIA_JUVENILE_SECONDS &&
+        this.vallisneriaHealth(daughter, daughterCell) >= 0.42 &&
+        daughterCell.biomass.vallisneria >=
+          VALLISNERIA_CLONAL_SUPPORT_TARGET &&
+        life.structuralScale >= VALLISNERIA_CLONAL_INDEPENDENCE_SCALE;
       if (
         !parent?.plant ||
         !parentCell ||
         !daughterCell ||
-        life.ageSeconds >= VALLISNERIA_JUVENILE_SECONDS
+        physiologicallyEstablished
       ) {
         life.connectedToParent = false;
         continue;
       }
-      const parentSurplus = Math.max(
-        0,
-        parentCell.biomass.vallisneria -
-          0.24 * VALLISNERIA_LEDGER_BIOMASS_SCALE,
+      const parentSurplus = this.vallisneriaTransferableSurplus(
+        parent.plant,
+        parentCell,
       );
       const daughterDeficit = Math.max(
         0,
         VALLISNERIA_CLONAL_SUPPORT_TARGET - daughterCell.biomass.vallisneria,
       );
+      // Clonal integration complements the daughter's realised local
+      // production; it does not blindly fill every daughter to the same mass.
+      // A well-lit ramet therefore grows mostly on its own, while a shaded or
+      // resource-limited adjacent ramet receives enough translocated matter to
+      // follow a conservative establishment trajectory.
+      const establishmentRate = (
+        VALLISNERIA_CLONAL_SUPPORT_TARGET - VALLISNERIA_RUNNER_BIOMASS
+      ) / VALLISNERIA_CLONAL_ESTABLISHMENT_SECONDS;
+      const localGrowth = life.lastGrowthBiomassDelta;
+      const supportNeedThisStep = Math.max(
+        0,
+        establishmentRate * deltaSeconds - localGrowth,
+      );
       const transfer = Math.min(
         parentSurplus,
         daughterDeficit,
+        supportNeedThisStep,
         VALLISNERIA_CLONAL_SUPPORT_PER_SECOND * deltaSeconds,
       );
       if (transfer <= 0) continue;
       parentCell.biomass.vallisneria -= transfer;
+      parent.plant.runnerReserveBiomass = Math.max(
+        0,
+        parent.plant.runnerReserveBiomass - transfer,
+      );
       daughterCell.biomass.vallisneria += transfer;
     }
   }
@@ -12706,16 +13406,21 @@ export class SimulationWorld {
       const life = placement.plant;
       life.ageSeconds += deltaSeconds;
       const biomass = cell.biomass.vallisneria;
+      const vegetativeBiomass = Math.max(
+        0,
+        biomass - life.runnerReserveBiomass,
+      );
       life.stressSeconds = biomass < VALLISNERIA_LOW_RESERVE
         ? life.stressSeconds + deltaSeconds
         : Math.max(0, life.stressSeconds - deltaSeconds * 1.8);
 
       const stage = this.vallisneriaLifeStage(life);
-      const reserveScale = 0.16 + 0.84 * clamp01(
+      const reserveScale = VALLISNERIA_MIN_RESERVE_SCALE +
+        (1 - VALLISNERIA_MIN_RESERVE_SCALE) * clamp01(
         (
-          biomass - 0.02 * VALLISNERIA_LEDGER_BIOMASS_SCALE
+          vegetativeBiomass - VALLISNERIA_BASE_VEGETATIVE_BIOMASS
         ) /
-          (0.46 * VALLISNERIA_LEDGER_BIOMASS_SCALE),
+          VALLISNERIA_LEAF_BIOMASS_RANGE,
       );
       const juvenileLimit = stage === 'juvenile'
         ? 0.22 + 0.78 * clamp01(life.ageSeconds / VALLISNERIA_JUVENILE_SECONDS)
@@ -12726,18 +13431,33 @@ export class SimulationWorld {
           (life.lifespanSeconds * (1 - VALLISNERIA_SENESCENCE_START_RATIO)),
         )
         : 0;
-      const targetScale = Math.min(reserveScale, juvenileLimit) * (1 - senescenceProgress * 0.42);
-      const responseSeconds = targetScale >= life.structuralScale ? 150 : 360;
-      life.structuralScale += (targetScale - life.structuralScale) *
-        clamp01(deltaSeconds / responseSeconds);
+      const targetCohortScale = Math.min(reserveScale, juvenileLimit) *
+        (1 - senescenceProgress * 0.42);
+      const cohortResponseSeconds = targetCohortScale >= life.leafCohortScale
+        ? 75
+        : 180;
+      life.leafCohortScale += (targetCohortScale - life.leafCohortScale) *
+        clamp01(deltaSeconds / cohortResponseSeconds);
+      life.leafCohortScale = clamp(life.leafCohortScale, 0.12, 1);
+
+      // Existing blades do not retract when respiration or runner transfer
+      // lowers reserve. Healthy juvenile and mature ramets can only extend
+      // their attained length; a smaller cohort removes whole old leaves.
+      const attainableScale = Math.min(reserveScale, juvenileLimit);
+      if (stage !== 'senescent' && attainableScale > life.structuralScale) {
+        life.structuralScale += (attainableScale - life.structuralScale) *
+          clamp01(deltaSeconds / 75);
+      }
       life.structuralScale = clamp(life.structuralScale, 0.12, 1);
 
       if (stage === 'senescent' && biomass > 0) {
         const senescenceLoss = Math.min(
           biomass,
-          biomass * (0.0008 + senescenceProgress * 0.0024) * deltaSeconds,
+          biomass * (0.0016 + senescenceProgress * 0.0048) * deltaSeconds,
         );
         cell.biomass.vallisneria -= senescenceLoss;
+        life.runnerReserveBiomass *= cell.biomass.vallisneria /
+          Math.max(1e-9, biomass);
         this.biogeochemistry.recordAlgaeTurnover(
           this.vallisneriaRootPosition(placement, cell),
           senescenceLoss,
@@ -12751,13 +13471,21 @@ export class SimulationWorld {
         reserveCollapsed ||
         cell.biomass.vallisneria <= VALLISNERIA_VISIBLE_BIOMASS
       ) {
+        const rootPoint = this.vallisneriaRootPosition(placement, cell);
         const remaining = Math.max(0, cell.biomass.vallisneria);
         if (remaining > 0) {
           this.biogeochemistry.recordAlgaeTurnover(
-            this.vallisneriaRootPosition(placement, cell),
+            rootPoint,
             remaining,
           );
           cell.biomass.vallisneria = 0;
+        }
+        if (life.nitrogenReserve > 0) {
+          this.biogeochemistry.releaseRootedPlantNitrogen(
+            rootPoint,
+            life.nitrogenReserve,
+          );
+          life.nitrogenReserve = 0;
         }
         deaths.add(placement.id);
         continue;
@@ -12767,42 +13495,54 @@ export class SimulationWorld {
       if (
         stage !== 'mature' ||
         health < 0.68 ||
-        biomass <
-          VALLISNERIA_RUNNER_BIOMASS +
-            0.18 * VALLISNERIA_LEDGER_BIOMASS_SCALE
+        life.structuralScale < VALLISNERIA_REPRODUCTIVE_STRUCTURAL_SCALE
       ) {
-        life.runnerProgress = Math.max(0, life.runnerProgress - deltaSeconds / 1_800);
+        life.runnerProgress = Math.max(0, life.runnerProgress - deltaSeconds / 900);
         continue;
       }
-      const temperature = this.biogeochemistry.temperatureAt(this.producerActivityPoint(cell, 'vallisneria'));
+      const temperature = this.biogeochemistry.temperatureAt(
+        this.producerActivityPoint(cell, 'vallisneria'),
+      );
       const suitability = this.vallisneriaCanopySuitability(cell, temperature);
       life.runnerProgress += deltaSeconds / VALLISNERIA_RUNNER_INTERVAL_SECONDS *
         clamp(
           health * suitability *
-            (
-              biomass /
-                (0.5 * VALLISNERIA_LEDGER_BIOMASS_SCALE)
-            ),
+            (biomass / Math.max(
+              VALLISNERIA_RUNNER_BIOMASS,
+              vallisneriaBiomassForLeafScale(life.leafCohortScale),
+            )),
           0,
           1.35,
         );
       if (life.runnerProgress < 1) continue;
 
+      // A healthy adult can form and extend a stolon before it has accumulated
+      // the full daughter packet. Rooting waits here until real surplus exists;
+      // the progress clock itself must not restart every time photosynthesis
+      // crosses the funding threshold during a day/night cycle.
+      if (
+        this.vallisneriaTransferableSurplus(life, cell) <
+          VALLISNERIA_RUNNER_COMMITMENT_BIOMASS
+      ) continue;
+
       const destination = this.runnerDestination(placement);
       if (!destination) {
-        life.runnerProgress = Math.min(1, life.runnerProgress);
+        // The completed stolon keeps elongating rather than retrying the same
+        // impossible radius forever. Extra progress expands the physical
+        // search distance on later steps; it does not inspect future survival.
+        life.runnerProgress = Math.min(2, life.runnerProgress);
         continue;
       }
       const transferred = Math.min(
         VALLISNERIA_RUNNER_BIOMASS,
-        cell.biomass.vallisneria -
-          0.18 * VALLISNERIA_LEDGER_BIOMASS_SCALE,
+        this.vallisneriaTransferableSurplus(life, cell),
       );
-      if (
-        transferred <=
-          0.04 * VALLISNERIA_LEDGER_BIOMASS_SCALE
-      ) continue;
+      if (transferred < VALLISNERIA_RUNNER_BIOMASS * 0.98) continue;
       cell.biomass.vallisneria -= transferred;
+      life.runnerReserveBiomass = Math.max(
+        0,
+        life.runnerReserveBiomass - transferred,
+      );
       destination.biomass.vallisneria += transferred;
       const daughterId = `seed-${++this.seedCounter}`;
       daughters.push(this.createSeedPlacement(
@@ -12812,7 +13552,7 @@ export class SimulationWorld {
         'runner',
         placement.id,
       ));
-      life.runnerProgress -= 1;
+      life.runnerProgress = 0;
       life.reproductionCount += 1;
     }
 
@@ -12824,6 +13564,86 @@ export class SimulationWorld {
       this.lightDirty = true;
     }
     if (deaths.size || daughters.length) this.snapshotDirty = true;
+  }
+
+  /**
+   * Light that actually entered living producer physiology during this tank
+   * state. Attached films include water attenuation and self-shading;
+   * Vallisneria is sampled along the same painted leaf points used by its
+   * photosynthesis calculation. Biomass weighting prevents hundreds of empty
+   * grid cells from defining the observation.
+   */
+  private measuredProducerEffectiveLight(): number {
+    let weightedLight = 0;
+    let producerBiomass = 0;
+    for (const cell of this.allCells()) {
+      const oedogonium = cell.biomass.oedogonium;
+      const nitzschia = cell.biomass.nitzschia;
+      if (oedogonium > 0 || nitzschia > 0) {
+        const activityPoint = this.cellWorldPoint(cell);
+        const incidentLight = cell.light *
+          this.biogeochemistry.algaeLightTransmissionAt(activityPoint);
+        if (oedogonium > 0) {
+          weightedLight += attachedAlgaeEffectiveLight(
+            'oedogonium',
+            incidentLight,
+            oedogonium,
+          ) * oedogonium;
+          producerBiomass += oedogonium;
+        }
+        if (nitzschia > 0) {
+          weightedLight += attachedAlgaeEffectiveLight(
+            'nitzschia',
+            incidentLight,
+            oedogonium,
+          ) * nitzschia;
+          producerBiomass += nitzschia;
+        }
+      }
+
+      const vallisneria = cell.biomass.vallisneria;
+      if (vallisneria <= 0) continue;
+      const sampleCount = this.vallisneriaCanopyLightSamples(cell);
+      let effectiveLight = 0;
+      if (sampleCount > 0) {
+        for (let index = 0; index < sampleCount; index += 1) {
+          effectiveLight += this.vallisneriaCanopyLightsScratch[index] *
+            this.biogeochemistry.algaeLightTransmissionAt(
+              this.vallisneriaCanopyPointsScratch[index],
+            );
+        }
+        effectiveLight /= sampleCount;
+      } else {
+        const activityPoint = this.producerActivityPoint(cell, 'vallisneria');
+        effectiveLight = this.sampleLightField(activityPoint) *
+          this.biogeochemistry.algaeLightTransmissionAt(activityPoint);
+      }
+      weightedLight += effectiveLight * vallisneria;
+      producerBiomass += vallisneria;
+    }
+    return producerBiomass > 1e-12
+      ? weightedLight / producerBiomass
+      : 0;
+  }
+
+  private recordProducerFluxSample(): void {
+    if (this.elapsedSeconds + 1e-9 < this.nextProducerFluxSampleAt) return;
+    const rates = this.biogeochemistry.producerFluxRates();
+    this.producerFluxHistory.push({
+      elapsedSeconds: this.elapsedSeconds,
+      effectiveLight: this.measuredProducerEffectiveLight(),
+      grossPhotosynthesis: rates.grossPhotosynthesis,
+      producerRespiration: rates.producerRespiration,
+    });
+    this.nextProducerFluxSampleAt =
+      (Math.floor(this.elapsedSeconds / PRODUCER_FLUX_SAMPLE_INTERVAL_SECONDS) + 1) *
+        PRODUCER_FLUX_SAMPLE_INTERVAL_SECONDS;
+    const cutoff = this.elapsedSeconds -
+      PRODUCER_FLUX_HISTORY_RETENTION_SECONDS;
+    const firstRetained = this.producerFluxHistory.findIndex(
+      (point) => point.elapsedSeconds + 1e-9 >= cutoff,
+    );
+    if (firstRetained > 0) this.producerFluxHistory.splice(0, firstRetained);
   }
 
   private stepGrowth(deltaSeconds: number): void {
@@ -12879,6 +13699,9 @@ export class SimulationWorld {
         original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] +
         original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] +
         original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria];
+      const attachedTotal =
+        original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] +
+        original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia];
       const backgroundNutrientFactor =
         backgroundProducerCapacity !== null &&
         this.scenario.backgroundProducerResourceMode === 'surface'
@@ -12888,7 +13711,10 @@ export class SimulationWorld {
             ),
           )
           : tankBackgroundNutrientFactor;
-      const freeCapacity = clamp01(1 - total);
+      // Rooted macrophyte mass rises into the water column and does not occupy
+      // the same two-dimensional film capacity as algae on the substrate.
+      // They still compete through finite C/N and canopy shade.
+      const freeCapacity = clamp01(1 - attachedTotal);
       const resourceFactors = this.growthResourceFactorsScratch;
       resourceFactors.fill(0);
       for (const speciesId of this.scenario.allowedSpecies) {
@@ -12923,10 +13749,15 @@ export class SimulationWorld {
           physiology[physiologyOffset + ALGAE_PHYSIOLOGY_NET] =
             response.netGrowth;
         } else {
+          const incidentLight = cell.light *
+            this.biogeochemistry.algaeLightTransmissionAt(physiologyPoint);
           writeAlgaePhysiologyRates(
             speciesId,
-            cell.light *
-              this.biogeochemistry.algaeLightTransmissionAt(physiologyPoint),
+            attachedAlgaeEffectiveLight(
+              speciesId,
+              incidentLight,
+              original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium],
+            ),
             localTemperature,
             physiology,
             physiologyOffset,
@@ -12996,16 +13827,6 @@ export class SimulationWorld {
         original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] +
         original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria];
       const cellPoint = this.cellWorldPoint(cell);
-      const weightedAverage = total > 0
-        ? (
-          original[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] *
-            rates[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] +
-          original[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] *
-            rates[cellOffset + GROWTH_SPECIES_INDEX.nitzschia] +
-          original[cellOffset + GROWTH_SPECIES_INDEX.vallisneria] *
-            rates[cellOffset + GROWTH_SPECIES_INDEX.vallisneria]
-        ) / total
-        : 0;
       const productions = this.growthProductionsScratch;
       const respirationRequests = this.growthRespirationRequestsScratch;
       const respirations = this.growthRespirationsScratch;
@@ -13023,6 +13844,27 @@ export class SimulationWorld {
       const attachedProductionRequest =
         productionRequests[cellOffset + oedogoniumSpeciesIndex] +
         productionRequests[cellOffset + nitzschiaSpeciesIndex];
+      const vallisneriaProductionRequest =
+        productionRequests[cellOffset + vallisneriaSpeciesIndex];
+      // The ammonium window partitions nitrifiers against all producers, but
+      // nitrate and carbon are withdrawn when production is committed. Always
+      // committing attached films first therefore gave them a permanent
+      // source-code-order advantage over a Vallisneria root in the same local
+      // resource stencil. Alternate the two producer forms by ecology second
+      // and spatial cell: neither receives a protected amount, while repeated
+      // competition no longer has a fixed winner unrelated to physiology.
+      const vallisneriaCommitsFirst =
+        ((Math.floor(this.elapsedSeconds) + cell.index) & 1) === 0;
+      if (vallisneriaCommitsFirst && vallisneriaProductionRequest > 0) {
+        productions[vallisneriaSpeciesIndex] = this.commitVallisneriaProduction(
+          cell,
+          this.vallisneriaUptakePoint(cell),
+          vallisneriaProductionRequest,
+          this.biogeochemistry.temperatureAt(
+            this.producerActivityPoint(cell, 'vallisneria'),
+          ),
+        );
+      }
       if (attachedProductionRequest > 0) {
         const committed = this.biogeochemistry.commitAlgaeProduction(
           cellPoint,
@@ -13035,11 +13877,11 @@ export class SimulationWorld {
           productionRequests[cellOffset + nitzschiaSpeciesIndex] /
           attachedProductionRequest;
       }
-      if (productionRequests[cellOffset + vallisneriaSpeciesIndex] > 0) {
+      if (!vallisneriaCommitsFirst && vallisneriaProductionRequest > 0) {
         productions[vallisneriaSpeciesIndex] = this.commitVallisneriaProduction(
           cell,
           this.vallisneriaUptakePoint(cell),
-          productionRequests[cellOffset + vallisneriaSpeciesIndex],
+          vallisneriaProductionRequest,
           this.biogeochemistry.temperatureAt(
             this.producerActivityPoint(cell, 'vallisneria'),
           ),
@@ -13092,18 +13934,14 @@ export class SimulationWorld {
           ALGAE_PHYSIOLOGY_VALUE_COUNT;
         const lightStressTurnover =
           physiology[physiologyOffset + ALGAE_PHYSIOLOGY_STRESS];
-        const rate = rates[cellOffset + speciesIndex];
         const production = productions[speciesIndex];
         const respiration = respirations[speciesIndex];
         fixedBiomass += production;
         respiredBiomass += respiration;
         const stressTurnover = amount * lightStressTurnover * deltaSeconds;
-        const replacement = total > 0.04
-          ? amount * (rate - weightedAverage) * total * 1.35 * deltaSeconds
-          : 0;
         const naturalTurnover = amount *
           SPECIES[speciesId].naturalTurnoverPerSecond *
-          producerProcessRateScale(speciesId) *
+          producerNaturalTurnoverRateScale(speciesId) *
           deltaSeconds;
         // Aerobic respiration can be limited by local oxygen. The unmet
         // maintenance demand still costs living tissue; otherwise anoxia
@@ -13113,28 +13951,28 @@ export class SimulationWorld {
           0,
           respirationRequests[speciesIndex] - respiration,
         );
-        next[cellOffset + speciesIndex] = Math.max(
+        const nextAmount = Math.max(
           0,
           amount + production - respiration - unmetMaintenanceTurnover -
-            stressTurnover + replacement - naturalTurnover,
+            stressTurnover - naturalTurnover,
         );
+        // A deterministic continuous loss curve otherwise approaches zero
+        // forever without ever allowing local extinction. Once an attached
+        // film has fallen below the smallest renderable propagule and is still
+        // shrinking, it represents less than one resolved colony on this
+        // sampling tile and is transferred to detritus as a real local loss.
+        // Increasing propagules are retained, and grazing can still remove any
+        // larger patch exactly; this is an extinction threshold, never a
+        // protected biomass floor. Rooted Vallisneria uses its individual
+        // lifecycle/death path instead of this surface-film resolution rule.
+        next[cellOffset + speciesIndex] = speciesId !== 'vallisneria'
+          ? resolvedSurfaceFilmBiomass(amount, nextAmount)
+          : nextAmount;
       }
 
-      // A developed filamentous canopy shades the low-profile diatom film below it.
       const oedogoniumIndex = cellOffset + GROWTH_SPECIES_INDEX.oedogonium;
       const nitzschiaIndex = cellOffset + GROWTH_SPECIES_INDEX.nitzschia;
       const vallisneriaIndex = cellOffset + GROWTH_SPECIES_INDEX.vallisneria;
-      if (
-        original[oedogoniumIndex] > 0.24 &&
-        rates[cellOffset + GROWTH_SPECIES_INDEX.oedogonium] >
-          rates[cellOffset + GROWTH_SPECIES_INDEX.nitzschia]
-      ) {
-        next[nitzschiaIndex] = Math.max(
-          0,
-          next[nitzschiaIndex] -
-            original[nitzschiaIndex] * original[oedogoniumIndex] * 0.018 * deltaSeconds,
-        );
-      }
       const localLoss = Math.max(
         0,
         total + fixedBiomass - respiredBiomass -
@@ -13158,8 +13996,7 @@ export class SimulationWorld {
         const receiverOffset = receiverIndex * 3;
         const receiverTotal =
           next[receiverOffset + GROWTH_SPECIES_INDEX.oedogonium] +
-          next[receiverOffset + GROWTH_SPECIES_INDEX.nitzschia] +
-          next[receiverOffset + GROWTH_SPECIES_INDEX.vallisneria];
+          next[receiverOffset + GROWTH_SPECIES_INDEX.nitzschia];
         const freeCapacity = clamp01(1 - receiverTotal);
         if (freeCapacity <= 0.0001) continue;
         for (const speciesId of this.scenario.allowedSpecies) {
@@ -13195,7 +14032,8 @@ export class SimulationWorld {
                 SURFACE_FILM_FRONT_DISPERSAL_RATE_CAP,
                 SPECIES[speciesId].dispersalRate * dispersalTimeScale,
               )
-            : SPECIES[speciesId].dispersalRate;
+            : SPECIES[speciesId].dispersalRate *
+              SURFACE_FILM_MATURE_DISPERSAL_MULTIPLIER;
           const rawRecruitment =
             dispersalRate *
             sourceAmount *
@@ -13246,8 +14084,7 @@ export class SimulationWorld {
       const freeCapacity = clamp01(
         1 -
           next[receiverOffset + GROWTH_SPECIES_INDEX.oedogonium] -
-          next[receiverOffset + GROWTH_SPECIES_INDEX.nitzschia] -
-          next[receiverOffset + GROWTH_SPECIES_INDEX.vallisneria],
+          next[receiverOffset + GROWTH_SPECIES_INDEX.nitzschia],
       );
       const demand = incomingDemand[transfer.receiverIndex];
       if (demand > freeCapacity && demand > 0) {
@@ -13293,23 +14130,33 @@ export class SimulationWorld {
       const oedogoniumIndex = offset + GROWTH_SPECIES_INDEX.oedogonium;
       const nitzschiaIndex = offset + GROWTH_SPECIES_INDEX.nitzschia;
       const vallisneriaIndex = offset + GROWTH_SPECIES_INDEX.vallisneria;
-      const total =
-        next[oedogoniumIndex] + next[nitzschiaIndex] + next[vallisneriaIndex];
-      if (total > 1) {
+      const attachedTotal = next[oedogoniumIndex] + next[nitzschiaIndex];
+      if (attachedTotal > 1) {
         // This path is normally only a floating-point/legacy-save safety net.
         // If it does activate, the removed living biomass must remain in the
         // closed material ledger instead of disappearing during normalisation.
         this.biogeochemistry.recordAlgaeTurnover(
           this.cellWorldPoint(cell),
-          total - 1,
+          attachedTotal - 1,
         );
-        next[oedogoniumIndex] /= total;
-        next[nitzschiaIndex] /= total;
-        next[vallisneriaIndex] /= total;
+        next[oedogoniumIndex] /= attachedTotal;
+        next[nitzschiaIndex] /= attachedTotal;
       }
       cell.biomass.oedogonium = clamp01(next[oedogoniumIndex]);
       cell.biomass.nitzschia = clamp01(next[nitzschiaIndex]);
-      cell.biomass.vallisneria = clamp01(next[vallisneriaIndex]);
+      cell.biomass.vallisneria = clamp(
+        next[vallisneriaIndex],
+        0,
+        VALLISNERIA_CELL_BIOMASS_CAPACITY,
+      );
+      const rametLife = this.vallisneriaRametForCell(cell)?.plant;
+      if (rametLife) {
+        this.updateVallisneriaRunnerReserveAfterGrowth(
+          rametLife,
+          original[vallisneriaIndex],
+          cell.biomass.vallisneria,
+        );
+      }
     }
   }
 
@@ -13981,9 +14828,34 @@ export class SimulationWorld {
       snapshot.ageSeconds = placement.plant.ageSeconds;
       snapshot.lifespanSeconds = placement.plant.lifespanSeconds;
       snapshot.lifeStage = this.vallisneriaLifeStage(placement.plant);
+      snapshot.leafRetention = this.vallisneriaLeafRetention(placement.plant);
       snapshot.structuralScale = placement.plant.structuralScale;
+      snapshot.nitrogenReserve = placement.plant.nitrogenReserve;
+      snapshot.runnerReserveBiomass = placement.plant.runnerReserveBiomass;
       snapshot.health = this.vallisneriaHealth(placement, cell);
       snapshot.runnerProgress = clamp01(placement.plant.runnerProgress);
+      if (snapshot.lifeStage === 'juvenile') {
+        snapshot.runnerState = 'juvenile';
+      } else if (snapshot.lifeStage === 'senescent') {
+        snapshot.runnerState = 'senescent';
+      } else if (snapshot.health < 0.68) {
+        snapshot.runnerState = 'recovering';
+      } else if (
+        snapshot.structuralScale < VALLISNERIA_REPRODUCTIVE_STRUCTURAL_SCALE
+      ) {
+        snapshot.runnerState = 'growing-leaves';
+      } else if (placement.plant.runnerProgress < 1) {
+        snapshot.runnerState = 'preparing';
+      } else if (
+        this.vallisneriaTransferableSurplus(placement.plant, cell) <
+          VALLISNERIA_RUNNER_COMMITMENT_BIOMASS
+      ) {
+        snapshot.runnerState = 'waiting-reserve';
+      } else if (!this.runnerDestination(placement)) {
+        snapshot.runnerState = 'waiting-site';
+      } else {
+        snapshot.runnerState = 'ready';
+      }
       snapshot.reproductionCount = placement.plant.reproductionCount;
       snapshots[snapshotIndex] = snapshot;
       snapshotIndex += 1;
@@ -14103,11 +14975,22 @@ export class SimulationWorld {
     const ageSeconds = SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS +
       deterministicNoise(characteristicSeed * 0.013 + 7.1) *
       (SHRIMP_SUPPLIED_ADULT_MAX_AGE_SECONDS - SHRIMP_SUPPLIED_ADULT_MIN_AGE_SECONDS);
+    const suppliedStructuralBiomass = seededRange(
+      characteristicSeed * 0.067 + 47.9,
+      isFemale
+        ? SHRIMP_ECOLOGY_RULES.suppliedFemaleStructuralBiomassMinimum
+        : SHRIMP_ECOLOGY_RULES.suppliedMaleStructuralBiomassMinimum,
+      isFemale
+        ? SHRIMP_ECOLOGY_RULES.suppliedFemaleStructuralBiomassMaximum
+        : SHRIMP_ECOLOGY_RULES.suppliedMaleStructuralBiomassMaximum,
+    );
     const ovarianClutchSize = isFemale
-      ? shrimpClutchSizeForStructure(
-        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
-      )
+      ? shrimpClutchSizeForStructure(suppliedStructuralBiomass)
       : undefined;
+    const suppliedReserveBiomass =
+      WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass *
+      suppliedStructuralBiomass /
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
     return {
       id,
       speciesId,
@@ -14116,8 +14999,7 @@ export class SimulationWorld {
       velocity: { x: 0, y: 0 },
       facing: motionNoise < 0.5 ? -1 : 1,
       poseAngle: 0,
-      bodyLength: SHRIMP_ADULT_LENGTH *
-        (0.94 + deterministicNoise(characteristicSeed * 0.037) * 0.12),
+      bodyLength: shrimpBodyLengthForStructure(suppliedStructuralBiomass),
       lifeStage: 'adult',
       sex: isFemale ? 'female' : 'male',
       ageSeconds,
@@ -14127,8 +15009,9 @@ export class SimulationWorld {
       // The former arbitrary 0.52-0.55 was immediately corrected to ~0.46,
       // creating a hidden one-step condition drop after stocking.
       energy: SHRIMP_SUPPLIED_INITIAL_ENERGY,
-      structuralBiomass: WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
-      storedBiomass: WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass,
+      structuralBiomass: suppliedStructuralBiomass,
+      peakStructuralBiomass: suppliedStructuralBiomass,
+      storedBiomass: suppliedReserveBiomass,
       reproductiveBiomass:
         isFemale && origin === 'supplied' && ovarianClutchSize !== undefined
           ? ovarianClutchSize *
@@ -14350,6 +15233,15 @@ export class SimulationWorld {
     const individualSeed = characteristicSeed * 0.001;
     const maturationTargetSeconds =
       shrimpMaturationTargetSeconds(individualSeed);
+    // Birth matter is one conserved egg packet, split into structure and the
+    // hatchling's first DEB reserve. Assigning all 0.009 B to structure left
+    // every newborn at exactly zero reserve, so it could die before completing
+    // one local food-search bout even beside a grazeable film. Keep the same
+    // total brood cost and the same adult reserve-to-structure ratio; no matter
+    // is added and no separate yolk compartment is invented.
+    const birthMatter = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
+    const initialStructure = SHRIMP_BIRTH_STRUCTURAL_BIOMASS;
+    const initialReserve = SHRIMP_BIRTH_RESERVE_BIOMASS;
     return {
       id,
       speciesId: parent.speciesId,
@@ -14361,17 +15253,14 @@ export class SimulationWorld {
       velocity: { x: 0, y: 0 },
       facing: clutchIndex % 2 === 0 ? 1 : -1,
       poseAngle: 0,
-      bodyLength: SHRIMP_JUVENILE_LENGTH,
+      bodyLength: shrimpBodyLengthForStructure(initialStructure),
       lifeStage: 'juvenile',
       sex: isFemale ? 'female' : 'male',
       ageSeconds: 0,
       lifespanSeconds: shrimpLifespanSeconds(individualSeed),
-      // The condition value is derived from conserved matter on the first
-      // ecology step. A newborn has no reserve, so do not show a fictitious
-      // well-fed value before that synchronization occurs.
-      energy: SHRIMP_STRUCTURE_CONDITION_SHARE,
-      structuralBiomass: WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
-      storedBiomass: 0,
+      energy: initialStructure / birthMatter,
+      structuralBiomass: initialStructure,
+      storedBiomass: initialReserve,
       reproductiveBiomass: 0,
       health: 1,
       behavior: 'resting',
@@ -14393,7 +15282,12 @@ export class SimulationWorld {
       gestationRemaining: null,
       maturationTargetSeconds,
       ovarianProgress: 0,
-      ovarianClutchSize: undefined,
+      // The first ovarian cycle starts during juvenile development. Lock its
+      // minimum-size clutch now so later somatic growth cannot move the matter
+      // target while the same ovary is being provisioned.
+      ovarianClutchSize: isFemale
+        ? SHRIMP_ECOLOGY_RULES.minimumClutchSize
+        : undefined,
       reproductiveCycleIndex: 0,
       matingAccumulator: 0,
       randomSeed: individualSeed,
@@ -14781,6 +15675,7 @@ export class SimulationWorld {
           cell.index,
           anchor,
           placement.plant.structuralScale,
+          this.vallisneriaLeafRetention(placement.plant),
         )
         : Math.sqrt(distanceSquared(point, anchor));
       if (!nearest || distance < nearest.distance) nearest = { placement, distance };
@@ -14802,6 +15697,7 @@ export class SimulationWorld {
         cell.index,
         anchor,
         placement.plant.structuralScale,
+        this.vallisneriaLeafRetention(placement.plant),
       );
       // Only the painted ribbons receive a hit area. Treating the entire
       // canopy bounding rectangle as the plant made its transparent gaps

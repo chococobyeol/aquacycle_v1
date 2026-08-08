@@ -9,7 +9,7 @@ import {
   SPECIES,
 } from '../src/simulation/config';
 import {
-  netGrowthPotential,
+  algaePhysiology,
   producerProcessRateScale,
 } from '../src/simulation/growth';
 import type {
@@ -248,13 +248,38 @@ describe('consumer-resource emergence', () => {
     const source = cells[Math.floor(cells.length / 2)];
     const initialBiomass = 0.28;
     source.biomass.oedogonium = initialBiomass;
+    internals.biogeochemistry.algaeResourceFactor = () => 1;
+    internals.biogeochemistry.algaeLightTransmissionAt = () => 1;
+    internals.biogeochemistry.commitAlgaeProduction = (
+      _point,
+      requestedBiomass,
+    ) => requestedBiomass;
+    internals.biogeochemistry.commitAlgaeRespiration = (
+      _point,
+      requestedBiomass,
+    ) => requestedBiomass;
 
     internals.stepGrowth(1);
 
     const temperature = initialWaterTemperatureForLight(SCENARIOS['mission-1'].lightOutput);
-    const rate = netGrowthPotential('oedogonium', 45, temperature);
+    const rates = algaePhysiology('oedogonium', 45, temperature);
+    const backgroundCapacity = SCENARIOS['mission-1'].backgroundProducerCapacity;
+    const backgroundNutrientFactor = backgroundCapacity === null
+      ? 1
+      : 1 - initialBiomass / backgroundCapacity;
+    const resourceAdjustedGross =
+      rates.grossPhotosynthesis * backgroundNutrientFactor;
+    const resourceAdjustedNet = resourceAdjustedGross - rates.respiration -
+      rates.lightStressTurnover;
+    const freeCapacity = 1 - initialBiomass;
+    const densityAdjustedGross = resourceAdjustedNet > 0
+      ? rates.respiration + rates.lightStressTurnover +
+        resourceAdjustedNet * freeCapacity
+      : resourceAdjustedGross;
     const expectedBiomass = initialBiomass +
-      initialBiomass * rate * (1 - initialBiomass) -
+      initialBiomass * densityAdjustedGross -
+      initialBiomass * rates.respiration -
+      initialBiomass * rates.lightStressTurnover -
       initialBiomass * SPECIES.oedogonium.naturalTurnoverPerSecond *
         producerProcessRateScale('oedogonium');
     const actualBiomass = cells.reduce(

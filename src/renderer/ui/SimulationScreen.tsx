@@ -39,6 +39,7 @@ import type {
   MeasurementKind,
   MicrobeGuildId,
   PlanktonKind,
+  ProducerFluxHistoryPoint,
   SelectionFilter,
   ScenarioId,
   SimulationCommand,
@@ -90,6 +91,7 @@ import {
   appendRollingHistory,
   ECOLOGY_HISTORY_WINDOW_SECONDS,
   ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS,
+  historyAttachedAlgaeBiomass,
   historyPointsInWindow,
   historyTimeBounds,
   historyTimeX,
@@ -139,7 +141,11 @@ export const inventoryPlacementEditable = (
   }
   if (phase !== 'paused') return false;
   if (kind === 'biofilm') return hasWaterCycle;
-  if (scenarioId === 'mission-4' || scenarioId === 'mission-5') {
+  if (
+    scenarioId === 'mission-4' ||
+    scenarioId === 'mission-5' ||
+    scenarioId === 'mission-6'
+  ) {
     return kind === 'seed' || kind === 'animal';
   }
   return scenarioId === 'mission-8' && kind === 'animal';
@@ -153,7 +159,9 @@ interface WaterQualityViewState {
 
 interface EcologyHistoryPoint {
   elapsedSeconds: number;
-  algaeBiomass: number;
+  /** Attached algae only. Legacy saved traces may still have `algaeBiomass`. */
+  attachedAlgaeBiomass?: number;
+  algaeBiomass?: number;
   plantBiomass: number;
   phytoplanktonBiomass: number;
   planktonicDecomposerBiomass: number;
@@ -209,6 +217,7 @@ export interface SimulationUiRestartState extends Record<string, unknown> {
   showGoalGuide: boolean;
   cameraTransform: AquariumCameraTransform | null;
   ecologyHistory: EcologyHistoryPoint[];
+  producerFluxHistory: ProducerFluxHistoryPoint[];
   ecologyHistoryWindowSeconds: number;
 }
 
@@ -898,6 +907,9 @@ export function SimulationScreen({
   const [ecologyHistory, setEcologyHistory] = useState<EcologyHistoryPoint[]>(
     initialUiState?.ecologyHistory ?? [],
   );
+  const [producerFluxHistory, setProducerFluxHistory] = useState<
+    ProducerFluxHistoryPoint[]
+  >(initialUiState?.producerFluxHistory ?? []);
   const [ecologyHistoryWindowSeconds, setEcologyHistoryWindowSeconds] = useState(
     initialUiState?.ecologyHistoryWindowSeconds ??
       ECOLOGY_HISTORY_WINDOW_SECONDS,
@@ -1003,6 +1015,7 @@ export function SimulationScreen({
     lastEcologySampleAt.current =
       restoredHistory.at(-1)?.elapsedSeconds ?? Number.NEGATIVE_INFINITY;
     setEcologyHistory(restoredHistory);
+    setProducerFluxHistory(initialUiState?.producerFluxHistory ?? []);
     setEcologyHistoryWindowSeconds(
       initialUiState?.ecologyHistoryWindowSeconds ??
         ECOLOGY_HISTORY_WINDOW_SECONDS,
@@ -1031,6 +1044,7 @@ export function SimulationScreen({
         showGoalGuide,
         cameraTransform,
         ecologyHistory,
+        producerFluxHistory,
         ecologyHistoryWindowSeconds,
       } satisfies SimulationUiRestartState);
     };
@@ -1049,6 +1063,7 @@ export function SimulationScreen({
     detachedObservationSections,
     detachedPanelLayouts,
     ecologyHistory,
+    producerFluxHistory,
     ecologyHistoryWindowSeconds,
     inventoryCategory,
     observationView,
@@ -1241,8 +1256,8 @@ export function SimulationScreen({
     const elapsedSeconds = snapshot.elapsedSeconds;
     const point: EcologyHistoryPoint = {
       elapsedSeconds,
-      algaeBiomass: snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia +
-        snapshot.totalBiomass.vallisneria,
+      attachedAlgaeBiomass:
+        snapshot.totalBiomass.oedogonium + snapshot.totalBiomass.nitzschia,
       plantBiomass: snapshot.totalBiomass.vallisneria,
       phytoplanktonBiomass:
         snapshot.biogeochemistry.plankton.phytoplanktonBiomass,
@@ -1331,6 +1346,27 @@ export function SimulationScreen({
     snapshot?.biogeochemistry.carbonCycle.headspaceCarbonDioxide,
     snapshot?.biogeochemistry.carbonCycle.headspaceOxygen,
   ]);
+
+  useEffect(() => {
+    if (!snapshot) return;
+    const measured = snapshot.producerFluxHistory;
+    if (!measured.length) return;
+    setProducerFluxHistory((current) => {
+      const currentLatest = current.at(-1)?.elapsedSeconds ??
+        Number.NEGATIVE_INFINITY;
+      const reset = snapshot.elapsedSeconds + 0.01 < currentLatest;
+      let next = reset ? [] : current;
+      let latest = reset
+        ? Number.NEGATIVE_INFINITY
+        : currentLatest;
+      for (const point of measured) {
+        if (point.elapsedSeconds <= latest + 0.01) continue;
+        next = appendRollingHistory(next, { ...point });
+        latest = point.elapsedSeconds;
+      }
+      return next;
+    });
+  }, [snapshot?.elapsedSeconds, snapshot?.producerFluxHistory]);
 
   useEffect(() => {
     if (snapshot?.outcome !== 'success' || completionReported.current) return;
@@ -1791,7 +1827,7 @@ export function SimulationScreen({
       inventoryCategory === 'organisms' &&
       (seedEditable || animalEditable)
     ) {
-      return scenarioId === 'mission-5'
+      return scenarioId === 'mission-5' || scenarioId === 'mission-6'
         ? '일시정지 중에는 남겨 둔 조류·새우를 추가하고 균 필름을 접종할 수 있습니다'
         : '먹이망이 자리 잡으면 남겨 둔 동물을 방류하거나 균 필름을 접종할 수 있습니다';
     }
@@ -2111,6 +2147,7 @@ export function SimulationScreen({
   const resetSimulation = (): void => {
     resetUiState();
     setEcologyHistory([]);
+    setProducerFluxHistory([]);
     lastEcologySampleAt.current = Number.NEGATIVE_INFINITY;
     completionReported.current = false;
     resumeAfterBriefing.current = false;
@@ -2129,6 +2166,7 @@ export function SimulationScreen({
     writeLaboratoryTankPreference(tankType);
     resetUiState();
     setEcologyHistory([]);
+    setProducerFluxHistory([]);
     lastEcologySampleAt.current = Number.NEGATIVE_INFINITY;
     completionReported.current = false;
     resumeAfterBriefing.current = false;
@@ -2166,6 +2204,7 @@ export function SimulationScreen({
     completionReported.current = false;
     resumeAfterBriefing.current = false;
     setEcologyHistory([]);
+    setProducerFluxHistory([]);
     setShowMissionBriefing(false);
     setCameraResetToken((current) => current + 1);
     setOpenHudPanels(closedHudPanels());
@@ -3215,6 +3254,7 @@ export function SimulationScreen({
                               section={section.id}
                               snapshot={snapshot}
                               ecologyHistory={ecologyHistory}
+                              producerFluxHistory={producerFluxHistory}
                               historyWindowSeconds={ecologyHistoryWindowSeconds}
                               onHistoryWindowDecrease={() => changeEcologyHistoryWindow(-1)}
                               onHistoryWindowIncrease={() => changeEcologyHistoryWindow(1)}
@@ -3374,6 +3414,7 @@ export function SimulationScreen({
                         section={section.id}
                         snapshot={snapshot}
                         ecologyHistory={ecologyHistory}
+                        producerFluxHistory={producerFluxHistory}
                         historyWindowSeconds={ecologyHistoryWindowSeconds}
                         onHistoryWindowDecrease={() => changeEcologyHistoryWindow(-1)}
                         onHistoryWindowIncrease={() => changeEcologyHistoryWindow(1)}
@@ -3448,6 +3489,7 @@ function ObservationSectionContent({
   section,
   snapshot,
   ecologyHistory,
+  producerFluxHistory,
   historyWindowSeconds,
   onHistoryWindowDecrease,
   onHistoryWindowIncrease,
@@ -3455,6 +3497,7 @@ function ObservationSectionContent({
   section: ObservationSection;
   snapshot: SimulationSnapshot;
   ecologyHistory: EcologyHistoryPoint[];
+  producerFluxHistory: ProducerFluxHistoryPoint[];
   historyWindowSeconds: number;
   onHistoryWindowDecrease: () => void;
   onHistoryWindowIncrease: () => void;
@@ -3576,6 +3619,10 @@ function ObservationSectionContent({
     ecologyHistory,
     historyWindowSeconds,
   );
+  const visibleProducerFluxHistory = historyPointsInWindow(
+    producerFluxHistory,
+    historyWindowSeconds,
+  );
   const shortestHistoryWindow = ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS[0];
   const longestHistoryWindow = ECOLOGY_HISTORY_WINDOW_OPTIONS_SECONDS.at(-1)!;
 
@@ -3639,7 +3686,7 @@ function ObservationSectionContent({
           initiallyOpen={!hasPlanktonRecord && !hasAnimalRecord}
         >
           <DayNightFluxChart
-            points={visibleEcologyHistory}
+            points={visibleProducerFluxHistory}
             windowSeconds={historyWindowSeconds}
           />
         </HistoryGraphGroup>
@@ -4567,7 +4614,7 @@ const DayNightFluxChart = memo(function DayNightFluxChart({
   points,
   windowSeconds,
 }: {
-  points: EcologyHistoryPoint[];
+  points: ProducerFluxHistoryPoint[];
   windowSeconds: number;
 }) {
   if (!points.length) return null;
@@ -4583,7 +4630,8 @@ const DayNightFluxChart = memo(function DayNightFluxChart({
       const y = top + height - Math.max(0, Math.min(1, value / maximum)) * height;
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
-  const light = line(points.map((point) => point.lightMultiplier), 8, 24, 1);
+  const maxLight = Math.max(100, ...points.map((point) => point.effectiveLight));
+  const light = line(points.map((point) => point.effectiveLight), 8, 24, maxLight);
   const gross = line(points.map((point) => point.grossPhotosynthesis), 45, 25, maxFlux);
   const respiration = line(points.map((point) => point.producerRespiration), 45, 25, maxFlux);
   const latest = points.at(-1)!;
@@ -4591,7 +4639,7 @@ const DayNightFluxChart = memo(function DayNightFluxChart({
     <div className="day-night-history">
       <div className="ecology-history-heading">
         <strong>낮·밤 생산자 대사</strong>
-        <small>광합성과 호흡을 분리해 기록</small>
+        <small>생산자 조직의 실제 유효광량·광합성·호흡</small>
       </div>
       <svg viewBox="0 0 240 82" role="img" aria-label="낮과 밤의 광량, 총광합성, 생산자 호흡 변화">
         <path className="ecology-history-guide" d="M46 32H224M46 70H224" />
@@ -4602,7 +4650,7 @@ const DayNightFluxChart = memo(function DayNightFluxChart({
         <polyline className="day-night-line respiration" points={respiration} />
       </svg>
       <div className="day-night-history-legend">
-        <span><i className="light" />광원 {Math.round(latest.lightMultiplier * 100)}%</span>
+        <span><i className="light" />생산자 유효광량 {latest.effectiveLight.toFixed(1)} / 100</span>
         <span><i className="gross" />총광합성 {latest.grossPhotosynthesis.toFixed(3)}</span>
         <span><i className="respiration" />호흡 {latest.producerRespiration.toFixed(3)}</span>
       </div>
@@ -4643,7 +4691,8 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
     const y = bottom - (value / Math.max(1, maximum)) * 22;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
-  const algaeValues = points.map((point) => point.algaeBiomass);
+  const algaeValues = points.map(historyAttachedAlgaeBiomass);
+  const plantValues = points.map((point) => point.plantBiomass);
   const shrimpValues = points.map((point) => point.shrimpCount);
   const shrimpBiomassValues = points.map((point) => point.shrimpBiomass);
   const femaleValues = points.map((point) => point.shrimpAdultFemales);
@@ -4653,7 +4702,7 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
   const maximumShrimpBiomass = Math.max(1, ...shrimpBiomassValues);
   const latest = points.at(-1) ?? {
     elapsedSeconds: 0,
-    algaeBiomass: 0,
+    attachedAlgaeBiomass: 0,
     plantBiomass: 0,
     phytoplanktonBiomass: 0,
     planktonicDecomposerBiomass: 0,
@@ -4687,15 +4736,17 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
     headspaceOxygen: 0,
   };
   const algaePoints = sparkPoints(algaeValues, 4, 28);
-  const shrimpPoints = zeroBasedPoints(shrimpValues, maximumShrimpCount, 65);
-  const femalePoints = zeroBasedPoints(femaleValues, maximumShrimpCount, 65);
-  const malePoints = zeroBasedPoints(maleValues, maximumShrimpCount, 65);
-  const juvenilePoints = zeroBasedPoints(juvenileValues, maximumShrimpCount, 65);
+  const plantPoints = sparkPoints(plantValues, 40, 28);
+  const shrimpPoints = zeroBasedPoints(shrimpValues, maximumShrimpCount, 101);
+  const femalePoints = zeroBasedPoints(femaleValues, maximumShrimpCount, 101);
+  const malePoints = zeroBasedPoints(maleValues, maximumShrimpCount, 101);
+  const juvenilePoints = zeroBasedPoints(juvenileValues, maximumShrimpCount, 101);
   const shrimpBiomassPoints = zeroBasedPoints(
     shrimpBiomassValues,
     maximumShrimpBiomass,
-    101,
+    137,
   );
+  const latestAlgaeBiomass = historyAttachedAlgaeBiomass(latest);
 
   return (
     <div className="ecology-history">
@@ -4703,27 +4754,30 @@ const EcologyHistoryChart = memo(function EcologyHistoryChart({
         <strong>시간에 따른 변화</strong>
         <small>{points.length > 1 ? `${formatTime(timeBounds.start)}–${formatTime(timeBounds.end)}` : '관찰 대기 중'}</small>
       </div>
-      <svg viewBox="0 0 240 108" role="img" aria-label="생산자 총량, 새우 개체 수와 새우 생체량의 시간 변화">
-        <path className="ecology-history-guide" d="M43 32H189M43 68H189M43 104H189" />
-        <text x="5" y="12">생산자</text>
-        <text x="5" y="48">새우</text>
-        <text x="5" y="84">새우 B</text>
+      <svg viewBox="0 0 240 144" role="img" aria-label="부착 조류, 나사말, 새우 개체 수와 새우 생체량의 시간 변화">
+        <path className="ecology-history-guide" d="M43 32H189M43 68H189M43 104H189M43 140H189" />
+        <text x="5" y="12">조류</text>
+        <text x="5" y="48">나사말</text>
+        <text x="5" y="84">새우</text>
+        <text x="5" y="120">새우 B</text>
         {algaePoints && <polyline className="ecology-history-line algae" points={algaePoints} />}
+        {plantPoints && <polyline className="ecology-history-line vallisneria" points={plantPoints} />}
         {shrimpPoints && <polyline className="ecology-history-line shrimp-total" points={shrimpPoints} />}
         {femalePoints && <polyline className="ecology-history-line shrimp-female" points={femalePoints} />}
         {malePoints && <polyline className="ecology-history-line shrimp-male" points={malePoints} />}
         {juvenilePoints && <polyline className="ecology-history-line shrimp-juvenile" points={juvenilePoints} />}
         {shrimpBiomassPoints && <polyline className="ecology-history-line shrimp-biomass" points={shrimpBiomassPoints} />}
-        <text className="ecology-history-value algae" x="235" y="12" textAnchor="end">{latest.algaeBiomass.toFixed(1)}</text>
-        <text className="ecology-history-value shrimp" x="235" y="48" textAnchor="end">{latest.shrimpCount}마리</text>
-        <text className="ecology-history-value shrimp-biomass" x="235" y="84" textAnchor="end">{latest.shrimpBiomass.toFixed(1)} B</text>
+        <text className="ecology-history-value algae" x="235" y="12" textAnchor="end">{latestAlgaeBiomass.toFixed(1)}</text>
+        <text className="ecology-history-value vallisneria" x="235" y="48" textAnchor="end">{latest.plantBiomass.toFixed(1)}</text>
+        <text className="ecology-history-value shrimp" x="235" y="84" textAnchor="end">{latest.shrimpCount}마리</text>
+        <text className="ecology-history-value shrimp-biomass" x="235" y="120" textAnchor="end">{latest.shrimpBiomass.toFixed(1)} B</text>
       </svg>
       <div className="population-history-legend">
         <span className="female">성체 ♀ <b>{latest.shrimpAdultFemales}</b></span>
         <span className="male">성체 ♂ <b>{latest.shrimpAdultMales}</b></span>
         <span className="juvenile">어린 새우 <b>{latest.shrimpJuveniles}</b></span>
       </div>
-      <small className="ecology-history-note">개체 수 선은 같은 눈금을 사용하고, 새우 생체량은 별도 0 기준 눈금입니다.</small>
+      <small className="ecology-history-note">조류와 나사말은 별도 변화 범위이며, 개체 수 선은 같은 눈금을 사용하고 새우 생체량은 별도 0 기준 눈금입니다.</small>
     </div>
   );
 });
@@ -5202,7 +5256,17 @@ function SpeciesGuide({
                 <div><dt>현재 나이</dt><dd>{Math.floor(plantRamets[0].ageSeconds / 60)}분 {Math.floor(plantRamets[0].ageSeconds % 60)}초 / 예상 {Math.floor(plantRamets[0].lifespanSeconds / 60)}분</dd></div>
                 <div><dt>생장 상태</dt><dd>{plantRamets[0].lifeStage === 'juvenile' ? '어린 포기 · 잎을 키우는 중' : plantRamets[0].lifeStage === 'mature' ? '성체 · 러너 번식 가능' : '노쇠 · 잎과 저장량 감소'}</dd></div>
                 <div><dt>건강</dt><dd>{Math.round(plantRamets[0].health * 100)} / 100</dd></div>
-                <div><dt>러너 준비</dt><dd>{Math.round(plantRamets[0].runnerProgress * 100)}% · 자손 {plantRamets[0].reproductionCount}포기</dd></div>
+                <div><dt>러너 준비</dt><dd>{Math.round(plantRamets[0].runnerProgress * 100)}% · {{
+                  juvenile: '어린 포기 생장 중',
+                  senescent: '노쇠로 번식 중단',
+                  recovering: '건강 회복 대기',
+                  'growing-leaves': '잎 성장 대기',
+                  preparing: '러너 형성 중',
+                  'waiting-reserve': '자손 생체량 비축 대기',
+                  'waiting-site': '정착 공간 탐색 중',
+                  ready: '정착 직전',
+                }[plantRamets[0].runnerState]} · 자손 {plantRamets[0].reproductionCount}포기</dd></div>
+                <div><dt>자손 비축량</dt><dd>{plantRamets[0].runnerReserveBiomass.toFixed(3)} B · 실제 총생체량 안에 포함</dd></div>
                 <div><dt>부모 연결</dt><dd>{plantRamets[0].connectedToParent ? '러너로 연결됨 · 저장량 지원 중' : '독립한 포기'}</dd></div>
               </dl>
             </>

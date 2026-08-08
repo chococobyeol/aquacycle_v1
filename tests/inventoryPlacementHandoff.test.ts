@@ -186,6 +186,41 @@ describe('mission 5 staged ecosystem stocking', () => {
   });
 });
 
+describe('mission 6 staged day/night stocking', () => {
+  it('unlocks algae, Vallisneria, sexed shrimp and biofilm while paused', () => {
+    for (const kind of ['seed', 'animal', 'biofilm'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-6',
+        'challenge',
+        'paused',
+        true,
+      )).toBe(true);
+    }
+    for (const kind of ['structure', 'plankton'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-6',
+        'challenge',
+        'paused',
+        true,
+      )).toBe(false);
+    }
+  });
+
+  it('keeps staged organisms locked while the day/night simulation is running', () => {
+    for (const kind of ['seed', 'animal', 'biofilm'] as const) {
+      expect(inventoryPlacementEditable(
+        kind,
+        'mission-6',
+        'challenge',
+        'running',
+        true,
+      )).toBe(false);
+    }
+  });
+});
+
 describe('mission 4 staged consumer release', () => {
   it('unlocks algae and animals, but not structures or hidden-cycle tools, while paused', () => {
     for (const kind of ['seed', 'animal'] as const) {

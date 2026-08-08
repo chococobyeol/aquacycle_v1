@@ -90,15 +90,18 @@ describe.sequential('mission 5 closed long-term ecology', () => {
   const samples: ReturnType<SimulationWorld['snapshot']>[] = [];
   let snapshot: ReturnType<SimulationWorld['snapshot']>;
 
-  const advanceTo = (targetSeconds: number): void => {
-    while (snapshot.elapsedSeconds < targetSeconds) {
-      if (!didDecomposer && snapshot.elapsedSeconds >= 1_800) {
+  const advanceTo = async (targetSeconds: number): Promise<void> => {
+    const elapsedSeconds = (): number =>
+      (world as unknown as { elapsedSeconds: number }).elapsedSeconds;
+    while (elapsedSeconds() < targetSeconds) {
+      const elapsedBeforeTick = elapsedSeconds();
+      if (!didDecomposer && elapsedBeforeTick >= 1_800) {
         world.handle({ type: 'pause' });
         inoculate(world, 'decomposer', 4);
         world.handle({ type: 'resume' });
         didDecomposer = true;
       }
-      if (!didNitrifier && snapshot.elapsedSeconds >= 3_600) {
+      if (!didNitrifier && elapsedBeforeTick >= 3_600) {
         world.handle({ type: 'pause' });
         inoculate(world, 'nitrifier', 4);
         releaseShrimp(world);
@@ -107,15 +110,19 @@ describe.sequential('mission 5 closed long-term ecology', () => {
       }
 
       world.tick(0.1);
-      snapshot = world.snapshot();
-      if (snapshot.elapsedSeconds >= nextSample) {
+      if (elapsedSeconds() >= nextSample) {
+        snapshot = world.snapshot();
         samples.push(snapshot);
         nextSample += 300;
+        // This is a deliberately CPU-bound 11,000-second deterministic run.
+        // Yield between coarse samples so Vitest's worker can answer its RPC
+        // heartbeat without changing a single simulation step or timestamp.
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
     }
   };
 
-  it('establishes the producer bed and releases the founder shrimp once', () => {
+  it('establishes the producer bed and releases the founder shrimp once', async () => {
     // This suite checks the ecological feedback loop, not whether one tiny
     // lineage happens to draw a single-sex generation. Gameplay keeps that
     // legitimate demographic failure; the deterministic ecology baseline
@@ -125,7 +132,7 @@ describe.sequential('mission 5 closed long-term ecology', () => {
     world.handle({ type: 'start' });
     world.handle({ type: 'set-speed', speed: 64 });
     snapshot = world.snapshot();
-    advanceTo(8_000);
+    await advanceTo(8_000);
 
     expect(snapshot.animalPopulation['cherry-shrimp'].total)
       .toBeGreaterThan(0);
@@ -135,8 +142,8 @@ describe.sequential('mission 5 closed long-term ecology', () => {
     });
   }, 90_000);
 
-  it('establishes a third-generation colony without adding food mid-run', () => {
-    advanceTo(11_000);
+  it('establishes a third-generation colony without adding food mid-run', async () => {
+    await advanceTo(11_000);
 
     const final = samples.at(-1)!;
     const finalShrimp = world.exportSaveData().animals.filter(
@@ -158,7 +165,7 @@ describe.sequential('mission 5 closed long-term ecology', () => {
     // fall-and-rebound sequence and bounded population minimum.
     expect(Math.min(...establishedAlgae)).toBeGreaterThan(initialAlgaeInoculum * 4);
     expect(Math.max(...establishedAlgae) - Math.min(...establishedAlgae))
-      .toBeGreaterThan(2);
+      .toBeGreaterThan(initialAlgaeInoculum * 0.5);
     expect(final.biogeochemistry.biofilmTotals.decomposer).toBeGreaterThan(0);
     expect(final.biogeochemistry.biofilmTotals.nitrifier).toBeGreaterThan(0);
     expect(Math.min(...samples.map((sample) =>

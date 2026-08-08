@@ -41,7 +41,9 @@ const placeStructure = (
 const advanceTo = (world: SimulationWorld, targetSeconds: number): void => {
   world.handle({ type: 'set-speed', speed: 64 });
   let guard = 0;
-  while (world.snapshot().elapsedSeconds < targetSeconds && guard < 5_000) {
+  const elapsedSeconds = (): number =>
+    (world as unknown as { elapsedSeconds: number }).elapsedSeconds;
+  while (elapsedSeconds() < targetSeconds && guard < 5_000) {
     world.tick(0.1);
     guard += 1;
   }
@@ -68,12 +70,13 @@ const findLeafPointInsideStructure = (
 describe('Vallisneria ramet life cycle', () => {
   it('keeps young rosettes compact while allowing healthy adults to fill the water column', () => {
     expect(vallisneriaLeafHeightScale(0.18)).toBeCloseTo(0.18, 8);
-    expect(vallisneriaLeafHeightScale(0.55)).toBeCloseTo(0.55, 8);
+    expect(vallisneriaLeafHeightScale(0.45)).toBeCloseTo(0.45, 8);
+    expect(vallisneriaLeafHeightScale(0.55)).toBeGreaterThan(0.7);
     expect(vallisneriaLeafHeightScale(0.8)).toBeGreaterThan(1.6);
-    expect(vallisneriaLeafHeightScale(1)).toBeCloseTo(2.55, 8);
+    expect(vallisneriaLeafHeightScale(1)).toBeCloseTo(2.82, 8);
 
     const root = { x: 600, y: 634 };
-    const youngLeaves = vallisneriaLeaves(8, root, 0.55);
+    const youngLeaves = vallisneriaLeaves(8, root, 0.35);
     const adultLeaves = vallisneriaLeaves(8, root, 1);
     const youngTop = Math.min(...youngLeaves.map((leaf) => leaf.tip.y));
     const adultTop = Math.min(...adultLeaves.map((leaf) => leaf.tip.y));
@@ -161,6 +164,57 @@ describe('Vallisneria ramet life cycle', () => {
     expect(snapshot.plants).toHaveLength(1);
     const plant = snapshot.plants[0];
     expect(vallisneriaRenderDepth(plant)).toBe('back');
+  });
+
+  it('does not treat front/back projection overlap as occupied runner space', () => {
+    const world = new SimulationWorld('mission-6', undefined, 41);
+    type RunnerDestinationInternals = {
+      substrateCells: Array<{
+        id: string;
+        x: number;
+        y: number;
+        row: number;
+        column: number;
+        biomass: { vallisneria: number };
+      }>;
+      seedPlacements: Array<{
+        id: string;
+        speciesId: SpeciesId;
+        cellId: string;
+      }>;
+      runnerDestination(parent: unknown): { id: string } | null;
+    };
+    const internals = world as unknown as RunnerDestinationInternals;
+    const parentCell = internals.substrateCells.find((cell) =>
+      cell.row === 1 && cell.column === 40
+    )!;
+    const frontCell = internals.substrateCells.find((cell) =>
+      cell.row === 0 && cell.column === 48
+    )!;
+    const rearTarget = internals.substrateCells.find((cell) =>
+      cell.row === 2 && cell.column === 48
+    )!;
+
+    placeSeed(world, 'vallisneria', parentCell);
+    placeSeed(world, 'vallisneria', frontCell);
+    const parent = internals.seedPlacements.find((placement) =>
+      placement.cellId === parentCell.id
+    )!;
+
+    // Leave exactly one physically distinct runner tip available. Its side
+    // view is within 28 px of the foreground ramet, but it occupies another
+    // x/depth ground cell and therefore must remain a valid destination.
+    for (const cell of internals.substrateCells) {
+      if (
+        cell.id !== parentCell.id &&
+        cell.id !== frontCell.id &&
+        cell.id !== rearTarget.id
+      ) {
+        cell.biomass.vallisneria = 1;
+      }
+    }
+
+    expect(internals.runnerDestination(parent)?.id).toBe(rearTarget.id);
   });
 
   it('casts translucent canopy shade without acting like an opaque rock', () => {
@@ -393,15 +447,36 @@ describe('Vallisneria ramet life cycle', () => {
     expect(before.plants).toHaveLength(1);
     expect(before.plants[0].lifeStage).toBe('juvenile');
     expect(before.remainingSeeds.vallisneria).toBe(2);
-    // Long leaves remain a visible rosette, but their low-nitrogen structural
-    // tissue must not reserve the same ledger mass as a full algal cell.
-    expect(before.totalBiomass.vallisneria).toBeCloseTo(0.154, 6);
-
+    // The shared B ledger stores nutrient/metabolic-equivalent matter, not
+    // literal macrophyte dry mass. Leaf geometry carries the much larger,
+    // carbon-rich visible structure without charging it the C:N ratio of a
+    // shrimp or active algal cell.
+    expect(before.totalBiomass.vallisneria).toBeCloseTo(0.132, 6);
+    const adultEquivalentBiomass = before.totalBiomass.vallisneria / 0.24;
+    expect(before.plants[0].lifespanSeconds).toBeGreaterThanOrEqual(3_600);
+    expect(before.plants[0].lifespanSeconds).toBeLessThanOrEqual(6_000);
     world.handle({ type: 'start' });
-    advanceTo(world, 1_200);
+    // The rooted stock must build its first runner from realised production,
+    // while still doing so during ordinary play rather than dozens of cycles.
+    advanceTo(world, 1_800);
     const after = world.snapshot();
-    expect(after.plants.length).toBeGreaterThan(1);
-    expect(after.plants.some((plant) => plant.origin === 'runner')).toBe(true);
+    expect(
+      after.plants.length,
+      JSON.stringify({
+        totalBiomass: after.totalBiomass.vallisneria,
+        plants: after.plants,
+      }),
+    ).toBeGreaterThan(1);
+    const runners = after.plants.filter((plant) => plant.origin === 'runner');
+    expect(runners.length).toBeGreaterThan(0);
+    expect(
+      runners.some((plant) =>
+        plant.ageSeconds >= 270 &&
+        plant.structuralScale >= 0.2 &&
+        plant.health >= 0.42
+      ),
+      JSON.stringify(runners),
+    ).toBe(true);
     expect(after.plants.every((plant) =>
       after.cells.find((cell) => cell.id === plant.cellId)?.surfaceKind === 'substrate'
     )).toBe(true);
@@ -409,16 +484,175 @@ describe('Vallisneria ramet life cycle', () => {
       const cell = after.cells.find((candidate) => candidate.id === plant.cellId)!;
       return Math.abs(plant.x - cell.x) > 0.01 || Math.abs(plant.y - cell.y) > 0.01;
     })).toBe(true);
+    const supplied = after.plants.find((plant) => plant.origin === 'supplied')!;
+    const suppliedCell = after.cells.find((cell) => cell.id === supplied.cellId)!;
+    // Runner funding is an explicit subset of total ramet mass. Subtracting
+    // it must still leave living crown/root/leaf matter in the parent; the
+    // daughter may not be paid by cannibalising the whole rosette.
+    expect(
+      suppliedCell.biomass.vallisneria - supplied.runnerReserveBiomass,
+    ).toBeGreaterThanOrEqual(adultEquivalentBiomass * 0.02 * 0.985);
+    // A daughter is not independent merely because its small crown survives.
+    // While its parent is alive, severance must wait until the runner has both
+    // a substantial reserve and leaves tall enough to leave the bottom layer.
+    for (const runner of runners) {
+      if (runner.connectedToParent || !after.plants.some(
+        (plant) => plant.id === runner.parentId,
+      )) continue;
+      const runnerCell = after.cells.find((cell) => cell.id === runner.cellId)!;
+      expect(runner.structuralScale).toBeGreaterThanOrEqual(0.68);
+      const independentCohortBiomass = adultEquivalentBiomass * (
+        0.02 + (0.68 - 0.16) / (1 - 0.16) * 0.32
+      );
+      expect(runnerCell.biomass.vallisneria).toBeGreaterThanOrEqual(
+        independentCohortBiomass * 0.985,
+      );
+    }
     // Runner-born daughters are ecology, not extra use of the supplied stock.
     expect(after.remainingSeeds.vallisneria).toBe(2);
     expect(Math.abs(after.biogeochemistry.materialBalance.nitrogenDriftRatio))
       .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
     expect(Math.abs(after.biogeochemistry.materialBalance.carbonDriftRatio))
       .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
-  }, 60_000);
+  }, 90_000);
+
+  it('shows natural ramet death and clonal replacement within ordinary mission time', async () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter(
+      (cell) => cell.surfaceKind === 'substrate',
+    );
+    placeSeed(world, 'vallisneria', substrate[Math.floor(substrate.length / 2)]);
+    const founderId = world.snapshot().plants[0].id;
+
+    world.handle({ type: 'start' });
+    const samples: Array<{
+      elapsedSeconds: number;
+      biomass: number;
+      plants: ReturnType<SimulationWorld['snapshot']>['plants'];
+    }> = [];
+    let tallestRunnerScale = 0;
+    let tallestRunnerLeafHeight = 0;
+    let maximumRunnerBiomass = 0;
+    // Follow several complete compressed ramet lives so a later-lived
+    // daughter has time to mature and start the next clonal generation after
+    // the founder disappears.
+    for (let elapsedSeconds = 600; elapsedSeconds <= 12_000; elapsedSeconds += 600) {
+      advanceTo(world, elapsedSeconds);
+      // The deterministic 12,000-second run is deliberately CPU-heavy. Yield
+      // at coarse biological samples so Vitest can service its worker RPC
+      // without changing any simulation step or timestamp.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const sample = world.snapshot();
+      samples.push({
+        elapsedSeconds: sample.elapsedSeconds,
+        biomass: sample.totalBiomass.vallisneria,
+        plants: sample.plants,
+      });
+      for (const plant of sample.plants) {
+        if (plant.origin !== 'runner') continue;
+        const cell = sample.cells.find(
+          (candidate) => candidate.id === plant.cellId,
+        )!;
+        maximumRunnerBiomass = Math.max(
+          maximumRunnerBiomass,
+          cell.biomass.vallisneria,
+        );
+        const leaves = vallisneriaLeaves(cell.index, plant, plant.structuralScale);
+        tallestRunnerScale = Math.max(tallestRunnerScale, plant.structuralScale);
+        tallestRunnerLeafHeight = Math.max(
+          tallestRunnerLeafHeight,
+          ...leaves.map((leaf) => leaf.root.y - leaf.tip.y),
+        );
+      }
+    }
+    const after = world.snapshot();
+
+    expect(after.plants.some((plant) => plant.id === founderId)).toBe(false);
+    expect(after.plants.length, JSON.stringify(samples)).toBeGreaterThan(0);
+    expect(after.plants.every((plant) => plant.origin === 'runner')).toBe(true);
+    expect(
+      after.totalBiomass.vallisneria,
+      JSON.stringify(samples.slice(-8)),
+    ).toBeGreaterThan(0.2);
+    // This must be a runner descendant rather than the already-large supplied
+    // founder: the clonal generation has to paint an unmistakable juvenile →
+    // adult transition before it can reproduce and senesce.
+    expect(tallestRunnerScale).toBeGreaterThan(0.9);
+    // A later generation must grow well beyond the corrected 0.132-B young
+    // supplied rosette. Do not retain the former 0.2475-B founder-only packet
+    // as a hidden definition of adulthood after removing that stock advantage.
+    expect(maximumRunnerBiomass).toBeGreaterThanOrEqual(0.20);
+    expect(
+      tallestRunnerLeafHeight,
+      JSON.stringify({ tallestRunnerScale, tallestRunnerLeafHeight }),
+    ).toBeGreaterThan(480);
+    expect(samples.some((sample) => sample.plants.some(
+      (plant) => plant.origin === 'runner' && plant.reproductionCount > 0,
+    )), JSON.stringify(samples.slice(-8))).toBe(true);
+    expect(Math.abs(after.biogeochemistry.materialBalance.nitrogenDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+    expect(Math.abs(after.biogeochemistry.materialBalance.carbonDriftRatio))
+      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+  }, 120_000);
+
+  it('photosynthesizes and respires at actual painted leaf positions', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
+    placeSeed(world, 'vallisneria', substrate[Math.floor(substrate.length / 2)]);
+    const planted = world.snapshot().plants[0];
+    const productionPoints: Vec2[] = [];
+    const respirationPoints: Vec2[] = [];
+    const internals = world as unknown as {
+      biogeochemistry: {
+        commitAlgaeProduction(
+          point: Vec2,
+          requestedBiomass: number,
+          oxygenReleasePoint?: Vec2,
+        ): number;
+        commitAlgaeRespiration(point: Vec2, requestedBiomass: number): number;
+        commitRootedPlantRespiration(
+          point: Vec2,
+          requestedBiomass: number,
+          rootPoint: Vec2,
+        ): number;
+      };
+    };
+    const originalProduction = internals.biogeochemistry.commitAlgaeProduction
+      .bind(internals.biogeochemistry);
+    const originalRespiration = internals.biogeochemistry.commitRootedPlantRespiration
+      .bind(internals.biogeochemistry);
+    internals.biogeochemistry.commitAlgaeProduction = (
+      point,
+      requestedBiomass,
+      oxygenReleasePoint = point,
+    ) => {
+      productionPoints.push({ ...oxygenReleasePoint });
+      return originalProduction(point, requestedBiomass, oxygenReleasePoint);
+    };
+    internals.biogeochemistry.commitRootedPlantRespiration = (
+      point,
+      requestedBiomass,
+      rootPoint,
+    ) => {
+      respirationPoints.push({ ...point });
+      return originalRespiration(point, requestedBiomass, rootPoint);
+    };
+
+    world.handle({ type: 'start' });
+    advanceTo(world, 12);
+
+    expect(productionPoints.length).toBeGreaterThan(8);
+    expect(respirationPoints.length).toBeGreaterThan(8);
+    expect(productionPoints.some((point) => point.y < planted.y - 25)).toBe(true);
+    expect(respirationPoints.some((point) => point.y < planted.y - 25)).toBe(true);
+    expect(new Set(productionPoints.map((point) => point.y.toFixed(1))).size)
+      .toBeGreaterThan(3);
+    expect(new Set(respirationPoints.map((point) => point.y.toFixed(1))).size)
+      .toBeGreaterThan(3);
+  }, 20_000);
 
   it('integrates ray-cast light across leaves exposed past a stone edge', () => {
-    const world = new SimulationWorld('mission-7');
+    const world = new SimulationWorld('mission-6');
     for (const point of [
       { x: 250, y: 300 },
       { x: 600, y: 300 },
@@ -459,12 +693,15 @@ describe('Vallisneria ramet life cycle', () => {
       );
     }
 
+    const initialVallisneria = world.snapshot().totalBiomass.vallisneria;
     world.handle({ type: 'start' });
     advanceTo(world, 660);
     const after = world.snapshot();
 
     expect(after.plants.filter((plant) => plant.origin === 'supplied')).toHaveLength(3);
-    expect(after.totalBiomass.vallisneria).toBeGreaterThan(0.6);
+    expect(after.totalBiomass.vallisneria).toBeGreaterThan(
+      initialVallisneria * 1.2,
+    );
     expect(after.plants.every((plant) => plant.health > 0.25)).toBe(true);
   }, 60_000);
 
@@ -480,6 +717,49 @@ describe('Vallisneria ramet life cycle', () => {
     expect(afterNight).toBeTruthy();
     expect(Math.abs(afterNight.structuralScale - beforeNight.structuralScale)).toBeLessThan(0.09);
   }, 20_000);
+
+  it('never retracts attained leaves when night respiration or runner funding lowers reserve', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
+    placeSeed(world, 'vallisneria', substrate[Math.floor(substrate.length / 2)]);
+    const founderId = world.snapshot().plants[0].id;
+    world.handle({ type: 'start' });
+
+    let previousScale = world.snapshot().plants[0].structuralScale;
+    let previousBiomass = world.snapshot().totalBiomass.vallisneria;
+    let reserveFell = false;
+    for (let elapsedSeconds = 30; elapsedSeconds <= 1_800; elapsedSeconds += 30) {
+      advanceTo(world, elapsedSeconds);
+      const sample = world.snapshot();
+      const founder = sample.plants.find((plant) => plant.id === founderId)!;
+      expect(founder.lifeStage).not.toBe('senescent');
+      expect(founder.structuralScale + 1e-9).toBeGreaterThanOrEqual(previousScale);
+      reserveFell ||= sample.totalBiomass.vallisneria < previousBiomass - 1e-5;
+      previousScale = founder.structuralScale;
+      previousBiomass = sample.totalBiomass.vallisneria;
+    }
+
+    const after = world.snapshot();
+    expect(after.plants.find((plant) => plant.id === founderId)!.reproductionCount)
+      .toBeGreaterThan(0);
+    expect(reserveFell).toBe(true);
+  }, 40_000);
+
+  it('sheds whole outer leaves without rescaling the retained blades', () => {
+    const root = { x: 600, y: 634 };
+    const full = vallisneriaLeaves(8, root, 0.82, 1);
+    const thinned = vallisneriaLeaves(8, root, 0.82, 0.5);
+
+    expect(thinned.length).toBeLessThan(full.length);
+    expect(thinned.length).toBeGreaterThan(0);
+    for (const retained of thinned) {
+      expect(full.some((leaf) =>
+        leaf.root.x === retained.root.x &&
+        leaf.tip.x === retained.tip.x &&
+        leaf.tip.y === retained.tip.y
+      )).toBe(true);
+    }
+  });
 
   it('dies at the end of its lifespan and returns its remaining mass to the closed cycle', () => {
     const world = new SimulationWorld('mission-6');
@@ -506,7 +786,7 @@ describe('Vallisneria ramet life cycle', () => {
       .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
   });
 
-  it('preserves age, lifespan, leaf structure and runner progress in frozen aquariums', () => {
+  it('preserves age, lifespan, leaf structure, internal nitrogen and runner allocation in frozen aquariums', () => {
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
     placeSeed(world, 'vallisneria', substrate[Math.floor(substrate.length / 2)]);
@@ -520,6 +800,11 @@ describe('Vallisneria ramet life cycle', () => {
     expect(after.ageSeconds).toBeCloseTo(before.ageSeconds, 6);
     expect(after.lifespanSeconds).toBeCloseTo(before.lifespanSeconds, 6);
     expect(after.structuralScale).toBeCloseTo(before.structuralScale, 6);
+    expect(after.nitrogenReserve).toBeCloseTo(before.nitrogenReserve, 6);
+    expect(after.runnerReserveBiomass).toBeCloseTo(
+      before.runnerReserveBiomass,
+      6,
+    );
     expect(after.runnerProgress).toBeCloseTo(before.runnerProgress, 6);
     expect(after.x).toBeCloseTo(before.x, 6);
     expect(after.y).toBeCloseTo(before.y, 6);

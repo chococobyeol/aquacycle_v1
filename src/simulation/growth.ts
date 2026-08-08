@@ -1,26 +1,78 @@
-import { ECOLOGY_PROCESS_RATE_SCALE, SPECIES } from './config';
+import {
+  ALGAE_RENDER_TRACE_BIOMASS,
+  ECOLOGY_PROCESS_RATE_SCALE,
+  SPECIES,
+} from './config';
 import type { GrowthTrend, SpeciesBiomass, SpeciesId } from './types';
 import { thetaTemperatureFactor } from './temperatureResponse';
 
 export const clamp01 = (value: number): number =>
   Math.max(0, Math.min(1, value));
 
-// The shared surface-film calibration is set by the standing producer mass
-// required to replace grazing in the shrimp-scale tank. Both attached algae
-// use the same multiplier in every mission and the laboratory; this is not a
-// mission-specific food bonus. Respiration, stress and turnover use the same
-// clock so increasing net production cannot create a free oxygen-only path.
-// Individual ration limits reproduction, but the producer bed must still be
-// able to establish while the four supplied shrimp graze from the beginning.
-// The former 2x clock produced less new algae than those founders removed and
-// could only pass a staged fixture that withheld shrimp for an hour. 5x keeps
-// the documented species curves and all missions on one shared clock while
-// matching the compressed juvenile growth demand; respiration, stress and
-// turnover remain on the same scale.
-export const SURFACE_ALGAE_PROCESS_RATE_SCALE = ECOLOGY_PROCESS_RATE_SCALE;
+/**
+ * Resolve the finite abundance represented by one attached-film sample.
+ * Declining biomass below the smallest rendered propagule is less than one
+ * represented colony and becomes a real local extinction. A propagule that
+ * is increasing through that same range remains available to establish.
+ */
+export const resolvedSurfaceFilmBiomass = (
+  previous: number,
+  next: number,
+): number =>
+  next < ALGAE_RENDER_TRACE_BIOMASS && next < previous
+    ? 0
+    : Math.max(0, next);
+
+// Both attached algae use one global calibration in every mission and the
+// laboratory. Their measured relative growth is faster than shrimp tissue
+// turnover on the compressed clock, so all film fluxes (gross production,
+// respiration, stress and routine turnover) receive the same additional 2x;
+// this is neither a mission exception nor protected food production.
+export const SURFACE_ALGAE_PROCESS_RATE_SCALE =
+  ECOLOGY_PROCESS_RATE_SCALE * 2;
+
+// Vallisneria's ramet life is compressed against the same gameplay generation
+// scale as shrimp. Leaving only its age clock compressed would make a runner
+// reach senescence before paying for its visible leaves. Scale all rooted-plant
+// fluxes together (gross production, respiration, stress and turnover), so the
+// faster birth-to-death clock does not create oxygen-only production or a
+// mission-specific survival gift.
+export const VALLISNERIA_LIFE_CYCLE_RATE_SCALE = 96;
 
 export const producerProcessRateScale = (speciesId: SpeciesId): number =>
-  speciesId === 'vallisneria' ? 1 : SURFACE_ALGAE_PROCESS_RATE_SCALE;
+  speciesId === 'vallisneria'
+    ? VALLISNERIA_LIFE_CYCLE_RATE_SCALE
+    : SURFACE_ALGAE_PROCESS_RATE_SCALE;
+
+/** Routine tissue turnover follows the same calibrated clock as physiology. */
+export const producerNaturalTurnoverRateScale = (
+  speciesId: SpeciesId,
+): number => producerProcessRateScale(speciesId);
+
+// Low-profile diatoms occupy the understory of a mixed periphyton film while
+// filamentous green algae form an overstory. Beer-Lambert attenuation creates
+// the missing density feedback: a sparse Oedogonium film barely changes the
+// light, while a dense canopy creates the partial-shade niche where Nitzschia
+// can outgrow it. This changes neither biomass nor carrying capacity and does
+// not reserve a protected amount for either species.
+// Cell biomass is a surface-cover fraction, not a water-column concentration.
+// At the old 0.95 coefficient a representative 0.20 Oedogonium cover passed
+// 83% of incident light, so even an obviously green filament mat did not
+// create the low-light niche this interaction was meant to model. An optical
+// depth of 4 makes moderate cover transmit about 45% while a packed mat still
+// becomes too dark for the understory. The resulting response is hump-shaped,
+// not a protected Nitzschia floor: sparse filaments barely help, intermediate
+// cover creates shade, and dense cover can suppress both layers beneath it.
+const FILAMENTOUS_OVERSTORY_OPTICAL_DEPTH = 4;
+export const attachedAlgaeEffectiveLight = (
+  speciesId: SpeciesId,
+  incidentLight: number,
+  oedogoniumBiomass: number,
+): number => speciesId === 'nitzschia'
+  ? Math.max(0, incidentLight) * Math.exp(
+    -FILAMENTOUS_OVERSTORY_OPTICAL_DEPTH * clamp01(oedogoniumBiomass),
+  )
+  : Math.max(0, incidentLight);
 
 const referenceNetLightRate = (speciesId: SpeciesId, light: number): number => {
   const curve = SPECIES[speciesId].lightCurve;

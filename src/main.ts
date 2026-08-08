@@ -15,7 +15,6 @@ const RENDER_SAFETY_REPAINT_INTERVAL_MS = 15_000;
 const RUNTIME_LOG_MAX_BYTES = 256 * 1024;
 const MEMORY_RECOVERY_PREPARE_TIMEOUT_MS = 20_000;
 const MEMORY_RECOVERY_MINIMUM_LOADING_MS = 900;
-const MEMORY_RECOVERY_CAPTURE_TIMEOUT_MS = 1_200;
 let lastMemoryRecoveryAt = Number.NEGATIVE_INFINITY;
 const intentionalRendererRestarts = new WeakSet<Electron.WebContents>();
 
@@ -48,7 +47,6 @@ const appendRuntimeDiagnostic = (message: string): void => {
 
 const createRecoveryWindow = (
   bounds: Electron.Rectangle,
-  capturedFrameDataUrl: string | null,
   parent: BrowserWindow,
 ): BrowserWindow => {
   const recoveryWindow = new BrowserWindow({
@@ -76,7 +74,6 @@ const createRecoveryWindow = (
         html,body{width:100%;height:100%;margin:0}
         body{display:grid;place-items:center;overflow:hidden;background:#3f858b;color:#344f4d;
           font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif}
-        img{position:fixed;inset:0;width:100%;height:100%;object-fit:fill}
         main{position:relative;padding:28px 32px 25px;border:3px solid #466863;
           border-radius:18px 14px 20px 15px;background:#f5f1df;
           box-shadow:7px 9px 0 rgba(52,79,77,.18);text-align:center}
@@ -86,9 +83,7 @@ const createRecoveryWindow = (
         p{margin:8px 0 0;color:#607873;font-size:13px}
         @keyframes spin{to{transform:rotate(360deg)}}
       </style>
-      <body>${capturedFrameDataUrl
-        ? `<img src="${capturedFrameDataUrl}" alt="">`
-        : ''}<main role="status" aria-live="assertive"><i></i>
+      <body><main role="status" aria-live="assertive"><i></i>
         <strong>수조 상태를 안전하게 정리하고 있습니다…</strong>
         <p>잠시 후 같은 지점부터 자동으로 계속됩니다.</p>
       </main></body>
@@ -104,35 +99,13 @@ const reloadMainRenderer = async (
 ): Promise<void> => {
   if (window.isDestroyed()) return;
   const bounds = window.getContentBounds();
-  let capturedFrameDataUrl: string | null = null;
-  let captureTimeout: ReturnType<typeof setTimeout> | null = null;
-  try {
-    const capturedFrame = await Promise.race([
-      window.webContents.capturePage().catch(() => null),
-      new Promise<null>((resolve) => {
-        captureTimeout = setTimeout(
-          () => resolve(null),
-          MEMORY_RECOVERY_CAPTURE_TIMEOUT_MS,
-        );
-      }),
-    ]);
-    if (captureTimeout !== null) clearTimeout(captureTimeout);
-    if (capturedFrame && !capturedFrame.isEmpty()) {
-      capturedFrameDataUrl = capturedFrame.toDataURL();
-    } else {
-      appendRuntimeDiagnostic('memory recovery: last-frame capture unavailable');
-    }
-  } catch {
-    appendRuntimeDiagnostic('memory recovery: failed to capture the last aquarium frame');
-  } finally {
-    if (captureTimeout !== null) clearTimeout(captureTimeout);
-  }
-  if (window.isDestroyed()) return;
-  const recoveryWindow = createRecoveryWindow(
-    bounds,
-    capturedFrameDataUrl,
-    window,
-  );
+  // Do not ask an already memory-heavy renderer to capture and PNG/base64
+  // encode its full frame. The former recovery path duplicated that frame
+  // into a giant data URL in the browser process; the 2026-08-06 soak reached
+  // its checkpoint and then trapped the Electron main process before renderer
+  // recycling began. A tiny static cover keeps recovery independent from the
+  // renderer whose native allocator is being discarded.
+  const recoveryWindow = createRecoveryWindow(bounds, window);
 
   let finished = false;
   let readyTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -179,7 +152,7 @@ const reloadMainRenderer = async (
       try {
         // A normal reload keeps Chromium's renderer process and its native
         // allocator high-water mark. Recycle only that process while the
-        // unchanged native window is covered by the captured aquarium frame.
+        // unchanged native window is covered by the lightweight recovery view.
         window.webContents.forcefullyCrashRenderer();
       } catch {
         window.webContents.removeListener(

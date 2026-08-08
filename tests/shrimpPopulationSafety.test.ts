@@ -5,6 +5,10 @@ import {
 } from '../src/simulation/SimulationWorld';
 import { BiogeochemistryLedger } from '../src/simulation/biogeochemistry';
 import {
+  SHRIMP_ECOLOGY_RULES,
+  WATER_CYCLE_RULES,
+} from '../src/simulation/config';
+import {
   GROUND_Y,
   TANK_WIDTH,
   WATER_TOP,
@@ -28,10 +32,13 @@ interface ReproductionAnimalState {
   lifeStage: 'juvenile' | 'adult' | 'egg';
   grazingSessionIntake: number;
   grazingSessionSeconds?: number;
+  recentGrazingCellId?: string | null;
+  recentGrazingCellCooldown?: number;
   sex: 'female' | 'male';
   energy: number;
   recentIntake: number;
   structuralBiomass: number;
+  peakStructuralBiomass?: number;
   storedBiomass: number;
   reproductiveBiomass: number;
   secondsSinceFood: number;
@@ -50,6 +57,9 @@ interface ReproductionWorldInternals {
   shrimpMotionBucketsScratch: ReproductionAnimalState[][];
   shrimpMotionUsedBucketIndicesScratch: number[];
   chooseFoodTarget(animal: ReproductionAnimalState): TestSurfaceCell | null;
+  shrimpRealisedGrazingReturn(animal: ReproductionAnimalState): number;
+  shrimpGrazingMaintenancePerSecond(animal: ReproductionAnimalState): number;
+  shrimpReserveCapacity(animal: ReproductionAnimalState): number;
   allCells(): TestSurfaceCell[];
   shrimpSurfaceContactPoint(cell: TestSurfaceCell): Vec2;
   biogeochemistry: BiogeochemistryLedger;
@@ -112,7 +122,9 @@ const directArrayLengths = (world: SimulationWorld): Record<string, number> =>
   Object.fromEntries(
     Object.entries(world as unknown as Record<string, unknown>)
       .filter((entry): entry is [string, unknown[]] =>
-        Array.isArray(entry[1]) && !entry[0].endsWith('Scratch'))
+        Array.isArray(entry[1]) &&
+        !entry[0].endsWith('Scratch') &&
+        entry[0] !== 'producerFluxHistory')
       .map(([key, value]) => [key, value.length]),
   );
 
@@ -242,6 +254,14 @@ describe('shrimp population safety contract', () => {
     const internals = reproductionInternals(world);
     const female = internals.animals[0];
     const male = internals.animals[1];
+    // Isolate local mating motion from the ordinary young-adult drive to find
+    // food for continued somatic growth.
+    for (const animal of [female, male]) {
+      animal.structuralBiomass =
+        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+      animal.peakStructuralBiomass = animal.structuralBiomass;
+      animal.storedBiomass = WATER_CYCLE_RULES.shrimp.adultReserveBiomass;
+    }
     female.sex = 'female';
     female.position = { x: 600, y: 300 };
     female.velocity = { x: 0, y: 0 };
@@ -600,20 +620,33 @@ describe('shrimp population safety contract', () => {
     expect(nourishedWorld.snapshot().animalPopulation[SHRIMP].total).toBeGreaterThan(2);
   });
 
-  it('does not allocate a new brood below the protected somatic reserve', () => {
-    const world = new SimulationWorld('laboratory');
-    const internals = configureReadyPair(world, true);
-    const female = internals.animals.find((animal) => animal.sex === 'female');
-    if (!female) throw new Error('surplus fixture needs a female shrimp');
-    female.storedBiomass = 0.16;
-    female.reproductiveBiomass = 0;
-    female.recentIntake = 0;
+  it('reduces production continuously with reserve density without a survival floor', () => {
+    const allocationAtReserveFraction = (reserveFraction: number): number => {
+      const world = new SimulationWorld('laboratory');
+      const internals = configureReadyPair(world, true);
+      const female = internals.animals.find((animal) => animal.sex === 'female');
+      if (!female) throw new Error('reserve fixture needs a female shrimp');
+      female.storedBiomass =
+        internals.shrimpReserveCapacity(female) * reserveFraction;
+      female.reproductiveBiomass = 0;
+      // Isolate reserve density from the separate recent net-production gate.
+      female.recentIntake = 1;
 
-    internals.stepAnimalEcology(1);
+      internals.stepAnimalEcology(1);
+      expect(female.gestationRemaining).toBeNull();
+      expect(world.snapshot().animalPopulation[SHRIMP].total).toBe(2);
+      return female.reproductiveBiomass;
+    };
 
-    expect(female.reproductiveBiomass).toBe(0);
-    expect(female.gestationRemaining).toBeNull();
-    expect(world.snapshot().animalPopulation[SHRIMP].total).toBe(2);
+    const fullReserveAllocation = allocationAtReserveFraction(1);
+    const midReserveAllocation = allocationAtReserveFraction(0.5);
+    const lowReserveAllocation = allocationAtReserveFraction(0.1);
+
+    expect(fullReserveAllocation).toBeGreaterThan(0);
+    expect(midReserveAllocation).toBeGreaterThan(0);
+    expect(midReserveAllocation).toBeLessThan(fullReserveAllocation);
+    expect(lowReserveAllocation).toBeGreaterThan(0);
+    expect(lowReserveAllocation).toBeLessThan(midReserveAllocation);
   });
 
   it('lets a funded pair mate and develop embryos across independent feeding gaps', () => {
@@ -622,12 +655,13 @@ describe('shrimp population safety contract', () => {
     const female = internals.animals.find((animal) => animal.sex === 'female');
     const male = internals.animals.find((animal) => animal.sex === 'male');
     if (!female || !male) throw new Error('funded fixture needs both sexes');
-    // A ready full-sized female is left at the real 1.2%-of-structure
-    // protected reserve after paying the three-token brood (0.0525 B). That
-    // reserve must remain above the mating condition gate without relying on
-    // the former oversized hidden store.
-    female.storedBiomass = 0.012;
-    female.reproductiveBiomass = 0.053;
+    // Once the brood is fully funded, its ring-fenced matter—not a second
+    // arbitrary short-term reserve threshold—keeps the female eligible to
+    // mate. The male still needs his ordinary courtship reserve.
+    female.storedBiomass = 0;
+    female.reproductiveBiomass =
+      SHRIMP_ECOLOGY_RULES.maximumClutchSize *
+      WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
     female.recentIntake = 0;
     male.storedBiomass = 0.012;
     male.recentIntake = 0;
@@ -811,11 +845,39 @@ describe('shrimp population safety contract', () => {
     shrimp.grazingSessionIntake = 0;
     shrimp.grazingSessionSeconds = 3.1;
     shrimp.energy = 0.1;
+    shrimp.lifeStage = 'juvenile';
 
     internals.stepAnimalMotion(0.25);
 
     expect(shrimp.behavior).not.toBe('grazing');
     expect(shrimp.targetCellId).not.toBe(trace.id);
+    expect(shrimp.recentGrazingCellId).toBe(trace.id);
+    // The memory must survive the complete mandatory roam so the next target
+    // decision can reject this sampled trace when another local patch exists.
+    expect(shrimp.recentGrazingCellCooldown ?? 0)
+      .toBeGreaterThan(shrimp.behaviorTimer);
+  });
+
+  it('requires a sampled juvenile patch to fund development as well as maintenance', () => {
+    const world = new SimulationWorld('laboratory');
+    placeShrimp(world, { x: 600, y: 621 });
+    const internals = reproductionInternals(world);
+    const shrimp = internals.animals[0];
+    shrimp.structuralBiomass = 0.05;
+    shrimp.storedBiomass = 0.002;
+    shrimp.reproductiveBiomass = 0;
+    shrimp.grazingSessionSeconds = 4;
+    const maintenance = internals.shrimpGrazingMaintenancePerSecond(shrimp);
+    shrimp.grazingSessionIntake = maintenance * 4 /
+      WATER_CYCLE_RULES.shrimp.assimilationFraction * 1.2;
+
+    shrimp.lifeStage = 'adult';
+    const adultReturn = internals.shrimpRealisedGrazingReturn(shrimp);
+    shrimp.lifeStage = 'juvenile';
+    const juvenileReturn = internals.shrimpRealisedGrazingReturn(shrimp);
+
+    expect(adultReturn).toBeCloseTo(1.2, 8);
+    expect(juvenileReturn).toBeLessThan(1);
   });
 
   it('depletes a sparse edible film continuously instead of clipping it to zero', () => {
@@ -910,10 +972,27 @@ describe('shrimp population safety contract', () => {
         });
       }
     }
+    // This test isolates persistent-array growth, not starvation. Put each
+    // fixture at a fully grown, fully reserved non-growing state so the
+    // no-food laboratory does not turn a memory assertion into a life-history
+    // calibration test.
+    const save = world.exportSaveData();
+    for (const animal of save.animals) {
+      animal.structuralBiomass =
+        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+      animal.peakStructuralBiomass = animal.structuralBiomass;
+      animal.storedBiomass = WATER_CYCLE_RULES.shrimp.adultReserveBiomass;
+      animal.reproductiveBiomass = 0;
+      animal.lifeStage = 'adult';
+      animal.sex = 'male';
+    }
+    save.materialReference = null;
+    world.loadSaveData(save);
     world.handle({ type: 'start' });
     const baseline = world.snapshot();
     const baselineWorldArrays = directArrayLengths(world);
-    const baselineSnapshotEntries = recursiveArrayEntryCount(baseline);
+    const baselineSnapshotEntries =
+      recursiveArrayEntryCount(baseline) - baseline.producerFluxHistory.length;
 
     expect(baseline.animalPopulation[SHRIMP].total).toBe(64);
     const afterFastForward = advanceTo(world, 48);
@@ -921,7 +1000,12 @@ describe('shrimp population safety contract', () => {
     expect(afterFastForward.animalPopulation[SHRIMP].total).toBe(64);
     expect(afterFastForward.carcasses).toHaveLength(0);
     expect(directArrayLengths(world)).toEqual(baselineWorldArrays);
-    expect(recursiveArrayEntryCount(afterFastForward)).toBe(
+    expect((world as unknown as { producerFluxHistory: unknown[] })
+      .producerFluxHistory.length).toBeLessThanOrEqual(91);
+    expect(
+      recursiveArrayEntryCount(afterFastForward) -
+        afterFastForward.producerFluxHistory.length,
+    ).toBe(
       baselineSnapshotEntries,
     );
     expectBoundedReactionWorkspaces(world, afterFastForward);

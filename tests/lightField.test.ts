@@ -87,7 +87,9 @@ describe('aquarium light field', () => {
     const snapshot = world.snapshot();
     expect(snapshot.dayNight?.phase).toBe('dusk');
     expect(snapshot.lightField.revision).toBeGreaterThan(initialRevision);
-    expect(snapshot.lightField.revision - initialRevision).toBeLessThan(36);
+    // The solar-arc profile adds a handful of intensity refreshes to the
+    // existing two-degree direction refreshes, while remaining bounded.
+    expect(snapshot.lightField.revision - initialRevision).toBeLessThan(44);
     expect(ray).toHaveBeenCalled();
     expect(internals.lightTransportCache).toBe(staticTransportCache);
     expect(staticTransportCache.get(cachedEntry![0])).toBe(cachedEntry![1]);

@@ -433,8 +433,10 @@ describe('algae visual refresh decisions', () => {
     const laterSpan = Math.max(...occupied600.map((cell) => cell.x)) -
       Math.min(...occupied600.map((cell) => cell.x));
 
-    // A ten-minute colony keeps advancing without retaining one dense,
-    // overlapping source clump or recreating the old 400+-cell trace cascade.
+    // A ten-minute colony keeps advancing without concentrating most of its
+    // real biomass in the inoculation cell or recreating the old 400+-cell
+    // trace cascade. The source is allowed to mature: requiring every occupied
+    // cell to stay below trace biomass contradicts local photosynthetic growth.
     expect(occupied600.length).toBeGreaterThan(occupied.length);
     expect(occupied600.length).toBeLessThanOrEqual(140);
     expect(rendered600.length).toBeGreaterThanOrEqual(occupied600.length);
@@ -445,8 +447,18 @@ describe('algae visual refresh decisions', () => {
     const densestLaterCell = Math.max(
       ...occupied600.map((cell) => cell.biomass.oedogonium),
     );
-    expect(densestLaterCell).toBeGreaterThan(0.003);
-    expect(densestLaterCell).toBeLessThan(0.012);
+    const laterFront = {
+      occupied: occupied600.length,
+      rendered: rendered600.length,
+      span: laterSpan,
+      total: snapshot.totalBiomass.oedogonium,
+      densest: densestLaterCell,
+    };
+    expect(densestLaterCell, JSON.stringify(laterFront)).toBeGreaterThan(0.003);
+    expect(
+      densestLaterCell / snapshot.totalBiomass.oedogonium,
+      JSON.stringify(laterFront),
+    ).toBeLessThan(0.5);
   });
 
   it('shows shrimp food flecks only when authoritative consumed biomass rises', () => {

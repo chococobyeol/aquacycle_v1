@@ -4305,6 +4305,7 @@ const drawVallisneriaPlant = (
   cellIndex: number,
   root: Vec2,
   structuralScale: number,
+  leafRetention: number,
   health: number,
   senescent: boolean,
   opacity = 1,
@@ -4312,7 +4313,12 @@ const drawVallisneriaPlant = (
   const healthAlpha = (0.48 + health * 0.46) * opacity;
   const healthyPalette = [0x557f47, 0x6f9651, 0x80a65d];
   const oldPalette = [0x7f7441, 0x9a8750, 0xa89159];
-  const leaves = vallisneriaLeaves(cellIndex, root, structuralScale);
+  const leaves = vallisneriaLeaves(
+    cellIndex,
+    root,
+    structuralScale,
+    leafRetention,
+  );
   for (let index = 0; index < leaves.length; index += 1) {
     const leaf = leaves[index];
     const ribbonWidth = leaf.ribbonWidth;
@@ -4386,21 +4392,23 @@ const drawAquaticPlants = (
 
   for (const { cell, plant } of visiblePlants) {
     const biomass = cell.biomass.vallisneria;
-    // Reserve biomass drives metabolism, while structuralScale changes slowly
-    // over a life stage. This keeps leaves stable through a single night but
-    // makes runner daughters small and old plants visibly thin and yellow.
+    // Attained leaf length never follows reserve downward. The separate
+    // retained-leaf fraction makes runner daughters small and lets old plants
+    // lose whole blades without retracting the blades that remain.
     const structuralScale = plant?.structuralScale ?? 0.72;
     const root = plant ?? cell;
     // A juvenile rosette should read as a few narrow strap leaves, not a
     // radial tentacle cluster. Maturity adds leaves and height while keeping
     // every blade anchored to the same compact crown.
     const health = plant?.health ?? Math.min(1, biomass / 0.28);
+    const leafRetention = plant?.leafRetention ?? 1;
     const senescent = plant?.lifeStage === 'senescent';
     drawVallisneriaPlant(
       layer,
       cell.index,
       root,
       structuralScale,
+      leafRetention,
       health,
       senescent,
     );
@@ -4415,6 +4423,7 @@ const vallisneriaVisualKey = (snapshot: SimulationSnapshot): string => {
     plant.x.toFixed(2),
     plant.y.toFixed(2),
     Math.round(plant.structuralScale / 0.015),
+    Math.round(plant.leafRetention / 0.05),
     Math.round(plant.health / 0.04),
     plant.lifeStage,
   ].join(':'));
@@ -4426,23 +4435,41 @@ const vallisneriaVisualKey = (snapshot: SimulationSnapshot): string => {
   return `${plants.join('|')}#${occupiedCells.join('|')}`;
 };
 
+const dayNightTintGeometryKeys = new WeakMap<Graphics, string>();
+
 const drawDayNightTint = (layer: Graphics, snapshot: SimulationSnapshot): void => {
-  layer.clear();
-  if (!snapshot.dayNight) return;
+  if (!snapshot.dayNight) {
+    layer.visible = false;
+    return;
+  }
   const fullLight = snapshot.lightOutput + snapshot.naturalLightOutput;
   const currentLight = snapshot.dayNight.effectiveLightOutput;
   const darkness = fullLight > 0
     ? Math.max(0, Math.min(1, 1 - currentLight / fullLight))
     : 0;
-  if (darkness <= 0.01) return;
-  layer
-    .rect(
-      0,
-      snapshot.tank.waterTop,
-      snapshot.tank.width,
-      snapshot.tank.groundY - snapshot.tank.waterTop,
-    )
-    .fill({ color: 0x173349, alpha: darkness * 0.34 });
+  const geometryKey = [
+    snapshot.tank.width,
+    snapshot.tank.waterTop,
+    snapshot.tank.groundY,
+  ].join(':');
+  // At x64 a full day/night cycle is only a few wall-clock seconds. Clearing
+  // and rebuilding this full-tank Graphics object for every snapshot made
+  // Pixi/Chromium retain native geometry generations even while the JS heap
+  // stayed flat. Retain one rectangle per tank and animate only its alpha.
+  if (dayNightTintGeometryKeys.get(layer) !== geometryKey) {
+    layer.clear();
+    layer
+      .rect(
+        0,
+        snapshot.tank.waterTop,
+        snapshot.tank.width,
+        snapshot.tank.groundY - snapshot.tank.waterTop,
+      )
+      .fill({ color: 0x173349 });
+    dayNightTintGeometryKeys.set(layer, geometryKey);
+  }
+  layer.visible = darkness > 0.01;
+  layer.alpha = darkness * 0.34;
 };
 
 const drawPhytoplankton = (layer: Container, snapshot: SimulationSnapshot): void => {
@@ -4511,6 +4538,7 @@ const drawInteraction = (
         997,
         { x: held.x, y: held.y },
         0.62,
+        1,
         1,
         false,
         held.valid ? 0.82 : 0.58,

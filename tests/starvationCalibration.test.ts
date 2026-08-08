@@ -46,7 +46,6 @@ interface ShrimpBirthInternals extends StarvationWorldInternals {
     clutchIndex: number,
   ): TestAnimal;
   shrimpReserveCapacity(animal: TestAnimal): number;
-  shrimpJuvenileGrowthReserveFloor(animal: TestAnimal): number;
 }
 
 const internalsOf = (
@@ -88,19 +87,98 @@ const advanceUntilDeath = (
 };
 
 describe('compressed starvation calibration', () => {
+  it('keeps small-shrimp maintenance on one monotonic allometric curve', () => {
+    const adultReferenceMass =
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+    const maintenanceAt = (structuralBiomass: number): number =>
+      continuousBodyMassMaintenance(
+        structuralBiomass,
+        adultReferenceMass,
+        SHRIMP_ECOLOGY_RULES.adultRoutineMaintenanceBiomassPerSecond /
+          adultReferenceMass,
+        SHRIMP_ECOLOGY_RULES.metabolicMassExponent,
+      );
+    const hatchlingStructure =
+      WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass /
+      (
+        1 + WATER_CYCLE_RULES.shrimp.adultReserveBiomass /
+          adultReferenceMass
+      );
+    const suppliedYoungAdultStructure = 0.09;
+    const hatchlingMaintenance = maintenanceAt(hatchlingStructure);
+    const youngAdultMaintenance = maintenanceAt(suppliedYoungAdultStructure);
+    const referenceAdultMaintenance = maintenanceAt(adultReferenceMass);
+
+    expect(hatchlingMaintenance).toBeLessThan(youngAdultMaintenance);
+    expect(youngAdultMaintenance).toBeLessThan(referenceAdultMaintenance);
+    expect(hatchlingMaintenance / referenceAdultMaintenance)
+      .toBeCloseTo(
+        Math.pow(
+          hatchlingStructure / adultReferenceMass,
+          SHRIMP_ECOLOGY_RULES.metabolicMassExponent,
+        ),
+        10,
+      );
+    expect(youngAdultMaintenance / referenceAdultMaintenance)
+      .toBeCloseTo(
+        Math.pow(
+          suppliedYoungAdultStructure / adultReferenceMass,
+          SHRIMP_ECOLOGY_RULES.metabolicMassExponent,
+        ),
+        10,
+      );
+    // Mild negative allometry may raise mass-specific demand, but a small
+    // shrimp must never receive an adult-sized absolute respiration charge.
+    expect(youngAdultMaintenance / suppliedYoungAdultStructure)
+      .toBeLessThan(
+        referenceAdultMaintenance / adultReferenceMass * 1.35,
+      );
+  });
+
+  it('does not add a juvenile-only respiration charge in the ecology step', () => {
+    const adultWorld = new SimulationWorld('laboratory');
+    placeAnimal(adultWorld, 'cherry-shrimp', { x: 520, y: 310 });
+    const adultInternals = adultWorld as unknown as ShrimpBirthInternals;
+    const adult = adultInternals.animals.find(
+      (animal) => animal.speciesId === 'cherry-shrimp',
+    )!;
+    adult.lifespanSeconds = 10_000;
+    adult.storedBiomass = 0;
+    adult.behavior = 'resting';
+    const adultInitialStructure = adult.structuralBiomass;
+    adultInternals.stepAnimalEcology(1);
+    const adultLoss = adultInitialStructure - adult.structuralBiomass;
+
+    const juvenileWorld = new SimulationWorld('laboratory');
+    placeAnimal(juvenileWorld, 'cherry-shrimp', { x: 520, y: 310 });
+    const juvenileInternals = juvenileWorld as unknown as ShrimpBirthInternals;
+    const parent = juvenileInternals.animals.find(
+      (animal) => animal.speciesId === 'cherry-shrimp',
+    )!;
+    const juvenile = juvenileInternals.createJuvenileAnimalState(parent, 0);
+    juvenile.lifespanSeconds = 10_000;
+    juvenile.storedBiomass = 0;
+    juvenile.behavior = 'resting';
+    juvenileInternals.animals.splice(0, juvenileInternals.animals.length, juvenile);
+    const juvenileInitialStructure = juvenile.structuralBiomass;
+    juvenileInternals.stepAnimalEcology(1);
+    const juvenileLoss = juvenileInitialStructure - juvenile.structuralBiomass;
+
+    expect(juvenileLoss).toBeLessThan(adultLoss);
+    expect(juvenileLoss / adultLoss).toBeCloseTo(
+      Math.pow(
+        juvenileInitialStructure / adultInitialStructure,
+        SHRIMP_ECOLOGY_RULES.metabolicMassExponent,
+      ),
+      8,
+    );
+  });
+
   it('keeps even maximum wasting metabolism below maximum assimilable intake', () => {
     const adultReferenceMass =
-      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass +
-      WATER_CYCLE_RULES.shrimp.suppliedReserveBiomass;
-    const maximumReproductiveBiomass =
-      SHRIMP_ECOLOGY_RULES.maximumClutchSize * 2 *
-      WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
-    const maximumFedBodyMass =
-      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass +
-      WATER_CYCLE_RULES.shrimp.adultReserveBiomass +
-      maximumReproductiveBiomass;
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
     const maximumWastingMaintenance = continuousBodyMassMaintenance(
-      maximumFedBodyMass,
+      adultReferenceMass,
       adultReferenceMass,
       SHRIMP_ECOLOGY_RULES.adultRoutineMaintenanceBiomassPerSecond /
         adultReferenceMass,
@@ -175,8 +253,8 @@ describe('compressed starvation calibration', () => {
     // clock, the stocked reserve and one-percent viable tissue margin must
     // therefore expose a complete food loss well before an ovarian cycle,
     // rather than letting the adult coast for most of a modelled generation.
-    expect(shrimpSurvival).toBeGreaterThan(90);
-    expect(shrimpSurvival).toBeLessThan(180);
+    expect(shrimpSurvival).toBeGreaterThanOrEqual(50);
+    expect(shrimpSurvival).toBeLessThan(120);
     expect(shrimp.storedBiomass).toBeCloseTo(0, 8);
     expect(shrimp.structuralBiomass).toBeLessThan(initialShrimpStructure);
     expect(shrimp.health).toBeCloseTo(1, 8);
@@ -212,6 +290,7 @@ describe('compressed starvation calibration', () => {
     wastingShrimp.lifespanSeconds = 10_000;
     wastingShrimp.storedBiomass = 0;
     wastingShrimp.structuralBiomass = 0.995;
+    wastingShrimp.peakStructuralBiomass = 1;
     wastingShrimp.behavior = 'resting';
     wastingInternals.stepAnimalMotion(0.1);
     expect(wastingShrimp.behavior).toBe('starving');
@@ -248,6 +327,8 @@ describe('compressed starvation calibration', () => {
     newborn.lifespanSeconds = 10_000;
     const initialMatter =
       newborn.structuralBiomass + newborn.storedBiomass;
+    const initialReserve = newborn.storedBiomass;
+    const initialEnergy = newborn.energy;
     internals.animals.splice(0, internals.animals.length, newborn);
 
     const survival = advanceUntilDeath(
@@ -262,6 +343,8 @@ describe('compressed starvation calibration', () => {
       WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass,
       8,
     );
+    expect(initialReserve).toBeGreaterThan(0);
+    expect(initialEnergy).toBeGreaterThan(0.8);
     // Food-deprived juveniles reach the point of no return sooner than adults;
     // the individual hatchling has no hidden cohort store or stage discount.
     expect(survival).toBeGreaterThan(45);
@@ -285,7 +368,12 @@ describe('compressed starvation calibration', () => {
     bornAdult.structuralBiomass = 0.20;
     bornAdult.peakStructuralBiomass = 0.20;
 
-    expect(internals.shrimpReserveCapacity(supplied)).toBeCloseTo(0.06, 10);
+    expect(internals.shrimpReserveCapacity(supplied)).toBeCloseTo(
+      supplied.structuralBiomass *
+        WATER_CYCLE_RULES.shrimp.adultReserveBiomass /
+        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
+      10,
+    );
     expect(internals.shrimpReserveCapacity(bornAdult)).toBeCloseTo(0.012, 10);
 
     // The former shared 0.06-B ceiling was 30% of this animal's structure
@@ -303,14 +391,18 @@ describe('compressed starvation calibration', () => {
       2,
     );
 
-    expect(survival).toBeGreaterThan(80);
-    expect(survival).toBeLessThan(170);
+    // This is the real size-scaled 0.012-B reserve plus the adult's narrow
+    // structural margin. It must remain far shorter than the 1,800-second
+    // minimum lifespan, but must not rely on an excessive optional-growth
+    // sink to manufacture an earlier starvation result.
+    expect(survival).toBeGreaterThan(120);
+    expect(survival).toBeLessThan(220);
     expect(internals.carcasses.find(
       (carcass) => carcass.sourceAnimalId === bornAdult.id,
     )?.cause).toBe('starvation');
   });
 
-  it('scales juvenile reserve and growth protection to achieved body size', () => {
+  it('scales juvenile reserve to current structure without a hidden growth floor', () => {
     const world = new SimulationWorld('laboratory');
     placeAnimal(world, 'cherry-shrimp', { x: 520, y: 310 });
     const internals = world as unknown as ShrimpBirthInternals;
@@ -320,28 +412,21 @@ describe('compressed starvation calibration', () => {
     const juvenile = internals.createJuvenileAnimalState(parent, 0);
 
     expect(internals.shrimpReserveCapacity(juvenile)).toBeCloseTo(
-      WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass * 0.06,
+      juvenile.structuralBiomass *
+        WATER_CYCLE_RULES.shrimp.adultReserveBiomass /
+        WATER_CYCLE_RULES.shrimp.adultStructuralBiomass,
       10,
     );
-    expect(internals.shrimpJuvenileGrowthReserveFloor(juvenile)).toBeCloseTo(
-      WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass * 0.04,
-      10,
-    );
-
     juvenile.structuralBiomass = 0.082;
     juvenile.peakStructuralBiomass = 0.082;
     expect(internals.shrimpReserveCapacity(juvenile)).toBeCloseTo(
       0.082 * 0.06,
       10,
     );
-    expect(internals.shrimpJuvenileGrowthReserveFloor(juvenile)).toBeCloseTo(
-      0.082 * 0.04,
-      10,
-    );
   });
 
   it('removes a legacy oversized juvenile store and exposes food loss before old age', () => {
-    const world = new SimulationWorld('laboratory');
+    const world = new SimulationWorld('laboratory', undefined, 17);
     placeAnimal(world, 'cherry-shrimp', { x: 520, y: 310 });
     const internals = world as unknown as ShrimpBirthInternals;
     const parent = internals.animals.find(
@@ -366,10 +451,12 @@ describe('compressed starvation calibration', () => {
       false,
       2,
     );
-    // A larger juvenile with a genuinely full size-scaled reserve outlasts a
-    // newborn, but food loss still reaches it long before natural old age.
-    expect(survival).toBeGreaterThan(180);
-    expect(survival).toBeLessThan(330);
+    // The old fixed store is discarded into detritus, leaving only the
+    // structure-scaled DEB reserve. Food loss therefore reaches the juvenile
+    // on the same short fractional-lifespan scale as a hatchling instead of
+    // being hidden behind an adult-sized compartment.
+    expect(survival).toBeGreaterThan(40);
+    expect(survival).toBeLessThan(180);
     expect(internals.carcasses.find(
       (carcass) => carcass.sourceAnimalId === juvenile.id,
     )?.cause).toBe('starvation');

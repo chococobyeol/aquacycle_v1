@@ -462,9 +462,13 @@ describe('Vallisneria lineage tracking', () => {
     ageSeconds: 100,
     lifespanSeconds: 1_000,
     lifeStage: 'mature',
+    leafRetention: 1,
     structuralScale: 1,
+    nitrogenReserve: 0,
+    runnerReserveBiomass: 0,
     health: 1,
     runnerProgress: 0,
+    runnerState: 'preparing',
     reproductionCount: 0,
   });
 

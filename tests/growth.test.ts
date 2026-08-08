@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  attachedAlgaeEffectiveLight,
   growthTrend,
   habitatSuitability,
   netGrowthPotential,
+  producerNaturalTurnoverRateScale,
+  producerProcessRateScale,
+  resolvedSurfaceFilmBiomass,
   stepLocalGrowth,
 } from '../src/simulation/growth';
 
@@ -15,11 +19,29 @@ describe('species light response', () => {
     expect(growthTrend('nitzschia', 25)).toBe('growing');
   });
 
+  it('creates a diatom understory niche only beneath a dense filamentous film', () => {
+    expect(attachedAlgaeEffectiveLight('nitzschia', 100, 0)).toBe(100);
+    expect(attachedAlgaeEffectiveLight('nitzschia', 100, 0.2)).toBeGreaterThan(38);
+    expect(attachedAlgaeEffectiveLight('nitzschia', 100, 0.2)).toBeLessThan(50);
+    expect(attachedAlgaeEffectiveLight('nitzschia', 100, 0.5)).toBeLessThan(20);
+    expect(attachedAlgaeEffectiveLight('nitzschia', 100, 1)).toBeLessThan(3);
+    expect(attachedAlgaeEffectiveLight('oedogonium', 100, 1)).toBe(100);
+  });
+
+  it('keeps routine tissue turnover on each producer physiology clock', () => {
+    expect(producerProcessRateScale('vallisneria'))
+      .toBeGreaterThan(producerProcessRateScale('oedogonium'));
+    expect(producerNaturalTurnoverRateScale('vallisneria'))
+      .toBe(producerProcessRateScale('vallisneria'));
+    expect(producerNaturalTurnoverRateScale('oedogonium'))
+      .toBe(producerProcessRateScale('oedogonium'));
+  });
+
   it('keeps Vallisneria low-light tolerant and saturating at bright light', () => {
-    expect(netGrowthPotential('vallisneria', 6)).toBeLessThan(0);
-    // The 24°C temperature response sits just below its 25°C optimum, so the
-    // realized compensation point is fractionally above the authored knot.
-    expect(netGrowthPotential('vallisneria', 10)).toBeGreaterThan(-0.0003);
+    expect(netGrowthPotential('vallisneria', 0)).toBeLessThan(0);
+    // This submerged macrophyte can just cover respiration under weak light;
+    // darkness, not an arbitrary low-light cutoff, remains a real loss.
+    expect(netGrowthPotential('vallisneria', 6)).toBeGreaterThan(0);
     expect(netGrowthPotential('vallisneria', 24)).toBeGreaterThan(0);
     expect(netGrowthPotential('vallisneria', 78))
       .toBeGreaterThanOrEqual(netGrowthPotential('vallisneria', 100));
@@ -54,5 +76,11 @@ describe('species light response', () => {
       deltaSeconds: 60,
     });
     expect(capped).toBeLessThanOrEqual(1);
+  });
+
+  it('lets a declining sub-propagule film go extinct without killing new growth', () => {
+    expect(resolvedSurfaceFilmBiomass(0.00006, 0.00004)).toBe(0);
+    expect(resolvedSurfaceFilmBiomass(0.00003, 0.00004)).toBe(0.00004);
+    expect(resolvedSurfaceFilmBiomass(0.01, 0.009)).toBe(0.009);
   });
 });

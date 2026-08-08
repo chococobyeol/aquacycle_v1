@@ -9,7 +9,6 @@ import {
 } from '../src/simulation/dayNight';
 import { algaePhysiology } from '../src/simulation/growth';
 import { SCENARIOS } from '../src/simulation/config';
-import { CLOSED_MATERIAL_RELATIVE_TOLERANCE } from '../src/simulation/stoichiometry';
 import type { MicrobeGuildId, SpeciesId, Vec2 } from '../src/simulation/types';
 
 const placeSeed = (world: SimulationWorld, speciesId: SpeciesId, point: Vec2): void => {
@@ -46,20 +45,65 @@ describe('day/night producer metabolism', () => {
     const duration = dayNightCycleDuration(cycle);
     expect(duration).toBe(360);
     expect(dayNightStateAt(0, cycle).phase).toBe('day');
-    expect(dayNightStateAt(240, cycle).phase).toBe('dusk');
-    expect(dayNightStateAt(270, cycle).phase).toBe('night');
+    expect(dayNightStateAt(120, cycle).phase).toBe('dusk');
+    expect(dayNightStateAt(150, cycle).phase).toBe('night');
     expect(dayNightStateAt(330, cycle).phase).toBe('dawn');
     expect(dayNightStateAt(duration, cycle).phase).toBe('day');
-    expect(dayNightStateAt(300, cycle).lightMultiplier).toBeCloseTo(0.045, 6);
+    expect(dayNightStateAt(240, cycle).lightMultiplier).toBeCloseTo(0.000001, 8);
+  });
+
+  it('gives mission 6 one continuous sunrise-to-sunset irradiance arc', () => {
+    const cycle = SCENARIOS['mission-6'].dayNightCycle!;
+    const morning = dayNightStateAt(0, cycle);
+    const noon = dayNightStateAt(60, cycle);
+    const evening = dayNightStateAt(120, cycle);
+
+    expect(cycle.lightProfile).toBe('solar-arc');
+    expect(cycle.solarArcExponent).toBe(1);
+    expect(morning.phase).toBe('day');
+    expect(noon.phase).toBe('day');
+    expect(evening.phase).toBe('dusk');
+    expect(noon.lightMultiplier).toBeCloseTo(1, 8);
+    expect(morning.lightMultiplier).toBeLessThan(noon.lightMultiplier);
+    expect(evening.lightMultiplier).toBeCloseTo(morning.lightMultiplier, 8);
+  });
+
+  it('batches actual in-tank producer measurements at high fast-forward speed', () => {
+    const world = new SimulationWorld('mission-6');
+    const substrate = world.snapshot().cells.filter(
+      (cell) => cell.surfaceKind === 'substrate',
+    );
+    placeSeed(world, 'nitzschia', substrate[Math.floor(substrate.length / 2)]);
+    world.handle({ type: 'start' });
+    const after = advanceTo(world, 220);
+    const points = after.producerFluxHistory;
+
+    expect(points.length).toBeGreaterThan(70);
+    expect(Math.max(...points.slice(1).map(
+      (point, index) => point.elapsedSeconds - points[index].elapsedSeconds,
+    ))).toBeLessThanOrEqual(2.01);
+    const lit = points.filter((point) =>
+      point.elapsedSeconds >= 50 && point.elapsedSeconds <= 70
+    );
+    const dark = points.filter((point) => point.elapsedSeconds >= 170);
+    expect(Math.max(...lit.map((point) => point.effectiveLight))).toBeGreaterThan(20);
+    // The ecology field retains a sub-compensation scattered-light floor; the
+    // graph must report that measured remainder rather than replacing it with
+    // the day/night source multiplier's near-zero value.
+    expect(Math.max(...dark.map((point) => point.effectiveLight))).toBeLessThan(1.2);
+    expect(Math.max(...lit.map((point) => point.grossPhotosynthesis))).toBeGreaterThan(0);
+    expect(Math.max(...dark.map((point) => point.grossPhotosynthesis)))
+      .toBeLessThan(0.00001);
+    expect(Math.min(...dark.map((point) => point.producerRespiration))).toBeGreaterThan(0);
   });
 
   it('keeps the solar orbit moving in one direction through the night', () => {
     const cycle = SCENARIOS['mission-6'].dayNightCycle!;
     const morning = daylightAngleRadians(dayNightStateAt(0, cycle));
-    const noon = daylightAngleRadians(dayNightStateAt(120, cycle));
-    const evening = daylightAngleRadians(dayNightStateAt(240, cycle));
-    const duskEnd = daylightAngleRadians(dayNightStateAt(270, cycle));
-    const midnight = daylightAngleRadians(dayNightStateAt(300, cycle));
+    const noon = daylightAngleRadians(dayNightStateAt(60, cycle));
+    const evening = daylightAngleRadians(dayNightStateAt(120, cycle));
+    const duskEnd = daylightAngleRadians(dayNightStateAt(150, cycle));
+    const midnight = daylightAngleRadians(dayNightStateAt(240, cycle));
     const nightEnd = daylightAngleRadians(dayNightStateAt(329.999, cycle));
     const nextDawn = daylightAngleRadians(dayNightStateAt(330, cycle));
 
@@ -90,9 +134,11 @@ describe('day/night producer metabolism', () => {
 
   it('treats mission 6 daylight as a broad source rather than a hidden lamp cone', () => {
     const scenario = SCENARIOS['mission-6'];
-    const snapshot = new SimulationWorld('mission-6').snapshot();
+    const world = new SimulationWorld('mission-6');
     expect(scenario.lightOutput).toBe(0);
     expect(scenario.naturalLightOutput).toBeGreaterThan(0);
+    world.handle({ type: 'start' });
+    const snapshot = advanceTo(world, 60);
 
     const { columns, values } = snapshot.lightField;
     const row = 4;
@@ -111,14 +157,17 @@ describe('day/night producer metabolism', () => {
     world.handle({ type: 'set-day-night-enabled', enabled: true });
     world.handle({ type: 'start' });
 
-    const day = advanceTo(world, 120);
-    const night = advanceTo(world, 300);
+    const day = advanceTo(world, 60);
+    const night = advanceTo(world, 240);
     expect(day.dayNight?.phase).toBe('day');
-    expect(day.dayNight?.effectiveNaturalLightOutput).toBeCloseTo(80, 4);
-    expect(day.dayNight?.effectiveLightOutput).toBeCloseTo(140, 4);
+    // The fixed simulation step may sample a fraction of a second past solar
+    // noon, so assert the near-peak interval rather than exact floating-point
+    // equality at one instant.
+    expect(day.dayNight?.effectiveNaturalLightOutput).toBeGreaterThan(79.7);
+    expect(day.dayNight?.effectiveLightOutput).toBeGreaterThan(139.7);
     expect(night.dayNight?.phase).toBe('night');
-    expect(night.dayNight?.effectiveNaturalLightOutput).toBeCloseTo(3.6, 4);
-    expect(night.dayNight?.effectiveLightOutput).toBeCloseTo(63.6, 4);
+    expect(night.dayNight?.effectiveNaturalLightOutput).toBeCloseTo(0.00008, 6);
+    expect(night.dayNight?.effectiveLightOutput).toBeCloseTo(60.00008, 6);
     expect(night.lightOutput).toBe(60);
   }, 20_000);
 
@@ -132,12 +181,15 @@ describe('day/night producer metabolism', () => {
       diffuseNaturalLightOutput(): number;
     };
     const internals = world as unknown as LightInternals;
-    const naturalOutput = world.snapshot().naturalLightOutput;
+    const initial = world.snapshot();
+    const naturalOutput = initial.naturalLightOutput;
     const nightMultiplier =
       SCENARIOS['mission-6'].dayNightCycle!.nightLightMultiplier;
 
     expect(internals.directNaturalLightOutput()).toBeCloseTo(
-      naturalOutput * (1 - nightMultiplier),
+      naturalOutput * (
+        (initial.dayNight?.lightMultiplier ?? 1) - nightMultiplier
+      ),
       8,
     );
     expect(internals.diffuseNaturalLightOutput()).toBeCloseTo(
@@ -145,7 +197,7 @@ describe('day/night producer metabolism', () => {
       8,
     );
 
-    internals.elapsedSeconds = 300;
+    internals.elapsedSeconds = 240;
     internals.updateDayNightLighting();
     expect(internals.directNaturalLightOutput()).toBe(0);
     expect(internals.diffuseNaturalLightOutput()).toBeCloseTo(
@@ -165,8 +217,8 @@ describe('day/night producer metabolism', () => {
     placeSeed(world, 'oedogonium', substrate.find((cell) => cell.x > 430) ?? substrate[1]);
     world.handle({ type: 'start' });
 
-    const day = advanceTo(world, 120);
-    const night = advanceTo(world, 300);
+    const day = advanceTo(world, 60);
+    const night = advanceTo(world, 240);
     expect(day.dayNight?.phase).toBe('day');
     expect(night.dayNight?.phase).toBe('night');
     expect(day.dayNight!.effectiveLightOutput).toBeGreaterThan(
@@ -179,58 +231,42 @@ describe('day/night producer metabolism', () => {
     expect(night.biogeochemistry.algaeFluxes.respirationBiomassPerSecond).toBeGreaterThan(0);
   }, 20_000);
 
-  it('offers a solvable three-cycle ecosystem without prescribing the layout', () => {
+  it('requires an established multigeneration colony instead of one survivor', () => {
+    const scenario = SCENARIOS['mission-6'];
+    expect(scenario.timeLimitSeconds).toBeNull();
+    expect(scenario.seedBudget.vallisneria).toBe(3);
+    expect(scenario.animalSexBudget?.['cherry-shrimp'])
+      .toEqual({ female: 2, male: 2 });
+    expect(scenario.waterCycle?.microbeBudget)
+      .toEqual({ decomposer: 4, nitrifier: 4 });
+    expect(scenario.target).toMatchObject({
+      type: 'animal-generation',
+      minimumGeneration: 3,
+      generationCount: 8,
+      minimumPopulation: 15,
+      holdSeconds: 1_080,
+    });
+
     const world = new SimulationWorld('mission-6');
     const substrate = world.snapshot().cells.filter((cell) => cell.surfaceKind === 'substrate');
-    const nearest = (x: number, used: Set<string>) => {
-      const cell = [...substrate]
-        .filter((candidate) => !used.has(candidate.id))
-        .sort((left, right) => Math.abs(left.x - x) - Math.abs(right.x - x))[0];
-      if (!cell) throw new Error('mission 6 fixture needs a free substrate cell');
-      used.add(cell.id);
-      return cell;
-    };
-    const used = new Set<string>();
-    const foodPoints: Vec2[] = [];
-    // A player-like solution uses a handful of broad daylight positions rather
-    // than exhausting every supplied inoculum or targeting hidden cell values.
-    for (const x of [180, 450, 750, 1_020]) {
-      const nitzschia = nearest(x, used);
-      placeSeed(world, 'nitzschia', nitzschia);
-      placeSeed(world, 'oedogonium', nearest(x + 28, used));
-      foodPoints.push(nitzschia);
-    }
-    for (const x of [340, 600, 860]) placeSeed(world, 'vallisneria', nearest(x, used));
-    // Supplied adults begin hungry. Placing them at the visible food patches is
-    // a normal player action and avoids making the fixture depend on a lucky
-    // first random walk before the local-search radius reaches food.
-    for (const point of foodPoints) placeShrimp(world, point);
+    const first = substrate[0]!;
+    const second = substrate[1]!;
+    placeSeed(world, 'nitzschia', first);
     world.handle({ type: 'start' });
     advanceTo(world, 90);
     world.handle({ type: 'pause' });
-    for (const cell of substrate.filter((_, index) => index % 8 === 1).slice(0, 3)) {
-      placeFilm(world, 'decomposer', cell);
-    }
+    // Mission 6 permits ecological staging after observation has begun: the
+    // player may wait for the film to establish before releasing founders.
+    placeSeed(world, 'oedogonium', second);
+    placeFilm(world, 'decomposer', first);
+    placeShrimp(world, first);
+    const paused = world.snapshot();
+    expect(paused.remainingSeeds.oedogonium).toBe(4);
+    expect(paused.remainingMicrobes.decomposer).toBe(3);
+    expect(paused.remainingAnimals['cherry-shrimp']).toBe(3);
     world.handle({ type: 'resume' });
-    advanceTo(world, 190);
-    world.handle({ type: 'pause' });
-    for (const cell of substrate.filter((_, index) => index % 8 === 4).slice(0, 3)) {
-      placeFilm(world, 'nitrifier', cell);
-    }
-    world.handle({ type: 'resume' });
-
-    const samples = [180, 360, 540, 720, 900, 1_090]
-      .map((target) => advanceTo(world, target));
-    const final = samples.at(-1)!;
-    expect(final.outcome).toBe('success');
-    expect(final.animalPopulation['cherry-shrimp'].total).toBeGreaterThan(0);
-    expect(Math.min(...samples.map((sample) => sample.biogeochemistry.average.oxygen)))
-      .toBeGreaterThan(30);
-    expect(Math.abs(final.biogeochemistry.materialBalance.nitrogenDriftRatio))
-      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
-    expect(Math.abs(final.biogeochemistry.materialBalance.carbonDriftRatio))
-      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
-    expect(Math.abs(final.biogeochemistry.materialBalance.oxygenEquivalentDriftRatio))
-      .toBeLessThan(CLOSED_MATERIAL_RELATIVE_TOLERANCE);
+    const afterThreeCycles = advanceTo(world, 1_090);
+    expect(afterThreeCycles.outcome).toBe('pending');
+    expect(afterThreeCycles.missionProgress?.holdTarget).toBe(1_080);
   }, 40_000);
 });

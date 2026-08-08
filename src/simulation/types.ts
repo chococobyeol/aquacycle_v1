@@ -211,9 +211,25 @@ export interface PlantRametSnapshot {
   ageSeconds: number;
   lifespanSeconds: number;
   lifeStage: PlantLifeStage;
+  /** Fraction of the attained leaf cohort still present; it does not rescale leaf length. */
+  leafRetention: number;
   structuralScale: number;
+  /** Mineral N retained by this ramet after carbohydrate respiration. */
+  nitrogenReserve: number;
+  /** Conserved subset of this ramet's biomass allocated to its next runner. */
+  runnerReserveBiomass: number;
   health: number;
   runnerProgress: number;
+  /** Why a finished runner has not yet produced a daughter, or what it still needs. */
+  runnerState:
+    | 'juvenile'
+    | 'senescent'
+    | 'recovering'
+    | 'growing-leaves'
+    | 'preparing'
+    | 'waiting-reserve'
+    | 'waiting-site'
+    | 'ready';
   reproductionCount: number;
 }
 
@@ -404,6 +420,10 @@ export interface BiogeochemistrySnapshot {
   potentialOxygenDemand: number;
   dissolvedWasteProduced: number;
   detritusMass: number;
+  /** Finite mineral nitrogen adsorbed in the rooted substrate compartment. */
+  sedimentMineralNitrogen: number;
+  /** Sum of nitrogen retained inside living rooted-plant individuals. */
+  rootedPlantStoredNitrogen: number;
   water: WaterQualityFieldSnapshot;
   transport: WaterTransportSnapshot;
   average: WaterQualityValues;
@@ -438,6 +458,20 @@ export interface BiogeochemistrySnapshot {
     carbonDriftRatio: number;
     oxygenEquivalentDriftRatio: number;
   };
+}
+
+/**
+ * A lightweight observation captured inside the ecology clock. Full renderer
+ * snapshots are intentionally much slower at high fast-forward speeds, so the
+ * graph receives these measured samples as a batch instead of joining sparse
+ * one-second presentation snapshots with fictitious straight lines.
+ */
+export interface ProducerFluxHistoryPoint {
+  elapsedSeconds: number;
+  /** Biomass-weighted light actually reaching living producer tissue, /100. */
+  effectiveLight: number;
+  grossPhotosynthesis: number;
+  producerRespiration: number;
 }
 
 export interface HoldingSnapshot {
@@ -611,6 +645,7 @@ export interface SimulationSnapshot {
   animalPopulationEvents: AnimalPopulationEventSnapshot[];
   animalPopulationEventTotals: AnimalPopulationEventTotals;
   biogeochemistry: BiogeochemistrySnapshot;
+  producerFluxHistory: ProducerFluxHistoryPoint[];
   coverageRatio: number;
   missionProgress: MissionProgressSnapshot | null;
   message: string;
@@ -622,6 +657,10 @@ export interface BiogeochemistrySaveState {
   organicMatter: number[];
   toxicWaste: number[];
   nutrients: number[];
+  /** Optional for compatibility with saves created before rooted sediment. */
+  sedimentNutrients?: number[];
+  /** Legacy spatial plant-N field; restored into ammonium by newer saves. */
+  rootedPlantStoredNitrogen?: number[];
   oxygen: number[];
   dissolvedInorganicCarbon: number;
   dissolvedInorganicCarbonField?: number[];
@@ -857,6 +896,14 @@ export interface SimulationSaveData {
       ageSeconds: number;
       lifespanSeconds: number;
       structuralScale: number;
+      /** Optional so saves made before leaf-cohort separation remain loadable. */
+      leafCohortScale?: number;
+      /** Optional so older saves restore with no unearned internal reserve. */
+      nitrogenReserve?: number;
+      /** Optional so saves made before explicit runner allocation still load. */
+      runnerReserveBiomass?: number;
+      /** Optional transient diagnostic; reset on restore before the next step. */
+      lastGrowthBiomassDelta?: number;
       runnerProgress: number;
       reproductionCount: number;
       stressSeconds: number;

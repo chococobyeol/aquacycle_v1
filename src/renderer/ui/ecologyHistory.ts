@@ -2,6 +2,24 @@ export interface TimedHistoryPoint {
   elapsedSeconds: number;
 }
 
+export interface ProducerBiomassHistoryPoint {
+  /** Attached algae only: Oedogonium + Nitzschia. */
+  attachedAlgaeBiomass?: number;
+  /**
+   * Legacy UI traces stored attached algae and Vallisneria together here.
+   * Keep it optional so a saved in-progress experiment can be migrated.
+   */
+  algaeBiomass?: number;
+  plantBiomass: number;
+}
+
+export const historyAttachedAlgaeBiomass = (
+  point: ProducerBiomassHistoryPoint,
+): number => point.attachedAlgaeBiomass ?? Math.max(
+  0,
+  (point.algaeBiomass ?? 0) - point.plantBiomass,
+);
+
 /**
  * Observation charts deliberately show one stable simulation-time window.
  * The window must not grow with the age of the aquarium: doing so compresses

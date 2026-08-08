@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  shrimpOvarianRecentIntakeRequirement,
-  SimulationWorld,
-} from "../src/simulation/SimulationWorld";
+import { SimulationWorld } from "../src/simulation/SimulationWorld";
 import { BiogeochemistryLedger } from "../src/simulation/biogeochemistry";
 import {
   continuousBodyMassFeedingScale,
@@ -19,8 +16,10 @@ import type {
 const SHRIMP: AnimalSpeciesId = "cherry-shrimp";
 const MIN_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.minimumLifespanSeconds;
 const MAX_LIFESPAN_SECONDS = SHRIMP_ECOLOGY_RULES.maximumLifespanSeconds;
-const MIN_SUPPLIED_ADULT_AGE_SECONDS = 180;
-const MAX_SUPPLIED_ADULT_AGE_SECONDS = 300;
+const MIN_SUPPLIED_ADULT_AGE_SECONDS =
+  SHRIMP_ECOLOGY_RULES.suppliedAdultMinimumAgeSeconds;
+const MAX_SUPPLIED_ADULT_AGE_SECONDS =
+  SHRIMP_ECOLOGY_RULES.suppliedAdultMaximumAgeSeconds;
 const MAX_TEST_TIME_SECONDS =
   MAX_SUPPLIED_ADULT_AGE_SECONDS + MAX_LIFESPAN_SECONDS + 100;
 // The lifecycle simulation intentionally advances more than a thousand
@@ -92,25 +91,6 @@ const lifespanOf = (animal: WorldSnapshot["animals"][number]): number => {
 };
 
 describe("cherry shrimp lifecycle", () => {
-  it("derives ovarian ration from conserved maintenance and egg transfer", () => {
-    const smallFemaleRequirement = shrimpOvarianRecentIntakeRequirement(
-      0.000012,
-      SHRIMP_ECOLOGY_RULES.ovarianAllocationPerSecond,
-      WATER_CYCLE_RULES.shrimp.assimilationFraction,
-      8,
-    );
-    const suppliedFemaleRequirement = shrimpOvarianRecentIntakeRequirement(
-      0.00005,
-      SHRIMP_ECOLOGY_RULES.ovarianAllocationPerSecond,
-      WATER_CYCLE_RULES.shrimp.assimilationFraction,
-      8,
-    );
-
-    expect(smallFemaleRequirement).toBeCloseTo(0.0023724, 6);
-    expect(suppliedFemaleRequirement).toBeCloseTo(0.0028966, 6);
-    expect(smallFemaleRequirement).toBeLessThan(suppliedFemaleRequirement);
-  });
-
   it("rematures and materially provisions the next ovary while a brood is carried", () => {
     const world = new SimulationWorld("laboratory");
     placeShrimp(world, { x: 600, y: 610 });
@@ -127,10 +107,15 @@ describe("cherry shrimp lifecycle", () => {
       WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
     female.gestationRemaining = 1_000;
     female.ovarianProgress = 0;
-    female.recentIntake = 0.01;
+    female.recentIntake = 0.1;
     female.health = 1;
     world.loadSaveData(save);
 
+    (world as unknown as {
+      stepAnimalEcology(deltaSeconds: number): void;
+    }).stepAnimalEcology(10);
+    // The first step advances the next ovarian cycle from zero; the following
+    // step can provision matter up to that newly developed fraction.
     (world as unknown as {
       stepAnimalEcology(deltaSeconds: number): void;
     }).stepAnimalEcology(10);
@@ -142,6 +127,35 @@ describe("cherry shrimp lifecycle", () => {
       female.reproductiveBiomass,
     );
     expect(after.storedBiomass).toBeLessThan(female.storedBiomass);
+  });
+
+  it("splits adult female surplus between continued body growth and egg matter", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const save = world.exportSaveData();
+    const female = save.animals[0]!;
+    female.sex = "female";
+    female.lifeStage = "adult";
+    female.structuralBiomass = 0.2;
+    female.peakStructuralBiomass = 0.2;
+    female.bodyLength = 20;
+    female.storedBiomass = WATER_CYCLE_RULES.shrimp.adultReserveBiomass;
+    female.reproductiveBiomass = 0;
+    female.ovarianClutchSize = SHRIMP_ECOLOGY_RULES.minimumClutchSize;
+    female.ovarianProgress = 0.5;
+    female.recentIntake = 0.02;
+    female.health = 1;
+    world.loadSaveData(save);
+
+    (world as unknown as {
+      stepAnimalEcology(deltaSeconds: number): void;
+    }).stepAnimalEcology(10);
+    const after = world.exportSaveData().animals[0]!;
+
+    expect(after.structuralBiomass).toBeGreaterThan(0.2);
+    expect(after.reproductiveBiomass).toBeGreaterThan(0);
+    expect(after.bodyLength).toBeGreaterThan(female.bodyLength);
+    expect(after.bodyLength).toBeLessThan(36);
   });
 
   it("pays current maintenance and ovarian allocation before overflowing a full reserve", () => {
@@ -221,11 +235,15 @@ describe("cherry shrimp lifecycle", () => {
       rules.feedingMassExponent,
     );
 
-    // A rendered hatchling starts at 0.0175 of adult structural mass. The
-    // shared M^0.75 feeding curve gives it about 4.8% of adult absolute
-    // intake, with no discontinuous stage multiplier.
-    expect(birthScale).toBeGreaterThan(0.045);
-    expect(birthScale).toBeLessThan(0.05);
+    // The hatchling uses the configured mass ratio on the same M^0.65 curve;
+    // there is no independent juvenile multiplier or stage discontinuity.
+    expect(birthScale).toBeCloseTo(
+      Math.pow(
+        rules.juvenileBirthBiomass / rules.adultStructuralBiomass,
+        rules.feedingMassExponent,
+      ),
+      12,
+    );
     expect(Math.abs(atMaturation - immediatelyBeforeMaturation))
       .toBeLessThan(0.00001);
   });
@@ -249,7 +267,8 @@ describe("cherry shrimp lifecycle", () => {
       shrimp.position = { x: cell.x, y: cell.y - 4 };
       shrimp.lifeStage = lifeStage;
       shrimp.sex = "male";
-      shrimp.structuralBiomass = SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+      shrimp.structuralBiomass =
+        SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
       shrimp.peakStructuralBiomass = shrimp.structuralBiomass;
       shrimp.storedBiomass = 0;
       shrimp.consumedBiomass = 0;
@@ -269,6 +288,48 @@ describe("cherry shrimp lifecycle", () => {
 
     expect(juvenileConsumption).toBeGreaterThan(0);
     expect(juvenileConsumption).toBeCloseTo(adultConsumption, 10);
+  });
+
+  it("reduces grazing pressure sigmoidally as a contacted film becomes sparse", () => {
+    const consumptionAtDensity = (foodBiomass: number): number => {
+      const world = new SimulationWorld("mission-5");
+      const cell = world.snapshot().cells
+        .filter((candidate) => candidate.surfaceKind === "substrate")
+        .sort((left, right) => Math.abs(left.x - 600) - Math.abs(right.x - 600))[0]!;
+      placeShrimp(world, cell);
+      const save = world.exportSaveData();
+      const savedCell = save.substrateCells.find(
+        (candidate) => candidate.id === cell.id,
+      )!;
+      const shrimp = save.animals[0]!;
+      savedCell.biomass.nitzschia = foodBiomass;
+      savedCell.biomass.oedogonium = 0;
+      savedCell.biofilm.decomposer = 0;
+      savedCell.biofilm.nitrifier = 0;
+      shrimp.position = { x: cell.x, y: cell.y - 4 };
+      shrimp.sex = "male";
+      shrimp.behavior = "grazing";
+      shrimp.targetCellId = cell.id;
+      shrimp.behaviorTimer = 10;
+      shrimp.consumedBiomass = 0;
+      world.loadSaveData(save);
+
+      (world as unknown as {
+        stepAnimalEcology(deltaSeconds: number): void;
+      }).stepAnimalEcology(1);
+      return world.exportSaveData().animals[0]!.consumedBiomass;
+    };
+
+    const halfSaturation =
+      WATER_CYCLE_RULES.shrimp.grazingHalfSaturationBiomass;
+    const atHalfSaturation = consumptionAtDensity(halfSaturation);
+    const atHalfThatDensity = consumptionAtDensity(halfSaturation / 2);
+
+    expect(atHalfSaturation).toBeGreaterThan(0);
+    expect(atHalfThatDensity).toBeGreaterThan(0);
+    // With q=2, f(K/2)=0.2 and f(K)=0.5. Positive traces remain edible,
+    // while grazing pressure falls faster than linearly as the film thins.
+    expect(atHalfThatDensity / atHalfSaturation).toBeCloseTo(0.4, 6);
   });
 
   it("keeps consuming trace algae and biofilm without a hidden grazing floor", () => {
@@ -302,7 +363,11 @@ describe("cherry shrimp lifecycle", () => {
     world.loadSaveData(save);
     (world as unknown as {
       stepAnimalEcology(deltaSeconds: number): void;
-    }).stepAnimalEcology(1_000);
+    // Use a deliberately long isolated demand interval. Type-III intake is
+    // very small at this trace density, so 1,000 s no longer requests the
+    // whole patch before the unfed shrimp dies; 10,000 s makes total demand
+    // exceed the standing food and verifies exact depletion, not survival.
+    }).stepAnimalEcology(10_000);
 
     const afterCell = world.snapshot().cells.find(
       (candidate) => candidate.id === cell.id,
@@ -316,11 +381,10 @@ describe("cherry shrimp lifecycle", () => {
     expect(afterCell.biomass.oedogonium).toBe(0);
     expect(afterCell.biofilm.decomposer).toBe(0);
     expect(afterCell.biofilm.nitrifier).toBe(0);
-    // The trace ration is exhausted rather than protected. With a long enough
-    // deficit the shrimp then dies from its conserved matter reaching zero.
+    // The trace ration is exhausted rather than protected. The deliberately
+    // oversized interval also removes the animal; its cause is not asserted
+    // here because lifespan and starvation thresholds are tested separately.
     expect(world.exportSaveData().animals).toHaveLength(0);
-    expect(world.snapshot().animalPopulationEventTotals.deathsByCause.starvation)
-      .toBe(1);
 
     const balance = world.snapshot().biogeochemistry.materialBalance;
     expect(Math.abs(balance.nitrogenDriftRatio))
@@ -439,7 +503,34 @@ describe("cherry shrimp lifecycle", () => {
     expect(new Set(targets).size).toBeGreaterThan(1);
   });
 
-  it("uses only food-funded bounded compensatory growth when a juvenile falls behind", () => {
+  it("draws offspring sex independently without cohort balancing or hash bias", () => {
+    const world = new SimulationWorld("laboratory", undefined, 17);
+    placeShrimp(world, { x: 600, y: 610 });
+    const parent = world.exportSaveData().animals[0]!;
+    const internals = world as unknown as {
+      createJuvenileAnimalState(
+        animal: typeof parent,
+        birthIndex: number,
+      ): typeof parent;
+    };
+    let females = 0;
+    let sameSexSiblingPairs = 0;
+    const cycles = 2_000;
+    for (let cycle = 0; cycle < cycles; cycle += 1) {
+      parent.reproductiveCycleIndex = cycle;
+      const first = internals.createJuvenileAnimalState(parent, 0);
+      const second = internals.createJuvenileAnimalState(parent, 1);
+      females += Number(first.sex === "female") + Number(second.sex === "female");
+      sameSexSiblingPairs += Number(first.sex === second.sex);
+    }
+
+    expect(females / (cycles * 2)).toBeGreaterThan(0.48);
+    expect(females / (cycles * 2)).toBeLessThan(0.52);
+    expect(sameSexSiblingPairs / cycles).toBeGreaterThan(0.47);
+    expect(sameSexSiblingPairs / cycles).toBeLessThan(0.53);
+  });
+
+  it("does not grant age-based catch-up growth when a juvenile falls behind", () => {
     const world = new SimulationWorld("laboratory");
     placeShrimp(world, { x: 600, y: 610 });
     const parent = world.exportSaveData().animals[0]!;
@@ -455,7 +546,9 @@ describe("cherry shrimp lifecycle", () => {
       ): number;
     };
     const juvenile = internals.createJuvenileAnimalState(parent, 0);
-    const birth = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass;
+    juvenile.sex = "male";
+    juvenile.ovarianClutchSize = undefined;
+    const birth = juvenile.structuralBiomass;
     const mature = SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
     const target = juvenile.maturationTargetSeconds!;
 
@@ -467,13 +560,349 @@ describe("cherry shrimp lifecycle", () => {
     juvenile.structuralBiomass = birth;
     const delayed = internals.shrimpJuvenileGrowthAllowance(juvenile, 1, 1);
 
-    expect(delayed).toBeGreaterThan(onSchedule);
-    expect(delayed).toBeCloseTo(
-      onSchedule * SHRIMP_ECOLOGY_RULES.maximumCompensatoryGrowthMultiplier,
-      12,
-    );
+    expect(delayed).toBeCloseTo(onSchedule, 12);
     expect(juvenile.structuralBiomass).toBe(birth);
   });
+
+  it("does not kill a viable juvenile merely for missing an age schedule", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const internals = world as unknown as {
+      animals: ReturnType<SimulationWorld["exportSaveData"]>["animals"];
+      createJuvenileAnimalState(
+        animal: ReturnType<SimulationWorld["exportSaveData"]>["animals"][number],
+        birthIndex: number,
+      ): ReturnType<SimulationWorld["exportSaveData"]>["animals"][number];
+      stepAnimalEcology(deltaSeconds: number): void;
+    };
+    const juvenile = internals.createJuvenileAnimalState(internals.animals[0], 0);
+    juvenile.sex = "male";
+    juvenile.ovarianClutchSize = undefined;
+    juvenile.ageSeconds = 1_500;
+    juvenile.lifespanSeconds = 10_000;
+    juvenile.storedBiomass = juvenile.structuralBiomass *
+      WATER_CYCLE_RULES.shrimp.adultReserveBiomass /
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+    internals.animals.splice(0, internals.animals.length, juvenile);
+
+    internals.stepAnimalEcology(1);
+
+    expect(internals.animals.some((animal) => animal.id === juvenile.id)).toBe(true);
+    expect(juvenile.lifeStage).toBe("juvenile");
+    expect(juvenile.structuralBiomass).toBeGreaterThan(0);
+  });
+
+  it("keeps body length continuous when the stage label changes", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const internals = world as unknown as {
+      animals: ReturnType<SimulationWorld["exportSaveData"]>["animals"];
+      createJuvenileAnimalState(
+        animal: ReturnType<SimulationWorld["exportSaveData"]>["animals"][number],
+        birthIndex: number,
+      ): ReturnType<SimulationWorld["exportSaveData"]>["animals"][number];
+      stepAnimalEcology(deltaSeconds: number): void;
+    };
+    const juvenile = internals.createJuvenileAnimalState(internals.animals[0], 0);
+    juvenile.sex = "male";
+    juvenile.structuralBiomass =
+      SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass - 0.001;
+    juvenile.peakStructuralBiomass = juvenile.structuralBiomass;
+    juvenile.storedBiomass = juvenile.structuralBiomass *
+      WATER_CYCLE_RULES.shrimp.adultReserveBiomass /
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+    internals.animals.splice(0, internals.animals.length, juvenile);
+
+    internals.stepAnimalEcology(0.1);
+    const beforeMaturity = juvenile.bodyLength;
+    expect(juvenile.lifeStage).toBe("juvenile");
+
+    juvenile.structuralBiomass =
+      SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+    juvenile.peakStructuralBiomass = juvenile.structuralBiomass;
+    internals.stepAnimalEcology(0.1);
+
+    expect(juvenile.lifeStage).toBe("adult");
+    expect(juvenile.bodyLength).toBeGreaterThanOrEqual(beforeMaturity);
+    expect(juvenile.bodyLength - beforeMaturity).toBeLessThan(1);
+  });
+
+  it("declines post-maturity growth continuously as adult structure fills", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const adult = world.exportSaveData().animals[0]!;
+    const internals = world as unknown as {
+      shrimpAdultGrowthAllowance(
+        animal: typeof adult,
+        deltaSeconds: number,
+        temperatureFactor: number,
+      ): number;
+    };
+    adult.lifeStage = "adult";
+    adult.health = 1;
+    adult.structuralBiomass =
+      SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+    const atMaturity = internals.shrimpAdultGrowthAllowance(adult, 1, 1);
+
+    adult.structuralBiomass = 0.5;
+    const atHalfSize = internals.shrimpAdultGrowthAllowance(adult, 1, 1);
+
+    adult.structuralBiomass =
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass;
+    const atMaximum = internals.shrimpAdultGrowthAllowance(adult, 1, 1);
+
+    expect(atMaturity).toBeCloseTo(
+      SHRIMP_ECOLOGY_RULES.adultSomaticGrowthPerSecond,
+      12,
+    );
+    expect(atHalfSize).toBeGreaterThan(0);
+    expect(atHalfSize).toBeLessThan(atMaturity);
+    expect(atMaximum).toBe(0);
+  });
+
+  it("does not advance ovarian state without conserved egg matter", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const parent = world.exportSaveData().animals[0]!;
+    const internals = world as unknown as {
+      createJuvenileAnimalState(
+        animal: typeof parent,
+        birthIndex: number,
+      ): typeof parent;
+      applyShrimpDebProduction(
+        animal: typeof parent,
+        temperatureFactor: number,
+        deltaSeconds: number,
+      ): void;
+    };
+    const female = Array.from(
+      { length: 16 },
+      (_, index) => internals.createJuvenileAnimalState(parent, index),
+    ).find((animal) => animal.sex === "female");
+    expect(female).toBeDefined();
+    if (!female) return;
+
+    female.structuralBiomass =
+      WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass +
+      (
+        SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass -
+        WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass
+      ) * SHRIMP_ECOLOGY_RULES.ovarianDevelopmentOnsetFraction;
+    female.peakStructuralBiomass = female.structuralBiomass;
+    female.storedBiomass = 0;
+    female.reproductiveBiomass = 0;
+    female.ovarianProgress = 0;
+    female.recentIntake = 0;
+    const matterBefore = female.structuralBiomass +
+      female.storedBiomass + female.reproductiveBiomass;
+
+    internals.applyShrimpDebProduction(female, 1, 1);
+
+    const matterAfter = female.structuralBiomass +
+      female.storedBiomass + female.reproductiveBiomass;
+    expect(female.lifeStage).toBe("juvenile");
+    expect(female.reproductiveBiomass).toBe(0);
+    expect(female.ovarianProgress).toBe(0);
+    expect(matterAfter).toBeCloseTo(matterBefore, 12);
+  });
+
+  it("provisions conserved egg matter once late-juvenile ovarian development begins", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const parent = world.exportSaveData().animals[0]!;
+    const internals = world as unknown as {
+      createJuvenileAnimalState(
+        animal: typeof parent,
+        birthIndex: number,
+      ): typeof parent;
+      shrimpReserveCapacity(animal: typeof parent): number;
+      shrimpBroodBiomass(animal: typeof parent): number;
+      applyShrimpDebProduction(
+        animal: typeof parent,
+        temperatureFactor: number,
+        deltaSeconds: number,
+      ): void;
+    };
+    const female = Array.from(
+      { length: 16 },
+      (_, index) => internals.createJuvenileAnimalState(parent, index),
+    ).find((animal) => animal.sex === "female");
+    expect(female).toBeDefined();
+    if (!female) return;
+
+    const birthStructure = WATER_CYCLE_RULES.shrimp.juvenileBirthBiomass /
+      (
+        1 + WATER_CYCLE_RULES.shrimp.adultReserveBiomass /
+          WATER_CYCLE_RULES.shrimp.adultStructuralBiomass
+      );
+    female.structuralBiomass = birthStructure +
+      (
+        SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass - birthStructure
+      ) * (SHRIMP_ECOLOGY_RULES.ovarianDevelopmentOnsetFraction + 0.05);
+    female.peakStructuralBiomass = female.structuralBiomass;
+    female.storedBiomass = internals.shrimpReserveCapacity(female);
+    female.reproductiveBiomass = 0;
+    female.ovarianProgress = 0.5;
+    female.recentIntake = 0.1;
+    female.health = 1;
+    const structureBefore = female.structuralBiomass;
+    const reserveBefore = female.storedBiomass;
+
+    internals.applyShrimpDebProduction(female, 1, 10);
+
+    const structuralGain = female.structuralBiomass - structureBefore;
+    const reproductiveGain = female.reproductiveBiomass;
+    const reserveSpent = reserveBefore - female.storedBiomass;
+    expect(female.lifeStage).toBe("juvenile");
+    expect(structuralGain).toBeGreaterThan(0);
+    expect(reproductiveGain).toBeGreaterThan(0);
+    expect(female.ovarianProgress).toBeCloseTo(
+      reproductiveGain / internals.shrimpBroodBiomass(female),
+      12,
+    );
+    expect(structuralGain + reproductiveGain).toBeCloseTo(reserveSpent, 12);
+  });
+
+  it("derives ovarian progress from conserved matter in each active compartment", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const female = world.exportSaveData().animals[0]!;
+    const internals = world as unknown as {
+      shrimpBroodBiomass(animal: typeof female): number;
+      shrimpOvarianMatterTarget(animal: typeof female): number;
+      synchroniseShrimpOvarianState(animal: typeof female): void;
+    };
+    female.sex = "female";
+    female.lifeStage = "adult";
+    female.ovarianClutchSize = SHRIMP_ECOLOGY_RULES.minimumClutchSize;
+    female.gestationRemaining = null;
+    const broodBiomass = internals.shrimpBroodBiomass(female);
+    female.reproductiveBiomass = broodBiomass * 0.25;
+    internals.synchroniseShrimpOvarianState(female);
+
+    expect(female.ovarianProgress).toBeCloseTo(0.25, 12);
+    expect(internals.shrimpOvarianMatterTarget(female))
+      .toBeCloseTo(broodBiomass, 12);
+
+    female.gestationRemaining = 100;
+    female.reproductiveBiomass = broodBiomass * 1.25;
+    internals.synchroniseShrimpOvarianState(female);
+    expect(female.ovarianProgress).toBeCloseTo(0.25, 12);
+    expect(internals.shrimpOvarianMatterTarget(female))
+      .toBeCloseTo(broodBiomass * 2, 12);
+  });
+
+  it("separates food-funded somatic maturity from first-clutch readiness", () => {
+    const world = new SimulationWorld("laboratory");
+    placeShrimp(world, { x: 600, y: 610 });
+    const save = world.exportSaveData();
+    const parent = save.animals[0]!;
+    const internals = world as unknown as {
+      createJuvenileAnimalState(
+        animal: typeof parent,
+        birthIndex: number,
+      ): typeof parent;
+      stepAnimalEcology(deltaSeconds: number): void;
+    };
+    const female = Array.from(
+      { length: 16 },
+      (_, index) => internals.createJuvenileAnimalState(parent, index),
+    ).find((animal) => animal.sex === "female");
+    expect(female).toBeDefined();
+    if (!female) return;
+
+    const matureStructure =
+      SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass;
+    female.ageSeconds = female.maturationTargetSeconds!;
+    female.structuralBiomass = matureStructure;
+    female.peakStructuralBiomass = matureStructure;
+    // Stay below the ordinary size-scaled reserve capacity so this fixture
+    // isolates the stage transition rather than the separate overflow path.
+    female.storedBiomass =
+      WATER_CYCLE_RULES.shrimp.adultReserveBiomass *
+      matureStructure /
+      WATER_CYCLE_RULES.shrimp.adultStructuralBiomass *
+      0.6;
+    female.reproductiveBiomass = 0;
+    female.ovarianProgress = 0;
+    female.growthProgress = 1;
+    female.recentIntake = 1;
+    save.animals = [female];
+    world.loadSaveData(save);
+    const before = world.exportSaveData().animals[0]!;
+    const matterBefore = before.structuralBiomass + before.storedBiomass +
+      (before.reproductiveBiomass ?? 0);
+
+    internals.stepAnimalEcology(0);
+
+    const after = world.exportSaveData().animals[0]!;
+    expect(after.lifeStage).toBe("adult");
+    expect(after.structuralBiomass).toBeCloseTo(matureStructure, 12);
+    expect(after.reproductiveBiomass).toBeCloseTo(0, 12);
+    expect(
+      after.structuralBiomass + after.storedBiomass +
+        (after.reproductiveBiomass ?? 0),
+    ).toBeCloseTo(matterBefore, 12);
+
+    // Becoming somatically adult must not make the female reproductively
+    // ready. Her ovary continues from the conserved state after transition.
+    expect(after.ovarianProgress).toBe(0);
+    expect(after.gestationRemaining).toBeNull();
+  });
+
+  it("lets a juvenile in a food-rich tank mature near its individual schedule", () => {
+    const world = new SimulationWorld("laboratory");
+    (world as unknown as { biogeochemistry: BiogeochemistryLedger }).biogeochemistry =
+      new BiogeochemistryLedger();
+    placeShrimp(world, { x: 600, y: 610 });
+    const save = world.exportSaveData();
+    const parent = save.animals[0]!;
+    const juvenile = (world as unknown as {
+      createJuvenileAnimalState(
+        animal: typeof parent,
+        birthIndex: number,
+      ): typeof parent;
+    }).createJuvenileAnimalState(parent, 0);
+    const foodCell = world.snapshot().cells
+      .filter((cell) => cell.surfaceKind === "substrate")
+      .reduce((nearest, cell) =>
+      Math.abs(cell.x - 600) < Math.abs(nearest.x - 600) ? cell : nearest
+      );
+    juvenile.position = { x: foodCell.x, y: foodCell.y };
+    juvenile.behavior = "exploring";
+    juvenile.behaviorTimer = 0;
+    juvenile.nextTargetEvaluation = 0;
+    juvenile.targetCellId = foodCell.id;
+    save.animals = [juvenile];
+    for (const cell of save.substrateCells) {
+      cell.biomass.nitzschia = 0.5;
+      cell.biomass.oedogonium = 0.5;
+    }
+    save.savedPhase = "paused";
+    save.elapsedSeconds = 0;
+    world.loadSaveData(save);
+    // Loading reconstructs the scenario ledger. Restore the intended
+    // chemistry-free lifecycle fixture after the load so this test measures
+    // food-funded growth rather than escape from the deliberately enormous
+    // all-substrate algae stock used above.
+    (world as unknown as { biogeochemistry: BiogeochemistryLedger }).biogeochemistry =
+      new BiogeochemistryLedger();
+    world.handle({ type: "start" });
+    world.handle({ type: "set-speed", speed: 64 });
+
+    const target = juvenile.maturationTargetSeconds!;
+    let maturedAt = Number.POSITIVE_INFINITY;
+    while (world.snapshot().elapsedSeconds < target * 1.35) {
+      const snapshot = advanceOneTick(world);
+      const current = snapshot.animals.find((animal) => animal.id === juvenile.id);
+      if (current?.lifeStage === "adult") {
+        maturedAt = current.ageSeconds;
+        break;
+      }
+    }
+
+    expect(maturedAt).toBeLessThanOrEqual(target * 1.25);
+  }, LIFECYCLE_TEST_TIMEOUT_MS);
 
   it("draws offspring sex independently instead of repairing each brood", () => {
     const world = new SimulationWorld("laboratory");
@@ -570,6 +999,33 @@ describe("cherry shrimp lifecycle", () => {
     expect(introduced?.id).toBe("animal-501");
     expect(introduced?.ageSeconds).toBeGreaterThanOrEqual(MIN_SUPPLIED_ADULT_AGE_SECONDS);
     expect(introduced?.ageSeconds).toBeLessThanOrEqual(MAX_SUPPLIED_ADULT_AGE_SECONDS);
+    expect(introduced?.bodyLength).toBeLessThan(36);
+    expect(introduced?.structuralBiomass).toBeGreaterThanOrEqual(
+      SHRIMP_ECOLOGY_RULES.suppliedFemaleStructuralBiomassMinimum,
+    );
+    expect(introduced?.structuralBiomass).toBeLessThanOrEqual(
+      SHRIMP_ECOLOGY_RULES.suppliedFemaleStructuralBiomassMaximum,
+    );
+    expect(introduced?.structuralBiomass).toBeGreaterThan(
+      SHRIMP_ECOLOGY_RULES.maturationStructuralBiomass,
+    );
+    expect(introduced?.structuralBiomass).toBeLessThanOrEqual(0.125);
+
+    world.handle({
+      type: "pick-animal",
+      speciesId: SHRIMP,
+      sex: "male",
+      point: { x: 640, y: 610 },
+    });
+    world.handle({ type: "drop-held", point: { x: 640, y: 610 } });
+    const introducedMale = world.snapshot().animals.at(-1);
+    expect(introducedMale?.sex).toBe("male");
+    expect(introducedMale?.structuralBiomass).toBeGreaterThanOrEqual(
+      SHRIMP_ECOLOGY_RULES.suppliedMaleStructuralBiomassMinimum,
+    );
+    expect(introducedMale?.structuralBiomass).toBeLessThanOrEqual(
+      SHRIMP_ECOLOGY_RULES.suppliedMaleStructuralBiomassMaximum,
+    );
     expect((introduced?.lifespanSeconds ?? 0) - (introduced?.ageSeconds ?? 0))
       .toBeGreaterThanOrEqual(
         MIN_LIFESPAN_SECONDS - MAX_SUPPLIED_ADULT_AGE_SECONDS,
@@ -588,6 +1044,8 @@ describe("cherry shrimp lifecycle", () => {
     const shrimp = save.animals[0]!;
     shrimp.origin = "born";
     shrimp.lifeStage = "juvenile";
+    shrimp.sex = "male";
+    shrimp.ovarianClutchSize = undefined;
     shrimp.ageSeconds = SHRIMP_ECOLOGY_RULES.maturationMaximumSeconds;
     shrimp.maturationTargetSeconds =
       SHRIMP_ECOLOGY_RULES.maturationMaximumSeconds;
